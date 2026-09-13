@@ -2,6 +2,7 @@
 #include "mtmd.h"
 
 #include <cstdio>
+#include <stdexcept>
 #include <vector>
 
 // Reproduces upstream U3: server_tokens::get_common_prefix must NOT treat two empty-id media
@@ -49,6 +50,27 @@ static int check_identity(
 int main() {
     const std::vector<llama_token> lead = { 10, 11 }; // 2 shared leading text tokens
     int fails = 0;
+
+    // Loading an mmproj sets capability even for a text-only sequence. Such a
+    // sequence is eligible for text-prefix reuse; real media must stay excluded.
+    {
+        server_tokens text(lead, /*has_mtmd=*/true);
+        fails += check("text-only media capability", text.has_media(), false);
+        const auto prefix = text.clone_text_prefix(1);
+        fails += check("capable text prefix", prefix.size(), 1);
+        fails += check("capability preserved", prefix.has_mtmd, true);
+        fails += check("prefix has no media", prefix.has_media(), false);
+
+        auto media = make("sha:abc", 3, lead);
+        fails += check("actual media present", media.has_media(), true);
+        bool refused = false;
+        try {
+            (void) media.clone_text_prefix(1);
+        } catch (const std::invalid_argument &) {
+            refused = true;
+        }
+        fails += check("text clone refuses media", refused, true);
+    }
 
     // U3 repro: two empty-id ("video frame") chunks of identical shape must diverge AT the media
     // (prefix = 2), never past it. HEAD/fixed = 2; parent/buggy = 5 (crosses). This is the red/green.

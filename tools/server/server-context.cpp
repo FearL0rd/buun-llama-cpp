@@ -5352,7 +5352,7 @@ private:
             !dst.task || dst.task->type != SERVER_TASK_TYPE_COMPLETION ||
             !dst.task->params.cache_prompt || dst.task->is_parent() || dst.task->is_child() ||
             !dst.prompt.tokens.empty() || !dst.prompt.checkpoints.empty() ||
-            dst.task->tokens.has_mtmd || !dst.lora.empty()) {
+            dst.task->tokens.has_media() || !dst.lora.empty()) {
             return;
         }
         const bool mtp = params_base.speculative.has_type(COMMON_SPECULATIVE_TYPE_DRAFT_MTP);
@@ -5382,7 +5382,7 @@ private:
                 if (source.id == dst.id || source.state != SLOT_STATE_GENERATING ||
                     !source.task || !source.task->params.cache_prompt ||
                     source.task->is_parent() || source.task->is_child() ||
-                    source.prompt.tokens.has_mtmd || !source.lora.empty() ||
+                    source.prompt.tokens.has_media() || !source.lora.empty() ||
                     source.can_speculate() != mtp ||
                     source.prompt.tokens.pos_next() != source.prompt.n_tokens()) {
                     continue;
