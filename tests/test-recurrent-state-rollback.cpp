@@ -254,6 +254,58 @@ static bool test_share_media_prefix(const common_params & params, llama_model * 
     return true;
 }
 
+static bool test_shared_swa_wrap(const common_params & params, llama_model * model) {
+    auto ctx = make_ctx(params, model, 3);
+    if (!ctx) { return false; }
+    auto * mem = dynamic_cast<llama_kv_cache_iswa *>(llama_get_memory(ctx.get()));
+    const uint32_t window = llama_model_n_swa(model);
+    if (!mem || window == 0 || mem->get_swa()->get_size() <= window + 64) { return false; }
+    const uint32_t prefix = mem->get_swa()->get_size() - 64;
+    const uint32_t end = prefix + window + 128;
+    if (end + 32 > llama_n_ctx(ctx.get())) { return false; }
+    const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model));
+    std::vector<llama_token> tokens(end + 32);
+    for (size_t i = 0; i < tokens.size(); ++i) { tokens[i] = llama_token(1 + i % (n_vocab - 1)); }
+    const auto fill = [&](uint32_t begin, uint32_t stop, llama_seq_id seq) {
+        for (; begin < stop; begin += 64) {
+            if (!decode_range(ctx.get(), tokens, begin, std::min(64u, stop - begin), seq)) {
+                fprintf(stderr, "Shared SWA wrap stalled: seq=%d pos=%u\n", seq, begin);
+                return false;
+            }
+        }
+        return true;
+    };
+    if (!fill(0, prefix, 0) || !mem->try_share_live_prefix(0, 1, prefix)) { return false; }
+    const auto paused = params.vbr_dynamic() ? std::vector<uint8_t>() :
+        save_seq(ctx.get(), 1, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+    if (!fill(prefix, end, 0)) { return false; }
+    if (!params.vbr_dynamic() && (paused.empty() ||
+        paused != save_seq(ctx.get(), 1, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY))) {
+        fprintf(stderr, "Shared SWA wrap changed the paused owner's window bytes\n");
+        return false;
+    }
+    // Advancing the faster owner must not recycle the slower owner's live window.
+    if (!mem->can_share_live_prefix(1, 2, prefix)) {
+        fprintf(stderr, "Shared SWA wrap lost lagging owner coverage\n");
+        return false;
+    }
+    if (!fill(prefix, end, 1)) { return false; }
+    for (llama_seq_id seq : {0, 1}) {
+        if (mem->get_swa()->seq_pos_min(seq) < llama_pos(prefix - window)) {
+            fprintf(stderr, "Shared SWA wrap did not recycle old shared rows: seq=%d min=%d\n",
+                    seq, mem->get_swa()->seq_pos_min(seq));
+            return false;
+        }
+        for (uint32_t pos = end; pos < end + 32; ++pos) {
+            if (!decode_range(ctx.get(), tokens, pos, 1, seq)) { return false; }
+            const auto logits = copy_logits(ctx.get(), n_vocab);
+            if (!logits_equal(logits, logits, "Shared SWA wrap finite continuation", 0.0f)) { return false; }
+        }
+    }
+    fprintf(stderr, "Shared SWA wrap: lagging owner preserved, both owners recycled, continuation PASS\n");
+    return true;
+}
+
 static bool test_share_media_swa_prefix(const common_params & params, llama_model * model) {
     const uint32_t window = llama_model_n_swa(model);
     if (window < 256) { return false; }
@@ -1122,6 +1174,12 @@ int main(int argc, char ** argv) {
     common_init();
 
     std::vector<std::string> parser_args(argv, argv + argc);
+    const auto shared_swa_arg = std::find(parser_args.begin(), parser_args.end(), "--shared-swa-wrap-only");
+    const bool shared_swa_only = shared_swa_arg != parser_args.end();
+    if (shared_swa_only) {
+        parser_args.erase(shared_swa_arg);
+        parser_args.push_back("--attn-prefix-only");
+    }
     const auto media_swa_arg = std::find(parser_args.begin(), parser_args.end(), "--media-swa-prefix-only");
     const bool media_swa_only = media_swa_arg != parser_args.end();
     if (media_swa_only) {
@@ -1176,6 +1234,12 @@ int main(int argc, char ** argv) {
     params.kv_unified = true;
 
     ggml_backend_load_all();
+
+    if (shared_swa_only) {
+        auto mparams = common_model_params_to_llama(params);
+        llama_model_ptr model(llama_model_load_from_file(params.model.path.c_str(), mparams));
+        return model && test_shared_swa_wrap(params, model.get()) ? 0 : 1;
+    }
 
     if (media_swa_only) {
         auto mparams = common_model_params_to_llama(params);

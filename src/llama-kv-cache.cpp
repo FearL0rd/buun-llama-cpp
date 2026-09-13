@@ -3424,9 +3424,9 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::plan_slots(const std::vector<lla
             const auto & cells = v_cells[stream];
             for (const uint32_t idx : sinfo_new.idxs[s]) {
                 if (!cells.is_empty(idx)) {
-                    GGML_ASSERT(cells.seq_count(idx) == 1);
-                    const llama_seq_id seq_id = cells.seq_get(idx);
-                    seq_pos_max_rm[seq_id] = std::max(seq_pos_max_rm[seq_id], cells.pos_get(idx));
+                    cells.seq_for_each(idx, [&](llama_seq_id seq_id) {
+                        seq_pos_max_rm[seq_id] = std::max(seq_pos_max_rm[seq_id], cells.pos_get(idx));
+                    });
                 }
             }
         }
@@ -3734,29 +3734,18 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
 
                 // can we use this cell? either:
                 //  - the cell is empty
-                //  - the cell is occupied only by one sequence:
-                //    - (disabled) mask causally, if the sequence is the same as the one we are inserting
-                //    - mask SWA, using current max pos for that sequence in the cache
-                //                always insert in the cell with minimum pos
+                //  - every owner masks it under SWA at its next position.
+                // A shared prefix is not permanently pinned: once ALL owners
+                // advance past a row, its backing can serve another token.
                 bool can_use = cells.is_empty(idx);
 
-                if (!can_use && cells.seq_count(idx) == 1) {
+                if (!can_use && n_swa > 0) {
                     const llama_pos pos_cell = cells.pos_get(idx);
-
-                    // (disabled) causal mask
-                    // note: it's better to purge any "future" tokens beforehand
-                    //if (cells.seq_has(idx, seq_id)) {
-                    //    can_use = pos_cell >= pos;
-                    //}
-
-                    if (!can_use) {
-                        const llama_seq_id seq_id_cell = cells.seq_get(idx);
-
-                        // SWA mask
-                        if (llama_hparams::is_masked_swa(n_swa, swa_type, pos_cell, cells.seq_pos_max(seq_id_cell) + 1)) {
-                            can_use = true;
-                        }
-                    }
+                    can_use = true;
+                    cells.seq_for_each(idx, [&](llama_seq_id seq_id) {
+                        can_use = can_use && llama_hparams::is_masked_swa(
+                            n_swa, swa_type, pos_cell, cells.seq_pos_max(seq_id) + 1);
+                    });
                 }
 
                 if (can_use) {
@@ -3884,18 +3873,17 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & 
                             decode_class, stream, vbr_generation_stamp_kind::dependency, true));
                 }
                 reused_occupied_cell = true;
-                assert(cells.seq_count(idx) == 1);
 
-                const llama_seq_id seq_id = cells.seq_get(idx);
-                const llama_pos    pos    = cells.pos_get(idx);
+                const llama_pos pos = cells.pos_get(idx);
                 prior_pos = pos;
 
-                seq_pos_max_rm[seq_id] = std::max(seq_pos_max_rm[seq_id], pos);
-                reused_sequences[size_t(seq_id)] = true;
-
-                if (decode_armed && vbr_ownership_) {
-                    vbr_ownership_->remove_cell(stream, seq_id, idx, pos);
-                }
+                cells.seq_for_each(idx, [&](llama_seq_id seq_id) {
+                    seq_pos_max_rm[seq_id] = std::max(seq_pos_max_rm[seq_id], pos);
+                    reused_sequences[size_t(seq_id)] = true;
+                    if (decode_armed && vbr_ownership_) {
+                        vbr_ownership_->remove_cell(stream, seq_id, idx, pos);
+                    }
+                });
                 if (idx < vbr_stash_rows_) {
                     vbr_stash_dirty_ = true; // the SWA slot is about to hold a different token
                 }
