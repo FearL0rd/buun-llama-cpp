@@ -2494,15 +2494,12 @@ struct server_slot {
         SLT_DBG(*this, "%s", "\n");
 
         frontier_logits.pending = false;
+        clear_retention_reuse();
         if (retention_obs) {
-            retention_obs->release_lineage_ticket(retention_reuse_source);
             retention_obs->release_lineage_ticket(retention_destination);
         } else {
-            retention_reuse_source = {};
             retention_destination = {};
         }
-        retention_reuse_pending = false;
-        retention_reuse_tokens = 0;
         retention_branch_pending = false;
         retention_request_succeeded = false;
         retention_geometry_failed = false;
@@ -2550,17 +2547,46 @@ struct server_slot {
 
     }
 
+    void clear_retention_reuse() noexcept {
+        if (retention_obs) {
+            retention_obs->release_lineage_ticket(retention_reuse_source);
+        } else {
+            retention_reuse_source = {};
+        }
+        retention_reuse_pending = false;
+        retention_reuse_tokens = 0;
+    }
+
+    void stage_active_prefix_reuse(
+            const server_retention_instance_key & source, uint64_t n_tokens) noexcept {
+        // Replace the discarded incumbent's receipt, not the destination lineage.
+        // This runs only after the historical image has been installed successfully.
+        clear_retention_reuse();
+        retention_branch_pending = false;
+        if (retention_obs && server_prompt_cache_retention_reuse_is_useful(
+                    n_tokens, &task->params.message_spans) &&
+            retention_obs->acquire_lineage_ticket(source, retention_reuse_source)) {
+            retention_reuse_pending = true;
+            retention_reuse_tokens = n_tokens;
+        }
+    }
+
     void commit_retention_reuse() noexcept {
         if (!retention_reuse_pending) {
             return;
         }
         retention_reuse_pending = false;
+        // A later trim or cold replay can supersede a staged reuse receipt.
+        retention_reuse_tokens = std::min(retention_reuse_tokens, stats.n_prompt_cached);
         const bool reused_branch = retention_branch_pending;
         common_retention_credit_result credit =
             common_retention_credit_result::unavailable;
-        if (retention_obs && retention_reuse_tokens != 0 &&
+        if (retention_obs && server_prompt_cache_retention_reuse_is_useful(
+                    retention_reuse_tokens, &task->params.message_spans) &&
             retention_reuse_source.valid()) {
             credit = retention_obs->credit_reuse(retention_reuse_source);
+        }
+        if (retention_obs) {
             retention_obs->release_lineage_ticket(retention_reuse_source);
         }
         if (vbr_prompt_cache_enabled && reused_branch &&
@@ -5029,8 +5055,10 @@ private:
             // original live slot.
             {
                 const auto * host = rec.selected_row(common_cache_plan_provider::host_cache_entry);
+                const auto * active = rec.selected_row(common_cache_plan_provider::active_context_checkpoint);
                 auto *       live = rec.selected_row(common_cache_plan_provider::live_slot);
-                if (slot.stats.n_prompt_cached > 0 && !(host && host->delivered) && live) {
+                if (slot.stats.n_prompt_cached > 0 && !(host && host->delivered) &&
+                    !(active && active->delivered) && live) {
                     live->disposition = common_cache_plan_disposition::accepted;
                     live->delivered   = true;
                     live->reason      = COMMON_CACHE_PLAN_REASON_NONE;
@@ -5052,6 +5080,7 @@ private:
             // chosen = the TERMINAL delivered provider (delivery is data recorded at each
             // site; the causal chain is emitted separately, so composition is not lost)
             const common_cache_plan_provider terminal_order[] = {
+                common_cache_plan_provider::active_context_checkpoint,
                 common_cache_plan_provider::live_context_checkpoint,
                 common_cache_plan_provider::host_cache_entry,
                 common_cache_plan_provider::live_slot,
@@ -5309,6 +5338,164 @@ private:
         return slot.prompt.tokens.media_content_identity(
                    frontier.token_count, media_identity) &&
                media_identity == frontier.media_content_identity;
+    }
+
+    // Late fallback only: normal live/host/checkpoint selection and its approved
+    // clearing have already left an empty destination. Never displace a hit or
+    // change a pre-mutation authoritative plan. The borrowed checkpoint remains
+    // owned by its active source for this entire non-yielding scheduler callback.
+    void restore_active_prefix(server_slot & dst) {
+        if (slots.size() < 2 || !fixed_host_cache_enabled() || !params_base.kv_unified ||
+            params_base.ctx_shift || params_base.n_cache_reuse != 0 ||
+            params_base.cache_plan_authority != common_cache_plan_authority_level::off ||
+            !llama_model_is_hybrid(model_tgt) || dst.diff_self_spec ||
+            !dst.task || dst.task->type != SERVER_TASK_TYPE_COMPLETION ||
+            !dst.task->params.cache_prompt || dst.task->is_parent() || dst.task->is_child() ||
+            !dst.prompt.tokens.empty() || !dst.prompt.checkpoints.empty() ||
+            dst.task->tokens.has_mtmd || !dst.lora.empty()) {
+            return;
+        }
+        const bool mtp = params_base.speculative.has_type(COMMON_SPECULATIVE_TYPE_DRAFT_MTP);
+        for (const auto type : params_base.speculative.types) {
+            if (type != COMMON_SPECULATIVE_TYPE_NONE && type != COMMON_SPECULATIVE_TYPE_DRAFT_MTP) {
+                return;
+            }
+        }
+        if (mtp != bool(ctx_dft) || mtp != dst.can_speculate()) {
+            return;
+        }
+
+        auto * rec = dst.cache_plan.get();
+        common_cache_plan_candidate * row = nullptr;
+        bool installed = false;
+        try {
+            struct candidate {
+                const server_slot * source = nullptr;
+                const common_prompt_checkpoint * checkpoint = nullptr;
+            } best;
+            const auto adapter = lora_config_identity(dst.lora);
+            const auto mem = llama_get_memory(ctx_tgt);
+            const auto provider = common_cache_plan_provider::active_context_checkpoint;
+            std::vector<float> carry;
+
+            for (const auto & source : slots) {
+                if (source.id == dst.id || source.state != SLOT_STATE_GENERATING ||
+                    !source.task || !source.task->params.cache_prompt ||
+                    source.task->is_parent() || source.task->is_child() ||
+                    source.prompt.tokens.has_mtmd || !source.lora.empty() ||
+                    source.can_speculate() != mtp ||
+                    source.prompt.tokens.pos_next() != source.prompt.n_tokens()) {
+                    continue;
+                }
+                // Always replay at least one input token to produce A2's own logits.
+                const size_t lcp = std::min(source.prompt.tokens.get_common_prefix(dst.task->tokens),
+                                           dst.task->tokens.size() - 1);
+                for (const auto & cp : source.prompt.checkpoints) {
+                    if (cp.n_tokens <= 0 || uint64_t(cp.n_tokens) > lcp ||
+                        (best.checkpoint && cp.n_tokens <= best.checkpoint->n_tokens) ||
+                        cp.pos_min != cp.pos_max || int64_t(cp.pos_max) + 1 != cp.n_tokens ||
+                        cp.data_tgt.empty() || !cp.data_qsa.empty() || !cp.accel.ring.empty() ||
+                        !checkpoint_frontier_is_current(source, cp, adapter) ||
+                        (source.retention_obs && !source.retention_obs->clone_source_available(
+                            server_retention_instance_key::for_checkpoint(source.id, &cp))) ||
+                        !llama_memory_can_share_attn_prefix(mem, source.id, dst.id, cp.n_tokens)) {
+                        continue;
+                    }
+                    if (mtp) {
+                        if (carry.empty()) {
+                            carry.resize(llama_model_n_embd_out(model_tgt));
+                        }
+                        common_speculative_mtp_carry_lifecycle scratch;
+                        if (cp.data_dft.empty() || !cp.data_dft_full_sequence ||
+                            !common_speculative_mtp_carry_state_load(scratch, carry, cp.accel.spec.view())) {
+                            continue;
+                        }
+                    }
+                    best = { &source, &cp };
+                }
+            }
+            if (rec) {
+                // Only the selected active checkpoint is transported, not a complete
+                // cost-planner inventory of every sibling/source considered here.
+                if (best.checkpoint) {
+                    rec->note_inventory_truncated(provider);
+                } else {
+                    rec->note_inventory_complete(provider);
+                }
+            }
+            if (!best.checkpoint) {
+                return;
+            }
+
+            const auto & cp = *best.checkpoint;
+            row = rec ? rec->find_or_add(provider, best.source->id, uint8_t(0),
+                                         dst.id, rec->selection) : nullptr;
+            if (row) {
+                row->lcp_tokens = llama_cache_acct_value::measured(cp.n_tokens);
+                row->payload_bytes = llama_cache_acct_value::measured(cp.size());
+                rec->select(provider, row);
+            }
+            const int64_t start = ggml_time_us();
+            auto prefix = dst.task->tokens.clone_text_prefix(cp.n_tokens);
+            std::string status = "restored active context checkpoint";
+            llama_synchronize(ctx_tgt);
+            if (ctx_dft) {
+                llama_synchronize(ctx_dft.get());
+            }
+            if (!llama_memory_try_share_attn_prefix(mem, best.source->id, dst.id, cp.n_tokens)) {
+                if (row) { row->note_reject(COMMON_CACHE_PLAN_REASON_COVERAGE_INSUFFICIENT); }
+                return;
+            }
+            installed = true;
+            const bool target_ok = llama_state_seq_set_data_ext(ctx_tgt,
+                    cp.data_tgt.data(), cp.data_tgt.size(), dst.id,
+                    LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == cp.data_tgt.size();
+            const bool draft_ok = target_ok && (!mtp || cp.try_load_dft(
+                    ctx_dft.get(), dst.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY));
+            if (!draft_ok || llama_memory_seq_pos_max(mem, dst.id) != cp.pos_max) {
+                throw std::runtime_error("active prefix checkpoint restore failed");
+            }
+            common_speculative_sequence_transition(dst.get_spec(), dst.id,
+                mtp ? common_speculative_sequence_event::composite_image_restored
+                    : common_speculative_sequence_event::target_restored_without_draft);
+            if (mtp && !common_speculative_set_state(dst.get_spec(), dst.id, cp.accel.spec.view())) {
+                throw std::runtime_error("active prefix MTP state restore failed");
+            }
+            // Publish only the input prefix, not source task/sampler/output or its
+            // checkpoint ring. The next ordinary decode establishes A2's lineage.
+            dst.prompt.tokens.swap(prefix);
+            ensure_frontier_sequence_epoch(dst.prompt);
+            dst.stats.n_prompt_cached = cp.n_tokens;
+            metrics.add_prompt_cached(cp.n_tokens);
+            dst.cache_status.swap(status);
+            dst.stage_active_prefix_reuse(
+                server_retention_instance_key::for_checkpoint(best.source->id, &cp), cp.n_tokens);
+            if (row) {
+                rec->revoke_deliveries();
+                row->accept();
+                row->delivered = true;
+            } else if (rec) {
+                // Reuse succeeded, but a full observer cannot represent its provider.
+                // Drop the record instead of attributing these tokens to the old live slot.
+                if (cache_plan_obs) { cache_plan_obs->shadow_unavailable++; }
+                dst.cache_plan.reset();
+                rec = nullptr;
+            }
+            SLT_INF(dst, "active prefix restored: source_slot=%d source_task=%d tokens=%" PRId64
+                    " replay=%zu restore_ms=%.3f\n", best.source->id, best.source->task->id,
+                    cp.n_tokens, dst.task->tokens.size() - size_t(cp.n_tokens),
+                    (ggml_time_us() - start) / 1000.0);
+            return;
+        } catch (const std::exception & e) {
+            if (installed) {
+                dst.mandatory_recovery_reset(server_cache_destruction_reason::restore_failure);
+                dst.stats.n_prompt_cached = 0;
+            }
+            if (row) { row->note_reject(COMMON_CACHE_PLAN_REASON_PAYLOAD_SHORT); }
+            if (rec && installed) { rec->restore_attempt_failed = true; }
+            SLT_WRN(dst, "active prefix unavailable, using cold prefill: %s\n", e.what());
+            return;
+        }
     }
 
     int trace = 0;        // env: LLAMA_TRACE
@@ -17127,6 +17314,7 @@ private:
                     bool checkpoint_tgt_recurrent_installed = false;
                     bool checkpoint_dft_recurrent_installed = false;
                     llama_pos checkpoint_installed_pos = -1;
+                    const bool starting_prompt = slot.state == SLOT_STATE_STARTED;
 
                     // used to determine the number of tokens added to the batch for the current slot
                     const auto n_tokens_prev = batch.size();
@@ -18288,6 +18476,10 @@ private:
                     vbr_restore_freeze.reset();
                     if (return_after_vbr_restore_trim) {
                         return;
+                    }
+
+                    if (starting_prompt && trim_ok && slot.prompt.tokens.empty()) {
+                        restore_active_prefix(slot);
                     }
 
                     // If using an alora, there may be uncached tokens that come
@@ -20796,6 +20988,88 @@ private:
         }
     }
 };
+
+bool server_active_prefix_retention_for_test() {
+    bool passed = true;
+    const auto check = [&](bool value, const char * label) {
+        if (!value) { std::fprintf(stderr, "active prefix retention: %s\n", label); }
+        passed &= value;
+    };
+    // Exercise the real slot receipt methods without loading a model. Cancellation
+    // uses the same clear method that reset() calls; live cancellation has its own gate.
+    for (const auto mode : { "success", "source-retired", "cancel", "cold", "trimmed", "short", "system", "missing" }) {
+        server_retention_sidecar_store store;
+        store.configure(nullptr, {}, nullptr);
+        common_chat_msg_spans spans;
+        spans.add(COMMON_CHAT_ROLE_USER, 0, 512);
+        const auto source = server_retention_instance_key::for_slot(0);
+        const auto incumbent = server_retention_instance_key::for_slot(2);
+        check(store.publish(source, common_retention_pool::attention, spans, true, 512, 512, true), "source admission");
+        check(store.publish(incumbent, common_retention_pool::attention, spans, true, 512, 512, true), "incumbent admission");
+        server_slot slot;
+        slot.id = 1;
+        slot.retention_obs = &store;
+        auto task = std::make_unique<server_task>();
+        task->params.message_spans = spans;
+        check(store.acquire_lineage_ticket(incumbent, slot.retention_reuse_source), "old receipt");
+        const auto old_lineage = slot.retention_reuse_source.lineage_id;
+        slot.retention_reuse_pending = true;
+        slot.retention_reuse_tokens = 512;
+        slot.retention_branch_pending = true;
+        server_retention_candidate candidate;
+        check(store.candidate_for_instance(source, candidate), "source candidate");
+        const auto lineage = candidate.record.stamp.lineage_id;
+        const auto hits = [&](uint64_t id) {
+            for (const auto & row : store.snapshot().lineages) {
+                if (row.lineage_id == id) { return row.reuse_hits; }
+            }
+            return UINT64_MAX;
+        };
+        const bool short_prefix = std::strcmp(mode, "short") == 0;
+        const bool system_prefix = std::strcmp(mode, "system") == 0;
+        const bool missing = std::strcmp(mode, "missing") == 0;
+        if (system_prefix) {
+            task->params.message_spans = {};
+            task->params.message_spans.add(COMMON_CHAT_ROLE_SYSTEM, 0, 8);
+            task->params.message_spans.add(COMMON_CHAT_ROLE_USER, 8, 504);
+        }
+        const uint64_t n = short_prefix ? 255 : system_prefix ? 8 : 256;
+        slot.task = std::move(task);
+        slot.stage_active_prefix_reuse(missing ? server_retention_instance_key::for_slot(99) : source, n);
+        slot.stats.n_prompt_cached = n;
+        check(!slot.retention_branch_pending, "discarded incumbent branch cleared");
+        check(hits(lineage) == 0 && hits(old_lineage) == 0, "staging earns no credit");
+        check(slot.retention_reuse_pending == (!short_prefix && !missing), "useful prefix threshold");
+        check(!slot.retention_destination.valid(), "destination lineage not adopted");
+        server_retention_lineage_ticket audit;
+        if (std::strcmp(mode, "source-retired") == 0) {
+            check(store.acquire_lineage_ticket(source, audit), "audit pin");
+            store.retire(source);
+            check(hits(lineage) == 0, "ticket retains retired source");
+        }
+        if (std::strcmp(mode, "cancel") == 0) {
+            slot.clear_retention_reuse();
+        } else if (std::strcmp(mode, "cold") == 0) {
+            slot.mandatory_recovery_reset(server_cache_destruction_reason::restore_failure);
+            slot.stats.n_prompt_cached = 0;
+        } else if (std::strcmp(mode, "trimmed") == 0) {
+            slot.stats.n_prompt_cached = 255;
+        }
+        slot.commit_retention_reuse();
+        const bool credited = std::strcmp(mode, "success") == 0 || system_prefix || audit.valid();
+        check(hits(lineage) == uint64_t(credited), "only successful useful reuse credited");
+        check(hits(old_lineage) == 0, "incumbent never credited");
+        check(!slot.retention_reuse_pending && !slot.retention_reuse_source.valid(), "receipt closed");
+        store.begin_competition_wave();
+        slot.commit_retention_reuse();
+        check(hits(lineage) == uint64_t(credited), "exactly once across epochs");
+        store.release_lineage_ticket(audit);
+        store.retire(source);
+        store.retire(incumbent);
+        check(store.snapshot().lineages.empty() && store.live_bytes() == 0, "no retained lineage or geometry");
+    }
+    return passed;
+}
 
 server_mmproj_lifecycle_test_result
 server_mmproj_lifecycle_for_test() {

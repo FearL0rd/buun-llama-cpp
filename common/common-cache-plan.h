@@ -9,7 +9,7 @@
 #include <string>
 #include <vector>
 
-// common-cache-plan.h — prompt-cache decision record, schema version 7.
+// common-cache-plan.h — prompt-cache decision record, schema version 8.
 //
 // §7.7 decision records + §7.5 shadow-planner inventory: the ONE closed plan-reason enum
 // shared by server and tests, the orthogonal candidate disposition, the closed provider
@@ -37,14 +37,15 @@
 // the shadow destruction quote/receipt; accounting remains schema 2. v7 names the
 // host payload representation independently of the provider so fixed state and sealed
 // VBR artifacts remain distinguishable throughout the control plane.
+// v8 adds the late, non-displacing active-context checkpoint provider.
 
-constexpr uint32_t COMMON_CACHE_PLAN_SCHEMA_VERSION = 7;
+constexpr uint32_t COMMON_CACHE_PLAN_SCHEMA_VERSION = 8;
 
 // Explicit record→embedded-accounting compatibility table. A C schema bump cannot compile
 // under the current record version until this table and the record version move together.
 constexpr uint32_t common_cache_plan_accounting_schema(uint32_t record_schema) {
     return (record_schema == 3 || record_schema == 4 || record_schema == 5 ||
-            record_schema == 6 || record_schema == 7) ? 2 :
+            record_schema == 6 || record_schema == 7 || record_schema == 8) ? 2 :
            (record_schema == 1 || record_schema == 2 ? 1 : 0);
 }
 static_assert(common_cache_plan_accounting_schema(COMMON_CACHE_PLAN_SCHEMA_VERSION) ==
@@ -178,6 +179,7 @@ enum class common_cache_plan_provider : uint8_t {
     live_context_checkpoint,
     host_cache_entry,
     cold_replay,
+    active_context_checkpoint,
     _count,
 };
 
@@ -834,7 +836,11 @@ struct common_cache_plan_record {
 
     // the shipped path's selected row per provider (inventory ordinal, -1 = none) — delivery
     // marking, revocation, and the delivered chain operate on selected rows
-    std::array<int32_t, size_t(common_cache_plan_provider::_count)> selected = {-1, -1, -1, -1};
+    std::array<int32_t, size_t(common_cache_plan_provider::_count)> selected = [] {
+        std::array<int32_t, size_t(common_cache_plan_provider::_count)> result;
+        result.fill(-1);
+        return result;
+    }();
 
     common_cache_plan_provider chosen  = common_cache_plan_provider::cold_replay;
     common_cache_plan_outcome  outcome = common_cache_plan_outcome::unknown; // != unknown ⇔ finalized

@@ -5431,6 +5431,7 @@ int main(int argc, char ** argv) {
         return failures == 0 ? 0 : 1;
     }
     test_lifecycle_full_cache_rotates();
+    CHECK(server_active_prefix_retention_for_test());
     test_idle_capture_session_cancellation();
     test_idle_capture_refuses_active_queue_yield();
     test_queue_yield_work_exception_precedes_callback_exception();

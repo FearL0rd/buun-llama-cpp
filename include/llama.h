@@ -902,6 +902,14 @@ extern "C" {
               llama_seq_id seq_id_dst,
                  llama_pos n_tokens);
 
+    // Non-mutating preflight for the operation above. Success is not a reservation;
+    // try_share rechecks coverage before changing membership.
+    LLAMA_API bool llama_memory_can_share_attn_prefix(
+            llama_memory_t mem,
+              llama_seq_id seq_id_src,
+              llama_seq_id seq_id_dst,
+                 llama_pos n_tokens);
+
     // Removes all tokens that do not belong to the specified sequence
     LLAMA_API void llama_memory_seq_keep(
             llama_memory_t mem,

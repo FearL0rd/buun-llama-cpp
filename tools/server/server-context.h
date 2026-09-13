@@ -40,6 +40,8 @@ struct server_committed_decode_reset_test_result {
 server_committed_decode_reset_test_result
 server_committed_decode_reset_for_test();
 
+bool server_active_prefix_retention_for_test();
+
 struct server_slot_frontier_logits_test_result {
     bool round_trip = false;
     bool primary_binding_mutation_refused = false;

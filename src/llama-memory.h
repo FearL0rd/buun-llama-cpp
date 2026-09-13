@@ -410,6 +410,9 @@ struct llama_memory_i {
         return try_seq_cp(seq_id_src, seq_id_dst, p0, p1);
     }
     // Checked fixed/unified attention sharing; other memory components are untouched.
+    virtual bool can_share_attn_prefix(llama_seq_id /*src*/, llama_seq_id /*dst*/, llama_pos /*n_tokens*/) const {
+        return false;
+    }
     virtual bool try_share_attn_prefix(llama_seq_id /*src*/, llama_seq_id /*dst*/, llama_pos /*n_tokens*/) {
         return false;
     }

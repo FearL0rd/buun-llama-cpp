@@ -2523,8 +2523,8 @@ bool llama_kv_cache::try_seq_cp_transient(
     return true;
 }
 
-bool llama_kv_cache::try_share_attn_prefix(
-        llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos n_tokens) {
+bool llama_kv_cache::can_share_attn_prefix(
+        llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos n_tokens) const {
     if (other || vbr_params_.dynamic || vbr_vmm_active() || n_stream != 1 || n_swa != 0 ||
         swa_type != LLAMA_SWA_TYPE_NONE || n_tokens <= 0 ||
         seq_id_src == seq_id_dst || seq_id_src < 0 || seq_id_dst < 0 ||
@@ -2535,8 +2535,13 @@ bool llama_kv_cache::try_share_attn_prefix(
     }
 
     const auto & cells = v_cells[0];
-    if (cells.get_has_shift() || cells.seq_pos_min(seq_id_dst) != -1 ||
-        !cells.seq_has_prefix(seq_id_src, n_tokens)) {
+    return !cells.get_has_shift() && cells.seq_pos_min(seq_id_dst) == -1 &&
+        cells.seq_has_prefix(seq_id_src, n_tokens);
+}
+
+bool llama_kv_cache::try_share_attn_prefix(
+        llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos n_tokens) {
+    if (!can_share_attn_prefix(seq_id_src, seq_id_dst, n_tokens)) {
         return false;
     }
 

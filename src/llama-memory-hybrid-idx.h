@@ -70,6 +70,7 @@ public:
     bool try_seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) override;
     // Sharing attention alone would omit the indexer history.
     bool try_share_attn_prefix(llama_seq_id, llama_seq_id, llama_pos) override { return false; }
+    bool can_share_attn_prefix(llama_seq_id, llama_seq_id, llama_pos) const override { return false; }
     bool try_seq_cp_transient(
             llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) override;
     void seq_keep(llama_seq_id seq_id)                                                          override;

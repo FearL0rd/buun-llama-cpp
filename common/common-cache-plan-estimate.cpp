@@ -397,6 +397,7 @@ static bool cache_plan_estimate_row(common_cache_plan_candidate & c, uint64_t n_
             break;
         case common_cache_plan_provider::host_cache_entry:
         case common_cache_plan_provider::live_context_checkpoint:
+        case common_cache_plan_provider::active_context_checkpoint:
             if (c.lcp_tokens.state    != llama_cache_acct_known::known ||
                 c.payload_bytes.state != llama_cache_acct_known::known) {
                 return false;

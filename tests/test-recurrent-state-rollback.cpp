@@ -186,7 +186,10 @@ static bool test_share_attn_prefix(
     };
     const auto share = [&](llama_seq_id src, llama_seq_id dst, llama_pos count) {
         llama_synchronize(ctx);
-        return llama_memory_try_share_attn_prefix(mem, src, dst, count);
+        const bool ready = llama_memory_can_share_attn_prefix(mem, src, dst, count);
+        const bool copied = llama_memory_try_share_attn_prefix(mem, src, dst, count);
+        GGML_ASSERT(ready == copied);
+        return copied;
     };
     const auto restore_partial = [&](const std::vector<uint8_t> & state) {
         return !state.empty() && llama_state_seq_set_data_ext(
