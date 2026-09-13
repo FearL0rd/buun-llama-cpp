@@ -205,6 +205,7 @@ public:
     bool seq_rm_transient(llama_seq_id seq_id,                       llama_pos p0, llama_pos p1) override;
     bool seq_rm_attn_transient(llama_seq_id seq_id,                  llama_pos p0, llama_pos p1) override;
     void seq_cp  (llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) override;
+    bool try_share_attn_prefix(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos n_tokens) override;
     bool try_seq_cp_transient(
             llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) override;
     void seq_keep(llama_seq_id seq_id)                                                          override;

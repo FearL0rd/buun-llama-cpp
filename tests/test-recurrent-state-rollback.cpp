@@ -134,8 +134,8 @@ static std::vector<float> copy_logits(llama_context * ctx, int n_vocab, int inde
 static bool logits_equal(
         const std::vector<float> & lhs,
         const std::vector<float> & rhs,
-        const char *               label) {
-    constexpr float eps = 1e-5f;
+        const char *               label,
+        float                      eps = 1e-5f) {
     if (lhs.size() != rhs.size() || lhs.empty()) {
         fprintf(stderr, "%s : missing or differently sized logits\n", label);
         return false;
@@ -147,6 +147,152 @@ static bool logits_equal(
             return false;
         }
     }
+    return true;
+}
+
+static bool test_share_attn_prefix(
+        llama_context * ctx, llama_context * ref, const std::vector<llama_token> & tokens, int n_vocab) {
+    // Out-of-order physical cells are fine; duplicate logical positions are not.
+    llama_kv_cells coverage;
+    coverage.resize(4);
+    for (uint32_t i = 0; i < 4; ++i) {
+        coverage.pos_set(i, 3 - i);
+        coverage.seq_add(i, 0);
+    }
+    if (!coverage.seq_has_prefix(0, 4) || coverage.seq_has_prefix(0, 5) ||
+        coverage.seq_has_prefix(1, 1) || coverage.seq_has_prefix(0, 0)) {
+        return false;
+    }
+    coverage.rm(0);
+    coverage.pos_set(0, 2);
+    coverage.seq_add(0, 0);
+    if (coverage.seq_has_prefix(0, 4) || coverage.seq_has_prefix(0, 3) ||
+        !coverage.seq_has_prefix(0, 2)) {
+        return false;
+    }
+    auto mem = llama_get_memory(ctx);
+    auto * hybrid = dynamic_cast<llama_memory_hybrid *>(mem);
+    if (!hybrid || dynamic_cast<llama_memory_hybrid_idx *>(mem)) {
+        return !llama_memory_try_share_attn_prefix(mem, 0, 1, 4);
+    }
+    auto * attn = hybrid->get_mem_attn();
+    auto * recurrent = hybrid->get_mem_recr();
+    constexpr auto partial = LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY;
+    const auto reset = [&]() {
+        llama_synchronize(ctx);
+        llama_synchronize(ref);
+        llama_memory_clear(mem, true);
+        llama_memory_clear(llama_get_memory(ref), true);
+    };
+    const auto share = [&](llama_seq_id src, llama_seq_id dst, llama_pos count) {
+        llama_synchronize(ctx);
+        return llama_memory_try_share_attn_prefix(mem, src, dst, count);
+    };
+    const auto restore_partial = [&](const std::vector<uint8_t> & state) {
+        return !state.empty() && llama_state_seq_set_data_ext(
+                ctx, state.data(), state.size(), 1, partial) == state.size();
+    };
+
+    // Source is ahead of the historical checkpoint. Destination has its own
+    // recurrent row but no attention, proving the primitive does not copy RS.
+    reset();
+    if (!decode_range(ctx, tokens, 0, 4)) {
+        return false;
+    }
+    const auto checkpoint = save_seq(ctx, 0, partial);
+    // Independent control: the existing composite copy is valid *at* the
+    // checkpoint, before the source advances. It creates the same physical row
+    // placement without using the new primitive or historical restore path.
+    if (!decode_range(ref, tokens, 0, 4)) {
+        return false;
+    }
+    llama_synchronize(ref);
+    if (!llama_memory_try_seq_cp(llama_get_memory(ref), 0, 1, -1, -1) ||
+        !decode_range(ref, tokens, 4, 4) ||
+        !decode_range(ctx, tokens, 4, 4) || !decode_range(ctx, tokens, 0, 2, 1)) {
+        return false;
+    }
+    const auto source = save_seq(ctx, 0);
+    const auto occupied = save_seq(ctx, 1);
+    if (share(0, 1, 4) || occupied != save_seq(ctx, 1) ||
+        !mem->seq_rm_attn(1, -1, -1)) {
+        return false;
+    }
+    const auto independent_rs = save_seq(ctx, 1, partial);
+    const auto source_depth = recurrent->rollback_valid_depth[0];
+    const auto destination_depth = recurrent->rollback_valid_depth[1];
+    for (const auto count : { -1, 0, 9 }) {
+        if (share(0, 1, count)) {
+            return false;
+        }
+    }
+    if (share(0, 0, 4) || share(-1, 1, 4) || share(0, LLAMA_MAX_SEQ, 4) ||
+        source != save_seq(ctx, 0) || independent_rs != save_seq(ctx, 1, partial) ||
+        attn->seq_pos_max(1) != -1 || !share(0, 1, 4) ||
+        source != save_seq(ctx, 0) || independent_rs != save_seq(ctx, 1, partial) ||
+        recurrent->rollback_valid_depth[0] != source_depth ||
+        recurrent->rollback_valid_depth[1] != destination_depth || attn->seq_pos_max(1) != 3) {
+        return false;
+    }
+    const auto & cells = attn->get_cells(0);
+    uint32_t shared = 0;
+    for (uint32_t i = 0; i < cells.size(); ++i) {
+        if (cells.seq_has(i, 1)) {
+            if (!cells.seq_has(i, 0) || cells.pos_get(i) >= 4) {
+                return false;
+            }
+            ++shared;
+        }
+    }
+    if (shared != 4 || !restore_partial(checkpoint) ||
+        recurrent->cells[0].tail == recurrent->cells[1].tail ||
+        recurrent->seq_pos_max(0) != 7 || recurrent->seq_pos_max(1) != 3 ||
+        source != save_seq(ctx, 0)) {
+        return false;
+    }
+
+    // Same batch geometry and physical KV layout for control and destination.
+    // A verify/rollback on the destination must leave the active source intact.
+    if (!decode_range(ctx, tokens, 4, 3, 1) || !decode_range(ref, tokens, 4, 3, 1) ||
+        !logits_equal(copy_logits(ctx, n_vocab, -1), copy_logits(ref, n_vocab, -1), "shared prefix verify", 0.0f) ||
+        !mem->seq_rm(1, 6, -1) || !llama_memory_seq_rm(llama_get_memory(ref), 1, 6, -1) ||
+        !decode_range(ctx, tokens, 6, 1, 1) || !decode_range(ref, tokens, 6, 1, 1) ||
+        !logits_equal(copy_logits(ctx, n_vocab), copy_logits(ref, n_vocab), "shared prefix rollback", 0.0f) ||
+        source != save_seq(ctx, 0)) {
+        return false;
+    }
+    // Removing the source must not free the shared prefix out from under A2.
+    if (!mem->seq_rm(0, -1, -1) || !llama_memory_seq_rm(llama_get_memory(ref), 0, -1, -1) ||
+        !decode_range(ctx, tokens, 7, 1, 1) || !decode_range(ref, tokens, 7, 1, 1) ||
+        !logits_equal(copy_logits(ctx, n_vocab), copy_logits(ref, n_vocab), "source cleared first", 0.0f)) {
+        return false;
+    }
+
+    // Failure after sharing: a truncated historical image must fail, and the
+    // caller can discard only A2 before retrying. Also exercise A2-first removal.
+    reset();
+    if (!load_seq(ctx, source, 0) || !load_seq(ref, source, 0) || !share(0, 1, 4)) {
+        return false;
+    }
+    auto truncated = checkpoint;
+    truncated.resize(truncated.size() / 2);
+    if (restore_partial(truncated) || !mem->seq_rm(1, -1, -1) ||
+        source != save_seq(ctx, 0) || !share(0, 1, 4) || !restore_partial(checkpoint) ||
+        !mem->seq_rm(1, -1, -1) || source != save_seq(ctx, 0) ||
+        !decode_range(ctx, tokens, 8, 1) || !decode_range(ref, tokens, 8, 1) ||
+        !logits_equal(copy_logits(ctx, n_vocab), copy_logits(ref, n_vocab), "destination cleared first", 0.0f)) {
+        return false;
+    }
+    // A source with a hole still has plausible min/max bounds, but is not a hit.
+    if (!mem->seq_rm_attn(0, 2, 3)) {
+        return false;
+    }
+    const auto gappy = save_seq(ctx, 0);
+    if (share(0, 1, 4) || gappy != save_seq(ctx, 0) || attn->seq_pos_max(1) != -1) {
+        return false;
+    }
+    reset();
+    fprintf(stderr, "%s : attention sharing, independent RS, rollback and cleanup passed\n", __func__);
     return true;
 }
 
@@ -395,6 +541,11 @@ static bool test_indexed_hybrid_tree_collection(const llama_model & model) {
         1, 1, false, false,
         reject_all, reject_all, reject_all);
 
+    if (llama_memory_try_share_attn_prefix(&indexed, 0, 1, 4)) {
+        fprintf(stderr, "%s : indexed hybrid accepted attention-only sharing\n", __func__);
+        return false;
+    }
+
     std::vector<llama_memory_tree_child> tree;
     if (!llama_memory_tree_collect(&indexed, tree) || tree.size() != 2 ||
         tree[0].child_id != 0 || tree[0].attention != indexed.get_mem_attn() ||
@@ -420,8 +571,14 @@ int main(int argc, char ** argv) {
     common_init();
 
     std::vector<std::string> parser_args(argv, argv + argc);
-    parser_args.push_back("-ct");
-    parser_args.push_back("f16");
+    const auto prefix_arg = std::find(parser_args.begin(), parser_args.end(), "--attn-prefix-only");
+    const bool prefix_only = prefix_arg != parser_args.end();
+    if (prefix_only) {
+        parser_args.erase(prefix_arg);
+    } else {
+        parser_args.push_back("-ct");
+        parser_args.push_back("f16");
+    }
     std::vector<char *> parser_argv;
     parser_argv.reserve(parser_args.size());
     for (auto & arg : parser_args) {
@@ -435,8 +592,8 @@ int main(int argc, char ** argv) {
 
     // This rollback test is cache-representation agnostic and intentionally
     // pins the static CPU-compatible cache rather than inheriting CLI defaults.
-    GGML_ASSERT(params.cache_type_k == GGML_TYPE_F16);
-    GGML_ASSERT(params.cache_type_v == GGML_TYPE_F16);
+    GGML_ASSERT(prefix_only || params.cache_type_k == GGML_TYPE_F16);
+    GGML_ASSERT(prefix_only || params.cache_type_v == GGML_TYPE_F16);
     GGML_ASSERT(!params.vbr_enabled());
 
     // The production MTP/VBR server uses unified KV. Its single physical stream
@@ -474,6 +631,16 @@ int main(int argc, char ** argv) {
     if (!ctx_src || !ctx_test || !ctx_ref || !ctx_parallel) {
         fprintf(stderr, "%s : failed to init contexts\n", __func__);
         return 1;
+    }
+    {
+        auto prefix_ref = make_ctx(params, model, 3);
+        if (!prefix_ref || !test_share_attn_prefix(ctx_parallel.get(), prefix_ref.get(), tokens, n_vocab)) {
+            fprintf(stderr, "%s : attention prefix sharing failed\n", __func__);
+            return 1;
+        }
+    }
+    if (prefix_only) {
+        return 0;
     }
     if (!test_nonfinite_reset(ctx_test.get(), tokens, n_vocab)) {
         fprintf(stderr, "%s : nonfinite recurrent reset failed\n", __func__);

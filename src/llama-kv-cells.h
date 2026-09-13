@@ -456,8 +456,9 @@ public:
         assert(pos[i] != -1);
         assert(!seq[i].test(seq_id));
 
-        seq[i].set(seq_id);
         seq_pos_inc(seq_id, i);
+        // Publish membership only after the allocating index insertion succeeds.
+        seq[i].set(seq_id);
     }
 
     // return the sequence id of this cell
@@ -498,6 +499,23 @@ public:
         }
 
         return seq_pos[seq_id].rbegin()->first;
+    }
+
+    // Require exactly one cell at each prefix position; min/max alone miss holes
+    // and counting cells alone can mistake duplicate positions for coverage.
+    bool seq_has_prefix(llama_seq_id seq_id, llama_pos n_tokens) const {
+        assert(seq_id >= 0 && seq_id < LLAMA_MAX_SEQ);
+        llama_pos next = 0;
+        for (const auto & entry : seq_pos[seq_id]) {
+            if (entry.first >= n_tokens) {
+                break;
+            }
+            if (entry.first != next) {
+                return false;
+            }
+            ++next;
+        }
+        return n_tokens > 0 && next == n_tokens;
     }
 
     // Exact cardinality from the canonical ownership index rather than trusting

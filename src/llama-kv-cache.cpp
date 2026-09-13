@@ -2523,6 +2523,35 @@ bool llama_kv_cache::try_seq_cp_transient(
     return true;
 }
 
+bool llama_kv_cache::try_share_attn_prefix(
+        llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos n_tokens) {
+    if (other || vbr_params_.dynamic || vbr_vmm_active() || n_stream != 1 || n_swa != 0 ||
+        swa_type != LLAMA_SWA_TYPE_NONE || n_tokens <= 0 ||
+        seq_id_src == seq_id_dst || seq_id_src < 0 || seq_id_dst < 0 ||
+        uint32_t(seq_id_src) >= n_seq_max || uint32_t(seq_id_dst) >= n_seq_max ||
+        (size_t) seq_id_src >= seq_to_stream.size() ||
+        (size_t) seq_id_dst >= seq_to_stream.size()) {
+        return false;
+    }
+
+    const auto & cells = v_cells[0];
+    if (cells.get_has_shift() || cells.seq_pos_min(seq_id_dst) != -1 ||
+        !cells.seq_has_prefix(seq_id_src, n_tokens)) {
+        return false;
+    }
+
+    try {
+        // Use the ordinary membership/lineage path, without a recurrent seq_cp.
+        seq_cp(seq_id_src, seq_id_dst, 0, n_tokens);
+    } catch (const std::bad_alloc &) {
+        // The destination was empty. Removing partial membership does not touch
+        // source bytes or its recurrent state. seq_add publishes its index first.
+        seq_rm(seq_id_dst, -1, -1);
+        return false;
+    }
+    return true;
+}
+
 void llama_kv_cache::seq_cp_impl(
         llama_seq_id seq_id_src, llama_seq_id seq_id_dst,
         llama_pos p0, llama_pos p1, bool publish_lineage) {
