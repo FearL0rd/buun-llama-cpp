@@ -299,6 +299,102 @@ static bool test_share_attn_prefix(
     return true;
 }
 
+// Compare late historical sharing with the existing full sequence copy taken
+// at the checkpoint. Run contexts sequentially: independent VBR trees must not
+// compete for one process's co-tenancy offer or change the control's budget.
+static bool test_share_attn_prefix_vbr(const common_params & params, llama_model * model) {
+    const uint32_t checkpoint_pos = params.n_ctx / 8;
+    const uint32_t source_pos = params.n_ctx * 3 / 8;
+    constexpr uint32_t replay = 32;
+    constexpr auto partial = LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY;
+    const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model));
+    std::vector<llama_token> tokens(source_pos + replay);
+    for (size_t i = 0; i < tokens.size(); ++i) {
+        tokens[i] = (llama_token) ((i * 17 + 1) % n_vocab);
+    }
+    std::vector<float> reference;
+    for (bool source_first : { false, true }) {
+        for (int arm = 0; arm < 3; ++arm) {
+            // arm 0: existing composite copy before source advances;
+            // arms 1/2: late attention share + historical RS, including a repeat.
+            auto ctx = make_ctx(params, model, 2);
+            if (!ctx) { return false; }
+            auto mem = llama_get_memory(ctx.get());
+            auto * hybrid = dynamic_cast<llama_memory_hybrid *>(mem);
+            if (!hybrid || !hybrid->get_mem_attn()->vbr_controller_active()) {
+                fprintf(stderr, "VBR sharing gate requires an armed ordinary hybrid\n");
+                return false;
+            }
+            auto * attn = hybrid->get_mem_attn();
+            const auto prefill = [&](uint32_t begin, uint32_t end) {
+                for (uint32_t pos = begin; pos < end; pos += 64) {
+                    if (!decode_range(ctx.get(), tokens, pos, std::min(64u, end - pos))) { return false; }
+                }
+                llama_synchronize(ctx.get());
+                return true;
+            };
+            if (!prefill(0, checkpoint_pos)) { return false; }
+            const auto checkpoint = save_seq(ctx.get(), 0, partial);
+            const auto epoch = attn->vbr_checkpoint_epoch(0);
+            const auto checkpoint_tier = attn->vbr_tier_epoch();
+            if (checkpoint.empty() || (arm == 0 && !llama_memory_try_seq_cp(mem, 0, 1, -1, -1)) ||
+                !prefill(checkpoint_pos, source_pos)) { return false; }
+            const auto source = save_seq(ctx.get(), 0, partial);
+            const auto tier = attn->vbr_tier_epoch();
+            if (epoch != attn->vbr_checkpoint_epoch(0) || tier <= checkpoint_tier) {
+                fprintf(stderr, "VBR gate needs a retiered, unchanged source lineage: epoch=%llu -> %llu tier=%llu\n",
+                        (unsigned long long) epoch, (unsigned long long) attn->vbr_checkpoint_epoch(0),
+                        (unsigned long long) tier);
+                return false;
+            }
+            if (arm != 0) {
+                if (llama_memory_can_share_attn_prefix(mem, 0, 1, source_pos + 1) ||
+                    !llama_memory_try_share_attn_prefix(mem, 0, 1, checkpoint_pos) ||
+                    llama_memory_try_share_attn_prefix(mem, 0, 1, checkpoint_pos) ||
+                    llama_state_seq_set_data_ext(ctx.get(), checkpoint.data(), checkpoint.size(),
+                        1, partial) != checkpoint.size()) { return false; }
+            }
+            if (source != save_seq(ctx.get(), 0, partial) ||
+                epoch != attn->vbr_checkpoint_epoch(0) || tier != attn->vbr_tier_epoch()) {
+                fprintf(stderr, "sharing changed source recurrent state, lineage or KV tiers\n");
+                return false;
+            }
+            uint32_t shared = 0;
+            const auto & cells = attn->get_cells(0);
+            for (uint32_t i = 0; i < cells.size(); ++i) {
+                if (cells.seq_has(i, 1)) {
+                    if (!cells.seq_has(i, 0) || cells.pos_get(i) >= (llama_pos) checkpoint_pos) { return false; }
+                    ++shared;
+                }
+            }
+            if (shared != checkpoint_pos || (source_first && !llama_memory_seq_rm(mem, 0, -1, -1))) {
+                return false;
+            }
+            std::vector<float> logits;
+            for (uint32_t pos = checkpoint_pos; pos < checkpoint_pos + replay; ++pos) {
+                if (!decode_range(ctx.get(), tokens, pos, 1, 1)) { return false; }
+                const auto row = copy_logits(ctx.get(), n_vocab);
+                logits.insert(logits.end(), row.begin(), row.end());
+            }
+            if (!llama_memory_seq_rm(mem, 1, -1, -1)) { return false; }
+            if (!source_first) {
+                if (source != save_seq(ctx.get(), 0, partial) ||
+                    !decode_range(ctx.get(), tokens, source_pos, 1)) { return false; }
+                const auto row = copy_logits(ctx.get(), n_vocab);
+                logits.insert(logits.end(), row.begin(), row.end());
+            }
+            if (arm == 0) { reference = logits; }
+            if (!logits_equal(reference, logits, "VBR historical share", 0.0f)) { return false; }
+            llama_memory_clear(mem, true);
+            if (attn->seq_pos_max(0) != -1 || attn->seq_pos_max(1) != -1) { return false; }
+            fprintf(stderr, "VBR share: source_first=%d arm=%d exact logits=%zu tier_epoch=%llu->%llu PASS\n",
+                    source_first, arm, logits.size(), (unsigned long long) checkpoint_tier,
+                    (unsigned long long) tier);
+        }
+    }
+    return true;
+}
+
 static bool test_nonfinite_reset(llama_context * ctx, const std::vector<llama_token> & tokens, int n_vocab) {
     auto * recurrent = get_recurrent(ctx);
     if (recurrent == nullptr) {
@@ -597,13 +693,23 @@ int main(int argc, char ** argv) {
     // pins the static CPU-compatible cache rather than inheriting CLI defaults.
     GGML_ASSERT(prefix_only || params.cache_type_k == GGML_TYPE_F16);
     GGML_ASSERT(prefix_only || params.cache_type_v == GGML_TYPE_F16);
-    GGML_ASSERT(!params.vbr_enabled());
+    GGML_ASSERT(prefix_only || !params.vbr_enabled());
 
     // The production MTP/VBR server uses unified KV. Its single physical stream
     // must remain distinct from the logical multi-sequence graph capacity.
     params.kv_unified = true;
 
     ggml_backend_load_all();
+
+    if (params.vbr_dynamic()) {
+        if (params.n_ctx < 2048 || params.vbr_vram_budget_bytes == 0) {
+            fprintf(stderr, "VBR sharing gate needs -c >= 2048 and an explicit --vbr-vram budget\n");
+            return 1;
+        }
+        auto mparams = common_model_params_to_llama(params);
+        llama_model_ptr model(llama_model_load_from_file(params.model.path.c_str(), mparams));
+        return model && test_share_attn_prefix_vbr(params, model.get()) ? 0 : 1;
+    }
 
     common_init_result_ptr llama_init = common_init_from_params(params);
     llama_model * model = llama_init->model();

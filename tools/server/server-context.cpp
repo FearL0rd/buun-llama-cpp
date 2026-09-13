@@ -5345,7 +5345,7 @@ private:
     // change a pre-mutation authoritative plan. The borrowed checkpoint remains
     // owned by its active source for this entire non-yielding scheduler callback.
     void restore_active_prefix(server_slot & dst) {
-        if (slots.size() < 2 || !fixed_host_cache_enabled() || !params_base.kv_unified ||
+        if (slots.size() < 2 || !prompt_cache || !params_base.kv_unified ||
             params_base.ctx_shift || params_base.n_cache_reuse != 0 ||
             params_base.cache_plan_authority != common_cache_plan_authority_level::off ||
             !llama_model_is_hybrid(model_tgt) || dst.diff_self_spec ||
@@ -5390,6 +5390,10 @@ private:
                 // Always replay at least one input token to produce A2's own logits.
                 const size_t lcp = std::min(source.prompt.tokens.get_common_prefix(dst.task->tokens),
                                            dst.task->tokens.size() - 1);
+                // The shared rows may have been retiered since capture. That is
+                // allowed, but a content edit/replacement invalidates the old RS
+                // checkpoint even when the same token positions are present.
+                std::optional<llama_memory_vbr_state_data> source_vbr;
                 for (const auto & cp : source.prompt.checkpoints) {
                     if (cp.n_tokens <= 0 || uint64_t(cp.n_tokens) > lcp ||
                         (best.checkpoint && cp.n_tokens <= best.checkpoint->n_tokens) ||
@@ -5400,6 +5404,16 @@ private:
                             server_retention_instance_key::for_checkpoint(source.id, &cp))) ||
                         !llama_memory_can_share_attn_prefix(mem, source.id, dst.id, cp.n_tokens)) {
                         continue;
+                    }
+                    if (server_vbr_dynamic_active(params_base)) {
+                        // The pressure snapshot also scans occupancy. Do not pay
+                        // for it on unrelated-prefix or fixed-KV requests.
+                        if (!source_vbr) {
+                            source_vbr = llama_memory_vbr_state(mem, source.id, 0);
+                        }
+                        if (!common_prompt_checkpoint_lineage_matches(cp, *source_vbr)) {
+                            continue;
+                        }
                     }
                     if (mtp) {
                         if (carry.empty()) {
