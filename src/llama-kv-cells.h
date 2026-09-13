@@ -3,6 +3,7 @@
 #include "llama.h"
 #include "llama-cparams.h"
 
+#include <algorithm>
 #include <bitset>
 #include <cassert>
 #include <cstring>
@@ -524,15 +525,16 @@ public:
     }
 
     bool seq_has_prefix_rows(llama_seq_id seq_id, llama_pos next_pos,
-                            const std::vector<llama_pos> & expected) const {
+                            const std::vector<llama_pos> & expected, llama_pos begin = 0) const {
         assert(seq_id >= 0 && seq_id < LLAMA_MAX_SEQ);
-        if (expected.empty() || expected.front() != 0 || next_pos <= expected.back()) {
+        if (begin < 0 || begin >= next_pos || expected.empty() || expected.front() != 0 ||
+            next_pos <= expected.back() || !std::is_sorted(expected.begin(), expected.end())) {
             return false;
         }
         const auto & positions = seq_pos[seq_id];
-        auto it = positions.begin();
-        for (llama_pos pos : expected) {
-            if (pos < 0 || pos >= next_pos || it == positions.end() || it->first != pos) {
+        auto it = positions.lower_bound({begin, 0});
+        for (auto row = std::lower_bound(expected.begin(), expected.end(), begin); row != expected.end(); ++row) {
+            if (it == positions.end() || it->first != *row) {
                 return false;
             }
             ++it;

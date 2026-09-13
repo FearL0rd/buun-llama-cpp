@@ -687,8 +687,37 @@ bool llama_kv_cache_iswa::can_share_live_prefix(llama_seq_id src, llama_seq_id d
         kv_swa->can_share_live_prefix(src, dst, n_tokens);
 }
 
+bool llama_kv_cache_iswa::can_share_attn_prefix_rows(llama_seq_id src, llama_seq_id dst,
+        llama_pos next_pos, const std::vector<llama_pos> & rows) const {
+    return !kv_base->vbr_controller_active() && !kv_swa->vbr_controller_active() &&
+        kv_base->can_share_attn_prefix_rows(src, dst, next_pos, rows) && kv_swa->seq_pos_min(dst) == -1;
+}
+
+bool llama_kv_cache_iswa::try_share_attn_prefix_rows(llama_seq_id src, llama_seq_id dst,
+        llama_pos next_pos, const std::vector<llama_pos> & rows) {
+    return can_share_attn_prefix_rows(src, dst, next_pos, rows) &&
+        kv_base->try_share_attn_prefix_rows(src, dst, next_pos, rows);
+}
+
+bool llama_kv_cache_iswa::can_share_live_prefix_rows(llama_seq_id src, llama_seq_id dst,
+        llama_pos next_pos, const std::vector<llama_pos> & rows) const {
+    return kv_base->can_share_live_prefix_rows(src, dst, next_pos, rows) &&
+        kv_swa->can_share_live_prefix_rows(src, dst, next_pos, rows);
+}
+
+bool llama_kv_cache_iswa::try_share_live_prefix_rows(llama_seq_id src, llama_seq_id dst,
+        llama_pos next_pos, const std::vector<llama_pos> & rows) {
+    return share_live_prefix(src, dst, next_pos, &rows);
+}
+
 bool llama_kv_cache_iswa::try_share_live_prefix(llama_seq_id src, llama_seq_id dst, llama_pos n_tokens) {
-    if (!can_share_live_prefix(src, dst, n_tokens)) { return false; }
+    return share_live_prefix(src, dst, n_tokens, nullptr);
+}
+
+bool llama_kv_cache_iswa::share_live_prefix(llama_seq_id src, llama_seq_id dst, llama_pos n_tokens,
+        const std::vector<llama_pos> * rows) {
+    if (!(rows ? can_share_live_prefix_rows(src, dst, n_tokens, *rows)
+               : can_share_live_prefix(src, dst, n_tokens))) { return false; }
     iswa_forwarded_op forwarded(kv_base.get(), kv_swa.get(),
         iswa_edit_binding(kv_base.get(), kv_swa.get(), vbr_operation_kind::sequence_edit,
                           vbr_operation_class::state_api, dst, 0, n_tokens));
@@ -700,8 +729,11 @@ bool llama_kv_cache_iswa::try_share_live_prefix(llama_seq_id src, llama_seq_id d
     };
     bool ok = false;
     try {
-        ok = kv_base->try_share_live_prefix(src, dst, n_tokens) &&
-            kv_swa->try_share_live_prefix(src, dst, n_tokens);
+        const auto share = [&](llama_kv_cache * child) {
+            return rows ? child->try_share_live_prefix_rows(src, dst, n_tokens, *rows)
+                        : child->try_share_live_prefix(src, dst, n_tokens);
+        };
+        ok = share(kv_base.get()) && share(kv_swa.get());
     } catch (...) {
         rollback();
         forwarded.finalize(false);

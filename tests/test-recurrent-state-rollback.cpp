@@ -169,6 +169,18 @@ static bool test_share_media_prefix(const common_params & params, llama_model * 
         coverage.seq_has_prefix_rows(0, 7, rows) || coverage.seq_has_prefix_rows(1, 8, rows)) {
         return false;
     }
+    // An image at the left edge requires every repeated row. Once its primary
+    // position leaves the window, those rows no longer contribute to coverage.
+    if (!coverage.seq_has_prefix_rows(0, 8, rows, 2) ||
+        coverage.seq_has_prefix_rows(0, 8, missing, 2) ||
+        coverage.seq_has_prefix_rows(0, 8, rows, -1) ||
+        coverage.seq_has_prefix_rows(0, 8, rows, 8)) { return false; }
+    auto unsorted = rows;
+    std::swap(unsorted[1], unsorted[2]);
+    if (coverage.seq_has_prefix_rows(0, 8, unsorted, 2)) { return false; }
+    coverage.seq_rm(2, 0);
+    if (coverage.seq_has_prefix_rows(0, 8, rows, 2) ||
+        !coverage.seq_has_prefix_rows(0, 8, rows, 3)) { return false; }
     const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model));
     std::vector<llama_token> tokens(256);
     for (size_t i = 0; i < tokens.size(); ++i) { tokens[i] = llama_token(i + 1); }
@@ -239,6 +251,143 @@ static bool test_share_media_prefix(const common_params & params, llama_model * 
                 remove_source ? "source" : "destination", arm);
         }
     }
+    return true;
+}
+
+static bool test_share_media_swa_prefix(const common_params & params, llama_model * model) {
+    const uint32_t window = llama_model_n_swa(model);
+    if (window < 256) { return false; }
+    // Synthetic image-shaped rows share position256. Keep distinct positions
+    // contiguous so this also runs on non-M-RoPE SWA models. The row set lies
+    // just inside the left edge of the first continuation's window.
+    const uint32_t prefix = window + 270;
+    if (params.n_ctx <= prefix + 32) { return false; }
+    const llama_pos next_pos = prefix - 15;
+    std::vector<llama_pos> rows(params.n_ctx);
+    for (size_t i = 0; i < rows.size(); ++i) {
+        rows[i] = i < 256 ? i : i < 272 ? 256 : i - 15;
+    }
+    const std::vector<llama_pos> expected(rows.begin(), rows.begin() + prefix);
+    const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model));
+    const auto decode = [&](llama_context * ctx, uint32_t begin, uint32_t end, llama_seq_id seq = 0) {
+        if (end > rows.size()) {
+            fprintf(stderr, "Media SWA decode exceeds test context: %u > %zu\n", end, rows.size());
+            return false;
+        }
+        for (uint32_t start = begin; start < end; start += 64) {
+            auto batch = llama_batch_init(std::min(64u, end - start), 0, 1);
+            for (uint32_t i = start; i < std::min(start + 64, end); ++i) {
+                common_batch_add(batch, llama_token(1 + i % (n_vocab - 1)), rows[i], {seq}, i + 1 == end);
+            }
+            const bool ok = llama_decode(ctx, batch) == 0;
+            llama_batch_free(batch);
+            if (!ok) { return false; }
+        }
+        llama_synchronize(ctx);
+        return true;
+    };
+    const bool live = params.vbr_dynamic();
+    for (bool remove_source : {false, true}) {
+        std::vector<uint8_t> reference_image;
+        std::vector<float> initial_reference;
+        std::vector<float> reference_logits;
+        for (int arm = 0; arm < 3; ++arm) {
+            auto ctx = make_ctx(params, model, 3);
+            if (!ctx) { return false; }
+            auto * mem = dynamic_cast<llama_kv_cache_iswa *>(llama_get_memory(ctx.get()));
+            if (!mem || !decode(ctx.get(), 0, prefix)) {
+                fprintf(stderr, "Media SWA initial fill failed\n");
+                return false;
+            }
+            const auto partial = LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY;
+            const auto companion = live ? std::vector<uint8_t>() : save_seq(ctx.get(), 0, partial);
+            const uint32_t ahead = live ? prefix + 512 : mem->get_swa()->get_size() + window + 256;
+            if (!decode(ctx.get(), prefix, ahead) ||
+                (!live && mem->get_swa()->seq_pos_min(0) <= next_pos - llama_pos(window))) {
+                fprintf(stderr, "Media SWA window advance failed: min=%d next=%d ahead=%u\n",
+                        mem->get_swa()->seq_pos_min(0), next_pos, ahead);
+                return false;
+            }
+            // Legacy serialization deliberately rejects a retiered VBR cache.
+            // Use its source-lineage contract plus exact live continuation instead.
+            const auto source = live ? std::vector<uint8_t>() : save_seq(ctx.get(), 0);
+            const auto lineage_before = llama_memory_vbr_state(mem, 0, 0);
+            const auto tier_before = mem->vbr_representation_identity();
+            if (arm == 0) {
+                if (live) { mem->seq_cp(0, 1, 0, next_pos); }
+                else { mem->get_base()->seq_cp(0, 1, 0, next_pos); }
+            } else {
+                const bool ok = live ? mem->try_share_live_prefix_rows(0, 1, next_pos, expected)
+                                     : mem->try_share_attn_prefix_rows(0, 1, next_pos, expected);
+                if (!ok) {
+                    fprintf(stderr, "Media SWA checked sharing refused\n");
+                    return false;
+                }
+            }
+            if (!live && (companion.empty() || llama_state_seq_set_data_ext(ctx.get(), companion.data(),
+                    companion.size(), 1, partial) != companion.size())) {
+                fprintf(stderr, "Media SWA companion restore failed\n");
+                return false;
+            }
+            const auto restored = live ? std::vector<uint8_t>() : save_seq(ctx.get(), 1);
+            const auto lineage_after = llama_memory_vbr_state(mem, 0, 0);
+            const auto tier_shared = mem->vbr_representation_identity();
+            if ((!live && (source != save_seq(ctx.get(), 0) || restored.empty())) ||
+                lineage_before.checkpoint_epoch != lineage_after.checkpoint_epoch ||
+                lineage_before.checkpoint_epoch_swa != lineage_after.checkpoint_epoch_swa ||
+                tier_before.tier_epoch != tier_shared.tier_epoch ||
+                tier_before.tier_epoch_swa != tier_shared.tier_epoch_swa ||
+                mem->try_share_live_prefix_rows(0, 1, next_pos, expected) ||
+                mem->try_share_attn_prefix_rows(0, 1, next_pos, expected)) {
+                fprintf(stderr, "Media SWA source image or occupied-destination check failed\n");
+                return false;
+            }
+            if (arm == 0) { reference_image = restored; }
+            else if (restored != reference_image) {
+                fprintf(stderr, "Media SWA shared image differs from established-copy control\n");
+                return false;
+            }
+            if (!decode(ctx.get(), prefix, prefix + 1, 1)) { return false; }
+            const auto initial = copy_logits(ctx.get(), n_vocab);
+            if (arm == 0) { initial_reference = initial; }
+            else if (!logits_equal(initial_reference, initial, "Media SWA first destination row", 0.0f)) {
+                return false;
+            }
+            const uint32_t advanced = live ? ahead + window + 512 : ahead;
+            if (!decode(ctx.get(), ahead, advanced)) { return false; }
+            const auto tier_after = mem->vbr_representation_identity();
+            if (live && (tier_after.tier_epoch <= tier_before.tier_epoch ||
+                         tier_after.tier_epoch_swa <= tier_before.tier_epoch_swa)) {
+                fprintf(stderr, "Media SWA gate requires post-sharing retiering of both children\n");
+                return false;
+            }
+            const llama_seq_id removed = remove_source ? 0 : 1;
+            const llama_seq_id survivor = 1 - removed;
+            if (!mem->seq_rm(removed, -1, -1) || !decode(ctx.get(), 0, 16, removed)) { return false; }
+            const uint32_t frontier = remove_source ? prefix + 1 : advanced;
+            std::vector<float> logits;
+            for (uint32_t i = frontier; i < frontier + 32; ++i) {
+                if (!decode(ctx.get(), i, i + 1, survivor)) { return false; }
+                const auto row = copy_logits(ctx.get(), n_vocab);
+                logits.insert(logits.end(), row.begin(), row.end());
+            }
+            if (arm == 0) { reference_logits = std::move(logits); }
+            else if (!logits_equal(reference_logits, logits, "Media SWA exact replay", 0.0f)) { return false; }
+            fprintf(stderr, "Media SWA %s %s-first arm=%d: exact replay; tier=(%llu,%llu)->(%llu,%llu) PASS\n",
+                live ? "live" : "historical", remove_source ? "source" : "destination", arm,
+                (unsigned long long) tier_before.tier_epoch, (unsigned long long) tier_before.tier_epoch_swa,
+                (unsigned long long) tier_after.tier_epoch, (unsigned long long) tier_after.tier_epoch_swa);
+        }
+    }
+    // Recycled image rows must not be mistaken for retained-window coverage.
+    auto ctx = make_ctx(params, model, 3);
+    if (!ctx) { return false; }
+    auto * mem = dynamic_cast<llama_kv_cache_iswa *>(llama_get_memory(ctx.get()));
+    if (!mem || !decode(ctx.get(), 0, mem->get_swa()->get_size() + window + 256) ||
+        mem->can_share_live_prefix_rows(0, 1, next_pos, expected) ||
+        mem->try_share_live_prefix_rows(0, 1, next_pos, expected) ||
+        mem->get_base()->seq_pos_max(1) != -1 || mem->get_swa()->seq_pos_max(1) != -1) { return false; }
+    fprintf(stderr, "Media SWA recycled-window no-mutation refusal PASS\n");
     return true;
 }
 
@@ -973,6 +1122,12 @@ int main(int argc, char ** argv) {
     common_init();
 
     std::vector<std::string> parser_args(argv, argv + argc);
+    const auto media_swa_arg = std::find(parser_args.begin(), parser_args.end(), "--media-swa-prefix-only");
+    const bool media_swa_only = media_swa_arg != parser_args.end();
+    if (media_swa_only) {
+        parser_args.erase(media_swa_arg);
+        parser_args.push_back("--attn-prefix-only");
+    }
     const auto media_arg = std::find(parser_args.begin(), parser_args.end(), "--media-prefix-only");
     const bool media_only = media_arg != parser_args.end();
     if (media_only) {
@@ -1021,6 +1176,12 @@ int main(int argc, char ** argv) {
     params.kv_unified = true;
 
     ggml_backend_load_all();
+
+    if (media_swa_only) {
+        auto mparams = common_model_params_to_llama(params);
+        llama_model_ptr model(llama_model_load_from_file(params.model.path.c_str(), mparams));
+        return model && test_share_media_swa_prefix(params, model.get()) ? 0 : 1;
+    }
 
     if (media_only) {
         auto mparams = common_model_params_to_llama(params);

@@ -2585,6 +2585,17 @@ bool llama_kv_cache::can_share_live_prefix(llama_seq_id src, llama_seq_id dst, l
     return can_share_range(src, dst, live_prefix_begin(n_tokens), n_tokens);
 }
 
+bool llama_kv_cache::can_share_live_prefix_rows(llama_seq_id src, llama_seq_id dst,
+        llama_pos next_pos, const std::vector<llama_pos> & rows) const {
+    return can_share_destination(src, dst) &&
+        v_cells[0].seq_has_prefix_rows(src, next_pos, rows, live_prefix_begin(next_pos));
+}
+
+bool llama_kv_cache::try_share_live_prefix_rows(llama_seq_id src, llama_seq_id dst,
+        llama_pos next_pos, const std::vector<llama_pos> & rows) {
+    return can_share_live_prefix_rows(src, dst, next_pos, rows) && share_checked_range(src, dst, 0, next_pos);
+}
+
 bool llama_kv_cache::try_share_live_prefix(llama_seq_id src, llama_seq_id dst, llama_pos n_tokens) {
     const auto begin = live_prefix_begin(n_tokens);
     // Validate the necessary window, but keep ordinary seq_cp's membership

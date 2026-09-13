@@ -5354,7 +5354,7 @@ private:
             !dst.task || dst.task->type != SERVER_TASK_TYPE_COMPLETION ||
             !dst.task->params.cache_prompt || dst.task->is_parent() || dst.task->is_child() ||
             !dst.prompt.tokens.empty() || !dst.prompt.checkpoints.empty() ||
-            (dst.task->tokens.has_media() && n_swa > 0) || !dst.lora.empty()) {
+            !dst.lora.empty()) {
             return;
         }
         const bool mtp = params_base.speculative.has_type(COMMON_SPECULATIVE_TYPE_DRAFT_MTP);
@@ -5403,10 +5403,25 @@ private:
                 const size_t lcp = std::min(source.prompt.tokens.get_common_prefix(dst.task->tokens),
                                            dst.task->tokens.size() - 1);
                 if (live_attention) {
-                    if (lcp > size_t(best.n_tokens) && lcp <= size_t(INT32_MAX) &&
-                        mem->can_share_live_prefix(source.id, dst.id, llama_pos(lcp))) {
-                        best = { &source, nullptr, int64_t(lcp), {} };
+                    if (lcp <= size_t(best.n_tokens) || lcp > size_t(INT32_MAX)) { continue; }
+                    std::vector<llama_pos> rows;
+                    if (source.prompt.tokens.has_media() || dst.task->tokens.has_media()) {
+                        std::string source_media, destination_media;
+                        if (!source.prompt.tokens.media_content_identity(lcp, source_media) ||
+                            !dst.task->tokens.media_content_identity(lcp, destination_media) ||
+                            source_media != destination_media ||
+                            source.prompt.tokens.pos_next(lcp) != dst.task->tokens.pos_next(lcp)) {
+                            continue;
+                        }
+                        rows = dst.task->tokens.prefix_row_positions(lcp);
+                        if (!mem->can_share_live_prefix_rows(source.id, dst.id,
+                                dst.task->tokens.pos_next(lcp), rows)) {
+                            continue;
+                        }
+                    } else if (!mem->can_share_live_prefix(source.id, dst.id, llama_pos(lcp))) {
+                        continue;
                     }
+                    best = { &source, nullptr, int64_t(lcp), std::move(rows) };
                     continue;
                 }
                 // The shared rows may have been retiered since capture. That is
@@ -5427,7 +5442,7 @@ private:
                     std::vector<llama_pos> rows;
                     if (source.prompt.tokens.has_media() || dst.task->tokens.has_media()) {
                         std::string media_identity;
-                        if (n_swa > 0 || !dst.task->tokens.media_content_identity(cp.n_tokens, media_identity) ||
+                        if (!dst.task->tokens.media_content_identity(cp.n_tokens, media_identity) ||
                             media_identity != cp.computation_frontier.media_content_identity ||
                             dst.task->tokens.pos_next(cp.n_tokens) != cp.computation_frontier.next_position) {
                             continue;
@@ -5479,6 +5494,7 @@ private:
 
             const auto * cp = best.checkpoint;
             const auto n_tokens = best.n_tokens;
+            const auto next_pos = dst.task->tokens.pos_next(n_tokens);
             row = rec ? rec->find_or_add(provider, best.source->id, uint8_t(0),
                                          dst.id, rec->selection) : nullptr;
             if (row) {
@@ -5488,13 +5504,17 @@ private:
             }
             const int64_t start = ggml_time_us();
             auto prefix = dst.task->tokens.clone_cached_prefix(n_tokens);
+            // Media capability belongs to the slot, not this request. A text
+            // completion can be followed by an image after erase/ID reuse.
+            prefix.has_mtmd = dst.prompt.tokens.has_mtmd;
             std::string status = live_attention ? "shared active attention prefix" : "restored active context checkpoint";
             llama_synchronize(ctx_tgt);
             if (ctx_dft) {
                 llama_synchronize(ctx_dft.get());
             }
             const bool shared = live_attention
-                ? mem->try_share_live_prefix(best.source->id, dst.id, n_tokens)
+                ? (best.rows.empty() ? mem->try_share_live_prefix(best.source->id, dst.id, next_pos)
+                                    : mem->try_share_live_prefix_rows(best.source->id, dst.id, next_pos, best.rows))
                 : !best.rows.empty()
                     ? mem->try_share_attn_prefix_rows(best.source->id, dst.id,
                         cp->computation_frontier.next_position, best.rows)
@@ -5509,7 +5529,7 @@ private:
                     LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == cp->data_tgt.size();
             const bool draft_ok = target_ok && (!mtp || cp->try_load_dft(
                     ctx_dft.get(), dst.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY));
-            if (!draft_ok || llama_memory_seq_pos_max(mem, dst.id) != (cp ? cp->pos_max : n_tokens - 1)) {
+            if (!draft_ok || llama_memory_seq_pos_max(mem, dst.id) != (cp ? cp->pos_max : next_pos - 1)) {
                 throw std::runtime_error("active prefix checkpoint restore failed");
             }
             common_speculative_sequence_transition(dst.get_spec(), dst.id,

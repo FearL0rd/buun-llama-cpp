@@ -187,6 +187,14 @@ public:
     bool can_share_attn_prefix(llama_seq_id src, llama_seq_id dst, llama_pos n_tokens) const override;
     bool try_share_attn_prefix(llama_seq_id src, llama_seq_id dst, llama_pos n_tokens) override;
     bool can_share_live_prefix(llama_seq_id src, llama_seq_id dst, llama_pos n_tokens) const override;
+    bool can_share_attn_prefix_rows(llama_seq_id src, llama_seq_id dst,
+            llama_pos next_pos, const std::vector<llama_pos> & rows) const override;
+    bool try_share_attn_prefix_rows(llama_seq_id src, llama_seq_id dst,
+            llama_pos next_pos, const std::vector<llama_pos> & rows) override;
+    bool can_share_live_prefix_rows(llama_seq_id src, llama_seq_id dst,
+            llama_pos next_pos, const std::vector<llama_pos> & rows) const override;
+    bool try_share_live_prefix_rows(llama_seq_id src, llama_seq_id dst,
+            llama_pos next_pos, const std::vector<llama_pos> & rows) override;
     bool try_share_live_prefix(llama_seq_id src, llama_seq_id dst, llama_pos n_tokens) override;
 
     bool seq_rm  (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1) override;
@@ -218,6 +226,8 @@ public:
     llama_kv_cache * get_swa () const;
 
 private:
+    bool share_live_prefix(llama_seq_id src, llama_seq_id dst, llama_pos next_pos,
+                           const std::vector<llama_pos> * rows);
     struct vbr_retier_freeze_children {
         vbr_operation_id operation_id = {};
         bool froze_base = false;

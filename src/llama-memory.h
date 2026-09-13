@@ -433,6 +433,10 @@ struct llama_memory_i {
     virtual bool try_share_live_prefix(llama_seq_id /*src*/, llama_seq_id /*dst*/, llama_pos /*n_tokens*/) {
         return false;
     }
+    virtual bool can_share_live_prefix_rows(llama_seq_id, llama_seq_id,
+            llama_pos, const std::vector<llama_pos> &) const { return false; }
+    virtual bool try_share_live_prefix_rows(llama_seq_id, llama_seq_id,
+            llama_pos, const std::vector<llama_pos> &) { return false; }
     virtual void seq_keep(llama_seq_id seq_id) = 0;
     virtual void seq_add (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1, llama_pos shift) = 0;
     virtual void seq_div (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1, int d) = 0;
