@@ -5348,7 +5348,7 @@ private:
         if (slots.size() < 2 || !prompt_cache || !params_base.kv_unified ||
             params_base.ctx_shift || params_base.n_cache_reuse != 0 ||
             params_base.cache_plan_authority != common_cache_plan_authority_level::off ||
-            !llama_model_is_hybrid(model_tgt) || dst.diff_self_spec ||
+            (!llama_model_is_hybrid(model_tgt) && n_swa <= 0) || dst.diff_self_spec ||
             !dst.task || dst.task->type != SERVER_TASK_TYPE_COMPLETION ||
             !dst.task->params.cache_prompt || dst.task->is_parent() || dst.task->is_child() ||
             !dst.prompt.tokens.empty() || !dst.prompt.checkpoints.empty() ||
@@ -5397,7 +5397,9 @@ private:
                 for (const auto & cp : source.prompt.checkpoints) {
                     if (cp.n_tokens <= 0 || uint64_t(cp.n_tokens) > lcp ||
                         (best.checkpoint && cp.n_tokens <= best.checkpoint->n_tokens) ||
-                        cp.pos_min != cp.pos_max || int64_t(cp.pos_max) + 1 != cp.n_tokens ||
+                        cp.pos_min < 0 || cp.pos_min > cp.pos_max ||
+                        (llama_model_is_hybrid(model_tgt) && cp.pos_min != cp.pos_max) ||
+                        int64_t(cp.pos_max) + 1 != cp.n_tokens ||
                         cp.data_tgt.empty() || !cp.data_qsa.empty() || !cp.accel.ring.empty() ||
                         !checkpoint_frontier_is_current(source, cp, adapter) ||
                         (source.retention_obs && !source.retention_obs->clone_source_available(

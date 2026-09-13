@@ -184,6 +184,9 @@ public:
 
     void clear(bool data) override;
 
+    bool can_share_attn_prefix(llama_seq_id src, llama_seq_id dst, llama_pos n_tokens) const override;
+    bool try_share_attn_prefix(llama_seq_id src, llama_seq_id dst, llama_pos n_tokens) override;
+
     bool seq_rm  (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1) override;
     bool seq_rm_transient(llama_seq_id seq_id,                       llama_pos p0, llama_pos p1) override;
     bool seq_rm_attn_transient(llama_seq_id seq_id,                  llama_pos p0, llama_pos p1) override;

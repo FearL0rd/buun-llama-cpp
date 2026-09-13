@@ -672,6 +672,22 @@ bool llama_kv_cache_iswa::get_has_shared_cells() const {
     return kv_base->get_has_shared_cells() || kv_swa->get_has_shared_cells();
 }
 
+bool llama_kv_cache_iswa::can_share_attn_prefix(
+        llama_seq_id src, llama_seq_id dst, llama_pos n_tokens) const {
+    // The source's current SWA window may be ahead of the checkpoint. Share
+    // only full-attention rows; PARTIAL_ONLY restores the saved window into
+    // independent cells. Legacy window images cannot follow VBR tier changes.
+    return !kv_base->vbr_controller_active() && !kv_swa->vbr_controller_active() &&
+        kv_base->can_share_attn_prefix(src, dst, n_tokens) &&
+        kv_swa->seq_pos_min(dst) == -1;
+}
+
+bool llama_kv_cache_iswa::try_share_attn_prefix(
+        llama_seq_id src, llama_seq_id dst, llama_pos n_tokens) {
+    return can_share_attn_prefix(src, dst, n_tokens) &&
+        kv_base->try_share_attn_prefix(src, dst, n_tokens);
+}
+
 void llama_kv_cache_iswa::state_write(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) const {
     if ((flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == 0) {
         kv_base->state_write(io, seq_id, flags);

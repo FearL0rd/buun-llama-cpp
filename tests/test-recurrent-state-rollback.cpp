@@ -150,6 +150,115 @@ static bool logits_equal(
     return true;
 }
 
+static bool test_share_attn_prefix_swa(const common_params & params, llama_model * model, bool remove_source) {
+    auto ctx = make_ctx(params, model, 3);
+    if (!ctx) { return false; }
+    auto * mem = dynamic_cast<llama_kv_cache_iswa *>(llama_get_memory(ctx.get()));
+    if (!mem || params.vbr_dynamic() || llama_model_n_swa(model) == 0) {
+        fprintf(stderr, "SWA prefix gate requires a fixed-KV interleaved SWA model\n");
+        return false;
+    }
+    const uint32_t window = llama_model_n_swa(model);
+    const uint32_t checkpoint_pos = window + 64;
+    const uint32_t source_pos = mem->get_swa()->get_size() + window + 256;
+    if (source_pos + 32 > llama_n_ctx(ctx.get())) {
+        fprintf(stderr, "SWA prefix gate needs context beyond its physical window pool\n");
+        return false;
+    }
+    const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model));
+    std::vector<llama_token> tokens(source_pos + 32);
+    for (size_t i = 0; i < tokens.size(); ++i) {
+        tokens[i] = llama_token(1 + i % (n_vocab - 1));
+    }
+    const auto decode_to = [&](uint32_t begin, uint32_t end) {
+        for (; begin < end; begin += 64) {
+            if (!decode_range(ctx.get(), tokens, begin, std::min(64u, end - begin))) {
+                return false;
+            }
+        }
+        llama_synchronize(ctx.get());
+        return true;
+    };
+    if (!decode_to(0, checkpoint_pos)) { return false; }
+    const auto historical = save_seq(ctx.get(), 0);
+    const auto companion = save_seq(ctx.get(), 0, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+    if (historical.empty() || companion.empty() || !decode_to(checkpoint_pos, source_pos) ||
+        mem->get_swa()->seq_pos_min(0) < llama_pos(checkpoint_pos)) {
+        fprintf(stderr, "SWA gate did not advance the retained window\n");
+        return false;
+    }
+    const auto source = save_seq(ctx.get(), 0);
+    if (llama_memory_can_share_attn_prefix(mem, -1, 1, checkpoint_pos) ||
+        llama_memory_can_share_attn_prefix(mem, 0, 3, checkpoint_pos) ||
+        llama_memory_can_share_attn_prefix(mem, 0, 0, checkpoint_pos) ||
+        llama_memory_can_share_attn_prefix(mem, 0, 1, source_pos + 1) ||
+        !llama_memory_try_share_attn_prefix(mem, 0, 1, checkpoint_pos)) {
+        fprintf(stderr, "SWA historical prefix sharing refused after window advance\n");
+        return false;
+    }
+    const size_t loaded = llama_state_seq_set_data_ext(ctx.get(), companion.data(), companion.size(), 1,
+            LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+    const bool source_equal = source == save_seq(ctx.get(), 0);
+    const auto restored = save_seq(ctx.get(), 1);
+    if (loaded != companion.size() || !source_equal || restored.empty()) {
+        fprintf(stderr, "SWA image check: loaded=%zu/%zu source_equal=%d size=%zu/%zu\n",
+            loaded, companion.size(), source_equal, historical.size(), restored.size());
+        return false;
+    }
+    if (llama_memory_try_share_attn_prefix(mem, 0, 1, checkpoint_pos) ||
+        source != save_seq(ctx.get(), 0) || restored != save_seq(ctx.get(), 1)) {
+        fprintf(stderr, "SWA occupied destination was not a no-mutation refusal\n");
+        return false;
+    }
+    const llama_seq_id removed = remove_source ? 0 : 1;
+    const llama_seq_id survivor = remove_source ? 1 : 0;
+    const auto & survivor_state = remove_source ? restored : source;
+    if (!llama_memory_seq_rm(mem, removed, -1, -1) ||
+        !decode_range(ctx.get(), tokens, 0, 32, removed) ||
+        survivor_state != save_seq(ctx.get(), survivor)) {
+        fprintf(stderr, "SWA removal/reuse changed the surviving sequence\n");
+        return false;
+    }
+    const uint32_t frontier = remove_source ? checkpoint_pos : source_pos;
+    for (uint32_t pos = frontier; pos < frontier + 32; ++pos) {
+        if (!decode_range(ctx.get(), tokens, pos, 1, survivor)) { return false; }
+        const auto row = copy_logits(ctx.get(), n_vocab);
+        if (!logits_equal(row, row, "SWA survivor finite continuation", 0.0f)) { return false; }
+    }
+    // Compare in canonical placement: physical attention reduction order need
+    // not be identical between a shared prefix and an independently loaded one.
+    ctx.reset();
+    std::vector<float> reference;
+    std::vector<uint8_t> canonical;
+    for (const auto * state : { &historical, &restored, &restored }) {
+        auto replay = make_ctx(params, model, 3);
+        if (!replay || !load_seq(replay.get(), *state, 0)) { return false; }
+        // Normalize the sequence IDs inside every serialized KV cell as well
+        // as the outer envelope before comparing complete images.
+        const auto image = save_seq(replay.get(), 0);
+        if (canonical.empty()) {
+            canonical = image;
+        } else if (canonical != image) {
+            fprintf(stderr, "SWA canonical historical image mismatch\n");
+            return false;
+        }
+        std::vector<float> logits;
+        for (uint32_t pos = checkpoint_pos; pos < checkpoint_pos + 32; ++pos) {
+            if (!decode_range(replay.get(), tokens, pos, 1)) { return false; }
+            const auto row = copy_logits(replay.get(), n_vocab);
+            logits.insert(logits.end(), row.begin(), row.end());
+        }
+        if (reference.empty()) {
+            reference = std::move(logits);
+        } else if (!logits_equal(reference, logits, "SWA canonical historical replay", 0.0f)) {
+            return false;
+        }
+    }
+    fprintf(stderr, "SWA historical prefix: %s-first removal/reuse, exact image, unchanged source, exact 32-row replay and repeat\n",
+            remove_source ? "source" : "destination");
+    return true;
+}
+
 static bool test_share_attn_prefix(
         llama_context * ctx, llama_context * ref, const std::vector<llama_token> & tokens, int n_vocab) {
     // Out-of-order physical cells are fine; duplicate logical positions are not.
@@ -670,6 +779,12 @@ int main(int argc, char ** argv) {
     common_init();
 
     std::vector<std::string> parser_args(argv, argv + argc);
+    const auto swa_arg = std::find(parser_args.begin(), parser_args.end(), "--swa-prefix-only");
+    const bool swa_prefix_only = swa_arg != parser_args.end();
+    if (swa_prefix_only) {
+        parser_args.erase(swa_arg);
+        parser_args.push_back("--attn-prefix-only");
+    }
     const auto prefix_arg = std::find(parser_args.begin(), parser_args.end(), "--attn-prefix-only");
     const bool prefix_only = prefix_arg != parser_args.end();
     if (prefix_only) {
@@ -700,6 +815,13 @@ int main(int argc, char ** argv) {
     params.kv_unified = true;
 
     ggml_backend_load_all();
+
+    if (swa_prefix_only) {
+        auto mparams = common_model_params_to_llama(params);
+        llama_model_ptr model(llama_model_load_from_file(params.model.path.c_str(), mparams));
+        return model && test_share_attn_prefix_swa(params, model.get(), true) &&
+            test_share_attn_prefix_swa(params, model.get(), false) ? 0 : 1;
+    }
 
     if (params.vbr_dynamic()) {
         if (params.n_ctx < 2048 || params.vbr_vram_budget_bytes == 0) {
