@@ -682,6 +682,36 @@ bool llama_kv_cache_iswa::can_share_attn_prefix(
         kv_swa->seq_pos_min(dst) == -1;
 }
 
+bool llama_kv_cache_iswa::can_share_live_prefix(llama_seq_id src, llama_seq_id dst, llama_pos n_tokens) const {
+    return kv_base->can_share_live_prefix(src, dst, n_tokens) &&
+        kv_swa->can_share_live_prefix(src, dst, n_tokens);
+}
+
+bool llama_kv_cache_iswa::try_share_live_prefix(llama_seq_id src, llama_seq_id dst, llama_pos n_tokens) {
+    if (!can_share_live_prefix(src, dst, n_tokens)) { return false; }
+    iswa_forwarded_op forwarded(kv_base.get(), kv_swa.get(),
+        iswa_edit_binding(kv_base.get(), kv_swa.get(), vbr_operation_kind::sequence_edit,
+                          vbr_operation_class::state_api, dst, 0, n_tokens));
+    const auto rollback = [&]() {
+        // Both destinations were empty; rollback stays within the parent's
+        // declared range and cannot remove any source membership.
+        kv_base->seq_rm(dst, 0, n_tokens);
+        kv_swa->seq_rm(dst, 0, n_tokens);
+    };
+    bool ok = false;
+    try {
+        ok = kv_base->try_share_live_prefix(src, dst, n_tokens) &&
+            kv_swa->try_share_live_prefix(src, dst, n_tokens);
+    } catch (...) {
+        rollback();
+        forwarded.finalize(false);
+        throw;
+    }
+    if (!ok) { rollback(); }
+    forwarded.finalize(ok);
+    return ok;
+}
+
 bool llama_kv_cache_iswa::try_share_attn_prefix(
         llama_seq_id src, llama_seq_id dst, llama_pos n_tokens) {
     return can_share_attn_prefix(src, dst, n_tokens) &&

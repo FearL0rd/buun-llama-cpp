@@ -504,18 +504,23 @@ public:
     // Require exactly one cell at each prefix position; min/max alone miss holes
     // and counting cells alone can mistake duplicate positions for coverage.
     bool seq_has_prefix(llama_seq_id seq_id, llama_pos n_tokens) const {
+        return seq_has_range(seq_id, 0, n_tokens);
+    }
+
+    bool seq_has_range(llama_seq_id seq_id, llama_pos p0, llama_pos p1) const {
         assert(seq_id >= 0 && seq_id < LLAMA_MAX_SEQ);
-        llama_pos next = 0;
-        for (const auto & entry : seq_pos[seq_id]) {
-            if (entry.first >= n_tokens) {
+        llama_pos next = p0;
+        const auto & positions = seq_pos[seq_id];
+        for (auto it = positions.lower_bound({ p0, 0 }); it != positions.end(); ++it) {
+            if (it->first >= p1) {
                 break;
             }
-            if (entry.first != next) {
+            if (it->first != next) {
                 return false;
             }
             ++next;
         }
-        return n_tokens > 0 && next == n_tokens;
+        return p0 >= 0 && p1 > p0 && next == p1;
     }
 
     // Exact cardinality from the canonical ownership index rather than trusting

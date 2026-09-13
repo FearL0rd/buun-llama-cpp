@@ -2560,7 +2560,7 @@ struct server_slot {
     void stage_active_prefix_reuse(
             const server_retention_instance_key & source, uint64_t n_tokens) noexcept {
         // Replace the discarded incumbent's receipt, not the destination lineage.
-        // This runs only after the historical image has been installed successfully.
+        // This runs only after the prefix has been installed successfully.
         clear_retention_reuse();
         retention_branch_pending = false;
         if (retention_obs && server_prompt_cache_retention_reuse_is_useful(
@@ -5056,9 +5056,10 @@ private:
             {
                 const auto * host = rec.selected_row(common_cache_plan_provider::host_cache_entry);
                 const auto * active = rec.selected_row(common_cache_plan_provider::active_context_checkpoint);
+                const auto * attention = rec.selected_row(common_cache_plan_provider::active_attention_prefix);
                 auto *       live = rec.selected_row(common_cache_plan_provider::live_slot);
                 if (slot.stats.n_prompt_cached > 0 && !(host && host->delivered) &&
-                    !(active && active->delivered) && live) {
+                    !(active && active->delivered) && !(attention && attention->delivered) && live) {
                     live->disposition = common_cache_plan_disposition::accepted;
                     live->delivered   = true;
                     live->reason      = COMMON_CACHE_PLAN_REASON_NONE;
@@ -5080,6 +5081,7 @@ private:
             // chosen = the TERMINAL delivered provider (delivery is data recorded at each
             // site; the causal chain is emitted separately, so composition is not lost)
             const common_cache_plan_provider terminal_order[] = {
+                common_cache_plan_provider::active_attention_prefix,
                 common_cache_plan_provider::active_context_checkpoint,
                 common_cache_plan_provider::live_context_checkpoint,
                 common_cache_plan_provider::host_cache_entry,
@@ -5342,8 +5344,8 @@ private:
 
     // Late fallback only: normal live/host/checkpoint selection and its approved
     // clearing have already left an empty destination. Never displace a hit or
-    // change a pre-mutation authoritative plan. The borrowed checkpoint remains
-    // owned by its active source for this entire non-yielding scheduler callback.
+    // change a pre-mutation authoritative plan. The source and any borrowed
+    // checkpoint remain alive for this entire non-yielding scheduler callback.
     void restore_active_prefix(server_slot & dst) {
         if (slots.size() < 2 || !prompt_cache || !params_base.kv_unified ||
             params_base.ctx_shift || params_base.n_cache_reuse != 0 ||
@@ -5364,6 +5366,11 @@ private:
         if (mtp != bool(ctx_dft) || mtp != dst.can_speculate()) {
             return;
         }
+        // Attention-only SWA needs no recurrent checkpoint. Its currently
+        // retained historical window is usable at the current VBR tiers;
+        // missing/recycled rows are a normal miss, never reconstructed here.
+        const bool live_attention = server_vbr_dynamic_active(params_base) &&
+            n_swa > 0 && !llama_model_is_hybrid(model_tgt) && !mtp;
 
         auto * rec = dst.cache_plan.get();
         common_cache_plan_candidate * row = nullptr;
@@ -5372,10 +5379,13 @@ private:
             struct candidate {
                 const server_slot * source = nullptr;
                 const common_prompt_checkpoint * checkpoint = nullptr;
+                int64_t n_tokens = 0;
             } best;
             const auto adapter = lora_config_identity(dst.lora);
             const auto mem = llama_get_memory(ctx_tgt);
-            const auto provider = common_cache_plan_provider::active_context_checkpoint;
+            const auto provider = live_attention
+                ? common_cache_plan_provider::active_attention_prefix
+                : common_cache_plan_provider::active_context_checkpoint;
             std::vector<float> carry;
 
             for (const auto & source : slots) {
@@ -5390,13 +5400,20 @@ private:
                 // Always replay at least one input token to produce A2's own logits.
                 const size_t lcp = std::min(source.prompt.tokens.get_common_prefix(dst.task->tokens),
                                            dst.task->tokens.size() - 1);
+                if (live_attention) {
+                    if (lcp > size_t(best.n_tokens) && lcp <= size_t(INT32_MAX) &&
+                        mem->can_share_live_prefix(source.id, dst.id, llama_pos(lcp))) {
+                        best = { &source, nullptr, int64_t(lcp) };
+                    }
+                    continue;
+                }
                 // The shared rows may have been retiered since capture. That is
                 // allowed, but a content edit/replacement invalidates the old RS
                 // checkpoint even when the same token positions are present.
                 std::optional<llama_memory_vbr_state_data> source_vbr;
                 for (const auto & cp : source.prompt.checkpoints) {
                     if (cp.n_tokens <= 0 || uint64_t(cp.n_tokens) > lcp ||
-                        (best.checkpoint && cp.n_tokens <= best.checkpoint->n_tokens) ||
+                        cp.n_tokens <= best.n_tokens ||
                         cp.pos_min < 0 || cp.pos_min > cp.pos_max ||
                         (llama_model_is_hybrid(model_tgt) && cp.pos_min != cp.pos_max) ||
                         int64_t(cp.pos_max) + 1 != cp.n_tokens ||
@@ -5427,65 +5444,70 @@ private:
                             continue;
                         }
                     }
-                    best = { &source, &cp };
+                    best = { &source, &cp, cp.n_tokens };
                 }
             }
             if (rec) {
-                // Only the selected active checkpoint is transported, not a complete
+                // Only the selected active prefix is recorded, not a complete
                 // cost-planner inventory of every sibling/source considered here.
-                if (best.checkpoint) {
+                if (best.source) {
                     rec->note_inventory_truncated(provider);
                 } else {
                     rec->note_inventory_complete(provider);
                 }
             }
-            if (!best.checkpoint) {
+            if (!best.source) {
                 return;
             }
 
-            const auto & cp = *best.checkpoint;
+            const auto * cp = best.checkpoint;
+            const auto n_tokens = best.n_tokens;
             row = rec ? rec->find_or_add(provider, best.source->id, uint8_t(0),
                                          dst.id, rec->selection) : nullptr;
             if (row) {
-                row->lcp_tokens = llama_cache_acct_value::measured(cp.n_tokens);
-                row->payload_bytes = llama_cache_acct_value::measured(cp.size());
+                row->lcp_tokens = llama_cache_acct_value::measured(n_tokens);
+                row->payload_bytes = llama_cache_acct_value::measured(cp ? cp->size() : 0);
                 rec->select(provider, row);
             }
             const int64_t start = ggml_time_us();
-            auto prefix = dst.task->tokens.clone_text_prefix(cp.n_tokens);
-            std::string status = "restored active context checkpoint";
+            auto prefix = dst.task->tokens.clone_text_prefix(n_tokens);
+            std::string status = live_attention ? "shared active attention prefix" : "restored active context checkpoint";
             llama_synchronize(ctx_tgt);
             if (ctx_dft) {
                 llama_synchronize(ctx_dft.get());
             }
-            if (!llama_memory_try_share_attn_prefix(mem, best.source->id, dst.id, cp.n_tokens)) {
+            const bool shared = live_attention
+                ? mem->try_share_live_prefix(best.source->id, dst.id, n_tokens)
+                : llama_memory_try_share_attn_prefix(mem, best.source->id, dst.id, n_tokens);
+            if (!shared) {
                 if (row) { row->note_reject(COMMON_CACHE_PLAN_REASON_COVERAGE_INSUFFICIENT); }
                 return;
             }
             installed = true;
-            const bool target_ok = llama_state_seq_set_data_ext(ctx_tgt,
-                    cp.data_tgt.data(), cp.data_tgt.size(), dst.id,
-                    LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == cp.data_tgt.size();
-            const bool draft_ok = target_ok && (!mtp || cp.try_load_dft(
+            const bool target_ok = live_attention || llama_state_seq_set_data_ext(ctx_tgt,
+                    cp->data_tgt.data(), cp->data_tgt.size(), dst.id,
+                    LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == cp->data_tgt.size();
+            const bool draft_ok = target_ok && (!mtp || cp->try_load_dft(
                     ctx_dft.get(), dst.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY));
-            if (!draft_ok || llama_memory_seq_pos_max(mem, dst.id) != cp.pos_max) {
+            if (!draft_ok || llama_memory_seq_pos_max(mem, dst.id) != n_tokens - 1) {
                 throw std::runtime_error("active prefix checkpoint restore failed");
             }
             common_speculative_sequence_transition(dst.get_spec(), dst.id,
                 mtp ? common_speculative_sequence_event::composite_image_restored
                     : common_speculative_sequence_event::target_restored_without_draft);
-            if (mtp && !common_speculative_set_state(dst.get_spec(), dst.id, cp.accel.spec.view())) {
+            if (mtp && !common_speculative_set_state(dst.get_spec(), dst.id, cp->accel.spec.view())) {
                 throw std::runtime_error("active prefix MTP state restore failed");
             }
             // Publish only the input prefix, not source task/sampler/output or its
             // checkpoint ring. The next ordinary decode establishes A2's lineage.
             dst.prompt.tokens.swap(prefix);
             ensure_frontier_sequence_epoch(dst.prompt);
-            dst.stats.n_prompt_cached = cp.n_tokens;
-            metrics.add_prompt_cached(cp.n_tokens);
+            dst.stats.n_prompt_cached = n_tokens;
+            metrics.add_prompt_cached(n_tokens);
             dst.cache_status.swap(status);
             dst.stage_active_prefix_reuse(
-                server_retention_instance_key::for_checkpoint(best.source->id, &cp), cp.n_tokens);
+                cp ? server_retention_instance_key::for_checkpoint(best.source->id, cp)
+                   : server_retention_instance_key::for_slot(best.source->id), n_tokens);
             if (row) {
                 rec->revoke_deliveries();
                 row->accept();
@@ -5499,7 +5521,7 @@ private:
             }
             SLT_INF(dst, "active prefix restored: source_slot=%d source_task=%d tokens=%" PRId64
                     " replay=%zu restore_ms=%.3f\n", best.source->id, best.source->task->id,
-                    cp.n_tokens, dst.task->tokens.size() - size_t(cp.n_tokens),
+                    n_tokens, dst.task->tokens.size() - size_t(n_tokens),
                     (ggml_time_us() - start) / 1000.0);
             return;
         } catch (const std::exception & e) {

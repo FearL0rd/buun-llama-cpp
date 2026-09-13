@@ -207,6 +207,8 @@ public:
     void seq_cp  (llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) override;
     bool try_share_attn_prefix(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos n_tokens) override;
     bool can_share_attn_prefix(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos n_tokens) const override;
+    bool can_share_live_prefix(llama_seq_id src, llama_seq_id dst, llama_pos n_tokens) const override;
+    bool try_share_live_prefix(llama_seq_id src, llama_seq_id dst, llama_pos n_tokens) override;
     bool try_seq_cp_transient(
             llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) override;
     void seq_keep(llama_seq_id seq_id)                                                          override;
@@ -494,6 +496,9 @@ public:
     void get_prev_tokens(const llama_ubatch & ubatch, uint32_t n, std::vector<llama_token> & res) const;
 
 private:
+    llama_pos live_prefix_begin(llama_pos n_tokens) const;
+    bool can_share_range(llama_seq_id src, llama_seq_id dst, llama_pos p0, llama_pos p1) const;
+    bool share_checked_range(llama_seq_id src, llama_seq_id dst, llama_pos p0, llama_pos p1);
     friend class vbr_live_capture_adapter;
     friend class vbr_kv_import_session;
     friend struct llama_kv_cache_vbr_stash_batch_test;

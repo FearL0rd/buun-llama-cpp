@@ -96,6 +96,7 @@ const char * common_cache_plan_provider_name(common_cache_plan_provider p) {
         case common_cache_plan_provider::host_cache_entry:        return "host_cache_entry";
         case common_cache_plan_provider::cold_replay:             return "cold_replay";
         case common_cache_plan_provider::active_context_checkpoint: return "active_context_checkpoint";
+        case common_cache_plan_provider::active_attention_prefix: return "active_attention_prefix";
         case common_cache_plan_provider::_count:                  break;
     }
     return "invalid";
@@ -992,7 +993,8 @@ json common_cache_plan_record_json(const common_cache_plan_record & rec) {
     for (const auto prov : { common_cache_plan_provider::live_slot,
                              common_cache_plan_provider::host_cache_entry,
                              common_cache_plan_provider::live_context_checkpoint,
-                             common_cache_plan_provider::active_context_checkpoint }) {
+                             common_cache_plan_provider::active_context_checkpoint,
+                             common_cache_plan_provider::active_attention_prefix }) {
         const int32_t sel = rec.selected[size_t(prov)];
         if (sel >= 0 && uint32_t(sel) < rec.n_inventory && rec.inventory[size_t(sel)].delivered) {
             chain.push_back(common_cache_plan_provider_name(prov));

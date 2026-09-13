@@ -2525,8 +2525,13 @@ bool llama_kv_cache::try_seq_cp_transient(
 
 bool llama_kv_cache::can_share_attn_prefix(
         llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos n_tokens) const {
-    if (other || n_stream != 1 || n_swa != 0 ||
-        swa_type != LLAMA_SWA_TYPE_NONE || n_tokens <= 0 ||
+    return n_swa == 0 && swa_type == LLAMA_SWA_TYPE_NONE &&
+        can_share_range(seq_id_src, seq_id_dst, 0, n_tokens);
+}
+
+bool llama_kv_cache::can_share_range(
+        llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) const {
+    if (other || n_stream != 1 || p0 < 0 || p1 <= p0 ||
         seq_id_src == seq_id_dst || seq_id_src < 0 || seq_id_dst < 0 ||
         uint32_t(seq_id_src) >= n_seq_max || uint32_t(seq_id_dst) >= n_seq_max ||
         (size_t) seq_id_src >= seq_to_stream.size() ||
@@ -2536,7 +2541,7 @@ bool llama_kv_cache::can_share_attn_prefix(
 
     const auto & cells = v_cells[0];
     return !cells.get_has_shift() && cells.seq_pos_min(seq_id_dst) == -1 &&
-        cells.seq_has_prefix(seq_id_src, n_tokens);
+        cells.seq_has_range(seq_id_src, p0, p1);
 }
 
 bool llama_kv_cache::try_share_attn_prefix(
@@ -2544,14 +2549,44 @@ bool llama_kv_cache::try_share_attn_prefix(
     if (!can_share_attn_prefix(seq_id_src, seq_id_dst, n_tokens)) {
         return false;
     }
+    return share_checked_range(seq_id_src, seq_id_dst, 0, n_tokens);
+}
 
+llama_pos llama_kv_cache::live_prefix_begin(llama_pos n_tokens) const {
+    if (n_tokens <= 0) { return -1; }
+    switch (swa_type) {
+        case LLAMA_SWA_TYPE_NONE: return 0;
+        // Preserve the window at the saved frontier n_tokens-1, including the
+        // oldest row even when the next decode no longer attends to it.
+        case LLAMA_SWA_TYPE_STANDARD:
+            return n_swa ? llama_pos(std::max<int64_t>(0, int64_t(n_tokens) - n_swa)) : -1;
+        case LLAMA_SWA_TYPE_CHUNKED:
+            return n_swa ? llama_pos(((n_tokens - 1) / n_swa) * n_swa) : -1;
+        default: return -1;
+    }
+}
+
+bool llama_kv_cache::can_share_live_prefix(llama_seq_id src, llama_seq_id dst, llama_pos n_tokens) const {
+    return can_share_range(src, dst, live_prefix_begin(n_tokens), n_tokens);
+}
+
+bool llama_kv_cache::try_share_live_prefix(llama_seq_id src, llama_seq_id dst, llama_pos n_tokens) {
+    const auto begin = live_prefix_begin(n_tokens);
+    // Validate the necessary window, but keep ordinary seq_cp's membership
+    // layout for all still-retained rows. Trimming masked history here changes
+    // subsequent cell placement and is not part of prefix sharing.
+    return can_share_range(src, dst, begin, n_tokens) && share_checked_range(src, dst, 0, n_tokens);
+}
+
+bool llama_kv_cache::share_checked_range(
+        llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) {
     try {
         // Use the ordinary membership/lineage path, without a recurrent seq_cp.
-        seq_cp(seq_id_src, seq_id_dst, 0, n_tokens);
+        seq_cp(seq_id_src, seq_id_dst, p0, p1);
     } catch (const std::bad_alloc &) {
         // The destination was empty. Removing partial membership does not touch
         // source bytes or its recurrent state. seq_add publishes its index first.
-        seq_rm(seq_id_dst, -1, -1);
+        seq_rm(seq_id_dst, p0, p1);
         return false;
     }
     return true;

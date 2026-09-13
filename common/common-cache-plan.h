@@ -38,14 +38,15 @@
 // host payload representation independently of the provider so fixed state and sealed
 // VBR artifacts remain distinguishable throughout the control plane.
 // v8 adds the late, non-displacing active-context checkpoint provider.
+// v9 distinguishes companion-free active attention sharing from checkpoint restore.
 
-constexpr uint32_t COMMON_CACHE_PLAN_SCHEMA_VERSION = 8;
+constexpr uint32_t COMMON_CACHE_PLAN_SCHEMA_VERSION = 9;
 
 // Explicit record→embedded-accounting compatibility table. A C schema bump cannot compile
 // under the current record version until this table and the record version move together.
 constexpr uint32_t common_cache_plan_accounting_schema(uint32_t record_schema) {
     return (record_schema == 3 || record_schema == 4 || record_schema == 5 ||
-            record_schema == 6 || record_schema == 7 || record_schema == 8) ? 2 :
+            record_schema == 6 || record_schema == 7 || record_schema == 8 || record_schema == 9) ? 2 :
            (record_schema == 1 || record_schema == 2 ? 1 : 0);
 }
 static_assert(common_cache_plan_accounting_schema(COMMON_CACHE_PLAN_SCHEMA_VERSION) ==
@@ -180,6 +181,7 @@ enum class common_cache_plan_provider : uint8_t {
     host_cache_entry,
     cold_replay,
     active_context_checkpoint,
+    active_attention_prefix,
     _count,
 };
 

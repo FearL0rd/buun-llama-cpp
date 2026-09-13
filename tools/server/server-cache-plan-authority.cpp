@@ -302,6 +302,7 @@ bool server_cache_plan_execution_from_candidate(
             return true;
         case common_cache_plan_provider::_count:
         case common_cache_plan_provider::active_context_checkpoint:
+        case common_cache_plan_provider::active_attention_prefix:
             // Active-prefix fallback is selected only after the ordinary plan
             // proved cold; it is not part of the pre-mutation authority inventory.
             break;

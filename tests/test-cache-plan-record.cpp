@@ -192,7 +192,8 @@ static void test_revoke_and_planner_clear() {
 // kinds with canonical raw units — a default array would collapse to five "restore" slots
 static void test_record_defaults() {
     common_cache_plan_record rec;
-    CHECK(rec.schema_version == 8);
+    CHECK(rec.schema_version == 9);
+    CHECK(common_cache_plan_accounting_schema(9) == 2);
     CHECK(common_cache_plan_accounting_schema(7) == 2);
     CHECK(rec.outcome == common_cache_plan_outcome::unknown);
     CHECK(rec.n_reused_tokens.state == llama_cache_acct_known::unknown);
@@ -326,7 +327,7 @@ static void test_name_tables() {
                          common_cache_plan_yield_actual_state(i)), "invalid") != 0);
     }
     // Closed inventory includes the late active-prefix provider.
-    CHECK(uint8_t(common_cache_plan_provider::_count) == 5);
+    CHECK(uint8_t(common_cache_plan_provider::_count) == 6);
     // schema-v5 record retains the v2 reason census + sentinel (compile-time pinned)
     CHECK(COMMON_CACHE_PLAN_REASON_MEMBER_COUNT == 30);
     CHECK(uint16_t(COMMON_CACHE_PLAN_REASON_COUNT_SENTINEL) == 601);
@@ -454,7 +455,7 @@ static void test_json_serialization() {
     if (std::getenv("CACHE_PLAN_PRINT_SCHEMA7_GOLDEN")) {
         std::puts(j.dump().c_str());
     }
-    CHECK(j["schema_version"] == 8);
+    CHECK(j["schema_version"] == 9);
     CHECK(j["candidates"].size() == 3);
     CHECK(j["candidates"][0]["id"] == 0);
     CHECK(j["candidates"][0]["provider"] == "host_cache_entry");
@@ -805,9 +806,8 @@ static void test_destruction_observer() {
     CHECK(unobserved.sequence == 0);
 }
 
-static void test_active_checkpoint_delivery() {
+static void test_active_checkpoint_delivery(common_cache_plan_provider provider, const char * name) {
     common_cache_plan_record rec;
-    const auto provider = common_cache_plan_provider::active_context_checkpoint;
     CHECK(rec.selected_row(provider) == nullptr);
     rec.id_slot = 1;
     rec.selection = common_cache_plan_selection::lru;
@@ -816,14 +816,15 @@ static void test_active_checkpoint_delivery() {
     row->accept();
     row->delivered = true;
     row->lcp_tokens = llama_cache_acct_value::measured(7948);
-    row->payload_bytes = llama_cache_acct_value::measured(189660664);
+    row->payload_bytes = llama_cache_acct_value::measured(
+        provider == common_cache_plan_provider::active_attention_prefix ? 0 : 189660664);
     rec.select(provider, row);
     rec.note_inventory_truncated(provider);
     rec.chosen = provider;
     rec.outcome = common_cache_plan_outcome::restored;
     const auto wire = common_cache_plan_record_json(rec);
-    CHECK(wire["chosen"] == "active_context_checkpoint");
-    CHECK(wire["delivered_chain"] == nlohmann::json::array({ "active_context_checkpoint" }));
+    CHECK(wire["chosen"] == name);
+    CHECK(wire["delivered_chain"] == nlohmann::json::array({ name }));
     CHECK(wire["candidates"][0]["source_id"] == 0);
     CHECK(wire["candidates"][0]["target_slot_id"] == 1);
     rec.revoke_deliveries();
@@ -831,7 +832,8 @@ static void test_active_checkpoint_delivery() {
 }
 
 int main() {
-    test_active_checkpoint_delivery();
+    test_active_checkpoint_delivery(common_cache_plan_provider::active_context_checkpoint, "active_context_checkpoint");
+    test_active_checkpoint_delivery(common_cache_plan_provider::active_attention_prefix, "active_attention_prefix");
     test_precedence();
     test_valid_loser();
     test_inventory_merge();
