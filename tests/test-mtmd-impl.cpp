@@ -137,6 +137,30 @@ MAKE_TEST(test_temporal_merge_grouping) {
     }
 }
 
+MAKE_TEST(test_temporal_merge_identity) {
+    mtmd::bitmap_ptr a(mtmd_bitmap_init(32, 32, nullptr));
+    mtmd::bitmap_ptr b(mtmd_bitmap_init(32, 32, nullptr));
+    mtmd::bitmap_ptr c(mtmd_bitmap_init(32, 32, nullptr));
+    mtmd_bitmap_set_id(a.get(), "frame-a");
+    mtmd_bitmap_set_id(b.get(), "frame-b");
+    mtmd_bitmap_set_id(c.get(), "frame-c");
+    const auto ab = mtmd_bitmap_group_id({a.get(), b.get()});
+    t.assert_equal("single image identity unchanged", std::string("frame-a"), mtmd_bitmap_group_id({a.get()}));
+    t.assert_equal("same merged frames", ab, mtmd_bitmap_group_id({a.get(), b.get()}));
+    t.assert_equal("second frame participates", true, ab != mtmd_bitmap_group_id({a.get(), c.get()}));
+    t.assert_equal("frame order participates", true, ab != mtmd_bitmap_group_id({b.get(), a.get()}));
+    t.assert_equal("empty group", std::string(), mtmd_bitmap_group_id({}));
+    mtmd_bitmap_set_id(c.get(), nullptr);
+    t.assert_equal("unknown second frame", std::string(), mtmd_bitmap_group_id({a.get(), c.get()}));
+    t.assert_equal("unknown first frame", std::string(), mtmd_bitmap_group_id({c.get(), a.get()}));
+    mtmd_bitmap_set_id(a.get(), "a:b");
+    mtmd_bitmap_set_id(b.get(), "c");
+    const auto delimited = mtmd_bitmap_group_id({a.get(), b.get()});
+    mtmd_bitmap_set_id(a.get(), "a");
+    mtmd_bitmap_set_id(b.get(), "b:c");
+    t.assert_equal("unambiguous member boundaries", true, delimited != mtmd_bitmap_group_id({a.get(), b.get()}));
+}
+
 //
 // main
 //

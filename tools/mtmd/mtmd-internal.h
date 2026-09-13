@@ -17,3 +17,6 @@ struct mtmd_input_part {
 
 // [QWEN_VIDEO] merged parts are erased from `parts`, so one group always maps to one part
 std::vector<std::vector<const mtmd_bitmap *>> mtmd_group_mergeable_bitmaps(std::vector<mtmd_input_part> & parts, int n_merge);
+
+// Identity of the entire ordered frame group; empty if any member is unidentified.
+std::string mtmd_bitmap_group_id(const std::vector<const mtmd_bitmap *> & bitmaps);

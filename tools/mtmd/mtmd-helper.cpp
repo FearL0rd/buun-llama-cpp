@@ -788,6 +788,12 @@ struct mtmd_helper_video {
         current_frame++;
         mtmd_bitmap * frame = mtmd_bitmap_init(info.width, info.height, frame_buf.data());
         mtmd_bitmap_set_mergeable(frame, true);
+        // Identify the decoded pixels, not only the container or frame index.
+        // Dimensions distinguish differently shaped interpretations of RGB bytes;
+        // timestamps remain ordinary text in the prompt and are compared there.
+        const std::string id = "mtmd-rgb-v1:" + std::to_string(info.width) + ":" +
+            std::to_string(info.height) + ":" + hash_sha256_hex(frame_buf.data(), frame_size);
+        mtmd_bitmap_set_id(frame, id.c_str());
         return frame;
     }
 

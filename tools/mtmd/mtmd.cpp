@@ -1109,6 +1109,17 @@ std::vector<std::vector<const mtmd_bitmap *>> mtmd_group_mergeable_bitmaps(std::
     return output;
 }
 
+std::string mtmd_bitmap_group_id(const std::vector<const mtmd_bitmap *> & bitmaps) {
+    if (bitmaps.empty()) { return {}; }
+    if (bitmaps.size() == 1) { return bitmaps.front()->id; }
+    std::string id = "mtmd-frames-v1:" + std::to_string(bitmaps.size());
+    for (const auto * bitmap : bitmaps) {
+        if (bitmap->id.empty()) { return {}; }
+        id += ":" + std::to_string(bitmap->id.size()) + ":" + bitmap->id;
+    }
+    return id;
+}
+
 struct mtmd_tokenizer {
     mtmd_context * ctx;
 
@@ -1490,7 +1501,8 @@ struct mtmd_tokenizer {
                 // do NOT use preproc_out from this point on, it's moved
 
                 image_tokens->batch_f32 = std::move(batch_f32);
-                image_tokens->id = bitmaps[0]->id; // optional
+                // Temporal merging encodes every frame, not just the first.
+                image_tokens->id = mtmd_bitmap_group_id(bitmaps);
 
                 LOG_DBG("image_tokens->nx = %d\n", image_tokens->nx);
                 LOG_DBG("image_tokens->ny = %d\n", image_tokens->ny);
