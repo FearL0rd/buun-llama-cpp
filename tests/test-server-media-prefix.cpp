@@ -52,7 +52,8 @@ int main() {
     int fails = 0;
 
     // Loading an mmproj sets capability even for a text-only sequence. Such a
-    // sequence is eligible for text-prefix reuse; real media must stay excluded.
+    // sequence is eligible for text-prefix reuse; the text-only clone must
+    // still refuse real media (the cached-prefix clone handles it separately).
     {
         server_tokens text(lead, /*has_mtmd=*/true);
         fails += check("text-only media capability", text.has_media(), false);
@@ -113,6 +114,51 @@ int main() {
         fails += check_identity("diff-id identity", c, 5, true, &ic);
         fails += check("identity equality", ia == ib, true);
         fails += check("identity distinction", ia != ic, true);
+    }
+
+    {
+        auto original = make("sha:abc", 3, lead);
+        original.push_back(12);
+        const auto cached = original.clone_cached_prefix(5);
+        fails += check("cached media prefix size", cached.size(), 5);
+        fails += check("cached media preserved", cached.has_media(), true);
+        fails += check("cached prefix identity", original.get_common_prefix(cached), 5);
+        fails += check("cached prefix positions", cached.pos_next(), original.pos_next(5));
+        fails += check("row positions preserved", cached.prefix_row_positions(5) ==
+            original.prefix_row_positions(5), true);
+        fails += check("normal row positions", cached.prefix_row_positions(5) ==
+            std::vector<llama_pos>({0, 1, 2, 3, 4}), true);
+        for (size_t n : { size_t(3), size_t(7) }) {
+            bool refused = false;
+            try { (void) original.clone_cached_prefix(n); }
+            catch (const std::invalid_argument &) { refused = true; }
+            fails += check("invalid cached boundary", refused, true);
+        }
+        auto unidentified = make("", 3, lead);
+        bool refused = false;
+        try { (void) unidentified.clone_cached_prefix(5); }
+        catch (const std::invalid_argument &) { refused = true; }
+        fails += check("unidentified clone refused", refused, true);
+        original.clear();
+        fails += check("independent media ledger", cached.prefix_row_positions(5).size(), 5);
+    }
+
+    {
+        server_tokens original(lead, true);
+        mtmd::input_chunk_ptr image(mtmd_test_create_mrope_image_chunk("mrope:2x2", 2, 2));
+        original.push_back(image.get());
+        original.push_back(12);
+        const auto cached = original.clone_cached_prefix(7);
+        fails += check("M-RoPE logical tokens", cached.size(), 7);
+        fails += check("M-RoPE next position", cached.pos_next(), 5);
+        fails += check("M-RoPE repeated rows/gap", cached.prefix_row_positions(7) ==
+            std::vector<llama_pos>({0, 1, 2, 2, 2, 2, 4}), true);
+        fails += check("M-RoPE placeholder rows", cached.prefix_row_positions(7) ==
+            original.prefix_row_positions(7), true);
+        bool refused = false;
+        try { (void) original.prefix_row_positions(5); }
+        catch (const std::invalid_argument &) { refused = true; }
+        fails += check("partial image rows refused", refused, true);
     }
 
     if (fails) {

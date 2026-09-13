@@ -5354,7 +5354,7 @@ private:
             !dst.task || dst.task->type != SERVER_TASK_TYPE_COMPLETION ||
             !dst.task->params.cache_prompt || dst.task->is_parent() || dst.task->is_child() ||
             !dst.prompt.tokens.empty() || !dst.prompt.checkpoints.empty() ||
-            dst.task->tokens.has_media() || !dst.lora.empty()) {
+            (dst.task->tokens.has_media() && n_swa > 0) || !dst.lora.empty()) {
             return;
         }
         const bool mtp = params_base.speculative.has_type(COMMON_SPECULATIVE_TYPE_DRAFT_MTP);
@@ -5380,6 +5380,7 @@ private:
                 const server_slot * source = nullptr;
                 const common_prompt_checkpoint * checkpoint = nullptr;
                 int64_t n_tokens = 0;
+                std::vector<llama_pos> rows;
             } best;
             const auto adapter = lora_config_identity(dst.lora);
             const auto mem = llama_get_memory(ctx_tgt);
@@ -5392,9 +5393,10 @@ private:
                 if (source.id == dst.id || source.state != SLOT_STATE_GENERATING ||
                     !source.task || !source.task->params.cache_prompt ||
                     source.task->is_parent() || source.task->is_child() ||
-                    source.prompt.tokens.has_media() || !source.lora.empty() ||
+                    !source.lora.empty() ||
                     source.can_speculate() != mtp ||
-                    source.prompt.tokens.pos_next() != source.prompt.n_tokens()) {
+                    (!source.prompt.tokens.has_media() &&
+                     source.prompt.tokens.pos_next() != source.prompt.n_tokens())) {
                     continue;
                 }
                 // Always replay at least one input token to produce A2's own logits.
@@ -5403,7 +5405,7 @@ private:
                 if (live_attention) {
                     if (lcp > size_t(best.n_tokens) && lcp <= size_t(INT32_MAX) &&
                         mem->can_share_live_prefix(source.id, dst.id, llama_pos(lcp))) {
-                        best = { &source, nullptr, int64_t(lcp) };
+                        best = { &source, nullptr, int64_t(lcp), {} };
                     }
                     continue;
                 }
@@ -5416,12 +5418,27 @@ private:
                         cp.n_tokens <= best.n_tokens ||
                         cp.pos_min < 0 || cp.pos_min > cp.pos_max ||
                         (llama_model_is_hybrid(model_tgt) && cp.pos_min != cp.pos_max) ||
-                        int64_t(cp.pos_max) + 1 != cp.n_tokens ||
                         cp.data_tgt.empty() || !cp.data_qsa.empty() || !cp.accel.ring.empty() ||
                         !checkpoint_frontier_is_current(source, cp, adapter) ||
                         (source.retention_obs && !source.retention_obs->clone_source_available(
-                            server_retention_instance_key::for_checkpoint(source.id, &cp))) ||
-                        !llama_memory_can_share_attn_prefix(mem, source.id, dst.id, cp.n_tokens)) {
+                            server_retention_instance_key::for_checkpoint(source.id, &cp)))) {
+                        continue;
+                    }
+                    std::vector<llama_pos> rows;
+                    if (source.prompt.tokens.has_media() || dst.task->tokens.has_media()) {
+                        std::string media_identity;
+                        if (n_swa > 0 || !dst.task->tokens.media_content_identity(cp.n_tokens, media_identity) ||
+                            media_identity != cp.computation_frontier.media_content_identity ||
+                            dst.task->tokens.pos_next(cp.n_tokens) != cp.computation_frontier.next_position) {
+                            continue;
+                        }
+                        rows = dst.task->tokens.prefix_row_positions(cp.n_tokens);
+                        if (!mem->can_share_attn_prefix_rows(source.id, dst.id,
+                                cp.computation_frontier.next_position, rows)) {
+                            continue;
+                        }
+                    } else if (int64_t(cp.pos_max) + 1 != cp.n_tokens ||
+                               !llama_memory_can_share_attn_prefix(mem, source.id, dst.id, cp.n_tokens)) {
                         continue;
                     }
                     if (server_vbr_dynamic_active(params_base)) {
@@ -5444,7 +5461,7 @@ private:
                             continue;
                         }
                     }
-                    best = { &source, &cp, cp.n_tokens };
+                    best = { &source, &cp, cp.n_tokens, std::move(rows) };
                 }
             }
             if (rec) {
@@ -5470,7 +5487,7 @@ private:
                 rec->select(provider, row);
             }
             const int64_t start = ggml_time_us();
-            auto prefix = dst.task->tokens.clone_text_prefix(n_tokens);
+            auto prefix = dst.task->tokens.clone_cached_prefix(n_tokens);
             std::string status = live_attention ? "shared active attention prefix" : "restored active context checkpoint";
             llama_synchronize(ctx_tgt);
             if (ctx_dft) {
@@ -5478,7 +5495,10 @@ private:
             }
             const bool shared = live_attention
                 ? mem->try_share_live_prefix(best.source->id, dst.id, n_tokens)
-                : llama_memory_try_share_attn_prefix(mem, best.source->id, dst.id, n_tokens);
+                : !best.rows.empty()
+                    ? mem->try_share_attn_prefix_rows(best.source->id, dst.id,
+                        cp->computation_frontier.next_position, best.rows)
+                    : llama_memory_try_share_attn_prefix(mem, best.source->id, dst.id, n_tokens);
             if (!shared) {
                 if (row) { row->note_reject(COMMON_CACHE_PLAN_REASON_COVERAGE_INSUFFICIENT); }
                 return;
@@ -5489,7 +5509,7 @@ private:
                     LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == cp->data_tgt.size();
             const bool draft_ok = target_ok && (!mtp || cp->try_load_dft(
                     ctx_dft.get(), dst.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY));
-            if (!draft_ok || llama_memory_seq_pos_max(mem, dst.id) != n_tokens - 1) {
+            if (!draft_ok || llama_memory_seq_pos_max(mem, dst.id) != (cp ? cp->pos_max : n_tokens - 1)) {
                 throw std::runtime_error("active prefix checkpoint restore failed");
             }
             common_speculative_sequence_transition(dst.get_spec(), dst.id,
@@ -17011,15 +17031,28 @@ private:
         std::vector<llama_tokens> batched_drafts(slots.size());
         std::vector<bool> batched_draft_attempted(slots.size(), false);
         std::vector<bool> batched_draft_decode_succeeded(slots.size(), false);
-        const auto recurrent_speculation_deferred = [&]() {
-            return needs_reeval &&
+        // A projector swap replaces the shared speculative owner later in
+        // pre_decode. Do not queue proposals against that owner first: their
+        // acceptance would otherwise run on the newly-created implementation.
+        // Ordinary target tokens can still run in this cycle. A STARTED media
+        // request may restore a prefix directly up to its first pending image.
+        const bool projector_swap_pending = mmproj_gpu_swap && !mmproj_is_on_gpu &&
+            std::any_of(slots.begin(), slots.end(), [](const server_slot & s) {
+                if (!s.task || !s.task->tokens.has_media()) { return false; }
+                return s.state == SLOT_STATE_STARTED ||
+                    (s.state == SLOT_STATE_PROCESSING_PROMPT &&
+                     s.prompt.n_tokens() < s.task->n_tokens() &&
+                     s.task->tokens[s.prompt.n_tokens()] == LLAMA_TOKEN_NULL);
+            });
+        const auto speculation_deferred = [&]() {
+            return projector_swap_pending || (needs_reeval &&
                 ctx_tgt_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_RS &&
-                recurrent_expansion.retry_deferred;
+                recurrent_expansion.retry_deferred);
         };
         if (ctx_dft_shared) {
             int n_drafting = 0;
             for (const auto & slot : slots) {
-                if (!recurrent_speculation_deferred() &&
+                if (!speculation_deferred() &&
                     slot.state == SLOT_STATE_GENERATING && slot.can_speculate() && slot.get_n_draft_max() > 0) {
                     n_drafting++;
                 }
@@ -17032,7 +17065,7 @@ private:
                 std::vector<int>                  batch_slot_ids;
 
                 for (auto & slot : slots) {
-                    if (!recurrent_speculation_deferred() &&
+                    if (!speculation_deferred() &&
                         slot.state == SLOT_STATE_GENERATING && slot.can_speculate() && slot.get_n_draft_max() > 0) {
                         batch_specs.push_back(slot.get_spec());
                         batch_id_lasts.push_back(slot.sampled);
@@ -17076,7 +17109,7 @@ private:
                 if (slot.state != SLOT_STATE_GENERATING || !slot.can_speculate()) {
                     continue;
                 }
-                const int n_draft_max = recurrent_speculation_deferred() ? 0 : slot.get_n_draft_max();
+                const int n_draft_max = speculation_deferred() ? 0 : slot.get_n_draft_max();
                 if (n_draft_max <= 0) {
                     continue;
                 }
@@ -17131,7 +17164,7 @@ private:
                 return;
             }
 
-            const int n_draft_max = recurrent_speculation_deferred() ? 0 : slot.get_n_draft_max();
+            const int n_draft_max = speculation_deferred() ? 0 : slot.get_n_draft_max();
             if (n_draft_max > 0) {
                 const int64_t t_draft_slot_start = ggml_time_us();
 

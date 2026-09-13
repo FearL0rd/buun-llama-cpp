@@ -416,6 +416,13 @@ struct llama_memory_i {
     virtual bool try_share_attn_prefix(llama_seq_id /*src*/, llama_seq_id /*dst*/, llama_pos /*n_tokens*/) {
         return false;
     }
+    // Media can have repeated primary positions and gaps. Match the exact
+    // ordered row positions below next_pos; a recurrent companion is restored
+    // separately by the caller, just as for checked text-prefix sharing.
+    virtual bool can_share_attn_prefix_rows(llama_seq_id, llama_seq_id,
+            llama_pos, const std::vector<llama_pos> &) const { return false; }
+    virtual bool try_share_attn_prefix_rows(llama_seq_id, llama_seq_id,
+            llama_pos, const std::vector<llama_pos> &) { return false; }
     // Complete attention-only prefix, including the required SWA window.
     // No companion restore follows this operation. Stateful/unknown topologies
     // refuse; the destination must be empty and every required source row live.

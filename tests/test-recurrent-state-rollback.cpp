@@ -150,6 +150,98 @@ static bool logits_equal(
     return true;
 }
 
+// Synthetic image-shaped primary positions exercise row multiplicity/gaps;
+// actual projector inputs and media identity are covered by server gates.
+static bool test_share_media_prefix(const common_params & params, llama_model * model) {
+    const std::vector<llama_pos> rows = {0, 1, 2, 2, 2, 2, 4, 5, 6, 7};
+    llama_kv_cells coverage;
+    coverage.resize(rows.size());
+    for (size_t i = 0; i < rows.size(); ++i) {
+        coverage.pos_set(i, rows[i]);
+        coverage.seq_add(i, 0);
+    }
+    auto missing = rows;
+    missing.erase(missing.begin() + 2);
+    auto extra = rows;
+    extra.insert(extra.begin() + 2, 2);
+    if (!coverage.seq_has_prefix_rows(0, 8, rows) || coverage.seq_has_prefix(0, 8) ||
+        coverage.seq_has_prefix_rows(0, 8, missing) || coverage.seq_has_prefix_rows(0, 8, extra) ||
+        coverage.seq_has_prefix_rows(0, 7, rows) || coverage.seq_has_prefix_rows(1, 8, rows)) {
+        return false;
+    }
+    const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model));
+    std::vector<llama_token> tokens(256);
+    for (size_t i = 0; i < tokens.size(); ++i) { tokens[i] = llama_token(i + 1); }
+    for (bool remove_source : {false, true}) {
+        std::vector<float> reference;
+        for (int arm = 0; arm < 3; ++arm) {
+            auto ctx = make_ctx(params, model, 3);
+            if (!ctx) { return false; }
+            auto * mem = dynamic_cast<llama_memory_hybrid *>(llama_get_memory(ctx.get()));
+            if (!mem) { return false; }
+            auto batch = llama_batch_init(rows.size(), 0, 1);
+            std::vector<llama_pos> positions(rows.size() * 4);
+            for (size_t i = 0; i < rows.size(); ++i) {
+                common_batch_add(batch, tokens[i], rows[i], {0}, i + 1 == rows.size());
+                for (size_t d = 0; d < 4; ++d) { positions[d * rows.size() + i] = rows[i]; }
+            }
+            auto * allocated_pos = batch.pos;
+            batch.pos = positions.data();
+            const bool decoded = llama_decode(ctx.get(), batch) == 0;
+            batch.pos = allocated_pos;
+            llama_batch_free(batch);
+            if (!decoded) { return false; }
+            const auto partial = LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY;
+            const auto checkpoint = save_seq(ctx.get(), 0, partial);
+            const auto checkpoint_full = save_seq(ctx.get(), 0);
+            if (checkpoint.empty() || checkpoint_full.empty()) { return false; }
+            if (arm == 0) { mem->seq_cp(0, 1, 0, 8); }
+            if (!decode_range(ctx.get(), tokens, 8, 32)) { return false; }
+            const auto source_before = save_seq(ctx.get(), 0);
+            if (arm != 0) {
+                if (mem->can_share_attn_prefix_rows(0, 1, 8, missing) ||
+                    mem->try_share_attn_prefix_rows(0, 1, 8, extra) || mem->seq_pos_max(1) != -1 ||
+                    !mem->try_share_attn_prefix_rows(0, 1, 8, rows) ||
+                    mem->try_share_attn_prefix_rows(0, 1, 8, rows) ||
+                    llama_state_seq_set_data_ext(ctx.get(), checkpoint.data(), checkpoint.size(), 1, partial)
+                        != checkpoint.size()) {
+                    return false;
+                }
+            }
+            if (source_before != save_seq(ctx.get(), 0)) { return false; }
+            const auto restored = save_seq(ctx.get(), 1);
+            if (restored.empty()) { return false; }
+            const llama_seq_id removed = remove_source ? 0 : 1;
+            const llama_seq_id survivor = 1 - removed;
+            if (!mem->seq_rm(removed, -1, -1) || !decode_range(ctx.get(), tokens, 0, 4, removed)) {
+                return false;
+            }
+            const uint32_t frontier = remove_source ? 8 : 40;
+            std::vector<float> logits;
+            for (uint32_t pos = frontier; pos < frontier + 32; ++pos) {
+                if (!decode_range(ctx.get(), tokens, pos, 1, survivor)) { return false; }
+                const auto row = copy_logits(ctx.get(), n_vocab);
+                logits.insert(logits.end(), row.begin(), row.end());
+            }
+            if (arm == 0) { reference = std::move(logits); }
+            else if (!logits_equal(reference, logits, "Media row sharing exact replay", 0.0f)) { return false; }
+            // Normalize all serialized sequence IDs through the reader, not
+            // just the outer envelope (attention metadata embeds IDs too).
+            ctx.reset();
+            auto canonical = make_ctx(params, model, 3);
+            if (!canonical || !load_seq(canonical.get(), checkpoint_full, 0)) { return false; }
+            const auto expected = save_seq(canonical.get(), 0);
+            if (!load_seq(canonical.get(), restored, 0) || expected != save_seq(canonical.get(), 0)) {
+                fprintf(stderr, "Media restored image differs after sequence-ID normalization\n");
+                return false;
+            }
+            fprintf(stderr, "Media rows %s-first arm=%d: exact image, source unchanged, exact 32-row replay PASS\n",
+                remove_source ? "source" : "destination", arm);
+        }
+    }
+    return true;
+}
+
 static bool test_share_live_prefix_swa(const common_params & params, llama_model * model) {
     const uint32_t window = llama_model_n_swa(model);
     if (window == 0) { return false; }
@@ -881,6 +973,12 @@ int main(int argc, char ** argv) {
     common_init();
 
     std::vector<std::string> parser_args(argv, argv + argc);
+    const auto media_arg = std::find(parser_args.begin(), parser_args.end(), "--media-prefix-only");
+    const bool media_only = media_arg != parser_args.end();
+    if (media_only) {
+        parser_args.erase(media_arg);
+        parser_args.push_back("--attn-prefix-only");
+    }
     const auto live_arg = std::find(parser_args.begin(), parser_args.end(), "--live-swa-prefix-only");
     const bool live_swa_only = live_arg != parser_args.end();
     if (live_swa_only) {
@@ -923,6 +1021,12 @@ int main(int argc, char ** argv) {
     params.kv_unified = true;
 
     ggml_backend_load_all();
+
+    if (media_only) {
+        auto mparams = common_model_params_to_llama(params);
+        llama_model_ptr model(llama_model_load_from_file(params.model.path.c_str(), mparams));
+        return model && test_share_media_prefix(params, model.get()) ? 0 : 1;
+    }
 
     if (live_swa_only) {
         auto mparams = common_model_params_to_llama(params);

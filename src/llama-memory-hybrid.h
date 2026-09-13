@@ -162,6 +162,14 @@ public:
     bool can_share_attn_prefix(llama_seq_id src, llama_seq_id dst, llama_pos n_tokens) const override {
         return mem_attn->can_share_attn_prefix(src, dst, n_tokens);
     }
+    bool can_share_attn_prefix_rows(llama_seq_id src, llama_seq_id dst,
+            llama_pos next_pos, const std::vector<llama_pos> & rows) const override {
+        return mem_attn->can_share_attn_prefix_rows(src, dst, next_pos, rows);
+    }
+    bool try_share_attn_prefix_rows(llama_seq_id src, llama_seq_id dst,
+            llama_pos next_pos, const std::vector<llama_pos> & rows) override {
+        return mem_attn->try_share_attn_prefix_rows(src, dst, next_pos, rows);
+    }
     bool try_seq_cp_transient(
             llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) override;
     void seq_keep(llama_seq_id seq_id)                                                          override;

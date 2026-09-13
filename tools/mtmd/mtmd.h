@@ -429,6 +429,7 @@ MTMD_API mtmd_input_chunks * mtmd_test_create_input_chunks(void);
 // empty-id fail-closed guard in server_tokens::get_common_prefix. caller owns the result
 // (mtmd_input_chunk_free), or hands it to a copying consumer such as server_tokens::push_back.
 MTMD_API mtmd_input_chunk * mtmd_test_create_image_chunk(const char * id, size_t n_tokens);
+MTMD_API mtmd_input_chunk * mtmd_test_create_mrope_image_chunk(const char * id, uint32_t nx, uint32_t ny);
 
 #ifdef __cplusplus
 } // extern "C"

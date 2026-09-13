@@ -2531,7 +2531,12 @@ bool llama_kv_cache::can_share_attn_prefix(
 
 bool llama_kv_cache::can_share_range(
         llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) const {
-    if (other || n_stream != 1 || p0 < 0 || p1 <= p0 ||
+    return p0 >= 0 && p1 > p0 && can_share_destination(seq_id_src, seq_id_dst) &&
+        v_cells[0].seq_has_range(seq_id_src, p0, p1);
+}
+
+bool llama_kv_cache::can_share_destination(llama_seq_id seq_id_src, llama_seq_id seq_id_dst) const {
+    if (other || n_stream != 1 ||
         seq_id_src == seq_id_dst || seq_id_src < 0 || seq_id_dst < 0 ||
         uint32_t(seq_id_src) >= n_seq_max || uint32_t(seq_id_dst) >= n_seq_max ||
         (size_t) seq_id_src >= seq_to_stream.size() ||
@@ -2540,8 +2545,18 @@ bool llama_kv_cache::can_share_range(
     }
 
     const auto & cells = v_cells[0];
-    return !cells.get_has_shift() && cells.seq_pos_min(seq_id_dst) == -1 &&
-        cells.seq_has_range(seq_id_src, p0, p1);
+    return !cells.get_has_shift() && cells.seq_pos_min(seq_id_dst) == -1;
+}
+
+bool llama_kv_cache::can_share_attn_prefix_rows(llama_seq_id src, llama_seq_id dst,
+        llama_pos next_pos, const std::vector<llama_pos> & rows) const {
+    return n_swa == 0 && swa_type == LLAMA_SWA_TYPE_NONE &&
+        can_share_destination(src, dst) && v_cells[0].seq_has_prefix_rows(src, next_pos, rows);
+}
+
+bool llama_kv_cache::try_share_attn_prefix_rows(llama_seq_id src, llama_seq_id dst,
+        llama_pos next_pos, const std::vector<llama_pos> & rows) {
+    return can_share_attn_prefix_rows(src, dst, next_pos, rows) && share_checked_range(src, dst, 0, next_pos);
 }
 
 bool llama_kv_cache::try_share_attn_prefix(

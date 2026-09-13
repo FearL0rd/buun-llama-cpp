@@ -2522,6 +2522,15 @@ mtmd_input_chunk * mtmd_test_create_image_chunk(const char * id, size_t n_tokens
     };
 }
 
+mtmd_input_chunk * mtmd_test_create_mrope_image_chunk(const char * id, uint32_t nx, uint32_t ny) {
+    GGML_ASSERT(nx > 0 && ny > 0);
+    auto * chunk = mtmd_test_create_image_chunk(id, size_t(nx) * ny);
+    chunk->tokens_image->nx = nx;
+    chunk->tokens_image->ny = ny;
+    chunk->tokens_image->pos = MTMD_POS_TYPE_MROPE;
+    return chunk;
+}
+
 void mtmd_log_set(ggml_log_callback log_callback, void * user_data) {
     g_logger_state.log_callback = log_callback ? log_callback : clip_log_callback_default;
     g_logger_state.log_callback_user_data = user_data;

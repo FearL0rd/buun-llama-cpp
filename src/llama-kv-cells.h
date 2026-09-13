@@ -523,6 +523,23 @@ public:
         return p0 >= 0 && p1 > p0 && next == p1;
     }
 
+    bool seq_has_prefix_rows(llama_seq_id seq_id, llama_pos next_pos,
+                            const std::vector<llama_pos> & expected) const {
+        assert(seq_id >= 0 && seq_id < LLAMA_MAX_SEQ);
+        if (expected.empty() || expected.front() != 0 || next_pos <= expected.back()) {
+            return false;
+        }
+        const auto & positions = seq_pos[seq_id];
+        auto it = positions.begin();
+        for (llama_pos pos : expected) {
+            if (pos < 0 || pos >= next_pos || it == positions.end() || it->first != pos) {
+                return false;
+            }
+            ++it;
+        }
+        return it == positions.end() || it->first >= next_pos;
+    }
+
     // Exact cardinality from the canonical ownership index rather than trusting
     // the covered mask's subset count. It allocates nothing and never scans empty
     // physical cells; the child supplies the visibility/serializer-manifest filter.
