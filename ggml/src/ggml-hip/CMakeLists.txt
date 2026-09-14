@@ -72,26 +72,15 @@ list(APPEND GGML_SOURCES_ROCM ${SRCS})
 file(GLOB   SRCS "../ggml-cuda/template-instances/mmf*.cu")
 list(APPEND GGML_SOURCES_ROCM ${SRCS})
 
-if (GGML_CUDA_FA_ALL_QUANTS)
-    file(GLOB   SRCS "../ggml-cuda/template-instances/fattn-vec*.cu")
-    list(APPEND GGML_SOURCES_ROCM ${SRCS})
-    add_compile_definitions(GGML_CUDA_FA_ALL_QUANTS)
-else()
-    list(APPEND GGML_SOURCES_ROCM
-        ../ggml-cuda/template-instances/fattn-vec-instance-f16-f16.cu
-        ../ggml-cuda/template-instances/fattn-vec-instance-q4_0-q4_0.cu
-        ../ggml-cuda/template-instances/fattn-vec-instance-q8_0-q8_0.cu
-        ../ggml-cuda/template-instances/fattn-vec-instance-bf16-bf16.cu)
-    # Match the CUDA backend's fattn-vec selection exactly: only the turbo*_0 vec instances.
-    # The TCQ codecs (turbo1/2/3_tcq) dispatch through the MMA path, not fattn-vec — and
-    # turbo1_tcq has no get_vec_dot_KQ/get_dequantize_V case, so its vec instance can't compile.
-    file(GLOB   SRCS "../ggml-cuda/template-instances/fattn-vec*turbo2_0*.cu")
-    list(APPEND GGML_SOURCES_ROCM ${SRCS})
-    file(GLOB   SRCS "../ggml-cuda/template-instances/fattn-vec*turbo3_0*.cu")
-    list(APPEND GGML_SOURCES_ROCM ${SRCS})
-    file(GLOB   SRCS "../ggml-cuda/template-instances/fattn-vec*turbo4_0*.cu")
-    list(APPEND GGML_SOURCES_ROCM ${SRCS})
-endif()
+ggml_cuda_fattn_vec_instances("${CMAKE_CURRENT_SOURCE_DIR}/../ggml-cuda" SRCS)
+list(APPEND GGML_SOURCES_ROCM ${SRCS})
+# HIP keeps the same Turbo vector instances as CUDA, independently of standard pairs.
+file(GLOB SRCS "../ggml-cuda/template-instances/fattn-vec*turbo2_0*.cu")
+list(APPEND GGML_SOURCES_ROCM ${SRCS})
+file(GLOB SRCS "../ggml-cuda/template-instances/fattn-vec*turbo3_0*.cu")
+list(APPEND GGML_SOURCES_ROCM ${SRCS})
+file(GLOB SRCS "../ggml-cuda/template-instances/fattn-vec*turbo4_0*.cu")
+list(APPEND GGML_SOURCES_ROCM ${SRCS})
 
 ggml_add_backend_library(ggml-hip
                          ${GGML_HEADERS_ROCM}
