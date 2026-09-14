@@ -1429,6 +1429,11 @@ json oaicompat_chat_params_parse(
         }
     }
 
+    // An explicitly empty schema requests any object; an absent schema stays absent.
+    if (json_schema.is_object() && json_schema.empty()) {
+        json_schema["type"] = "object";
+    }
+
     // get input files
     if (!body.contains("messages")) {
         throw std::invalid_argument("'messages' is required");
