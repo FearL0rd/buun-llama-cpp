@@ -371,12 +371,20 @@ struct llama_kv_cache_vbr_epoch_test {
         check(*selected.rbegin() < plan.required_watermark() && plan.required_watermark() <= cells.size(), "wrong mapping endpoint");
     }
 
-    static void verify(const llama_kv_cache & cache, const vbr_swa_window_image & image) {
+    static void verify(const llama_kv_cache & cache, const vbr_swa_window_image & image,
+                       const vbr_explicit_representation_policy & representation) {
         for (const auto & unit : image.units()) {
             const auto & layer = cache.layers.at(unit.logical_unit/2);
             const auto * t = unit.logical_unit & 1 ? layer.v : layer.k;
             check(unit.model_layer == layer.il && unit.generation.current_type == t->type, "wrong unit identity");
             check(unit.row_bytes == t->nb[1] && unit.payload.size() == image.rows().size()*unit.row_bytes, "wrong payload shape");
+            vbr_explicit_representation_identity expected;
+            check(vbr_explicit_capture_representation_identity(&representation, t->type, (unit.logical_unit&1) != 0,
+                layer.turbo_meansub_ref.model_id, expected), "independent identity failed");
+            check(unit.codec.codec_id == expected.codec_id && unit.codec.codec_version == expected.codec_version &&
+                unit.codec.codebook_digest == expected.codebook_digest && unit.codec.rotation_digest == expected.rotation_digest &&
+                unit.codec.meansub_digest == expected.meansub_digest && unit.codec.meansub_baked == expected.meansub_baked,
+                "reused identity differs from independent identity");
             std::vector<uint8_t> row(unit.row_bytes);
             for (size_t i = 0; i < image.rows().size(); ++i) {
                 ggml_backend_tensor_get(t, row.data(), image.rows()[i].physical_cell*unit.row_bytes, row.size());
@@ -570,7 +578,7 @@ static void retained_prefix_gate(llama_model * model, llama_context_params cp,
         check(original.image->units()[u].payload == delayed.image->units()[u].payload,
               "later append changed captured prefix bytes");
     }
-    llama_kv_cache_vbr_epoch_test::verify(*tree.get_swa(), *delayed.image);
+    llama_kv_cache_vbr_epoch_test::verify(*tree.get_swa(), *delayed.image, request.representation);
     request.frontier = frontier+5;
     check(vbr_capture_swa_window(*ctx, request).status == vbr_swa_window_status::unavailable,
           "uncommitted future frontier accepted");
@@ -598,6 +606,59 @@ static void retained_prefix_gate(llama_model * model, llama_context_params cp,
     check(std::all_of(logits, logits+llama_vocab_n_tokens(llama_model_get_vocab(model)),
         [](float v) { return std::isfinite(v); }), "delayed image continuation nonfinite");
     fprintf(stderr, "WINDOW RETAINED PREFIX PASS immediate/delayed exact bytes; future/recycled refusal; install/source/continuation\n");
+}
+
+static void interleaved_capture_gate(llama_model * model, llama_context_params cp,
+                                     const std::vector<llama_token> & tokens,
+                                     vbr_swa_window_capture_request request) {
+    cp.n_seq_max = 2;
+    llama_context_ptr ctx(llama_init_from_model(model, cp));
+    check(bool(ctx), "interleaved context failed");
+    auto & tree = *dynamic_cast<llama_kv_cache_iswa *>(llama_get_memory(ctx.get()));
+    int frontier = 0;
+    vbr_swa_window_capture_result image;
+    auto batch = llama_batch_init(2, 0, 1);
+    // A ring wrap can place part of the live window in physical sink rows.
+    // Advance both owners until the whole selected window is capturable.
+    while (frontier < 2816) {
+        const int end = frontier ? frontier+128 : 768;
+        for (; frontier < end; ++frontier) {
+            common_batch_clear(batch);
+            common_batch_add(batch, tokens.at(frontier), frontier, {0}, false);
+            common_batch_add(batch, tokens.at(frontier+1), frontier, {1}, true);
+            check(llama_decode(ctx.get(), batch) == 0, "interleaved decode failed");
+            llama_synchronize(ctx.get());
+        }
+        request.frontier = frontier;
+        const auto peer_before = llama_kv_cache_vbr_epoch_test::required_bytes(tree, 1);
+        image = vbr_capture_swa_window(*ctx, request);
+        check(peer_before == llama_kv_cache_vbr_epoch_test::required_bytes(tree, 1),
+              "interleaved gather changed peer rows");
+        if (image.status == vbr_swa_window_status::ok) { break; }
+        check(image.status == vbr_swa_window_status::protected_rows, "interleaved capture unexpected refusal");
+    }
+    llama_batch_free(batch);
+    llama_synchronize(ctx.get());
+    const auto before = llama_kv_cache_vbr_epoch_test::fingerprint(tree);
+    const auto peer = llama_kv_cache_vbr_epoch_test::required_bytes(tree, 1);
+    check(image.status == vbr_swa_window_status::ok, "interleaved capture failed");
+    size_t strided = 0;
+    const auto & rows = image.image->rows();
+    for (size_t i = 1; i < rows.size(); ++i) {
+        if (rows[i].physical_cell == uint64_t(rows[i-1].physical_cell)+2) { ++strided; }
+    }
+    check(strided > rows.size()/2, "interleaved test did not exercise strided rows");
+    llama_kv_cache_vbr_epoch_test::verify(*tree.get_swa(), *image.image, request.representation);
+    auto budget = *static_cast<std::shared_ptr<window_budget> *>(request.capacity_context);
+    const auto retained = budget->used;
+    int chunks = 3;
+    request.continue_capture = cancel_transfer; request.continue_context = &chunks;
+    auto cancelled = vbr_capture_swa_window(*ctx, request);
+    check(cancelled.status == vbr_swa_window_status::cancelled && !cancelled.image && budget->used == retained,
+          "interleaved cancellation published or leaked");
+    check(before == llama_kv_cache_vbr_epoch_test::fingerprint(tree) &&
+          peer == llama_kv_cache_vbr_epoch_test::required_bytes(tree, 1), "interleaved capture changed live owners");
+    fprintf(stderr, "WINDOW INTERLEAVED PASS stride2_edges=%zu exact-bytes/identity/cancellation/owners\n", strided);
 }
 
 int main(int argc, char ** argv) {
@@ -668,7 +729,7 @@ int main(int argc, char ** argv) {
         for (auto [type, count] : types) {
             fprintf(stderr, "WINDOW capture codec=%s units=%zu\n", ggml_type_name(ggml_type(type)), count);
         }
-        llama_kv_cache_vbr_epoch_test::verify(*tree->get_swa(), *result.image);
+        llama_kv_cache_vbr_epoch_test::verify(*tree->get_swa(), *result.image, request.representation);
         const size_t retained = budget->used;
         auto reader = result.image;
         result.image.reset();
@@ -824,6 +885,8 @@ int main(int argc, char ** argv) {
         budget->limit = 64*1024*1024; // immediate + delayed F16 images and install rollback storage
         retained_prefix_gate(model.get(), cp, tokens, request);
         check(budget->used == 0, "retained-prefix image charge leaked");
+        interleaved_capture_gate(model.get(), cp, tokens, request);
+        check(budget->used == 0, "interleaved image charge leaked");
         budget->limit = 16*1024*1024;
         if (test_shared) {
             request.sequence_epoch = 2;

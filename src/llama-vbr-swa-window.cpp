@@ -145,8 +145,17 @@ public:
             unit.generation = generation;
             unit.meansub_model_id = layer.turbo_meansub_ref.model_id;
             unit.meansub_layer = layer.turbo_meansub_ref.layer;
-            if (!vbr_explicit_capture_representation_identity(&request.representation, t->type, (id&1) != 0,
-                    unit.meansub_model_id, unit.codec)) { return fail(status::unavailable); }
+            // Same capture-scoped key as the explicit-capture adapter. Reuse
+            // identities already in this image; never cache an override across captures.
+            const auto cached = std::find_if(image->units_.begin(), image->units_.end(),
+                [&](const auto & prior) {
+                    return prior.generation.current_type == t->type &&
+                        (prior.logical_unit&1) == (id&1) && prior.meansub_model_id == unit.meansub_model_id;
+                });
+            if (cached != image->units_.end()) {
+                unit.codec = cached->codec;
+            } else if (!vbr_explicit_capture_representation_identity(&request.representation, t->type, (id&1) != 0,
+                           unit.meansub_model_id, unit.codec)) { return fail(status::unavailable); }
             std::memcpy(unit.tensor_name.data(), t->name, unit.tensor_name.size());
             unit.columns = t->ne[0]; unit.row_bytes = t->nb[1];
             if (!add_bytes(bytes, row_count, unit.row_bytes)) { return fail(status::capacity_refused); }
@@ -168,8 +177,31 @@ public:
             auto & unit = image->units_[u];
             unit.payload.resize(row_count*unit.row_bytes);
             for (size_t i = 0; i < row_count;) {
+                uint32_t stride = 1;
+                if (i+1 < row_count && unit.row_bytes &&
+                    image->rows_[i+1].physical_cell > image->rows_[i].physical_cell) {
+                    const auto delta = image->rows_[i+1].physical_cell-image->rows_[i].physical_cell;
+                    if (delta <= chunk_bytes/unit.row_bytes) { stride = delta; }
+                }
                 size_t end = i+1;
-                while (end < row_count && image->rows_[end].physical_cell == image->rows_[end-1].physical_cell+1) { ++end; }
+                while (end < row_count &&
+                    image->rows_[end].physical_cell == uint64_t(image->rows_[end-1].physical_cell)+stride) { ++end; }
+                if (stride > 1) {
+                    // Interleaved slots often yield a constant physical stride.
+                    // Bound source span AND payload by the cancellation quantum;
+                    // a wrap, stride change or large gap ends this 2D gather.
+                    const size_t pitch = stride*unit.row_bytes;
+                    const size_t rows_per_copy = 1+(chunk_bytes-unit.row_bytes)/pitch;
+                    while (i < end) {
+                        if (request.continue_capture && !request.continue_capture(request.continue_context)) { return fail(status::cancelled); }
+                        if (!stable()) { return fail(status::source_changed); }
+                        const size_t count = std::min(end-i, rows_per_copy);
+                        ggml_backend_tensor_get_2d(tensors[u], unit.payload.data()+i*unit.row_bytes,
+                            image->rows_[i].physical_cell*unit.row_bytes, unit.row_bytes, count, pitch, unit.row_bytes);
+                        i += count;
+                    }
+                    continue;
+                }
                 const size_t run_bytes = (end-i)*unit.row_bytes;
                 for (size_t offset = 0; offset < run_bytes;) {
                     if (request.continue_capture && !request.continue_capture(request.continue_context)) { return fail(status::cancelled); }
