@@ -183,6 +183,8 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
 
     llama_build(test-vbr-representation-epoch.cpp)
     target_include_directories(test-vbr-representation-epoch PRIVATE ${PROJECT_SOURCE_DIR}/src)
+    llama_build_and_test(test-vbr-representation-identity.cpp)
+    target_include_directories(test-vbr-representation-identity PRIVATE ${PROJECT_SOURCE_DIR}/src)
     add_test(
         NAME test-vbr-controller-identity-cpu
         COMMAND $<TARGET_FILE:test-vbr-representation-epoch> --identity-cpu)

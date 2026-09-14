@@ -116,16 +116,27 @@ const char * representation_override(
 std::array<uint8_t, 32> representation_rotation_identity(
         int32_t type,
         bool value_side) {
-    llama_sha256_writer writer;
-    static constexpr char domain_label[] =
-        "buun.vbr.codec-rotation/v1";
-    writer.string(domain_label, sizeof(domain_label) - 1);
-    writer.u32(uint32_t(type));
-    writer.u32(value_side);
-    const auto * matrix = value_side
-        ? TURBO_ROTATION_RT : TURBO_ROTATION_R;
-    writer.bytes(matrix, 128*128*sizeof(matrix[0]));
-    return writer.finish();
+    // These TU-local const matrices never change. Cache their exact final
+    // digest, including type/side tags, without changing the wire recipe.
+    // Mutable codebook/mean overrides remain checked by the caller every time.
+    struct cached_rotation {
+        std::once_flag once;
+        std::array<uint8_t, 32> digest {};
+    };
+    static std::array<cached_rotation, 2*GGML_TYPE_COUNT> cache;
+    // The sole caller validates type before reaching this helper.
+    auto & entry = cache[2*size_t(type) + size_t(value_side)];
+    std::call_once(entry.once, [&] {
+        llama_sha256_writer writer;
+        static constexpr char domain_label[] = "buun.vbr.codec-rotation/v1";
+        writer.string(domain_label, sizeof(domain_label) - 1);
+        writer.u32(uint32_t(type));
+        writer.u32(value_side);
+        const auto * matrix = value_side ? TURBO_ROTATION_RT : TURBO_ROTATION_R;
+        writer.bytes(matrix, 128*128*sizeof(matrix[0]));
+        entry.digest = writer.finish();
+    });
+    return entry.digest;
 }
 
 std::array<uint8_t, 32> representation_meansub_identity(
