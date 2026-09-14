@@ -22,6 +22,7 @@
 
 #include "ggml.h"
 #include "gguf.h"
+#include "fusion-check.h"
 
 #include <algorithm>
 #include <array>
@@ -303,7 +304,7 @@ int main(int argc, char ** argv) {
     if (!dev) {
         LOG_WRN("%s: device '%s' not found - skipping (baseline is device-specific)\n",
                 __func__, device_name.c_str());
-        return 0;
+        return 77;
     }
 
     // resolve the generic fusion debugging functions through the ad-hoc get_proc_address
@@ -355,13 +356,25 @@ int main(int argc, char ** argv) {
             }
             cols.push_back(trim(line));
             if (cols.size() != 5) {
-                continue;
+                LOG_ERR("%s: malformed baseline row\n", __func__);
+                return 1;
             }
-            baseline[cols[0] + "|" + cols[1] + "|" + cols[2] + "|" + cols[3]] = std::stoull(cols[4]);
+            if (!baseline.emplace(cols[0] + "|" + cols[1] + "|" + cols[2] + "|" + cols[3],
+                                  std::stoull(cols[4])).second) {
+                LOG_ERR("%s: duplicate baseline row\n", __func__);
+                return 1;
+            }
+        }
+        if (baseline.empty()) {
+            LOG_ERR("%s: empty baseline\n", __func__);
+            return 1;
         }
     }
 
     std::vector<fusion_row> rows;
+    std::set<std::string> observed;
+    std::string check_scope;
+    int failures = 0;
 
     LOG_INF("%s: running fusion test over %zu models on '%s'\n", __func__, models.size(), base_name.c_str());
 
@@ -370,6 +383,9 @@ int main(int argc, char ** argv) {
     for (const auto & model_path : models) {
         const std::string arch = get_arch(model_path);
         const bool moe = arch.find("moe") != std::string::npos;
+        if (!model_file.empty()) {
+            check_scope = arch + "|" + (moe ? "1" : "0") + "|";
+        }
 
         llama_model_ptr model;
         llama_model_ptr model_cpu;
@@ -380,6 +396,7 @@ int main(int argc, char ** argv) {
             n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model.get()));
         } catch (const std::exception & e) {
             LOG_ERR("%s: %s: %s\n", __func__, model_path.c_str(), e.what());
+            ++failures;
             continue;
         }
 
@@ -417,6 +434,7 @@ int main(int argc, char ** argv) {
                 logits_cpu = mode.decode(model_cpu.get(), ctx.get(), tokens);
             } catch (const std::exception & e) {
                 LOG_WRN("%s: %s: cpu reference: %s\n", __func__, model_path.c_str(), e.what());
+                ++failures;
             }
 
             // fused run on a fresh context (fresh state)
@@ -453,6 +471,13 @@ int main(int argc, char ** argv) {
             const double nmse_fus = nmse(logits_fused, logits_unfused);
             const double nmse_dev = logits_cpu.empty() ? 0.0 : nmse(logits_fused, logits_cpu);
 
+            // Check numerical fidelity even when every fusion counter is zero.
+            if (!fusion_nmse_ok(nmse_fus) || !std::isfinite(nmse_dev)) {
+                LOG_ERR("%s: %s %s: invalid fusion fidelity (fusion=%g device=%g)\n",
+                        __func__, arch.c_str(), mode.name.c_str(), nmse_fus, nmse_dev);
+                ++failures;
+            }
+
             if (has_counts) {
                 for (int i = 0; i < (int) labels.size(); i++) {
                     const uint64_t fused   = counts_fused[i]   / mode.n_graphs;
@@ -466,10 +491,10 @@ int main(int argc, char ** argv) {
                     d.count_unfused = unfused;
                     d.nmse_fus      = nmse_fus;
                     d.nmse_dev      = nmse_dev;
-                    d.ok_nmse       = nmse_fus <= 1e-4;
+                    d.ok_nmse       = fusion_nmse_ok(nmse_fus);
                 }
             } else {
-                rows.push_back({ arch, moe, mode.name, "?", 0, 0, 0, nmse_fus, nmse_dev, true, nmse_fus <= 1e-4 });
+                rows.push_back({ arch, moe, mode.name, "?", 0, 0, 0, nmse_fus, nmse_dev, true, fusion_nmse_ok(nmse_fus) });
             }
         }
 
@@ -486,7 +511,8 @@ int main(int argc, char ** argv) {
                     // one "any" row; use the worst NMSE across the two modes
                     const std::string any_key = arch + "|" + (moe ? "1" : "0") + "|any|" + label;
                     const uint64_t expected = baseline.count(any_key) ? baseline.at(any_key) : 0;
-                    const bool ok_count = check_path.empty() || d[0].count_fused == expected;
+                    observed.insert(any_key);
+                    const bool ok_count = check_path.empty() || (baseline.count(any_key) && d[0].count_fused == expected);
                     const bool ok_nmse   = d[0].ok_nmse && d[1].ok_nmse;
                     const double nmse_fus = std::max(d[0].nmse_fus, d[1].nmse_fus);
                     const double nmse_dev = std::max(d[0].nmse_dev, d[1].nmse_dev);
@@ -501,7 +527,8 @@ int main(int argc, char ** argv) {
                         const mode_data & a = d[mi];
                         const std::string mode_key = arch + "|" + (moe ? "1" : "0") + "|" + modes[mi].name + "|" + label;
                         const uint64_t expected = baseline.count(mode_key) ? baseline.at(mode_key) : 0;
-                        const bool ok_count = check_path.empty() || a.count_fused == expected;
+                        observed.insert(mode_key);
+                        const bool ok_count = check_path.empty() || (baseline.count(mode_key) && a.count_fused == expected);
                         rows.push_back({ arch, moe, modes[mi].name, label, a.count_fused, a.count_unfused,
                                          expected, a.nmse_fus, a.nmse_dev, ok_count, a.ok_nmse });
                     }
@@ -510,6 +537,13 @@ int main(int argc, char ** argv) {
         }
 
         LOG_INF("%s: %-20s (%s) done\n", __func__, arch.c_str(), model_path.c_str());
+    }
+
+    if (!check_path.empty()) {
+        for (const auto & key : fusion_missing_rows(baseline, observed, check_scope)) {
+            LOG_ERR("%s: missing fusion baseline row: %s\n", __func__, key.c_str());
+            ++failures;
+        }
     }
 
     // print the report
@@ -529,7 +563,7 @@ int main(int argc, char ** argv) {
         LOG_INF("%-20s %-4s %-8s %-22s %7s %7s %7s %10s %10s %s\n",
                 "arch", "moe", "mode", "label", "fused", "unfused", "expected", "nmse_fus", "nmse_dev", "status");
         int n_ok = 0;
-        int n_bad = 0;
+        int n_bad = failures;
         for (const auto & r : rows) {
             const bool ok = r.ok_count && r.ok_nmse;
             const char * status = ok ? "ok" : "FAIL";
@@ -560,6 +594,6 @@ int main(int argc, char ** argv) {
                     __func__, models_dir.c_str(), argv[0], device_name.c_str(), models_dir.c_str(), check_path.c_str());
         }
 
-        return n_bad;
+        return n_bad != 0;
     }
 }

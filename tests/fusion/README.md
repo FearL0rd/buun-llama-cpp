@@ -21,6 +21,9 @@ rm -rf build-ci-models && mkdir -p build-ci-models
 ./build/bin/test-fusion --models build-ci-models --device MTL0 --check MTL.csv
 ```
 
-Non-zero exit means a row differs from the baseline. Use `--model FILE` to run a single
-architecture. Note `--check` only sees present rows — a fusion that stops matching is not
-reported, so diff the recorded CSV to catch removed patterns.
+Checks compare row presence as well as counts, so a disappeared fusion or missing
+model in a directory run fails. Use `--model FILE` to check only that architecture's
+rows against a larger baseline. Nonfinite results and failed model/reference runs
+also fail, even if no fusion counters were emitted. An unavailable device returns
+77 (not a pass). `test-fusion-check` exercises the row-set and numeric predicates
+without requiring a model or GPU.
