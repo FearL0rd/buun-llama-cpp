@@ -2671,6 +2671,13 @@ extern "C" {
     GGML_API enum ggml_prec ggml_flash_attn_ext_get_prec(
             const struct ggml_tensor * a);
 
+    // Use finite mask entries as a sparse K/V set. Set 0 to disable.
+    // n_kv_max must bound the number of finite entries in every mask row.
+    // This is independent of the boolean sparse-mask scheduling hint below.
+    GGML_API void ggml_flash_attn_ext_set_n_kv_max(
+            struct ggml_tensor * a,
+            int32_t              n_kv_max);
+
     // Hint that the mask selects a sparse, non-contiguous subset of KV rows.
     // Backends may use this to skip fully masked work; it does not change results.
     GGML_API void ggml_flash_attn_ext_set_sparse_mask(

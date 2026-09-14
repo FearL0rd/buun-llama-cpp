@@ -5977,19 +5977,29 @@ enum ggml_prec ggml_flash_attn_ext_get_prec(
     return (enum ggml_prec) prec_i32;
 }
 
+void ggml_flash_attn_ext_set_n_kv_max(
+        struct ggml_tensor * a,
+        int32_t              n_kv_max) {
+    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT);
+    GGML_ASSERT(n_kv_max >= 0);
+
+    ggml_set_op_params_i32(a, 4, n_kv_max);
+}
+
 void ggml_flash_attn_ext_set_sparse_mask(
         struct ggml_tensor * a,
         bool                 sparse) {
     GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT);
 
-    ggml_set_op_params_i32(a, 4, sparse);
+    // Slot 4 is the finite-row bound, not a boolean optimization hint.
+    ggml_set_op_params_i32(a, 5, sparse);
 }
 
 bool ggml_flash_attn_ext_get_sparse_mask(
         const struct ggml_tensor * a) {
     GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT);
 
-    return ggml_get_op_params_i32(a, 4) != 0;
+    return ggml_get_op_params_i32(a, 5) != 0;
 }
 
 void ggml_flash_attn_ext_add_sinks(

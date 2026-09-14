@@ -78,6 +78,19 @@ int main() {
     GGML_ASSERT(ggml_prec_set_acc(&fa, GGML_PREC_F32));
     GGML_ASSERT(ggml_flash_attn_ext_get_prec(&fa) == GGML_PREC_F32);
     GGML_ASSERT(!ggml_prec_set_src(&fa, GGML_PREC_F16, 1));
+    // FA's finite-row bound must never read a boolean hint as a bound of one.
+    GGML_ASSERT(ggml_get_op_params_i32(&fa, 4) == 0);
+    ggml_flash_attn_ext_set_sparse_mask(&fa, true);
+    GGML_ASSERT(ggml_get_op_params_i32(&fa, 4) == 0);
+    for (int32_t bound : {1, 640, 4096, 0}) {
+        ggml_flash_attn_ext_set_n_kv_max(&fa, bound);
+        GGML_ASSERT(ggml_flash_attn_ext_get_sparse_mask(&fa));
+        ggml_flash_attn_ext_set_sparse_mask(&fa, false);
+        GGML_ASSERT(ggml_get_op_params_i32(&fa, 4) == bound);
+        ggml_flash_attn_ext_set_sparse_mask(&fa, true);
+        GGML_ASSERT(ggml_get_op_params_i32(&fa, 4) == bound);
+        GGML_ASSERT(ggml_flash_attn_ext_get_prec(&fa) == GGML_PREC_F32);
+    }
     const ggml_tensor before = *a;
     GGML_ASSERT(!ggml_prec_set_acc(a, GGML_PREC_F32));
     GGML_ASSERT(!ggml_prec_set_src(a, GGML_PREC_F32, 1));
