@@ -166,7 +166,7 @@ __global__ void pack_gdn_inputs_bf16(
     GGML_UNUSED(sv3);
 }
 
-// Preserve llama.cpp's L2_NORM arithmetic exactly while eliding its F32
+// Preserve the graph's Q/K normalization formula while eliding its F32
 // destination. Eight warps normalize eight Q/K rows per CTA; the remaining
 // CTAs copy V. All three outputs land directly in the BF16 layout consumed by
 // the embedded FLA kernels.
@@ -177,7 +177,7 @@ __global__ void pack_gdn_inputs_l2_bf16(
         float * gp, float * betap, float * statep,
         int n_tokens, int H, int HK,
         int64_t sq1, int64_t sq2, int64_t sq3,
-        int64_t sv1, int64_t sv2, int64_t sv3, float eps) {
+        int64_t sv1, int64_t sv2, int64_t sv3, ggml_cuda_gdn_norm norm) {
     constexpr int rows_per_block = 8;
     const int n_qk_rows = 2 * n_tokens * HK;
     const int norm_blocks = n_qk_rows / rows_per_block;
@@ -203,10 +203,10 @@ __global__ void pack_gdn_inputs_l2_bf16(
             sum += values[j] * values[j];
         }
         sum = warp_reduce_sum(sum);
-        const float scale = rsqrtf(fmaxf(sum, eps * eps));
+        const float scale = norm.inverse(sum, GDN_D);
 #pragma unroll
         for (int j = 0; j < GDN_D / WARP_SIZE; ++j) {
-            dst[lane + j * WARP_SIZE] = scale * values[j];
+            dst[lane + j * WARP_SIZE] = norm.apply(values[j], scale);
         }
     } else {
         const int64_t i = (int64_t(blockIdx.x) - norm_blocks) * blockDim.x + threadIdx.x;
@@ -249,7 +249,7 @@ __global__ void pack_gdn_compact_conv_l2_bf16(
         const float * g, const float * beta, const float * state,
         nv_bfloat16 * qp, nv_bfloat16 * kp, nv_bfloat16 * vp,
         float * gp, float * betap, float * statep,
-        int n_tokens, int H, int HK, float eps) {
+        int n_tokens, int H, int HK, ggml_cuda_gdn_norm norm) {
     constexpr int rows_per_block = 8;
     const int qk_channels = HK * GDN_D;
     const int channels = 2 * qk_channels + H * GDN_D;
@@ -275,10 +275,10 @@ __global__ void pack_gdn_compact_conv_l2_bf16(
             sum += values[j] * values[j];
         }
         sum = warp_reduce_sum(sum);
-        const float scale = rsqrtf(fmaxf(sum, eps * eps));
+        const float scale = norm.inverse(sum, GDN_D);
 #pragma unroll
         for (int j = 0; j < GDN_D / WARP_SIZE; ++j) {
-            dst[lane + j * WARP_SIZE] = scale * values[j];
+            dst[lane + j * WARP_SIZE] = norm.apply(values[j], scale);
         }
     } else {
         const int64_t i = (int64_t(blockIdx.x) - norm_blocks) * blockDim.x + threadIdx.x;
@@ -566,7 +566,7 @@ void ggml_cuda_gdn_fla_ptx(
         int64_t sq1, int64_t sq2, int64_t sq3,
         int64_t sv1, int64_t sv2, int64_t sv3,
         const void * compact_conv_bf16,
-        float l2_eps,
+        ggml_cuda_gdn_norm l2_norm,
         const float * rms_weight, const float * rms_gate, bool rms_gate_bf16,
         float * rms_output, bool rms_output_bf16,
         bool rms_output_int8, float * rms_output_scale, float rms_eps) {
@@ -610,15 +610,15 @@ void ggml_cuda_gdn_fla_ptx(
     const int64_t n_state_dev = int64_t(H) * GDN_D * GDN_D;
     const int64_t n_g_dev     = n_tokens * H;
     if (compact_conv_bf16 != nullptr) {
-        GGML_ASSERT(l2_eps >= 0.0f);
+        GGML_ASSERT(l2_norm.eps >= 0.0f);
         constexpr int rows_per_block = 8;
         const int norm_blocks = 2 * int(n_tokens) * HK / rows_per_block;
         const int v_blocks = (std::max(n_v_dev / 4, n_state_dev) + threads - 1) / threads;
         pack_gdn_compact_conv_l2_bf16<<<norm_blocks + v_blocks, threads, 0, stream>>>(
             static_cast<const nv_bfloat16 *>(compact_conv_bf16), g, beta, state_in,
             q_p.get(), k_p.get(), v_p.get(), g_p.get(), beta_p.get(), state_in_p.get(),
-            int(n_tokens), H, HK, l2_eps);
-    } else if (l2_eps >= 0.0f) {
+            int(n_tokens), H, HK, l2_norm);
+    } else if (l2_norm.eps >= 0.0f) {
         constexpr int rows_per_block = 8;
         const int norm_blocks = 2 * int(n_tokens) * HK / rows_per_block;
         const int v_blocks = (std::max(n_v_dev / 4, n_state_dev) + threads - 1) / threads;
@@ -626,7 +626,7 @@ void ggml_cuda_gdn_fla_ptx(
             q, k, v, g, beta, state_in,
             q_p.get(), k_p.get(), v_p.get(), g_p.get(), beta_p.get(), state_in_p.get(),
             int(n_tokens), H, HK,
-            sq1, sq2, sq3, sv1, sv2, sv3, l2_eps);
+            sq1, sq2, sq3, sv1, sv2, sv3, l2_norm);
     } else {
         pack_gdn_inputs_bf16<<<(n_v_dev + threads - 1) / threads, threads, 0, stream>>>(
             q, k, v, q_p.get(), k_p.get(), v_p.get(), int(n_tokens), H, HK,
@@ -720,7 +720,7 @@ void ggml_cuda_gdn_fla_ptx(
 bool ggml_cuda_gdn_fla_ptx_supported(int, bool, bool, int64_t, int64_t, int64_t, int64_t, int64_t) { return false; }
 void ggml_cuda_gdn_fla_ptx(ggml_backend_cuda_context &, int, const float *, const float *, const float *,
         const float *, const float *, const float *, float *, float *, int64_t, int64_t, int64_t, int64_t, int64_t,
-        int64_t, int64_t, int64_t, int64_t, const void *, float, const float *, const float *, bool, float *, bool,
+        int64_t, int64_t, int64_t, int64_t, const void *, ggml_cuda_gdn_norm, const float *, const float *, bool, float *, bool,
         bool, float *, float) { GGML_ABORT("FLA PTX is CUDA-only"); }
 
 #endif

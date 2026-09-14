@@ -1,4 +1,5 @@
 #include "norm.cuh"
+#include "gdn-norm.cuh"
 #include "unary.cuh"
 #include <cstdint>
 
@@ -499,7 +500,7 @@ template <int block_size>
 static __global__ void l2_norm_pair_f32(
         const float * q, float * q_dst, const float * k, float * k_dst,
         const int ncols, const int nrows, const int64_t stride_row,
-        const int64_t stride_channel, const int64_t stride_sample, const float eps) {
+        const int64_t stride_channel, const int64_t stride_sample, const ggml_cuda_gdn_norm norm) {
     const bool is_k     = blockIdx.x >= nrows;
     const int row       = blockIdx.x - (is_k ? nrows : 0);
     const int channel   = blockIdx.y;
@@ -523,9 +524,9 @@ static __global__ void l2_norm_pair_f32(
     tmp = block_reduce<block_reduce_method::SUM, block_size>(tmp, s_sum);
     ggml_cuda_pdl_lc();
 
-    const float scale = rsqrtf(fmaxf(tmp, eps * eps));
+    const float scale = norm.inverse(tmp, ncols);
     for (int col = tid; col < ncols; col += block_size) {
-        dst[col] = scale * x[col];
+        dst[col] = norm.apply(x[col], scale);
     }
 }
 
@@ -1047,19 +1048,18 @@ void ggml_cuda_op_l2_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
 
 void ggml_cuda_op_l2_norm_pair(
         ggml_backend_cuda_context & ctx, ggml_tensor * q_dst, ggml_tensor * k_dst) {
-    const ggml_tensor * q = q_dst->src[0];
-    const ggml_tensor * k = k_dst->src[0];
+    ggml_cuda_gdn_norm q_norm, k_norm;
+    const ggml_tensor * q = ggml_cuda_gdn_norm_input(q_dst, q_norm);
+    const ggml_tensor * k = ggml_cuda_gdn_norm_input(k_dst, k_norm);
+    GGML_ASSERT(q && k);
 
     GGML_ASSERT(q->type == GGML_TYPE_F32 && k->type == GGML_TYPE_F32);
     GGML_ASSERT(q_dst->type == GGML_TYPE_F32 && k_dst->type == GGML_TYPE_F32);
     GGML_ASSERT(ggml_are_same_shape(q, k) && ggml_are_same_shape(q_dst, k_dst));
     GGML_ASSERT(q->ne[0] < 1024);
 
-    float q_eps;
-    float k_eps;
-    memcpy(&q_eps, q_dst->op_params, sizeof(float));
-    memcpy(&k_eps, k_dst->op_params, sizeof(float));
-    GGML_ASSERT(q_eps == k_eps && q_eps >= 0.0f);
+    GGML_ASSERT(q_norm.eps == k_norm.eps && q_norm.rms == k_norm.rms &&
+                q_norm.post_scale == k_norm.post_scale);
 
     const size_t ts = sizeof(float);
     GGML_ASSERT(q->nb[0] == ts && k->nb[0] == ts);
@@ -1071,5 +1071,5 @@ void ggml_cuda_op_l2_norm_pair(
     ggml_cuda_kernel_launch(l2_norm_pair_f32<WARP_SIZE>, launch_params,
             (const float *) q->data, (float *) q_dst->data,
             (const float *) k->data, (float *) k_dst->data,
-            q->ne[0], q->ne[1], q->nb[1]/ts, q->nb[2]/ts, q->nb[3]/ts, q_eps);
+            q->ne[0], q->ne[1], q->nb[1]/ts, q->nb[2]/ts, q->nb[3]/ts, q_norm);
 }

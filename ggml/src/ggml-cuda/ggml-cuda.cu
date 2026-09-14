@@ -6019,40 +6019,61 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     // One grid preserves the ordinary per-row reduction while removing one
     // launch per recurrent layer.
     static const bool qwen35_pair_norm = std::getenv("GGML_CUDA_DISABLE_QWEN35_PAIR_NORM") == nullptr;
-    if (qwen35_pair_norm &&
-            i + 2 < cgraph->n_nodes && node->op == GGML_OP_L2_NORM) {
-        ggml_tensor * k_view = cgraph->nodes[i + 1];
-        ggml_tensor * k_norm = cgraph->nodes[i + 2];
-        const ggml_tensor * q_view = node->src[0];
-        float q_eps = -1.0f;
-        float k_eps = -2.0f;
-        memcpy(&q_eps, node->op_params, sizeof(float));
-        memcpy(&k_eps, k_norm->op_params, sizeof(float));
+    const bool gdn_rms = node->op == GGML_OP_RMS_NORM;
+    const int norm_nodes = gdn_rms ? 5 : 3;
+    if (qwen35_pair_norm && i + norm_nodes <= cgraph->n_nodes &&
+            (gdn_rms || node->op == GGML_OP_L2_NORM)) {
+        const int q_idx = i + (gdn_rms ? 1 : 0);
+        const int k_view_idx = i + (gdn_rms ? 2 : 1);
+        const int k_idx = i + norm_nodes - 1;
+        ggml_tensor * q_norm = cgraph->nodes[q_idx];
+        ggml_tensor * k_view = cgraph->nodes[k_view_idx];
+        ggml_tensor * k_norm = cgraph->nodes[k_idx];
+        ggml_cuda_gdn_norm q_params, k_params;
+        const ggml_tensor * q_view = ggml_cuda_gdn_norm_input(q_norm, q_params);
+        const ggml_tensor * k_input = ggml_cuda_gdn_norm_input(k_norm, k_params);
 
-        const bool valid = k_view->op == GGML_OP_VIEW && k_norm->op == GGML_OP_L2_NORM &&
-            k_norm->src[0] == k_view && q_view && q_view->op == GGML_OP_VIEW &&
+        // RMS intermediates disappear only when the following SCALE is their sole use.
+        bool chain_valid = true;
+        if (gdn_rms) {
+            ggml_tensor * k_rms = cgraph->nodes[i + 3];
+            const int outputs[] = { q_idx, k_idx };
+            chain_valid = q_norm->op == GGML_OP_SCALE && q_norm->src[0] == node &&
+                k_rms->op == GGML_OP_RMS_NORM && k_rms->src[0] == k_view &&
+                k_norm->op == GGML_OP_SCALE && k_norm->src[0] == k_rms &&
+                ggml_node_get_use_count(cgraph, i) == 1 &&
+                ggml_node_get_use_count(cgraph, i + 3) == 1 &&
+                !(node->flags & GGML_TENSOR_FLAG_OUTPUT) &&
+                !(k_rms->flags & GGML_TENSOR_FLAG_OUTPUT) &&
+                (node->flags & GGML_TENSOR_FLAG_COMPUTE) &&
+                (k_rms->flags & GGML_TENSOR_FLAG_COMPUTE) &&
+                node->type == GGML_TYPE_F32 && k_rms->type == GGML_TYPE_F32 &&
+                ggml_cuda_check_fusion_memory_ranges(cgraph, i, norm_nodes, outputs, 2);
+        }
+        const bool valid = chain_valid && k_view->op == GGML_OP_VIEW && k_input == k_view && q_view && q_view->op == GGML_OP_VIEW &&
             q_view->view_src && k_view->view_src == q_view->view_src &&
             q_view->type == GGML_TYPE_F32 && k_view->type == GGML_TYPE_F32 &&
-            node->type == GGML_TYPE_F32 && k_norm->type == GGML_TYPE_F32 &&
-            ggml_are_same_shape(q_view, k_view) && ggml_are_same_shape(node, k_norm) &&
+            q_norm->type == GGML_TYPE_F32 && k_norm->type == GGML_TYPE_F32 &&
+            ggml_are_same_shape(q_view, k_view) && ggml_are_same_shape(q_norm, k_norm) &&
             q_view->ne[0] > 0 && q_view->ne[0] < 1024 &&
             q_view->nb[0] == sizeof(float) && k_view->nb[0] == sizeof(float) &&
             q_view->nb[1] == k_view->nb[1] && q_view->nb[2] == k_view->nb[2] &&
-            q_view->nb[3] == k_view->nb[3] && ggml_is_contiguous(node) &&
-            ggml_is_contiguous(k_norm) && q_eps == k_eps && q_eps >= 0.0f &&
-            !(node->flags & GGML_TENSOR_FLAG_OUTPUT) &&
+            q_view->nb[3] == k_view->nb[3] && ggml_is_contiguous(q_norm) &&
+            ggml_is_contiguous(k_norm) && q_params.eps == k_params.eps && q_params.rms == k_params.rms &&
+            q_params.post_scale == k_params.post_scale &&
+            !(q_norm->flags & GGML_TENSOR_FLAG_OUTPUT) &&
             !(k_norm->flags & GGML_TENSOR_FLAG_OUTPUT) &&
-            ggml_node_get_use_count(cgraph, i + 1) == 1 &&
-            (node->flags & GGML_TENSOR_FLAG_COMPUTE) &&
+            ggml_node_get_use_count(cgraph, k_view_idx) == 1 &&
+            (q_norm->flags & GGML_TENSOR_FLAG_COMPUTE) &&
             (k_view->flags & GGML_TENSOR_FLAG_COMPUTE) &&
             (k_norm->flags & GGML_TENSOR_FLAG_COMPUTE);
         if (valid) {
-            if (ggml_node_get_use_count(cgraph, i) == 1 &&
-                    ggml_node_get_use_count(cgraph, i + 2) == 1) {
-                for (int j = i + 3; j < cgraph->n_nodes; ++j) {
+            if (ggml_node_get_use_count(cgraph, q_idx) == 1 &&
+                    ggml_node_get_use_count(cgraph, k_idx) == 1) {
+                for (int j = i + norm_nodes; j < cgraph->n_nodes; ++j) {
                     ggml_tensor * gdn = cgraph->nodes[j];
                     if (gdn->op != GGML_OP_GATED_DELTA_NET ||
-                            gdn->src[0] != node || gdn->src[1] != k_norm) {
+                            gdn->src[0] != q_norm || gdn->src[1] != k_norm) {
                         continue;
                     }
                     const ggml_tensor * v = gdn->src[2];
@@ -6063,26 +6084,26 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                             ggml_cuda_info().devices[cuda_ctx->device].cc,
                             gdn->src[3]->ne[0] == v->ne[0],
                             ggml_get_op_params_i32(gdn, 0) > 1,
-                            v->ne[0], v->ne[1], node->ne[1], v->ne[2], v->ne[3]);
+                            v->ne[0], v->ne[1], q_norm->ne[1], v->ne[2], v->ne[3]);
 #if !defined(GGML_USE_HIP)
-                    // The standard kernel also normalizes q/k in place (bit-
-                    // identical to l2_norm_pair) when the gate is scalar.
-                    const bool standard = gdn->src[3] && gdn->src[3]->ne[0] == 1;
+                    // V keeps the shared convolution alive until deferred normalization.
+                    const bool standard = (!gdn_rms || same_conv) &&
+                        gdn->src[3] && gdn->src[3]->ne[0] == 1;
 #else
                     const bool standard = false;
 #endif
 #if !defined(GGML_USE_HIP)
                     if (supported || standard) {
-                        cuda_ctx->gdn_deferred_l2.insert(node->data);
+                        cuda_ctx->gdn_deferred_l2.insert(q_norm->data);
                         cuda_ctx->gdn_deferred_l2.insert(k_norm->data);
-                        return 2;
+                        return norm_nodes - 1;
                     }
 #endif
                     break;
                 }
             }
-            ggml_cuda_op_l2_norm_pair(*cuda_ctx, node, k_norm);
-            return 2;
+            ggml_cuda_op_l2_norm_pair(*cuda_ctx, q_norm, k_norm);
+            return norm_nodes - 1;
         }
     }
 
