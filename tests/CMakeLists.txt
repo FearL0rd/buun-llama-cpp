@@ -535,7 +535,9 @@ else()
     target_compile_options(test-vbr-transaction PRIVATE -UNDEBUG)
 endif()
 llama_build_and_test(test-model-resolution.cpp)
-llama_build_and_test(test-moe-metadata.cpp)
+add_executable(test-moe-metadata test-moe-metadata.cpp)
+target_link_libraries(test-moe-metadata PRIVATE llama)
+llama_test(test-moe-metadata)
 # the test serves its repos from an httplib server, and the library links it privately
 target_link_libraries(test-model-resolution PRIVATE cpp-httplib)
 
