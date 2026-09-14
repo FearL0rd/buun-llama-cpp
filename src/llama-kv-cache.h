@@ -509,6 +509,7 @@ private:
     bool can_share_destination(llama_seq_id src, llama_seq_id dst) const;
     bool share_checked_range(llama_seq_id src, llama_seq_id dst, llama_pos p0, llama_pos p1);
     friend class vbr_live_capture_adapter;
+    friend class vbr_swa_window_capture;
     friend class vbr_kv_import_session;
     friend struct llama_kv_cache_vbr_stash_batch_test;
     struct vbr_capture_unit_request {

@@ -81,6 +81,7 @@ add_library(llama
             llama-vbr-downward.cpp
             llama-vbr-upward.cpp
             llama-vbr-explicit-capture.cpp
+            llama-vbr-swa-window.cpp
             llama-vbr-controller-id.cpp
             llama-vbr-generation.cpp
             llama-vbr-operation.cpp

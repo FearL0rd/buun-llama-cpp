@@ -175,6 +175,8 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
 
     llama_build(test-recurrent-state-rollback.cpp)
     target_include_directories(test-recurrent-state-rollback PRIVATE ${PROJECT_SOURCE_DIR}/src)
+    llama_build(test-vbr-swa-window.cpp)
+    target_include_directories(test-vbr-swa-window PRIVATE ${PROJECT_SOURCE_DIR}/src)
 
     llama_build(test-vbr-representation-epoch.cpp)
     target_include_directories(test-vbr-representation-epoch PRIVATE ${PROJECT_SOURCE_DIR}/src)
