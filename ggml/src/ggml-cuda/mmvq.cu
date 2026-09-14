@@ -17,6 +17,35 @@
 #include <limits>
 #include <type_traits>
 
+// only enabled on DGX Spark, where it is a gain on every type below. On the higher-bandwidth parts the kernel
+// has little exposed latency left to hide and the extra requests cost more than they save.
+// For perf data, see https://github.com/ggml-org/llama.cpp/pull/26705#issuecomment-5569335031
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == GGML_CUDA_CC_DGX_SPARK
+// returns true only for those quants that benefit from prefetch and false otherwise
+static constexpr __host__ __device__ bool mmvq_should_prefetch(ggml_type type) {
+    switch (type) {
+        case GGML_TYPE_Q4_0:
+        case GGML_TYPE_Q5_0:
+        case GGML_TYPE_Q8_0:
+        case GGML_TYPE_MXFP4:
+        case GGML_TYPE_Q3_K:
+        case GGML_TYPE_Q4_K:
+        case GGML_TYPE_Q5_K:
+        case GGML_TYPE_Q6_K:
+        case GGML_TYPE_IQ1_M:
+        case GGML_TYPE_IQ4_NL:
+        case GGML_TYPE_IQ4_XS:
+            return true;
+        default:
+            return false;
+    }
+}
+
+static __device__ __forceinline__ void mmvq_prefetch_l2(const void * p) {
+    asm volatile("prefetch.global.L2 [%0];" :: "l"(p));
+}
+#endif
+
 struct ggml_cuda_mmvq_fusion_args_device : ggml_cuda_mm_fusion_args_device {
     float post_scale = 1.0f;
     bool  post_silu = false;
@@ -1198,6 +1227,18 @@ bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne11) {
     if (max_n_env >= 0) {
         return ne11 <= max_n_env;
     }
+    if (GGML_CUDA_CC_IS_NVIDIA(cc) && cc == GGML_CUDA_CC_ORIN) {
+        switch (type) {
+            case GGML_TYPE_Q2_K:
+            case GGML_TYPE_Q3_K:
+            case GGML_TYPE_Q4_K:
+            case GGML_TYPE_Q5_K:
+            case GGML_TYPE_Q6_K:
+                return ne11 <= 1;
+            default:
+                return ne11 <= MMVQ_MAX_BATCH_SIZE;
+        }
+    }
     // Consumer Ampere (GA10x): MMQ's int8 tensor-core path is flat from n=2 to n=8 while MMVQ re-reads and
     // re-decodes the weights per column. K-quants and IQ4_NL decode dearly, so MMQ wins from n=3 (n=2 for
     // Q5_K); the cheap-to-decode types keep MMVQ to n=4 (its per-column cost there is within MMQ's fixed
@@ -1224,9 +1265,6 @@ bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne11) {
                 return ne11 <= 4;
             case GGML_TYPE_Q3_K:
                 return ne11 <= 6;
-            case GGML_TYPE_Q4_K:
-            case GGML_TYPE_Q5_K:
-                return ne11 <= 7;
             default:
                 return ne11 <= MMVQ_MAX_BATCH_SIZE;
         }
@@ -1236,8 +1274,9 @@ bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne11) {
             case GGML_TYPE_Q2_K:
             case GGML_TYPE_Q3_K:
             case GGML_TYPE_Q4_K:
-            case GGML_TYPE_Q5_K:
                 return ne11 <= 5;
+            case GGML_TYPE_Q5_K:
+                return ne11 <= 6;
             case GGML_TYPE_Q6_K:
                 return ne11 <= 7;
             default:
@@ -1648,6 +1687,26 @@ static __global__ void mul_mat_vec_q(
 
         // x block quant index when casting the quants to int
         const int kqs = vdr * (tid % (qi/vdr));
+
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == GGML_CUDA_CC_DGX_SPARK
+        // start the next iterations' weight loads early
+        if constexpr (mmvq_should_prefetch(type)) {
+            constexpr int pf_dist = 2; // loop iterations, not blocks
+            const int kbx_pf = kbx + pf_dist*blocks_per_iter;
+            if (kbx_pf < blocks_per_row_x) {
+#pragma unroll
+                for (int i = 0; i < rows_per_cuda_block; ++i) {
+                    const size_t off = (size_t)(kbx_offset + i*stride_row_x + kbx_pf) * ggml_cuda_type_traits<type>::bs;
+                    mmvq_prefetch_l2((const char *) vx + off);
+                    if constexpr (has_fusion) {
+                        if (use_gate) {
+                            mmvq_prefetch_l2((const char *) vgate + off);
+                        }
+                    }
+                }
+            }
+        }
+#endif
 
 #pragma unroll
         for (int j = 0; j < ncols_dst; ++j) {
