@@ -1,6 +1,7 @@
 *
 !*.*
 !snapshots/
+!fusion/
 !fixtures/
 !fixtures/*.json
 *.o
