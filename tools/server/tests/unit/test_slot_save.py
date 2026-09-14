@@ -80,10 +80,10 @@ def _assert_completion_probabilities_close(actual, expected):
 server = ServerPreset.tinyllama2()
 
 @pytest.fixture(autouse=True)
-def create_server():
+def create_server(tmp_path):
     global server
     server = ServerPreset.tinyllama2()
-    server.slot_save_path = "./tmp"
+    server.slot_save_path = str(tmp_path)
     server.temperature = 0.0
 
 
@@ -191,7 +191,7 @@ def test_slot_frontier_logits_hot_restore_and_cold_fallback():
         "filename": "slot_frontier_logits.bin",
     })
     assert saved.status_code == 200
-    path = os.path.join("tmp", "slot_frontier_logits.bin")
+    path = os.path.join(server.slot_save_path, "slot_frontier_logits.bin")
     _, packed, _ = _read_v3_slot(path)
     assert packed[:8] == b"BUUNSLOT"
     assert struct.unpack_from("<I", packed, 16)[0] & 1
@@ -273,7 +273,7 @@ def test_slot_restore_legacy_token_list():
     assert res.body["n_saved"] == 84
 
     # rewrite the token payload into a plain token list, as written by servers that predate the packed server_tokens format
-    path = os.path.join("tmp", "slot_legacy.bin")
+    path = os.path.join(server.slot_save_path, "slot_legacy.bin")
     prefix, serialized, state = _server_tokens_from_slot(path)
     # The embedded server_tokens payload starts with marker/version/count.
     packed_header_size = 12
@@ -345,11 +345,11 @@ def _get_img_base64(url: str) -> str:
 
 
 @pytest.fixture
-def mmproj_server():
+def mmproj_server(tmp_path):
     # tinygemma3 is a small multimodal model: the mmproj is provided by the HF registry API and auto-downloaded on first run.
     os.environ['LLAMA_MEDIA_MARKER'] = '<__media__>'
     mm_server = ServerPreset.tinygemma3()
-    mm_server.slot_save_path = "./tmp"
+    mm_server.slot_save_path = str(tmp_path)
     mm_server.temperature = 0.0
     return mm_server
 
@@ -631,10 +631,9 @@ def test_slot_save_restore_image_payload_larger_than_context(mmproj_server):
     })
     assert res.status_code == 200
 
-    path = os.path.join("tmp", "mm_slot_large_payload.bin")
-    with open(path, "rb") as f:
-        data = bytearray(f.read())
-    payload_size = struct.unpack_from("=I", data, STATE_FILE_HEADER_SIZE - 4)[0]
+    path = os.path.join(server.slot_save_path, "mm_slot_large_payload.bin")
+    _, packed, _ = _read_v3_slot(path)
+    payload_size = len(packed) // 4
     assert payload_size > n_ctx_slot  # the scenario under test: the payload does not fit in n_ctx
 
     # drop the image from the slot, then restore it from the file
