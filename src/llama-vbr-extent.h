@@ -121,7 +121,7 @@ class vbr_extent_store {
 
 // Dual-view ownership index: physical per-(stream,seq) page masks for
 // canonical dependency-set enumeration + a lazily allocated per-active-seq logical-position
-// Fenwick tree for exact rank-below-frontier. Positions outside [0, n_cells) mark the
+// Fenwick tree for exact rank-below-frontier. Positions outside [0, n_positions) mark the
 // (stream,seq) view unavailable (fail-closed shadow-unavailable; legacy never consults this).
 class vbr_ownership_index {
   public:
@@ -129,7 +129,9 @@ class vbr_ownership_index {
     // index's pages match the tracker's, so the constants must be the same symbols.
     static constexpr uint32_t MASK_WORDS_PER_PAGE = VBR_GENERATION_MASK_WORDS;
 
-    vbr_ownership_index(uint32_t n_stream, uint32_t n_seq_max, uint32_t n_cells);
+    // Physical masks follow n_cells; logical rank may cover a larger context
+    // for an SWA ring. Zero n_positions preserves the ordinary cache domain.
+    vbr_ownership_index(uint32_t n_stream, uint32_t n_seq_max, uint32_t n_cells, uint32_t n_positions = 0);
     ~vbr_ownership_index();  // out-of-line: views_ holds an incomplete type here
 
     vbr_ownership_index(const vbr_ownership_index &)             = delete;
@@ -163,7 +165,9 @@ class vbr_ownership_index {
     // Allocation may throw; the original index is untouched.
     std::unique_ptr<vbr_ownership_index> clone() const;
 
-    // Memory note: the Fenwick domain is n_cells positions * 4 bytes,
+    uint32_t position_capacity() const { return n_positions_; }
+
+    // Memory note: the Fenwick domain is n_positions * 4 bytes,
     // ~800 KB per ACTIVE seq at 200k cells, lazily allocated on first add; capacity is
     // RETAINED at clear_seq for seq-id reuse. Masks cost pages * 32 B per active seq.
 
@@ -176,6 +180,7 @@ class vbr_ownership_index {
     uint32_t n_stream_  = 0;
     uint32_t n_seq_max_ = 0;
     uint32_t n_cells_   = 0;
+    uint32_t n_positions_ = 0;
     uint32_t n_pages_   = 0;
 
     // Flat O(1) map: slot = stream * n_seq_max + seq_id. Views are lazily

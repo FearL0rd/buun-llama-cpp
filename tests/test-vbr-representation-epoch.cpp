@@ -2250,6 +2250,31 @@ static bool run_operation_cpu_tests() {
         }
     }
 
+    // SWA: logical positions continue beyond the physical ring. Clone and
+    // mutation must preserve the separate rank domain, without changing masks.
+    {
+        vbr_ownership_index index(1, 2, 512, 32768);
+        for (uint32_t cell = 0; cell < 512; ++cell) {
+            if (!index.add_cell(0, 1, cell, 20500+cell)) { return false; }
+        }
+        auto clone = index.clone();
+        uint32_t rank = 0;
+        std::vector<uint32_t> owned;
+        if (clone->position_capacity() != 32768 ||
+            !clone->rank_below(0, 1, 20756, rank) || rank != 256 ||
+            !clone->enumerate_owned(0, 1, owned) || owned.size() != 512 ||
+            !clone->remove_cell(0, 1, 0, 20500) ||
+            !clone->move_cell(0, 1, 1, 20501, 30000) ||
+            !clone->rank_below(0, 1, 20756, rank) || rank != 254 ||
+            !index.rank_below(0, 1, 20756, rank) || rank != 256 ||
+            clone->add_cell(0, 1, 512, 20500) ||
+            !clone->available(0, 1) || clone->add_cell(0, 1, 0, 32768) ||
+            clone->available(0, 1)) {
+            fprintf(stderr, "operation extent/recovery SWA logical-domain/clone mismatch\n");
+            return false;
+        }
+    }
+
     // --- recovery ring + capability ----------------------------------------------------------
     {
         test_operation rop(vbr_operation_kind::sequence_edit, tracker.runtime_instance(), 2, 0, 64);

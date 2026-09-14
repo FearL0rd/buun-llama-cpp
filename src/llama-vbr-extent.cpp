@@ -166,12 +166,12 @@ struct vbr_ownership_index::seq_view {
 
     // Physical page masks: pages * 4 words, cell-indexed.
     std::vector<uint64_t> page_masks;
-    // Logical-position Fenwick over [0, n_cells): fenwick[i] counts positions. 1-based.
+    // Logical-position Fenwick over [0, n_positions): 1-based counts.
     std::vector<uint32_t> fenwick;
 };
 
 std::unique_ptr<vbr_ownership_index> vbr_ownership_index::clone() const {
-    auto result = std::make_unique<vbr_ownership_index>(n_stream_, n_seq_max_, n_cells_);
+    auto result = std::make_unique<vbr_ownership_index>(n_stream_, n_seq_max_, n_cells_, n_positions_);
     result->views_ = views_;
     return result;
 }
@@ -207,10 +207,11 @@ mask_pos mask_locate(uint32_t cell) {
 
 }  // namespace
 
-vbr_ownership_index::vbr_ownership_index(uint32_t n_stream, uint32_t n_seq_max, uint32_t n_cells) :
+vbr_ownership_index::vbr_ownership_index(uint32_t n_stream, uint32_t n_seq_max, uint32_t n_cells, uint32_t n_positions) :
     n_stream_(n_stream),
     n_seq_max_(n_seq_max),
     n_cells_(n_cells),
+    n_positions_(n_positions ? n_positions : n_cells),
     n_pages_((n_cells + VBR_GENERATION_PAGE_CELLS - 1) / VBR_GENERATION_PAGE_CELLS) {
     // Flat O(1) slot map: views are lazy but their slots are preallocated.
     views_.resize(size_t(n_stream_) * n_seq_max_);
@@ -236,7 +237,7 @@ vbr_ownership_index::seq_view & vbr_ownership_index::obtain_view(uint32_t stream
         view.owned       = 0;
         // assign() reuses retained capacity on seq-id reuse (no shrink churn).
         view.page_masks.assign(size_t(n_pages_) * MASK_WORDS_PER_PAGE, 0);
-        view.fenwick.assign(size_t(n_cells_) + 1, 0);
+        view.fenwick.assign(size_t(n_positions_) + 1, 0);
     }
     return view;
 }
@@ -257,7 +258,7 @@ bool vbr_ownership_index::add_cell(uint32_t stream, llama_seq_id seq_id, uint32_
         return false;
     }
     auto & view = *view_ptr;
-    if (pos < 0 || static_cast<uint32_t>(pos) >= n_cells_) {
+    if (pos < 0 || static_cast<uint32_t>(pos) >= n_positions_) {
         // Fail-closed domain restriction.
         view.unavailable = true;
         return false;
@@ -282,7 +283,7 @@ bool vbr_ownership_index::remove_cell(uint32_t stream, llama_seq_id seq_id, uint
         return true;
     }
     view->page_masks[loc.word] &= ~loc.bit;
-    if (pos >= 0 && static_cast<uint32_t>(pos) < n_cells_) {
+    if (pos >= 0 && static_cast<uint32_t>(pos) < n_positions_) {
         fenwick_update(view->fenwick, static_cast<uint32_t>(pos), -1);
     } else {
         // Removing a cell whose recorded position was out of domain: the view was already
@@ -305,10 +306,10 @@ bool vbr_ownership_index::move_cell(uint32_t stream, llama_seq_id seq_id, uint32
     if ((view->page_masks[loc.word] & loc.bit) == 0) {
         return true;  // not owned by this view; nothing to move
     }
-    if (old_pos >= 0 && static_cast<uint32_t>(old_pos) < n_cells_) {
+    if (old_pos >= 0 && static_cast<uint32_t>(old_pos) < n_positions_) {
         fenwick_update(view->fenwick, static_cast<uint32_t>(old_pos), -1);
     }
-    if (new_pos >= 0 && static_cast<uint32_t>(new_pos) < n_cells_) {
+    if (new_pos >= 0 && static_cast<uint32_t>(new_pos) < n_positions_) {
         fenwick_update(view->fenwick, static_cast<uint32_t>(new_pos), +1);
     } else {
         view->unavailable = true;
@@ -352,7 +353,7 @@ bool vbr_ownership_index::rank_below(uint32_t stream, llama_seq_id seq_id, llama
     if (view == nullptr || view->unavailable || frontier < 0) {
         return false;
     }
-    const uint32_t bound = std::min<uint32_t>(static_cast<uint32_t>(frontier), n_cells_);
+    const uint32_t bound = std::min<uint32_t>(static_cast<uint32_t>(frontier), n_positions_);
     rank = fenwick_prefix(view->fenwick, bound);
     return true;
 }

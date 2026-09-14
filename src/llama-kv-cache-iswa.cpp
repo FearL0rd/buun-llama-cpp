@@ -121,6 +121,14 @@ llama_kv_cache_iswa::llama_kv_cache_iswa(
             v_trans, offload, unified, size_swa, n_seq_max, n_pad,
             hparams.n_swa, hparams.swa_type, mem_other_swa, filter_swa, reuse, share, vbr_swa);
 
+    if (kv_swa->vbr_ownership_ && size_swa < size_base) {
+        // Construction only: no rows or ownership views exist yet. The ring's
+        // physical capacity does not bound its logical positions. Keep rank
+        // coverage at the base context size; storage remains lazy per sequence.
+        kv_swa->vbr_ownership_ = std::make_unique<vbr_ownership_index>(
+                kv_swa->n_stream, uint32_t(kv_swa->seq_to_stream.size()), size_swa, size_base);
+    }
+
     const uint64_t scalar_budget = llama_memory_vbr_budget_bytes_resolve(vbr);
     if (scalar_budget > 0) {
         vbr_repartition_scalar_budget(scalar_budget);

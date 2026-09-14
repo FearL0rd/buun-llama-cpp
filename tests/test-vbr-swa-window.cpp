@@ -335,6 +335,49 @@ static void shared_owner_gate(llama_model * model, llama_context_params cp, cons
     fprintf(stderr, "WINDOW THREE-OWNER PASS shared_removals=%zu; paused-owner/source-release/independent-continuations\n", removals);
 }
 
+static void long_frontier_gate(llama_model * model, llama_context_params cp, const std::vector<llama_token> & tokens,
+                               vbr_swa_window_capture_request capture) {
+    llama_context_ptr ctx(llama_init_from_model(model, cp));
+    check(bool(ctx), "long-frontier context failed");
+    auto & tree = *dynamic_cast<llama_kv_cache_iswa *>(llama_get_memory(ctx.get()));
+    int frontier = 4263;
+    for (int p = 0; p < frontier;) {
+        const int n = std::min(512, frontier-p);
+        decode(ctx.get(), tokens, p, n); p += n;
+    }
+    capture.frontier = frontier;
+    auto sealed = vbr_capture_swa_window(*ctx, capture);
+    for (int attempt = 0; sealed.status == vbr_swa_window_status::protected_rows && attempt < 12; ++attempt) {
+        decode(ctx.get(), tokens, frontier, 128); frontier += 128;
+        capture.frontier = frontier;
+        sealed = vbr_capture_swa_window(*ctx, capture);
+    }
+    check(sealed.status == vbr_swa_window_status::ok, "long-frontier capture failed");
+    check(frontier > int(tree.get_swa()->get_size()), "long-frontier fixture is not beyond physical pool");
+    for (int p = frontier; p < frontier+2048; ++p) { decode(ctx.get(), tokens, p, 1); }
+    vbr_swa_window_plan_request request;
+    request.source_epoch = capture.sequence_epoch; request.destination = 1; request.destination_epoch = 1;
+    request.execution_identity = capture.execution_identity; request.representation = capture.representation;
+    auto plan = vbr_prepare_swa_window(*ctx, sealed.image, request);
+    check(plan.status == vbr_swa_window_status::ok, "long-frontier prepare failed");
+    const auto source_bytes = llama_kv_cache_vbr_epoch_test::required_bytes(tree, 0);
+    vbr_swa_window_install_request install {request.source_epoch, 1, request.execution_identity};
+    const auto result = vbr_install_swa_window(*ctx, std::move(plan.plan), install);
+    fprintf(stderr, "WINDOW LONG-FRONTIER result=%d frontier=%d physical=%u\n", int(result), frontier, tree.get_swa()->get_size());
+    check(result == vbr_swa_window_status::ok, "long-frontier install failed");
+    check(source_bytes == llama_kv_cache_vbr_epoch_test::required_bytes(tree, 0), "long-frontier source bytes changed");
+    for (int i = 0; i < 16; ++i) {
+        decode(ctx.get(), tokens, frontier+i, 1, 1);
+        decode(ctx.get(), tokens, frontier+2048+i, 1, 0);
+    }
+    check(tree.seq_rm(0, -1, -1), "long-frontier source release failed");
+    decode(ctx.get(), tokens, frontier+16, 1, 1);
+    const auto * logits = llama_get_logits_ith(ctx.get(), -1);
+    check(std::all_of(logits, logits+llama_vocab_n_tokens(llama_model_get_vocab(model)),
+        [](float v) { return std::isfinite(v); }), "long-frontier continuation nonfinite");
+    fprintf(stderr, "WINDOW LONG-FRONTIER PASS beyond-physical-pool/source-release/continuation\n");
+}
+
 int main(int argc, char ** argv) {
     try {
         common_params params;
@@ -528,6 +571,9 @@ int main(int argc, char ** argv) {
             request.sequence_epoch = 2;
             shared_owner_gate(model.get(), cp, tokens, request);
             check(budget->used == 0, "three-owner image charge leaked");
+            request.sequence_epoch = 3;
+            long_frontier_gate(model.get(), cp, tokens, request);
+            check(budget->used == 0, "long-frontier image charge leaked");
         }
         fprintf(stderr, "WINDOW PLAN PASS no-write/all-owners/protected-purge/capacity/busy/stale-decode/epochs/identity/lifetime\n");
         fprintf(stderr, "WINDOW CAPTURE PASS bytes=%zu capture_ms=%.3f; protected/refusal/cancel/repeat/recycle/lifetime/accounting\n", retained, ms);

@@ -1062,7 +1062,7 @@ class vbr_kv_import_session {
                 final_cells_[stream].resize(cache_->v_cells[stream].size());
             }
             final_ownership_ = std::make_unique<vbr_ownership_index>(
-                cache_->n_stream, cache_->n_seq_max, cache_->get_size());
+                cache_->n_stream, cache_->n_seq_max, cache_->get_size(), cache_->vbr_ownership_->position_capacity());
             std::vector<vbr_artifact_stream_placement> placements;
             if (replacement) {
                 auto & cells = final_cells_.front();
