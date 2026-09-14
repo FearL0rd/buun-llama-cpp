@@ -5356,6 +5356,25 @@ private:
                media_identity == frontier.media_content_identity;
     }
 
+    bool active_prefix_enabled() const {
+        return slots.size() > 1 && prompt_cache && params_base.kv_unified &&
+            !params_base.ctx_shift && params_base.n_cache_reuse == 0 &&
+            params_base.cache_plan_authority == common_cache_plan_authority_level::off;
+    }
+
+    std::optional<common_speculative_type> active_prefix_draft_type() const {
+        auto selected = COMMON_SPECULATIVE_TYPE_NONE;
+        for (auto type : params_base.speculative.types) {
+            if (type == COMMON_SPECULATIVE_TYPE_NONE) { continue; }
+            if (selected != COMMON_SPECULATIVE_TYPE_NONE ||
+                (type != COMMON_SPECULATIVE_TYPE_DRAFT_MTP &&
+                 type != COMMON_SPECULATIVE_TYPE_DFLASH &&
+                 type != COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH)) { return {}; }
+            selected = type;
+        }
+        return selected;
+    }
+
     bool swa_window_eligible(const server_slot & slot) const {
         return swa_window_checkpoint_limit > 0 && prompt_cache && slots.size() > 1 &&
             params_base.kv_unified && !params_base.ctx_shift && params_base.n_cache_reuse == 0 &&
@@ -5412,9 +5431,7 @@ private:
     // change a pre-mutation authoritative plan. The source and any borrowed
     // checkpoint remain alive for this entire non-yielding scheduler callback.
     void restore_active_prefix(server_slot & dst) {
-        if (slots.size() < 2 || !prompt_cache || !params_base.kv_unified ||
-            params_base.ctx_shift || params_base.n_cache_reuse != 0 ||
-            params_base.cache_plan_authority != common_cache_plan_authority_level::off ||
+        if (!active_prefix_enabled() ||
             (!llama_model_is_hybrid(model_tgt) && n_swa <= 0) || dst.diff_self_spec ||
             !dst.task || dst.task->type != SERVER_TASK_TYPE_COMPLETION ||
             !dst.task->params.cache_prompt || dst.task->is_parent() || dst.task->is_child() ||
@@ -5422,19 +5439,21 @@ private:
             !dst.lora.empty()) {
             return;
         }
-        const bool mtp = params_base.speculative.has_type(COMMON_SPECULATIVE_TYPE_DRAFT_MTP);
-        for (const auto type : params_base.speculative.types) {
-            if (type != COMMON_SPECULATIVE_TYPE_NONE && type != COMMON_SPECULATIVE_TYPE_DRAFT_MTP) {
-                return;
-            }
-        }
-        if (mtp != bool(ctx_dft) || mtp != dst.can_speculate()) {
-            return;
-        }
+        const auto draft_type = active_prefix_draft_type();
+        if (!draft_type) { return; }
+        const bool mtp = *draft_type == COMMON_SPECULATIVE_TYPE_DRAFT_MTP;
+        const bool dflash = *draft_type == COMMON_SPECULATIVE_TYPE_DFLASH;
+        const bool shared_dflash = *draft_type == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH;
+        const bool drafting = mtp || dflash || shared_dflash;
+        auto * draft_ctx = dflash ? ctx_dft_shared.get() : ctx_dft.get();
+        if (drafting != bool(draft_ctx) || drafting != dst.can_speculate()) { return; }
+        // DFlash media/rebased positions need their own qualification. Existing
+        // MTP/media and target-only SWA admission are unchanged.
+        if ((dflash || shared_dflash) && dst.task->tokens.has_media()) { return; }
         // Retained attention windows use zero-copy sharing. Recycled windows
         // may use the separately qualified typed historical companion.
         const bool live_attention = server_vbr_dynamic_active(params_base) &&
-            n_swa > 0 && !llama_model_is_hybrid(model_tgt) && !mtp;
+            n_swa > 0 && !llama_model_is_hybrid(model_tgt) && !drafting;
 
         auto * rec = dst.cache_plan.get();
         common_cache_plan_candidate * row = nullptr;
@@ -5462,7 +5481,8 @@ private:
                     !source.task || !source.task->params.cache_prompt ||
                     source.task->is_parent() || source.task->is_child() ||
                     !source.lora.empty() ||
-                    source.can_speculate() != mtp ||
+                    source.can_speculate() != drafting ||
+                    ((dflash || shared_dflash) && source.prompt.tokens.has_media()) ||
                     (!source.prompt.tokens.has_media() &&
                      source.prompt.tokens.pos_next() != source.prompt.n_tokens())) {
                     continue;
@@ -5508,7 +5528,7 @@ private:
                         cp.n_tokens <= best.n_tokens ||
                         cp.pos_min < 0 || cp.pos_min > cp.pos_max ||
                         (llama_model_is_hybrid(model_tgt) && cp.pos_min != cp.pos_max) ||
-                        cp.data_tgt.empty() || !cp.data_qsa.empty() || !cp.accel.ring.empty() ||
+                        cp.data_tgt.empty() || !cp.data_qsa.empty() || (!dflash && !cp.accel.ring.empty()) ||
                         !checkpoint_frontier_is_current(source, cp, adapter) ||
                         (source.retention_obs && !source.retention_obs->clone_source_available(
                             server_retention_instance_key::for_checkpoint(source.id, &cp)))) {
@@ -5551,6 +5571,12 @@ private:
                             continue;
                         }
                     }
+                    if (shared_dflash && (cp.data_dft.empty() || !cp.data_dft_full_sequence || !cp.accel.spec.empty())) {
+                        continue;
+                    }
+                    if (dflash && (!cp.accel.spec.empty() ||
+                        !common_speculative_ring_state_matches_frontier(dst.get_spec(), cp.accel.ring.view().data(),
+                            cp.accel.ring.size(), cp.pos_max))) { continue; }
                     best = { &source, &cp, cp.n_tokens, std::move(rows) };
                 }
             }
@@ -5617,8 +5643,8 @@ private:
             std::string status = live_attention ? "shared active attention prefix" : "restored active context checkpoint";
             if (best.window_bytes) { status = "restored historical SWA window"; }
             if (!synchronized) { llama_synchronize(ctx_tgt); }
-            if (ctx_dft) {
-                llama_synchronize(ctx_dft.get());
+            if (draft_ctx) {
+                llama_synchronize(draft_ctx);
             }
             const bool shared = installed || (live_attention
                 ? (best.rows.empty() ? mem->try_share_live_prefix(best.source->id, dst.id, next_pos)
@@ -5635,16 +5661,24 @@ private:
             const bool target_ok = live_attention || llama_state_seq_set_data_ext(ctx_tgt,
                     cp->data_tgt.data(), cp->data_tgt.size(), dst.id,
                     LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == cp->data_tgt.size();
-            const bool draft_ok = target_ok && (!mtp || cp->try_load_dft(
-                    ctx_dft.get(), dst.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY));
+            const bool draft_ok = target_ok && (!(mtp || shared_dflash) || cp->try_load_dft(
+                    draft_ctx, dst.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY));
             if (!draft_ok || llama_memory_seq_pos_max(mem, dst.id) != (cp ? cp->pos_max : next_pos - 1)) {
                 throw std::runtime_error("active prefix checkpoint restore failed");
             }
+            if (shared_dflash && llama_memory_seq_pos_max(llama_get_memory(draft_ctx), dst.id) != cp->pos_max) {
+                throw std::runtime_error("active prefix draft frontier mismatch");
+            }
             common_speculative_sequence_transition(dst.get_spec(), dst.id,
                 mtp ? common_speculative_sequence_event::composite_image_restored
+                    : shared_dflash ? common_speculative_sequence_event::draft_image_restored
                     : common_speculative_sequence_event::target_restored_without_draft);
             if (mtp && !common_speculative_set_state(dst.get_spec(), dst.id, cp->accel.spec.view())) {
                 throw std::runtime_error("active prefix MTP state restore failed");
+            }
+            if (dflash && !common_speculative_ring_state_load(dst.get_spec(),
+                    cp->accel.ring.view().data(), cp->accel.ring.size())) {
+                throw std::runtime_error("active prefix DFlash ring restore failed");
             }
             // Publish only the input prefix, not source task/sampler/output or its
             // checkpoint ring. The next ordinary decode establishes A2's lineage.
@@ -19096,7 +19130,12 @@ private:
                                     params_base.speculative.uses_mtp_as_primary_drafter());
                             const bool mtp_checkpoint_required =
                                 checkpoint_policy.require_complete_draft_and_state;
-                            const bool capture_draft = checkpoint_policy.capture_draft;
+                            // An empty DFlash2 sequence needs its complete draft
+                            // image (including retained SWA), not just target RS.
+                            const bool capture_dflash = active_prefix_enabled() && slot.can_speculate() &&
+                                !slot.prompt.tokens.has_media() &&
+                                active_prefix_draft_type() == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH;
+                            const bool capture_draft = checkpoint_policy.capture_draft || capture_dflash;
                             std::vector<uint8_t> spec_state;
                             const bool mtp_state_ready = !mtp_checkpoint_required ||
                                 (common_speculative_get_state(
@@ -19120,6 +19159,8 @@ private:
                                     uint64_t(checkpoint_size);
                             const bool draft_vbr_fits =
                                 draft_size != 0 && qsa_vbr_fits &&
+                                (!capture_dflash || llama_memory_seq_pos_max(
+                                    llama_get_memory(ctx_dft.get()), slot.id) == pos_max) &&
                                 mtp_state_ready &&
                                 uint64_t(ring_size) <=
                                     exact_capture_limit-
