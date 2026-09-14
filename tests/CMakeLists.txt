@@ -552,6 +552,11 @@ target_link_libraries(test-mul-mat-params PRIVATE ggml-base)
 llama_test(test-mul-mat-params)
 add_executable(test-fusion-check test-fusion-check.cpp)
 llama_test(test-fusion-check)
+if (TARGET ggml-cpu)
+    add_executable(test-expert-window-params test-expert-window-params.cpp)
+    target_link_libraries(test-expert-window-params PRIVATE ggml ggml-cpu)
+    llama_test(test-expert-window-params)
+endif()
 if (TARGET ggml-cuda AND GGML_CUDA_Q8_MMV_TEST_INSTRUMENTATION)
     llama_test(test-backend-ops NAME test-cuda-q8-mmv-dispatch
         LABEL "main;backend"
