@@ -77,7 +77,7 @@ size_t ggml_backend_buft_get_alloc_size(ggml_backend_buffer_type_t buft, const s
         assert(size >= ggml_nbytes(tensor));
 
         // [TAG_ALLOC_SIZE_EXPAND]
-        // if you hit this assert, update ggml_backend_op_alloc_size_may_expand() accordingly
+        // if you hit this assert, update ggml_op_alloc_size_may_expand() accordingly
         GGML_ASSERT(size <= ggml_nbytes(tensor) ||
                     ggml_op_is_empty(tensor->op) ||
                     ggml_is_quantized(tensor->type) || // [TAG_ALLOC_SIZE_EXPAND]

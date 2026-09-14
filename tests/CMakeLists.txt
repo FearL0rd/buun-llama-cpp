@@ -536,6 +536,11 @@ if (NOT LLAMA_SANITIZE_ADDRESS AND NOT GGML_SCHED_NO_REALLOC)
   llama_build_and_test(test-opt.cpp)
 endif()
 llama_build_and_test(test-backend-ops.cpp)
+# Metadata ABI gate needs no model or device backend.
+add_executable(test-mul-mat-params test-mul-mat-params.cpp)
+target_include_directories(test-mul-mat-params PRIVATE ../ggml/src)
+target_link_libraries(test-mul-mat-params PRIVATE ggml-base)
+llama_test(test-mul-mat-params)
 if (TARGET ggml-cuda AND GGML_CUDA_Q8_MMV_TEST_INSTRUMENTATION)
     llama_test(test-backend-ops NAME test-cuda-q8-mmv-dispatch
         LABEL "main;backend"

@@ -3693,6 +3693,37 @@ struct ggml_tensor * ggml_l2_norm_inplace(
     return ggml_l2_norm_impl(ctx, a, eps, true);
 }
 
+// ggml_prec
+
+bool ggml_prec_set_acc(struct ggml_tensor * a, enum ggml_prec prec) {
+    switch (a->op) {
+        case GGML_OP_MUL_MAT:
+        case GGML_OP_MUL_MAT_ID:
+            ggml_set_op_params_i32(a, 0, (int32_t) prec);
+            return true;
+        case GGML_OP_FLASH_ATTN_EXT:
+            ggml_set_op_params_i32(a, 3, (int32_t) prec);
+            return true;
+        default:
+            return false;
+    }
+}
+
+bool ggml_prec_set_src(struct ggml_tensor * a, enum ggml_prec prec, int idx) {
+    GGML_ASSERT(idx >= 0 && idx < GGML_MAX_SRC);
+    switch (a->op) {
+        case GGML_OP_MUL_MAT:
+        case GGML_OP_MUL_MAT_ID:
+            if (idx != 1) {
+                return false;
+            }
+            ggml_set_op_params_i32(a, 2 + idx, (int32_t) prec);
+            return true;
+        default:
+            return false;
+    }
+}
+
 // ggml_mul_mat
 
 static inline bool ggml_can_mul_mat(const struct ggml_tensor * t0, const struct ggml_tensor * t1) {
@@ -3784,8 +3815,8 @@ void ggml_mul_mat_id_set_expert_window(struct ggml_tensor * mmid, int32_t lo, in
     GGML_ASSERT(mmid->op == GGML_OP_MUL_MAT_ID);
     GGML_ASSERT(n_local >= 0 && lo >= 0);
     GGML_ASSERT(n_local == 0 || mmid->src[0]->ne[2] == n_local);
-    ggml_set_op_params_i32(mmid, 2, lo);
-    ggml_set_op_params_i32(mmid, 3, n_local);
+    ggml_set_op_params_i32(mmid, GGML_MMID_WINDOW_LO, lo);
+    ggml_set_op_params_i32(mmid, GGML_MMID_WINDOW_N_LOCAL, n_local);
 }
 
 // ggml_out_prod

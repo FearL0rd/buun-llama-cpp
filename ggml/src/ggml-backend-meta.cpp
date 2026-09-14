@@ -1334,8 +1334,8 @@ static enum ggml_status ggml_backend_meta_buffer_init_tensor_impl(ggml_backend_m
                     lo += (int32_t) ss0.ne[jj];
                 }
                 // (the per-device src pointers are wired below; set the params directly)
-                ggml_set_op_params_i32(t_ij, 2, lo);
-                ggml_set_op_params_i32(t_ij, 3, (int32_t) ss0.ne[j]);
+                ggml_set_op_params_i32(t_ij, GGML_MMID_WINDOW_LO, lo);
+                ggml_set_op_params_i32(t_ij, GGML_MMID_WINDOW_N_LOCAL, (int32_t) ss0.ne[j]);
             }
         }
         ggml_set_name(t_ij, tensor->name);

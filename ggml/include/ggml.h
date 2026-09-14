@@ -575,10 +575,16 @@ extern "C" {
         uint32_t total_size;
     };
 
-    // precision
+    // [TAG_GGML_PREC]
+    // Allowed accumulation and source-representation types, stored in op_params.
     enum ggml_prec {
-        GGML_PREC_DEFAULT =  0, // stored as ggml_tensor.op_params, 0 by default
-        GGML_PREC_F32     = 10,
+        GGML_PREC_UNDEFINED = 0,
+        GGML_PREC_DEFAULT   = 0, // deprecated, use GGML_PREC_UNDEFINED
+        GGML_PREC_F32       = 10,
+        GGML_PREC_BF16      = 15,
+        GGML_PREC_F16       = 20,
+        GGML_PREC_Q8        = 30,
+        GGML_PREC_Q4        = 40,
     };
 
     // op hint
@@ -1606,6 +1612,24 @@ extern "C" {
             struct ggml_tensor  * b,
             float                 eps);
 
+    // [TAG_GGML_PREC]
+    // Minimum accumulator type: F32 requires F32; BF16 or F16 also allow F32.
+    // Q8 and Q4 are not accumulator types. Returns false for unsupported ops.
+    GGML_API bool ggml_prec_set_acc(
+            struct ggml_tensor * a,
+            enum ggml_prec       prec);
+
+    // [TAG_GGML_PREC]
+    // Smallest representation rank allowed for src[idx], in decreasing order:
+    // F32, BF16, F16, Q8 (Q8_0/Q8_1/Q8_K/etc.), Q4 (Q4_K/NVFP4/MXFP4/etc.).
+    // For example, Q8 allows F32 -> Q8_0 but not F32 -> NVFP4.
+    // Currently only src[1] of MUL_MAT/MUL_MAT_ID is supported. Returns false
+    // for unsupported ops or sources; idx must be in [0, GGML_MAX_SRC).
+    GGML_API bool ggml_prec_set_src(
+            struct ggml_tensor * a,
+            enum ggml_prec       prec,
+            int                  idx);
+
     // A: k columns, n rows => [ne03, ne02, n, k]
     // B: k columns, m rows  (i.e. we transpose it internally) => [ne03 * x, ne02 * y, m, k]
     // result is n columns, m rows => [ne03 * x, ne02 * y, m, n]
@@ -1616,9 +1640,10 @@ extern "C" {
 
     // change the precision of a matrix multiplication
     // set to GGML_PREC_F32 for higher precision (useful for phi-2)
-    GGML_API void ggml_mul_mat_set_prec(
+    GGML_DEPRECATED(GGML_API void ggml_mul_mat_set_prec(
             struct ggml_tensor * a,
-            enum ggml_prec       prec);
+            enum ggml_prec       prec),
+        "use ggml_prec_set_acc() instead");
 
     // change the hint of a matrix multiplication
     GGML_API void ggml_mul_mat_set_hint(
@@ -2638,9 +2663,10 @@ extern "C" {
             float                 max_bias,
             float                 logit_softcap);
 
-    GGML_API void ggml_flash_attn_ext_set_prec(
+    GGML_DEPRECATED(GGML_API void ggml_flash_attn_ext_set_prec(
             struct ggml_tensor * a,
-            enum ggml_prec       prec);
+            enum ggml_prec       prec),
+        "use ggml_prec_set_acc() instead");
 
     GGML_API enum ggml_prec ggml_flash_attn_ext_get_prec(
             const struct ggml_tensor * a);
