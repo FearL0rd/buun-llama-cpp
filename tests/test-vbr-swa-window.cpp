@@ -377,9 +377,6 @@ struct llama_kv_cache_vbr_epoch_test {
             const auto * t = unit.logical_unit & 1 ? layer.v : layer.k;
             check(unit.model_layer == layer.il && unit.generation.current_type == t->type, "wrong unit identity");
             check(unit.row_bytes == t->nb[1] && unit.payload.size() == image.rows().size()*unit.row_bytes, "wrong payload shape");
-            llama_sha256 hash;
-            hash.update(unit.payload.data(), unit.payload.size());
-            check(hash.finish() == unit.checksum, "payload checksum differs");
             std::vector<uint8_t> row(unit.row_bytes);
             for (size_t i = 0; i < image.rows().size(); ++i) {
                 ggml_backend_tensor_get(t, row.data(), image.rows()[i].physical_cell*unit.row_bytes, row.size());
@@ -545,6 +542,62 @@ static void downward_gate(llama_model * model, llama_context_params cp, const st
         }
         fprintf(stderr, "WINDOW DOWNWARD PASS exact-live-chain-bytes/source-preserved/continuations\n");
     }
+}
+
+static void retained_prefix_gate(llama_model * model, llama_context_params cp,
+                                 const std::vector<llama_token> & tokens,
+                                 vbr_swa_window_capture_request request) {
+    llama_context_ptr ctx(llama_init_from_model(model, cp));
+    check(bool(ctx), "retained-prefix context failed");
+    auto & tree = *dynamic_cast<llama_kv_cache_iswa *>(llama_get_memory(ctx.get()));
+    constexpr int frontier = 1191;
+    decode(ctx.get(), tokens, 0, 64);
+    for (int p = 64; p < frontier;) {
+        const int n = std::min(512, frontier-p);
+        decode(ctx.get(), tokens, p, n); p += n;
+    }
+    request.frontier = frontier;
+    auto original = vbr_capture_swa_window(*ctx, request);
+    check(original.status == vbr_swa_window_status::ok, "retained-prefix original failed");
+    decode(ctx.get(), tokens, frontier, 4);
+    const auto before = llama_kv_cache_vbr_epoch_test::fingerprint(tree);
+    auto delayed = vbr_capture_swa_window(*ctx, request);
+    check(delayed.status == vbr_swa_window_status::ok, "retained-prefix delayed failed");
+    check(delayed.image->frontier() == frontier, "delayed capture advanced frontier");
+    check(before == llama_kv_cache_vbr_epoch_test::fingerprint(tree), "delayed capture changed source");
+    check(original.image->units().size() == delayed.image->units().size(), "delayed capture changed units");
+    for (size_t u = 0; u < original.image->units().size(); ++u) {
+        check(original.image->units()[u].payload == delayed.image->units()[u].payload,
+              "later append changed captured prefix bytes");
+    }
+    llama_kv_cache_vbr_epoch_test::verify(*tree.get_swa(), *delayed.image);
+    request.frontier = frontier+5;
+    check(vbr_capture_swa_window(*ctx, request).status == vbr_swa_window_status::unavailable,
+          "uncommitted future frontier accepted");
+    request.frontier = frontier;
+    for (int p = frontier+4; p < frontier+2052; p += 512) { decode(ctx.get(), tokens, p, 512); }
+    check(vbr_capture_swa_window(*ctx, request).status == vbr_swa_window_status::unavailable,
+          "recycled incomplete historical window accepted");
+    vbr_swa_window_plan_request placement;
+    placement.source_epoch = request.sequence_epoch; placement.destination_epoch = 1;
+    placement.destination = 1; placement.execution_identity = request.execution_identity;
+    placement.representation = request.representation;
+    placement.reserve = request.reserve; placement.capacity_context = request.capacity_context;
+    auto plan = vbr_prepare_swa_window(*ctx, delayed.image, placement);
+    check(plan.status == vbr_swa_window_status::ok, "delayed image planning failed");
+    auto rows = plan.plan->destination_cells();
+    const auto source_bytes = llama_kv_cache_vbr_epoch_test::required_bytes(tree, 0);
+    vbr_swa_window_install_request install {request.sequence_epoch, 1, request.execution_identity};
+    install.reserve = request.reserve; install.capacity_context = request.capacity_context;
+    check(vbr_install_swa_window(*ctx, std::move(plan.plan), install) == vbr_swa_window_status::ok,
+          "delayed image installation failed");
+    check(source_bytes == llama_kv_cache_vbr_epoch_test::required_bytes(tree, 0), "delayed install changed source");
+    llama_kv_cache_vbr_epoch_test::verify_payload_rows(*tree.get_swa(), *original.image, rows, false);
+    decode(ctx.get(), tokens, frontier, 1, 1);
+    const auto * logits = llama_get_logits_ith(ctx.get(), -1);
+    check(std::all_of(logits, logits+llama_vocab_n_tokens(llama_model_get_vocab(model)),
+        [](float v) { return std::isfinite(v); }), "delayed image continuation nonfinite");
+    fprintf(stderr, "WINDOW RETAINED PREFIX PASS immediate/delayed exact bytes; future/recycled refusal; install/source/continuation\n");
 }
 
 int main(int argc, char ** argv) {
@@ -768,6 +821,10 @@ int main(int argc, char ** argv) {
         check(budget->used == with_plan, "plan did not retain image ownership");
         recycled.plan.reset();
         check(budget->used == 0, "last reader did not release charge");
+        budget->limit = 64*1024*1024; // immediate + delayed F16 images and install rollback storage
+        retained_prefix_gate(model.get(), cp, tokens, request);
+        check(budget->used == 0, "retained-prefix image charge leaked");
+        budget->limit = 16*1024*1024;
         if (test_shared) {
             request.sequence_epoch = 2;
             shared_owner_gate(model.get(), cp, tokens, request);

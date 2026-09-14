@@ -27,13 +27,12 @@ struct vbr_swa_window_unit {
     std::array<char, GGML_MAX_NAME> tensor_name {};
     uint64_t columns;
     size_t row_bytes;
-    std::array<uint8_t, 32> checksum {};
     std::vector<uint8_t> payload;
 };
 
 struct vbr_swa_window_capture_request {
     llama_seq_id sequence = -1;
-    llama_pos frontier = -1; // exclusive; capture only the committed frontier
+    llama_pos frontier = -1; // exclusive; all required prefix rows must still be committed and retained
     uint64_t sequence_epoch = 0; // caller's logical slot lifetime, not slot ID
     std::array<uint8_t, 32> execution_identity {};
     vbr_explicit_representation_policy representation;

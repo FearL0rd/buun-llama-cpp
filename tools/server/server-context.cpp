@@ -18844,7 +18844,10 @@ private:
                         //  - 4 + n_ubatch
                         //  - 4
                         // ref: https://github.com/ggml-org/llama.cpp/pull/20288
-                        if (do_checkpoint) {
+                        // Typed attention windows can capture an earlier retained
+                        // prefix after this batch. Do not add a four-token model
+                        // pass merely to materialize that checkpoint boundary.
+                        if (do_checkpoint && !typed_swa_checkpoint) {
                             static const int checkpoint_offsets[] = {4 + n_ubatch, 4};
 
                             bool should_break = false;
@@ -18942,7 +18945,12 @@ private:
                     const int ckpt_id_task = slot.task->id;
                     const int64_t ckpt_n_tokens = slot.prompt.n_tokens() - n_tokens_cur;
                     if (do_checkpoint && typed_swa_checkpoint) {
-                        capture_swa_window(slot, ckpt_n_tokens);
+                        // A natural multi-slot batch may leave fewer than four
+                        // tokens. The deferred near-end capture below already
+                        // covers that boundary; do not save an overlapping later one.
+                        if (ckpt_n_tokens + 4 <= slot.task->n_tokens()) {
+                            capture_swa_window(slot, ckpt_n_tokens);
+                        }
                         do_checkpoint = false; // never route a typed window through legacy serialization
                     }
                     const llama_pos ckpt_pos_min = checkpoint_exact_frontier ? pos_max : pos_min;
@@ -20155,6 +20163,12 @@ private:
                 }
 
                 GGML_ASSERT(slot.task->need_sampling());
+
+                if (swa_window_eligible(slot) && slot.prompt.n_tokens() >= 68) {
+                    // Preserve the near-end reusable frontier without splitting
+                    // prefill. Capture declines if those earlier rows were recycled.
+                    capture_swa_window(slot, slot.prompt.n_tokens() - 4);
+                }
 
                 wait_for_prompt_capture = capture_vbr_swa_prompt_frontier(
                     slot, slot.i_batch-off);

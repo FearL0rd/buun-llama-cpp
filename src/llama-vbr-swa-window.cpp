@@ -2,7 +2,6 @@
 
 #include "llama-hparams.h"
 #include "llama-kv-cache-iswa.h"
-#include "llama-sha256.h"
 #include "llama-vbr-downward.h"
 
 #include <algorithm>
@@ -77,7 +76,12 @@ public:
         if (!ready(base) || !ready(swa) || !vbr_operation_registry_quiescent_for(instances, 2) ||
             !swa.vbr_capture_settle()) { return fail(status::unavailable); }
         const auto & cells = swa.v_cells[0];
-        if (cells.seq_pos_max(request.sequence) != request.frontier-1 ||
+        const llama_pos begin = std::max<int64_t>(0, int64_t(request.frontier)-swa.n_swa);
+        // Attention-only KV rows are independently reusable after later tokens
+        // have been evaluated. Capture an earlier prefix only while its ENTIRE
+        // window is retained; never infer coverage from the sequence high-water mark.
+        if (cells.seq_pos_max(request.sequence) < request.frontier-1 ||
+            !cells.seq_has_range(request.sequence, begin, request.frontier) ||
             !base.v_cells[0].seq_has_prefix(request.sequence, request.frontier)) {
             return fail(status::unavailable);
         }
@@ -94,7 +98,8 @@ public:
         const size_t row_count = std::min<uint32_t>(swa.n_swa, request.frontier);
         image->rows_.reserve(row_count);
         for (uint32_t r = 0; r < cells.size(); ++r) {
-            if (!swa.state_write_includes_cell(cells, r, request.sequence)) { continue; }
+            if (!cells.seq_has(r, request.sequence) || cells.pos_get(r) < begin ||
+                cells.pos_get(r) >= request.frontier) { continue; }
             if (r < swa.vbr_stash_rows_) { return fail(status::protected_rows); }
             const auto & ext = cells.ext_get(r);
             if (ext.x != 0 || ext.y != 0 || ext.tok == LLAMA_TOKEN_NULL || image->rows_.size() == row_count) {
@@ -162,7 +167,6 @@ public:
         for (size_t u = 0; u < image->units_.size(); ++u) {
             auto & unit = image->units_[u];
             unit.payload.resize(row_count*unit.row_bytes);
-            llama_sha256 hash;
             for (size_t i = 0; i < row_count;) {
                 size_t end = i+1;
                 while (end < row_count && image->rows_[end].physical_cell == image->rows_[end-1].physical_cell+1) { ++end; }
@@ -173,12 +177,10 @@ public:
                     const size_t size = std::min(chunk_bytes, run_bytes-offset);
                     auto * dst = unit.payload.data()+i*unit.row_bytes+offset;
                     ggml_backend_tensor_get(tensors[u], dst, image->rows_[i].physical_cell*unit.row_bytes+offset, size);
-                    hash.update(dst, size);
                     offset += size;
                 }
                 i = end;
             }
-            unit.checksum = hash.finish();
         }
         if (!stable()) { return fail(status::source_changed); }
         if (request.continue_capture && !request.continue_capture(request.continue_context)) { return fail(status::cancelled); }
