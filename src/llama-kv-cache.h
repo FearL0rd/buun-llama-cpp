@@ -510,6 +510,7 @@ private:
     bool share_checked_range(llama_seq_id src, llama_seq_id dst, llama_pos p0, llama_pos p1);
     friend class vbr_live_capture_adapter;
     friend class vbr_swa_window_capture;
+    friend class vbr_swa_window_planner;
     friend class vbr_kv_import_session;
     friend struct llama_kv_cache_vbr_stash_batch_test;
     struct vbr_capture_unit_request {
@@ -1489,6 +1490,10 @@ private:
     }
 
   private:
+
+    // Shared by decode placement and historical-window planning. An occupied
+    // SWA cell is reusable only when it is masked for every current owner.
+    bool can_reuse_cell(uint32_t stream, uint32_t cell) const;
 
     vbr_generation_event vbr_generation_begin(
             vbr_mutation_registrant registrant,

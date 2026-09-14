@@ -3737,18 +3737,7 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
                 //  - every owner masks it under SWA at its next position.
                 // A shared prefix is not permanently pinned: once ALL owners
                 // advance past a row, its backing can serve another token.
-                bool can_use = cells.is_empty(idx);
-
-                if (!can_use && n_swa > 0) {
-                    const llama_pos pos_cell = cells.pos_get(idx);
-                    can_use = true;
-                    cells.seq_for_each(idx, [&](llama_seq_id seq_id) {
-                        can_use = can_use && llama_hparams::is_masked_swa(
-                            n_swa, swa_type, pos_cell, cells.seq_pos_max(seq_id) + 1);
-                    });
-                }
-
-                if (can_use) {
+                if (can_reuse_cell(res.strm[s], idx)) {
                     res.idxs[s].push_back(idx);
                 } else {
                     if (cont) {
@@ -3780,6 +3769,18 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
     assert(res.s1 >= res.s0);
 
     return res;
+}
+
+bool llama_kv_cache::can_reuse_cell(uint32_t stream, uint32_t cell) const {
+    const auto & cells = v_cells[stream];
+    if (cells.is_empty(cell)) { return true; }
+    if (n_swa == 0) { return false; }
+    bool reusable = true;
+    cells.seq_for_each(cell, [&](llama_seq_id seq) {
+        reusable = reusable && llama_hparams::is_masked_swa(
+            n_swa, swa_type, cells.pos_get(cell), cells.seq_pos_max(seq) + 1);
+    });
+    return reusable;
 }
 
 void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & ubatch, bool commit) {

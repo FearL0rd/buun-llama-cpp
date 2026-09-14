@@ -9,6 +9,7 @@
 #include <cstring>
 #include <limits>
 #include <new>
+#include <string>
 
 namespace {
 bool nonzero(const std::array<uint8_t, 32> & value) {
@@ -187,6 +188,202 @@ vbr_swa_window_capture_result vbr_capture_swa_window(
         llama_context & ctx, const vbr_swa_window_capture_request & request) {
     try {
         return vbr_swa_window_capture::capture(ctx, request);
+    } catch (const std::bad_alloc &) {
+        return {vbr_swa_window_status::allocation_failed, nullptr};
+    }
+}
+
+struct vbr_swa_window_plan::impl {
+    struct boundary {
+        uint64_t controller, mutation, representation, destination_content;
+        uint32_t head, watermark;
+    };
+    std::shared_ptr<const vbr_swa_window_image> image;
+    llama_seq_id destination = -1;
+    uint64_t destination_epoch = 0;
+    std::string build_identity;
+    std::array<boundary, 2> children {};
+    std::vector<uint32_t> destination_cells, base_cells;
+    std::vector<vbr_swa_window_membership_removal> removals;
+    uint32_t required_watermark = 0;
+};
+
+class vbr_swa_window_planner {
+    using status = vbr_swa_window_status;
+    using state = vbr_swa_window_plan::impl;
+
+    static state::boundary boundary(const llama_kv_cache & cache, llama_seq_id destination) {
+        const auto * t = cache.vbr_generation_tracker_get();
+        return {t->controller_generation(), t->mutation_serial(), cache.vbr_representation_epoch(),
+            cache.vbr_checkpoint_epoch(destination), cache.v_heads[0], cache.vbr_pools_[0].wm_cells};
+    }
+
+    static bool same(const state::boundary & a, const state::boundary & b) {
+        return a.controller == b.controller && a.mutation == b.mutation &&
+            a.representation == b.representation && a.destination_content == b.destination_content &&
+            a.head == b.head && a.watermark == b.watermark;
+    }
+
+    static bool same_codec(const vbr_explicit_representation_identity & a,
+                           const vbr_explicit_representation_identity & b) {
+        return a.codec_id == b.codec_id && a.codec_version == b.codec_version &&
+            a.codebook_digest == b.codebook_digest && a.rotation_digest == b.rotation_digest &&
+            a.meansub_digest == b.meansub_digest && a.meansub_baked == b.meansub_baked;
+    }
+
+    static bool representation_matches(const state & plan, const llama_kv_cache & swa) {
+        const auto * tracker = swa.vbr_generation_tracker_get();
+        if (plan.image->units().size() != tracker->unit_count()) { return false; }
+        const vbr_explicit_representation_policy policy {plan.build_identity.data(), plan.build_identity.size()};
+        for (const auto & unit : plan.image->units()) {
+            const auto & layer = swa.layers.at(unit.logical_unit/2);
+            const auto extents = swa.vbr_units_of(unit.logical_unit/2, (unit.logical_unit&1) != 0);
+            if (extents.size() != 1) { return false; }
+            const auto [pool, extent] = extents.front();
+            const auto * t = extent->t;
+            const auto gen = tracker->unit_generation(unit.logical_unit);
+            const auto & saved = unit.generation;
+            // No unit-wide history adoption: this initial COPY proposal requires
+            // the existing loss/domain history too. Downward conversion is P3.
+            if (!t || t->type != saved.current_type || gen.domain != saved.domain ||
+                gen.last_source_type != saved.last_source_type || gen.promote_hops != saved.promote_hops ||
+                gen.last_transition != saved.last_transition || gen.flags != saved.flags ||
+                layer.il != unit.model_layer || t->ne[0] != int64_t(unit.columns) ||
+                t->ne[2] != 1 || t->ne[3] != 1 || t->nb[1] != unit.row_bytes ||
+                ggml_row_size(t->type, t->ne[0]) != unit.row_bytes ||
+                std::strncmp(t->name, unit.tensor_name.data(), GGML_MAX_NAME) != 0 ||
+                layer.turbo_meansub_ref.model_id != unit.meansub_model_id ||
+                layer.turbo_meansub_ref.layer != unit.meansub_layer ||
+                vbr_explicit_capture_validate_extent_generation(pool->wm_cells, t->type, extent->promote_hops, gen) !=
+                    vbr_explicit_size_failure::none) { return false; }
+            vbr_explicit_representation_identity codec;
+            if (!vbr_explicit_capture_representation_identity(&policy, t->type, (unit.logical_unit&1) != 0,
+                    unit.meansub_model_id, codec) || !same_codec(codec, unit.codec)) { return false; }
+        }
+        return true;
+    }
+
+public:
+    static bool current(const state & plan, llama_context & ctx, uint64_t source_epoch,
+                        uint64_t destination_epoch, const std::array<uint8_t, 32> & execution) {
+        if (destination_epoch != plan.destination_epoch ||
+            !plan.image->source_matches(ctx, source_epoch, execution)) { return false; }
+        auto & tree = *dynamic_cast<llama_kv_cache_iswa *>(llama_get_memory(&ctx));
+        const auto & base = *tree.get_base();
+        const auto & swa = *tree.get_swa();
+        return base.can_share_attn_prefix(plan.image->sequence_, plan.destination, plan.image->frontier_) &&
+            swa.can_share_destination(plan.image->sequence_, plan.destination) &&
+            !base.vbr_stash_dirty_ && !swa.vbr_stash_dirty_ &&
+            same(plan.children[0], boundary(base, plan.destination)) &&
+            same(plan.children[1], boundary(swa, plan.destination)) && representation_matches(plan, swa);
+    }
+
+    static vbr_swa_window_plan_result prepare(llama_context & ctx,
+            std::shared_ptr<const vbr_swa_window_image> image, const vbr_swa_window_plan_request & request) {
+        const auto fail = [](status s) { return vbr_swa_window_plan_result {s, nullptr}; };
+        if (!image || request.destination_epoch == 0 ||
+            !request.representation.build_identity || !request.representation.build_identity_len) {
+            return fail(status::unsupported);
+        }
+        if (!image->source_matches(ctx, request.source_epoch, request.execution_identity)) {
+            return fail(status::source_changed);
+        }
+        auto & tree = *dynamic_cast<llama_kv_cache_iswa *>(llama_get_memory(&ctx));
+        const auto & base = *tree.get_base();
+        const auto & swa = *tree.get_swa();
+        if (!base.can_share_attn_prefix(image->sequence_, request.destination, image->frontier_) ||
+            !swa.can_share_destination(image->sequence_, request.destination)) {
+            return fail(status::destination_unavailable);
+        }
+        if (base.vbr_stash_dirty_ || swa.vbr_stash_dirty_) { return fail(status::unavailable); }
+        auto result = std::unique_ptr<vbr_swa_window_plan>(new vbr_swa_window_plan);
+        auto & plan = *result->impl_;
+        plan.image = std::move(image);
+        plan.destination = request.destination;
+        plan.destination_epoch = request.destination_epoch;
+        plan.build_identity.assign(request.representation.build_identity, request.representation.build_identity_len);
+        plan.children = {boundary(base, request.destination), boundary(swa, request.destination)};
+        if (!representation_matches(plan, swa)) { return fail(status::representation_mismatch); }
+
+        const auto & cells = swa.v_cells[0];
+        const uint32_t count = plan.image->rows().size();
+        if (count > cells.size()) { return fail(status::insufficient_cells); }
+        uint32_t head = swa.v_heads[0];
+        if (uint64_t(head) > uint64_t(cells.get_used()) + 2*uint64_t(count)) { head = 0; }
+        plan.destination_cells.reserve(count);
+        for (uint32_t tested = 0; tested < cells.size() && plan.destination_cells.size() < count; ++tested) {
+            const uint32_t cell = (uint64_t(head)+tested)%cells.size();
+            if (cell >= swa.vbr_stash_rows_ && swa.can_reuse_cell(0, cell)) {
+                plan.destination_cells.push_back(cell);
+            }
+        }
+        if (plan.destination_cells.size() != count) { return fail(status::insufficient_cells); }
+
+        std::array<llama_pos, LLAMA_MAX_SEQ> purge_to;
+        purge_to.fill(-1);
+        for (uint32_t cell : plan.destination_cells) {
+            cells.seq_for_each(cell, [&](llama_seq_id seq) {
+                purge_to[seq] = std::max(purge_to[seq], cells.pos_get(cell));
+            });
+        }
+        // Like apply_ubatch, preserve each previous owner's contiguous suffix.
+        // Enumerate ALL older-prefix edits, not merely the rows receiving bytes.
+        uint32_t last_used = 0;
+        for (uint32_t cell = 0; cell < cells.size(); ++cell) {
+            size_t remaining = 0;
+            cells.seq_for_each(cell, [&](llama_seq_id seq) {
+                const llama_pos pos = cells.pos_get(cell);
+                if (pos <= purge_to[seq]) {
+                    plan.removals.push_back({cell, seq, pos});
+                } else {
+                    ++remaining;
+                }
+            });
+            // seq_rm marks a protected cell dirty when its last owner leaves.
+            // Refuse even an INDIRECT stash eviction; skipping destination
+            // rows alone would not prevent the later prefix purge doing this.
+            if (!cells.is_empty(cell) && remaining == 0 && cell < swa.vbr_stash_rows_) {
+                return fail(status::protected_rows);
+            }
+            if (remaining) { last_used = cell+1; }
+        }
+        for (uint32_t cell : plan.destination_cells) { last_used = std::max(last_used, cell+1); }
+        const uint32_t pad = std::max(swa.n_pad, swa.get_pad_floor());
+        plan.required_watermark = std::min<uint64_t>(cells.size(),
+            ((uint64_t(last_used)+pad-1)/pad)*pad);
+        // This is a required endpoint, NOT proof of mapping or byte capacity.
+        // P2's write adapter must preflight actual backing at this endpoint.
+        const auto & base_cells = base.v_cells[0];
+        for (uint32_t cell = 0; cell < base_cells.size(); ++cell) {
+            if (base_cells.pos_in(cell, 0, plan.image->frontier_) && base_cells.seq_has(cell, plan.image->sequence_)) {
+                plan.base_cells.push_back(cell);
+            }
+        }
+        if (!current(plan, ctx, request.source_epoch, request.destination_epoch, request.execution_identity)) {
+            return fail(status::source_changed);
+        }
+        return {status::ok, std::move(result)};
+    }
+};
+
+vbr_swa_window_plan::vbr_swa_window_plan() : impl_(new impl) {}
+vbr_swa_window_plan::~vbr_swa_window_plan() = default;
+const std::vector<uint32_t> & vbr_swa_window_plan::destination_cells() const { return impl_->destination_cells; }
+const std::vector<uint32_t> & vbr_swa_window_plan::base_cells() const { return impl_->base_cells; }
+const std::vector<vbr_swa_window_membership_removal> & vbr_swa_window_plan::removals() const { return impl_->removals; }
+uint32_t vbr_swa_window_plan::required_watermark() const { return impl_->required_watermark; }
+bool vbr_swa_window_plan::current(llama_context & ctx, uint64_t source_epoch, uint64_t destination_epoch,
+                                const std::array<uint8_t, 32> & execution) const {
+    try {
+        return vbr_swa_window_planner::current(*impl_, ctx, source_epoch, destination_epoch, execution);
+    } catch (const std::bad_alloc &) {
+        return false;
+    }
+}
+vbr_swa_window_plan_result vbr_prepare_swa_window(llama_context & ctx,
+        std::shared_ptr<const vbr_swa_window_image> image, const vbr_swa_window_plan_request & request) {
+    try {
+        return vbr_swa_window_planner::prepare(ctx, std::move(image), request);
     } catch (const std::bad_alloc &) {
         return {vbr_swa_window_status::allocation_failed, nullptr};
     }

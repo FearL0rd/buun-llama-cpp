@@ -58,6 +58,9 @@ enum class vbr_swa_window_status {
     cancelled,
     source_changed,
     allocation_failed,
+    destination_unavailable,
+    representation_mismatch,
+    insufficient_cells,
 };
 
 class vbr_swa_window_image {
@@ -80,6 +83,7 @@ public:
 
 private:
     friend class vbr_swa_window_capture;
+    friend class vbr_swa_window_planner;
     vbr_swa_window_image() = default;
     // Declared first so the charge outlives payload/metadata destruction.
     std::shared_ptr<void> capacity_;
@@ -103,3 +107,53 @@ struct vbr_swa_window_capture_result {
 // allowing concurrent decode; callbacks must not reenter the context.
 vbr_swa_window_capture_result vbr_capture_swa_window(
     llama_context & ctx, const vbr_swa_window_capture_request & request);
+
+struct vbr_swa_window_plan_request {
+    uint64_t source_epoch = 0;
+    llama_seq_id destination = -1;
+    uint64_t destination_epoch = 0;
+    std::array<uint8_t, 32> execution_identity {};
+    vbr_explicit_representation_policy representation;
+};
+
+struct vbr_swa_window_membership_removal {
+    uint32_t cell;
+    llama_seq_id sequence;
+    llama_pos position;
+};
+
+// Read-only placement proposal, NOT a reservation or authority to write.
+// Owns the immutable image and the complete older-prefix removal list, including
+// owners other than the source. No VMM mapping or operation/recovery capacity is
+// reserved yet. The transactional installer must acquire those before writing.
+class vbr_swa_window_plan {
+public:
+    ~vbr_swa_window_plan();
+    vbr_swa_window_plan(const vbr_swa_window_plan &) = delete;
+    vbr_swa_window_plan & operator=(const vbr_swa_window_plan &) = delete;
+    const std::vector<uint32_t> & destination_cells() const;
+    const std::vector<uint32_t> & base_cells() const;
+    const std::vector<vbr_swa_window_membership_removal> & removals() const;
+    uint32_t required_watermark() const;
+    // Caller supplies current logical slot lifetimes. Requires the same exclusive,
+    // synchronized scheduler boundary as prepare; does not synchronize or mutate.
+    bool current(llama_context & ctx, uint64_t source_epoch, uint64_t destination_epoch,
+                 const std::array<uint8_t, 32> & execution_identity) const;
+private:
+    friend class vbr_swa_window_planner;
+    vbr_swa_window_plan();
+    struct impl;
+    std::unique_ptr<impl> impl_;
+};
+
+struct vbr_swa_window_plan_result {
+    vbr_swa_window_status status = vbr_swa_window_status::unavailable;
+    std::unique_ptr<vbr_swa_window_plan> plan;
+};
+
+// Equal-representation planning only. No live state edits, transfers, mapping,
+// callbacks or implicit settlement. Unsettled/busy contexts decline. No server
+// caller until the separate transactional install and accounting gates pass.
+vbr_swa_window_plan_result vbr_prepare_swa_window(
+    llama_context & ctx, std::shared_ptr<const vbr_swa_window_image> image,
+    const vbr_swa_window_plan_request & request);
