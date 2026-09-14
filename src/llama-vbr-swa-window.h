@@ -61,6 +61,9 @@ enum class vbr_swa_window_status {
     destination_unavailable,
     representation_mismatch,
     insufficient_cells,
+    backing_unavailable,
+    operation_refused,
+    rolled_back,
 };
 
 class vbr_swa_window_image {
@@ -157,3 +160,19 @@ struct vbr_swa_window_plan_result {
 vbr_swa_window_plan_result vbr_prepare_swa_window(
     llama_context & ctx, std::shared_ptr<const vbr_swa_window_image> image,
     const vbr_swa_window_plan_request & request);
+
+struct vbr_swa_window_install_request {
+    uint64_t source_epoch = 0, destination_epoch = 0;
+    std::array<uint8_t, 32> execution_identity {};
+    // Boundary cancellation only; must not reenter or mutate the context.
+    void * continue_context = nullptr;
+    bool (*continue_install)(void *) noexcept = nullptr;
+};
+
+// Consumes the proposal on ALL outcomes. Initial equal-tier implementation uses
+// already mapped backing only; missing backing declines without mapping/growing
+// the live pool. Cancellation after a write restores saved bytes before return
+// (rolled_back); backend-fatal transfer errors retain their fatal semantics.
+// Caller owns exclusive synchronized context access for the entire call.
+vbr_swa_window_status vbr_install_swa_window(llama_context & ctx,
+    std::unique_ptr<vbr_swa_window_plan> plan, const vbr_swa_window_install_request & request);

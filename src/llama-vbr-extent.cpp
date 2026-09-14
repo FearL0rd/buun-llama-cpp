@@ -45,10 +45,11 @@ vbr_extent_handle vbr_extent_store::reserve(vbr_mutation_family family,
                                             uint16_t            stream,
                                             llama_seq_id        seq_id,
                                             llama_pos           p0,
-                                            llama_pos           p1) {
+                                            llama_pos           p1,
+                                            bool                latch_exhaustion) {
     if (free_list_.empty()) {
         // Exhaustion latches; the caller must invalidate-before-mutate and reset_all().
-        exhausted_ = true;
+        exhausted_ = exhausted_ || latch_exhaustion;
         return {};
     }
     const uint32_t index = free_list_.back();
@@ -61,7 +62,7 @@ vbr_extent_handle vbr_extent_store::reserve(vbr_mutation_family family,
         // No-wrap rule: refuse and latch; the owner performs the global
         // invalidation + reset_all() which rebases every generation.
         free_list_.push_back(index);
-        exhausted_ = true;
+        exhausted_ = exhausted_ || latch_exhaustion;
         return {};
     }
     entry.slot_gen += 1;  // even -> odd: live
@@ -168,6 +169,12 @@ struct vbr_ownership_index::seq_view {
     // Logical-position Fenwick over [0, n_cells): fenwick[i] counts positions. 1-based.
     std::vector<uint32_t> fenwick;
 };
+
+std::unique_ptr<vbr_ownership_index> vbr_ownership_index::clone() const {
+    auto result = std::make_unique<vbr_ownership_index>(n_stream_, n_seq_max_, n_cells_);
+    result->views_ = views_;
+    return result;
+}
 
 namespace {
 

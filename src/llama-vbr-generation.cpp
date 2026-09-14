@@ -50,6 +50,7 @@ constexpr std::array<generation_dispatch_effect,
             generation_dispatch_effect::unit,                   // promote_next
             generation_dispatch_effect::delegated_transaction,  // execute_shed -> degrade_next
             generation_dispatch_effect::global,                 // authenticated_recovery
+            generation_dispatch_effect::dependency,             // window_install
         }
 };
 static_assert(VBR_GENERATION_DISPATCH.size() == static_cast<size_t>(vbr_mutation_registrant::count),
@@ -210,6 +211,30 @@ struct vbr_tracker_import_image::impl {
         }
     }
 };
+
+struct vbr_tracker_cell_update::impl {
+    vbr_controller_instance_id instance {};
+    vbr_operation_id operation {};
+    vbr_extent_store * store = nullptr;
+    std::vector<vbr_generation_stream_state> streams;
+    std::array<vbr_extent_handle, vbr_operation_binding::MAX_TARGETS> handles {};
+    std::array<vbr_extent_ref, vbr_operation_binding::MAX_TARGETS> guards {};
+    uint64_t global = 0, before_mutation = 0, before_event = 0, after_mutation = 0, after_event = 0;
+    bool ready = false;
+
+    ~impl() {
+        if (!store) { return; }
+        for (auto & stream : streams) {
+            for (auto ref : stream.cell_dependency_extent) { store->release_ref(ref); }
+            for (auto ref : stream.cell_membership_extent) { store->release_ref(ref); }
+        }
+        for (auto ref : guards) { store->release_ref(ref); }
+        for (auto handle : handles) { if (handle) { store->fail(handle); } }
+    }
+};
+
+vbr_tracker_cell_update::vbr_tracker_cell_update() = default;
+vbr_tracker_cell_update::~vbr_tracker_cell_update() = default;
 
 static void resize_stream_state(
         vbr_generation_stream_state & stream,
@@ -450,6 +475,118 @@ bool vbr_generation_tracker::stamp_cell(vbr_generation_event & event,
                                         llama_seq_id           membership_seq,
                                         llama_pos              pre_mutation_pos) {
     return stamp_cell(event, cell, &membership_seq, 1, pre_mutation_pos);
+}
+
+bool vbr_generation_tracker::prepare_cell_update(const std::vector<vbr_cell_update_event> & events,
+        vbr_operation_id operation, vbr_tracker_cell_update & output) {
+    if (output.impl_ || !active() || !stable() || shadow_unavailable_ || active_event_depth_ ||
+        events.empty() || events.size() > MAX_EVENT_DEPTH ||
+        event_serial_ > UINT64_MAX-events.size() || mutation_serial_ > UINT64_MAX-2*events.size()) { return false; }
+    vbr_operation_binding binding;
+    if (!vbr_operation_registry_binding(operation, binding) || binding.kind != vbr_operation_kind::window_restore ||
+        streams_.size() != 1) { return false; }
+    // Refuse rare counter wrap instead of allowing stamp_cell's global reset.
+    for (const auto gen : streams_[0].page_event_gen) {
+        if (gen > UINT32_MAX-events.size()) { return false; }
+    }
+    for (const auto & event : events) {
+        if (event.registrant != vbr_mutation_registrant::seq_cp &&
+            event.registrant != vbr_mutation_registrant::seq_rm &&
+            event.registrant != vbr_mutation_registrant::window_install) { return false; }
+        for (const auto & stamp : event.stamps) {
+            if (stamp.cell >= n_cells_ || stamp.sequence < 0 || stamp.sequence >= LLAMA_MAX_SEQ ||
+                !binding.find_covering_target_at(instance_id_, 0, event.operation_class,
+                    vbr_registrant_bit(event.registrant), stamp.sequence, stamp.position)) { return false; }
+        }
+    }
+    auto next = std::make_unique<vbr_tracker_cell_update::impl>();
+    next->streams = streams_;
+    // Original streams retain their own references throughout preparation.
+    // Existing obsolete references remain unknown; don't revive their handles.
+    for (auto & stream : next->streams) {
+        for (auto & ref : stream.cell_dependency_extent) { if (ref) { ref = extents_.add_ref({ref.index, ref.expected_gen}); } }
+        for (auto & ref : stream.cell_membership_extent) { if (ref) { ref = extents_.add_ref({ref.index, ref.expected_gen}); } }
+    }
+    next->store = &extents_;
+    next->instance = instance_id_; next->operation = operation;
+    next->global = global_generation_; next->before_mutation = mutation_serial_; next->before_event = event_serial_;
+
+    struct extent_context {
+        vbr_tracker_cell_update::impl * next;
+        const vbr_operation_binding * binding;
+        vbr_mutation_family family;
+    } extent_ctx {next.get(), &binding, vbr_mutation_family::import};
+    const auto extent_fn = [](void * opaque, uint8_t target) -> vbr_extent_handle {
+        auto & ctx = *static_cast<extent_context *>(opaque);
+        auto & n = *ctx.next;
+        if (!n.handles[target]) {
+            const auto & t = ctx.binding->targets[target];
+            n.handles[target] = n.store->reserve(ctx.family, t.operation_class, t.stream,
+                t.seq_id, t.range.p0, t.range.p1, /*latch_exhaustion=*/false);
+            if (n.handles[target]) { n.guards[target] = n.store->add_ref(n.handles[target]); }
+        }
+        return n.handles[target];
+    };
+
+    // Scope contains NO caller callbacks or device operations. The ordinary
+    // authenticator/stamper sees the clone, not the live stream vectors.
+    bool ok = true;
+    {
+        streams_.swap(next->streams);
+        struct restore_live {
+            vbr_generation_tracker & tracker;
+            vbr_tracker_cell_update::impl & next;
+            ~restore_live() {
+                tracker.streams_.swap(next.streams);
+                tracker.mutation_serial_ = next.before_mutation;
+                tracker.event_serial_ = next.before_event;
+                tracker.shadow_unavailable_ = false;
+                tracker.generation_at_latch_ = latch;
+            }
+            uint64_t latch;
+        } restore {*this, *next, generation_at_latch_};
+        for (const auto & request : events) {
+            const bool imported = request.registrant == vbr_mutation_registrant::window_install;
+            const bool destructive = request.registrant != vbr_mutation_registrant::seq_cp;
+            extent_ctx.family = registration_for(request.registrant)->family;
+            auto event = begin_event(request.registrant, request.operation_class, 0,
+                imported ? vbr_generation_stamp_kind::dependency : vbr_generation_stamp_kind::membership,
+                operation, extent_fn, &extent_ctx, destructive, imported);
+            if (!event) { ok = false; break; }
+            for (const auto & stamp : request.stamps) {
+                if (!stamp_cell(event, stamp.cell, stamp.sequence, stamp.position)) { ok = false; break; }
+            }
+            if (!event.finish()) { ok = false; }
+            if (!ok) { break; }
+        }
+        next->after_mutation = mutation_serial_; next->after_event = event_serial_;
+    }
+    if (!ok) { return false; }
+    next->ready = true;
+    output.impl_ = std::move(next);
+    return true;
+}
+
+bool vbr_generation_tracker::cell_update_installable(const vbr_tracker_cell_update & update,
+        vbr_operation_id operation) const {
+    const auto * n = update.impl_.get();
+    vbr_operation_binding binding;
+    return n && n->ready && n->instance == instance_id_ && n->operation == operation &&
+        active() && stable() && !shadow_unavailable_ && n->before_mutation == mutation_serial_ &&
+        n->before_event == event_serial_ && n->global == global_generation_ &&
+        vbr_operation_registry_binding(operation, binding) && binding.kind == vbr_operation_kind::window_restore;
+}
+
+void vbr_generation_tracker::install_cell_update(vbr_tracker_cell_update & update, vbr_operation_id operation) noexcept {
+    GGML_ASSERT(cell_update_installable(update, operation));
+    auto & n = *update.impl_;
+    for (auto & handle : n.handles) {
+        if (handle) { GGML_ASSERT(extents_.commit(handle)); handle = {}; }
+    }
+    streams_.swap(n.streams);
+    mutation_serial_ = n.after_mutation; event_serial_ = n.after_event;
+    // n now owns the old streams' references. Unit history/lineage are unchanged.
+    n.ready = false;
 }
 
 bool vbr_generation_tracker::stamp_cell(vbr_generation_event & event,

@@ -73,6 +73,7 @@ enum class vbr_operation_kind : uint8_t {
     state_export,
     controller_retier,
     recovery,
+    window_restore,
     count,
 };
 
@@ -87,6 +88,7 @@ constexpr std::array<const char *, static_cast<size_t>(vbr_operation_kind::count
     "state_export",
     "controller_retier",
     "recovery",
+    "window_restore",
 }};
 static_assert(VBR_OPERATION_KIND_NAMES.size() ==
         static_cast<size_t>(vbr_operation_kind::count),
@@ -230,6 +232,7 @@ enum class vbr_mutation_registrant : uint8_t {
     promote_next,
     execute_shed,
     authenticated_recovery,
+    window_install,
     count,
 };
 
@@ -332,6 +335,9 @@ constexpr std::array<vbr_mutation_registration,
     { vbr_mutation_registrant::authenticated_recovery,      vbr_mutation_family::recovery,
       vbr_operation_phase::recovery,
       vbr_operation_class_bit(vbr_operation_class::controller) },
+    { vbr_mutation_registrant::window_install,              vbr_mutation_family::import,
+      vbr_operation_phase::mutate,
+      vbr_operation_class_bit(vbr_operation_class::checkpoint_restore) },
 }};
 
 constexpr bool vbr_mutation_registry_is_exhaustive() {
@@ -419,6 +425,7 @@ constexpr vbr_mutation_family vbr_operation_kind_family(vbr_operation_kind  kind
          : kind == vbr_operation_kind::sequence_edit       ? vbr_mutation_family::trim
          : kind == vbr_operation_kind::checkpoint_restore  ? vbr_mutation_family::restore
          : kind == vbr_operation_kind::state_import        ? vbr_mutation_family::import
+         : kind == vbr_operation_kind::window_restore      ? vbr_mutation_family::import
          : kind == vbr_operation_kind::controller_retier   ? vbr_mutation_family::degrade
          : kind == vbr_operation_kind::recovery            ? vbr_mutation_family::recovery
                                                            : vbr_mutation_family::clear;
@@ -430,7 +437,11 @@ constexpr uint32_t vbr_registrant_bit(vbr_mutation_registrant registrant) {
     return uint32_t(1u) << static_cast<uint8_t>(registrant);
 }
 constexpr uint32_t vbr_operation_kind_registrants(vbr_operation_kind kind) {
-    return kind == vbr_operation_kind::decode
+    return kind == vbr_operation_kind::window_restore
+               ? vbr_registrant_bit(vbr_mutation_registrant::window_install) |
+                 vbr_registrant_bit(vbr_mutation_registrant::seq_cp) |
+                 vbr_registrant_bit(vbr_mutation_registrant::seq_rm)
+         : kind == vbr_operation_kind::decode
                ? vbr_registrant_bit(vbr_mutation_registrant::apply_ubatch_append) |
                  vbr_registrant_bit(vbr_mutation_registrant::apply_ubatch_occupied_reuse) |
                  vbr_registrant_bit(vbr_mutation_registrant::seq_rm)  // composite purge (§7.3)
@@ -736,7 +747,7 @@ bool vbr_recovery_untake_quarantine(vbr_quarantine_token token,
 
 // The only generic mint-owning RAII. All operation minting outside the
 // legacy freeze wrapper flows through this type, keeping registry_begin call sites confined to
-// this translation unit. Close is outcome-coded; destruction without close commits.
+// this translation unit. Close is outcome-coded; destruction without close fails.
 class vbr_scoped_operation {
   public:
     explicit vbr_scoped_operation(vbr_operation_binding binding);

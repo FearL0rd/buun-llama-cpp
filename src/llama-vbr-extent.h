@@ -5,6 +5,7 @@
 
 #include <array>
 #include <cstdint>
+#include <memory>
 #include <vector>
 
 // Committed-extent store and dual-view ownership index.
@@ -75,12 +76,15 @@ class vbr_extent_store {
     // the caller must then take the invalidate-before-mutate path (availability transition +
     // qualification reset) and MAY call reset_all() once every outstanding reference is
     // obsolete by that same global invalidation.
+    // Optional off-side transactions pass latch_exhaustion=false: refusal
+    // leaves the live availability latch alone and the staged edits are dropped.
     vbr_extent_handle reserve(vbr_mutation_family family,
                               vbr_operation_class operation_class,
                               uint16_t            stream,
                               llama_seq_id        seq_id,
                               llama_pos           p0,
-                              llama_pos           p1);
+                              llama_pos           p1,
+                              bool                latch_exhaustion = true);
 
     // Family-boundary transitions. submit() is only legal from prepared (async append/reuse);
     // commit() from prepared or submitted; fail() from any non-free state.
@@ -154,6 +158,10 @@ class vbr_ownership_index {
     // Diagnostics distinguish a view that was never populated from one that
     // was populated and later failed the bounded logical-position contract.
     bool initialized(uint32_t stream, llama_seq_id seq_id) const;
+
+    // Off-side transaction copy: preserves unavailable views as unavailable.
+    // Allocation may throw; the original index is untouched.
+    std::unique_ptr<vbr_ownership_index> clone() const;
 
     // Memory note: the Fenwick domain is n_cells positions * 4 bytes,
     // ~800 KB per ACTIVE seq at 200k cells, lazily allocated on first add; capacity is

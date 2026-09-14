@@ -10,6 +10,7 @@
 #include <limits>
 #include <new>
 #include <string>
+#include <type_traits>
 
 namespace {
 bool nonzero(const std::array<uint8_t, 32> & value) {
@@ -264,6 +265,167 @@ class vbr_swa_window_planner {
     }
 
 public:
+    static status install(llama_context & ctx, vbr_swa_window_plan & proposal,
+                          const vbr_swa_window_install_request & request) {
+        auto & plan = *proposal.impl_;
+        if (!current(plan, ctx, request.source_epoch, request.destination_epoch, request.execution_identity)) {
+            return status::source_changed;
+        }
+        auto & tree = *dynamic_cast<llama_kv_cache_iswa *>(llama_get_memory(&ctx));
+        auto & base = *tree.get_base();
+        auto & swa = *tree.get_swa();
+        if (plan.required_watermark > swa.vbr_pools_[0].wm_cells) { return status::backing_unavailable; }
+        if (!base.vbr_ownership_ || !swa.vbr_ownership_ || base.vbr_representation_epoch_ == UINT64_MAX ||
+            swa.vbr_representation_epoch_ == UINT64_MAX || base.vbr_checkpoint_epoch_ == UINT64_MAX ||
+            swa.vbr_checkpoint_epoch_ == UINT64_MAX) { return status::unavailable; }
+        const auto proceed = [&] { return !request.continue_install || request.continue_install(request.continue_context); };
+        if (!proceed()) { return status::cancelled; }
+
+        // All allocating membership/index edits happen on copies. Preserve even
+        // unavailable ownership views; rebuilding them would change other slots.
+        auto base_cells = base.v_cells[0];
+        auto swa_cells = swa.v_cells[0];
+        auto base_owners = base.vbr_ownership_->clone();
+        auto swa_owners = swa.vbr_ownership_->clone();
+        std::array<bool, LLAMA_MAX_SEQ> swa_changed {};
+        std::array<llama_pos, LLAMA_MAX_SEQ> purge_to;
+        purge_to.fill(-1);
+        vbr_cell_update_event share {vbr_mutation_registrant::seq_cp, vbr_operation_class::prompt_share, {}};
+        vbr_cell_update_event remove {vbr_mutation_registrant::seq_rm, vbr_operation_class::state_api, {}};
+        vbr_cell_update_event import {vbr_mutation_registrant::window_install, vbr_operation_class::checkpoint_restore, {}};
+        for (auto cell : plan.base_cells) {
+            const auto pos = base_cells.pos_get(cell);
+            base_cells.seq_add(cell, plan.destination);
+            if (!base_owners->add_cell(0, plan.destination, cell, pos)) { return status::unavailable; }
+            share.stamps.push_back({cell, plan.destination, pos});
+        }
+        for (const auto & edit : plan.removals) {
+            swa_cells.seq_rm(edit.cell, edit.sequence);
+            // An already unavailable source view remains unavailable. Its
+            // retained rows still belong to that owner in the actual cell map.
+            swa_owners->remove_cell(0, edit.sequence, edit.cell, edit.position);
+            swa_changed[edit.sequence] = true;
+            purge_to[edit.sequence] = std::max(purge_to[edit.sequence], edit.position);
+            remove.stamps.push_back({edit.cell, edit.sequence, edit.position});
+        }
+        for (size_t i = 0; i < plan.destination_cells.size(); ++i) {
+            const auto cell = plan.destination_cells[i];
+            const auto & row = plan.image->rows()[i];
+            GGML_ASSERT(swa_cells.is_empty(cell));
+            swa_cells.pos_set(cell, row.position);
+            llama_kv_cell_ext ext; ext.tok = row.token;
+            swa_cells.ext_set(cell, ext);
+            swa_cells.seq_add(cell, plan.destination);
+            if (!swa_owners->add_cell(0, plan.destination, cell, row.position)) { return status::unavailable; }
+            import.stamps.push_back({cell, plan.destination, row.position});
+        }
+        swa_changed[plan.destination] = true;
+        for (llama_seq_id seq = 0; seq < LLAMA_MAX_SEQ; ++seq) {
+            if (swa_changed[seq] && swa_cells.seq_pos_min(seq) < 0) { swa_owners->clear_seq(0, seq); }
+        }
+        const std::vector<vbr_cell_update_event> base_events {std::move(share)};
+        std::vector<vbr_cell_update_event> swa_events;
+        // Empty placement needs no removal target or authenticated remove event.
+        if (!remove.stamps.empty()) { swa_events.push_back(std::move(remove)); }
+        swa_events.push_back(std::move(import));
+        vbr_operation_binding binding;
+        binding.kind = vbr_operation_kind::window_restore;
+        binding.child_phase = vbr_operation_phase::mutate;
+        const auto target = [&](vbr_controller_instance_id instance, vbr_operation_class cls,
+                                llama_seq_id seq, llama_pos p0, llama_pos p1) {
+            return vbr_binding_add_instance_target(binding, binding.kind, cls, instance, 0, seq, p0, p1);
+        };
+        if (!target(base.vbr_instance_id(), vbr_operation_class::prompt_share, plan.destination, 0, plan.image->frontier_) ||
+            !target(swa.vbr_instance_id(), vbr_operation_class::checkpoint_restore, plan.destination,
+                    plan.image->rows().front().position, plan.image->frontier_)) { return status::operation_refused; }
+        for (llama_seq_id seq = 0; seq < LLAMA_MAX_SEQ; ++seq) {
+            if (purge_to[seq] >= 0 && !target(swa.vbr_instance_id(), vbr_operation_class::state_api,
+                    seq, 0, purge_to[seq]+1)) { return status::operation_refused; }
+        }
+        vbr_scoped_operation operation(binding);
+        if (!operation) { return status::operation_refused; }
+        struct recovery_owner {
+            vbr_operation_id operation;
+            std::array<int32_t, 2> slots {-1, -1};
+            ~recovery_owner() {
+                for (auto slot : slots) { if (slot >= 0) { GGML_ASSERT(vbr_recovery_release_unused(slot, operation)); } }
+            }
+        } recovery {operation.id()};
+        recovery.slots[0] = vbr_recovery_reserve(operation.id(), base.vbr_instance_id());
+        recovery.slots[1] = vbr_recovery_reserve(operation.id(), swa.vbr_instance_id());
+        if (recovery.slots[0] < 0 || recovery.slots[1] < 0) { return status::operation_refused; }
+        auto * base_tracker = base.vbr_generation_tracker_mut();
+        auto * swa_tracker = swa.vbr_generation_tracker_mut();
+        vbr_tracker_cell_update base_update, swa_update;
+        if (!base_tracker->prepare_cell_update(base_events, operation.id(), base_update) ||
+            !swa_tracker->prepare_cell_update(swa_events, operation.id(), swa_update)) { return status::operation_refused; }
+
+        struct transfer_unit { ggml_tensor * tensor; const vbr_swa_window_unit * saved; std::vector<uint8_t> backup; };
+        std::vector<transfer_unit> units;
+        units.reserve(plan.image->units().size());
+        for (const auto & saved : plan.image->units()) {
+            const auto & layer = swa.layers[saved.logical_unit/2];
+            units.push_back({(saved.logical_unit&1) ? layer.v : layer.k, &saved,
+                             std::vector<uint8_t>(saved.payload.size())});
+        }
+        // Read all rollback bytes before the first write. No allocations after
+        // this point. Bounded transfers; no per-row GPU scratch or new mapping.
+        const auto transfer = [&](transfer_unit & unit, bool upload, const uint8_t * bytes, bool cancellable) {
+            const auto stride = unit.saved->row_bytes;
+            for (size_t i = 0; i < plan.destination_cells.size();) {
+                size_t end = i+1;
+                while (end < plan.destination_cells.size() && plan.destination_cells[end] == plan.destination_cells[end-1]+1) { ++end; }
+                const size_t run = (end-i)*stride;
+                for (size_t offset = 0; offset < run;) {
+                    if (cancellable && !proceed()) { return false; }
+                    const auto count = std::min<size_t>(64*1024, run-offset);
+                    const auto dst_offset = plan.destination_cells[i]*stride+offset;
+                    if (upload) { ggml_backend_tensor_set(unit.tensor, bytes+i*stride+offset, dst_offset, count); }
+                    else { ggml_backend_tensor_get(unit.tensor, unit.backup.data()+i*stride+offset, dst_offset, count); }
+                    offset += count;
+                }
+                i = end;
+            }
+            if (upload) {
+                // CUDA's tensor_get completes the same per-thread transfer
+                // stream as tensor_set, unlike the compute backend fence.
+                uint8_t fence;
+                ggml_backend_tensor_get(unit.tensor, &fence, plan.destination_cells.back()*stride, 1);
+            }
+            return true;
+        };
+        for (auto & unit : units) { if (!transfer(unit, false, nullptr, true)) { return status::cancelled; } }
+        if (!proceed()) { return status::cancelled; }
+        bool copied = true;
+        for (auto & unit : units) {
+            if (!transfer(unit, true, unit.saved->payload.data(), true)) { copied = false; break; }
+        }
+        if (!copied || !proceed() || !base_tracker->cell_update_installable(base_update, operation.id()) ||
+            !swa_tracker->cell_update_installable(swa_update, operation.id())) {
+            // Even the interrupted unit's earlier queued uploads precede these
+            // restores on the same stream. Fence every restore before returning.
+            for (auto & unit : units) { transfer(unit, true, unit.backup.data(), false); }
+            return status::rolled_back;
+        }
+        static_assert(std::is_nothrow_swappable<llama_kv_cells>::value, "cell publication must not allocate");
+        base_tracker->install_cell_update(base_update, operation.id());
+        swa_tracker->install_cell_update(swa_update, operation.id());
+        std::swap(base.v_cells[0], base_cells);
+        std::swap(swa.v_cells[0], swa_cells);
+        base.vbr_ownership_.swap(base_owners);
+        swa.vbr_ownership_.swap(swa_owners);
+        swa.v_heads[0] = plan.destination_cells.back()+1;
+        base.vbr_attention_content_changed(plan.destination);
+        swa.vbr_attention_content_changed(swa_changed);
+        // Release recovery before the successful root close. A failed path
+        // unwinds it before the root's failed close, after rollback completed.
+        for (auto & slot : recovery.slots) {
+            GGML_ASSERT(vbr_recovery_release_unused(slot, operation.id())); slot = -1;
+        }
+        GGML_ASSERT(operation.close(vbr_operation_outcome::committed));
+        return status::ok;
+    }
+
     static bool current(const state & plan, llama_context & ctx, uint64_t source_epoch,
                         uint64_t destination_epoch, const std::array<uint8_t, 32> & execution) {
         if (destination_epoch != plan.destination_epoch ||
@@ -386,5 +548,16 @@ vbr_swa_window_plan_result vbr_prepare_swa_window(llama_context & ctx,
         return vbr_swa_window_planner::prepare(ctx, std::move(image), request);
     } catch (const std::bad_alloc &) {
         return {vbr_swa_window_status::allocation_failed, nullptr};
+    }
+}
+
+vbr_swa_window_status vbr_install_swa_window(llama_context & ctx,
+        std::unique_ptr<vbr_swa_window_plan> plan, const vbr_swa_window_install_request & request) {
+    if (!plan) { return vbr_swa_window_status::unsupported; }
+    try {
+        return vbr_swa_window_planner::install(ctx, *plan, request);
+    } catch (const std::bad_alloc &) {
+        // All allocating work is before the first upload.
+        return vbr_swa_window_status::allocation_failed;
     }
 }
