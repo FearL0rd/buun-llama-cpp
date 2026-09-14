@@ -1651,6 +1651,19 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         }
     }
 
+    // AUTO lazy placement must respect the selected backends' mmap capability.
+    // Explicit ON remains an explicit placement choice.
+    if (ml.lazy.mode == LLAMA_LAZY_MODE_AUTO) {
+        for (const auto & dev : devices) {
+            ggml_backend_dev_props props;
+            ggml_backend_dev_get_props(dev.dev, &props);
+            if (!props.caps.mmap_support) {
+                ml.lazy.mode = LLAMA_LAZY_MODE_OFF;
+                break;
+            }
+        }
+    }
+
     const char * load_mode_name = params.load_mode == LLAMA_LOAD_MODE_AUTO
         ? llama_load_mode_name(ml.use_mmap ? LLAMA_LOAD_MODE_MMAP : LLAMA_LOAD_MODE_NONE)
         : llama_load_mode_name(params.load_mode);
@@ -2273,6 +2286,15 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
 
     if (ml.no_alloc) {
         return true;
+    }
+
+    // GGUF non-host uploads need temporary staging. Load those contexts before
+    // host weights; native sources keep their own load/binding order.
+    if (!ml.use_mmap && !ml.files.empty() && !ml.tensor_source) {
+        std::stable_partition(ctx_buf_maps.begin(), ctx_buf_maps.end(), [](const auto & ctx_buf_map) {
+            const auto & buf_map = ctx_buf_map.second;
+            return !buf_map.empty() && !ggml_backend_buffer_is_host(buf_map.begin()->second);
+        });
     }
 
     // load tensor data
