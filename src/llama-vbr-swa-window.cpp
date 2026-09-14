@@ -206,6 +206,7 @@ struct vbr_swa_window_plan::impl {
     std::array<boundary, 2> children {};
     std::vector<uint32_t> destination_cells, base_cells;
     std::vector<vbr_swa_window_membership_removal> removals;
+    std::vector<vbr_downward_recipe> recipes;
     uint32_t required_watermark = 0;
 };
 
@@ -232,7 +233,8 @@ class vbr_swa_window_planner {
             a.meansub_digest == b.meansub_digest && a.meansub_baked == b.meansub_baked;
     }
 
-    static bool representation_matches(const state & plan, const llama_kv_cache & swa) {
+    static bool representation_matches(const state & plan, const llama_kv_cache & swa,
+                                       std::vector<vbr_downward_recipe> * recipes = nullptr) {
         const auto * tracker = swa.vbr_generation_tracker_get();
         if (plan.image->units().size() != tracker->unit_count()) { return false; }
         const vbr_explicit_representation_policy policy {plan.build_identity.data(), plan.build_identity.size()};
@@ -244,22 +246,40 @@ class vbr_swa_window_planner {
             const auto * t = extent->t;
             const auto gen = tracker->unit_generation(unit.logical_unit);
             const auto & saved = unit.generation;
-            // No unit-wide history adoption: this initial COPY proposal requires
-            // the existing loss/domain history too. Downward conversion is P3.
-            if (!t || t->type != saved.current_type || gen.domain != saved.domain ||
-                gen.last_source_type != saved.last_source_type || gen.promote_hops != saved.promote_hops ||
-                gen.last_transition != saved.last_transition || gen.flags != saved.flags ||
+            if (!t || gen.flags != saved.flags ||
                 layer.il != unit.model_layer || t->ne[0] != int64_t(unit.columns) ||
-                t->ne[2] != 1 || t->ne[3] != 1 || t->nb[1] != unit.row_bytes ||
-                ggml_row_size(t->type, t->ne[0]) != unit.row_bytes ||
+                t->ne[2] != 1 || t->ne[3] != 1 ||
+                ggml_row_size(t->type, t->ne[0]) != t->nb[1] ||
                 std::strncmp(t->name, unit.tensor_name.data(), GGML_MAX_NAME) != 0 ||
                 layer.turbo_meansub_ref.model_id != unit.meansub_model_id ||
                 layer.turbo_meansub_ref.layer != unit.meansub_layer ||
                 vbr_explicit_capture_validate_extent_generation(pool->wm_cells, t->type, extent->promote_hops, gen) !=
                     vbr_explicit_size_failure::none) { return false; }
+            vbr_downward_recipe recipe;
+            const auto resolved = vbr_downward_resolve_recipe(ggml_type(saved.current_type), t->type, t->type, true, recipe);
+            if (resolved == vbr_downward_recipe_status::equal_tier) {
+                if (gen.domain != saved.domain || gen.last_source_type != saved.last_source_type ||
+                    gen.promote_hops != saved.promote_hops || gen.last_transition != saved.last_transition) { return false; }
+            } else if (resolved == vbr_downward_recipe_status::resolved) {
+                // No live unit-wide history adoption or promotion reconstruction.
+                // The last adjacent edge must match the live destination's loss history.
+                if (saved.promote_hops || gen.promote_hops ||
+                    saved.domain != recipe.edges[0].source_domain ||
+                    gen.domain != recipe.edges[recipe.n_edges-1].target_domain ||
+                    gen.last_source_type != recipe.edges[recipe.n_edges-1].source_type ||
+                    (gen.last_transition != vbr_repr_transition::degrade_other &&
+                     gen.last_transition != vbr_repr_transition::degrade_f16_to_t8_admitted)) { return false; }
+            } else { return false; }
             vbr_explicit_representation_identity codec;
-            if (!vbr_explicit_capture_representation_identity(&policy, t->type, (unit.logical_unit&1) != 0,
+            if (!vbr_explicit_capture_representation_identity(&policy, ggml_type(saved.current_type), (unit.logical_unit&1) != 0,
                     unit.meansub_model_id, codec) || !same_codec(codec, unit.codec)) { return false; }
+            // Each destination/edge codec must exist in this executable too.
+            for (size_t edge = 0; edge < recipe.n_edges; ++edge) {
+                if (!vbr_explicit_capture_representation_identity(&policy, recipe.edges[edge].target_type,
+                        (unit.logical_unit&1) != 0, unit.meansub_model_id, codec)) { return false; }
+            }
+            if (recipes) { recipes->push_back(recipe); }
+            else if (unit.logical_unit >= plan.recipes.size() || !(plan.recipes[unit.logical_unit] == recipe)) { return false; }
         }
         return true;
     }
@@ -360,18 +380,74 @@ public:
         if (!base_tracker->prepare_cell_update(base_events, operation.id(), base_update) ||
             !swa_tracker->prepare_cell_update(swa_events, operation.id(), swa_update)) { return status::operation_refused; }
 
-        struct transfer_unit { ggml_tensor * tensor; const vbr_swa_window_unit * saved; std::vector<uint8_t> backup; };
+        struct transfer_unit {
+            ggml_tensor * tensor;
+            const vbr_swa_window_unit * saved;
+            std::vector<uint8_t> backup, converted;
+        };
         std::vector<transfer_unit> units;
         units.reserve(plan.image->units().size());
+        size_t staging_bytes = 0;
+        uint64_t staging_columns = 0;
         for (const auto & saved : plan.image->units()) {
             const auto & layer = swa.layers[saved.logical_unit/2];
-            units.push_back({(saved.logical_unit&1) ? layer.v : layer.k, &saved,
-                             std::vector<uint8_t>(saved.payload.size())});
+            auto * tensor = (saved.logical_unit&1) ? layer.v : layer.k;
+            const size_t bytes = plan.image->rows().size()*tensor->nb[1];
+            const bool convert = plan.recipes[saved.logical_unit].n_edges != 0;
+            units.push_back({tensor, &saved, std::vector<uint8_t>(bytes),
+                             std::vector<uint8_t>(convert ? bytes : 0)});
+            if (convert) {
+                staging_bytes = std::max(staging_bytes, saved.payload.size());
+                staging_columns = std::max(staging_columns, saved.columns);
+            }
+        }
+        if (staging_bytes) {
+            const auto & pool = swa.vbr_pools_[0];
+            const auto * be = pool.be;
+            if (!be || !be->kv_transcode || !be->kv_transcode_workspace_reserve) { return status::staging_unavailable; }
+            // Temporary backend/workspace: optional conversion leaves no grow-only
+            // workspace charge on the live controller after a miss or completion.
+            ggml_backend_ptr backend(be->backend_init(pool.device));
+            if (!backend) { return status::staging_unavailable; }
+            ggml_backend_buffer_ptr buffer(ggml_backend_alloc_buffer(backend.get(), staging_bytes));
+            if (!buffer || !be->kv_transcode_workspace_reserve(backend.get(), plan.image->rows().size(), staging_columns, 0)) {
+                return status::staging_unavailable;
+            }
+            for (auto & unit : units) {
+                if (unit.converted.empty()) { continue; }
+                if (!proceed()) { return status::cancelled; }
+                const auto & recipe = plan.recipes[unit.saved->logical_unit];
+                ggml_tensor scratch = *unit.tensor;
+                scratch.type = recipe.source_type;
+                scratch.ne[1] = plan.image->rows().size();
+                scratch.nb[0] = ggml_type_size(scratch.type);
+                scratch.nb[1] = unit.saved->row_bytes;
+                scratch.nb[2] = scratch.nb[3] = scratch.nb[1]*scratch.ne[1];
+                scratch.data = ggml_backend_buffer_get_base(buffer.get());
+                scratch.buffer = buffer.get(); scratch.view_src = nullptr; scratch.view_offs = 0;
+                ggml_backend_tensor_set(&scratch, unit.saved->payload.data(), 0, unit.saved->payload.size());
+                uint8_t fence;
+                ggml_backend_tensor_get(&scratch, &fence, 0, 1);
+                for (size_t edge = 0; edge < recipe.n_edges; ++edge) {
+                    if (!proceed()) { return status::cancelled; }
+                    // Packed row zero is NOT a sink. Only unprotected source and
+                    // destination rows are admitted; never inject a synthetic stash.
+                    const ggml_vbr_transcode_params transcode {&scratch, recipe.edges[edge].target_type,
+                        scratch.data, buffer.get(), scratch.ne[1], bool(unit.saved->logical_unit&1), nullptr, 0, 0};
+                    be->kv_transcode(backend.get(), &transcode);
+                    ggml_backend_synchronize(backend.get());
+                    scratch.type = transcode.type_B;
+                    scratch.nb[0] = ggml_type_size(scratch.type);
+                    scratch.nb[1] = ggml_row_size(scratch.type, scratch.ne[0]);
+                    scratch.nb[2] = scratch.nb[3] = scratch.nb[1]*scratch.ne[1];
+                }
+                ggml_backend_tensor_get(&scratch, unit.converted.data(), 0, unit.converted.size());
+            }
         }
         // Read all rollback bytes before the first write. No allocations after
         // this point. Bounded transfers; no per-row GPU scratch or new mapping.
         const auto transfer = [&](transfer_unit & unit, bool upload, const uint8_t * bytes, bool cancellable) {
-            const auto stride = unit.saved->row_bytes;
+            const auto stride = unit.tensor->nb[1];
             for (size_t i = 0; i < plan.destination_cells.size();) {
                 size_t end = i+1;
                 while (end < plan.destination_cells.size() && plan.destination_cells[end] == plan.destination_cells[end-1]+1) { ++end; }
@@ -398,7 +474,8 @@ public:
         if (!proceed()) { return status::cancelled; }
         bool copied = true;
         for (auto & unit : units) {
-            if (!transfer(unit, true, unit.saved->payload.data(), true)) { copied = false; break; }
+            const auto * bytes = unit.converted.empty() ? unit.saved->payload.data() : unit.converted.data();
+            if (!transfer(unit, true, bytes, true)) { copied = false; break; }
         }
         if (!copied || !proceed() || !base_tracker->cell_update_installable(base_update, operation.id()) ||
             !swa_tracker->cell_update_installable(swa_update, operation.id())) {
@@ -465,7 +542,7 @@ public:
         plan.destination_epoch = request.destination_epoch;
         plan.build_identity.assign(request.representation.build_identity, request.representation.build_identity_len);
         plan.children = {boundary(base, request.destination), boundary(swa, request.destination)};
-        if (!representation_matches(plan, swa)) { return fail(status::representation_mismatch); }
+        if (!representation_matches(plan, swa, &plan.recipes)) { return fail(status::representation_mismatch); }
 
         const auto & cells = swa.v_cells[0];
         const uint32_t count = plan.image->rows().size();

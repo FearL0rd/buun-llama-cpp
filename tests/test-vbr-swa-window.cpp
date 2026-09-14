@@ -3,6 +3,7 @@
 #include "llama-kv-cache-iswa.h"
 #include "llama-sha256.h"
 #include "llama-vbr-swa-window.h"
+#include "llama-vbr-downward.h"
 
 #include <algorithm>
 #include <chrono>
@@ -41,6 +42,117 @@ static bool cancel_transfer(void * context) noexcept {
 }
 
 struct llama_kv_cache_vbr_epoch_test {
+    static void downward_failure_gates(llama_context & ctx, llama_kv_cache_iswa & tree,
+            const std::shared_ptr<const vbr_swa_window_image> & image,
+            const vbr_swa_window_plan_request & request) {
+        auto & pool = tree.get_swa()->vbr_pools_[0];
+        const auto * backend = pool.be;
+        const auto prepare = [&] {
+            auto p = vbr_prepare_swa_window(ctx, image, request);
+            check(p.status == vbr_swa_window_status::ok, "downward failure prepare failed");
+            return std::move(p.plan);
+        };
+        const auto before = fingerprint(tree);
+        const auto entries = tree.get_swa()->vbr_generation_tracker_get()->extent_store().live_entries();
+        vbr_swa_window_install_request install {request.source_epoch, request.destination_epoch, request.execution_identity};
+        // Replace only the private test pool's callback table, never the global
+        // backend or a production environment gate. Restore before any check.
+        for (bool workspace : {false, true}) {
+            auto p = prepare();
+            auto failing = *backend;
+            if (workspace) {
+                failing.kv_transcode_workspace_reserve = [](ggml_backend_t, int64_t, int64_t, int64_t) { return false; };
+            } else {
+                failing.backend_init = [](int) -> ggml_backend_t { return nullptr; };
+            }
+            pool.be = &failing;
+            const auto result = vbr_install_swa_window(ctx, std::move(p), install);
+            pool.be = backend;
+            check(result == vbr_swa_window_status::staging_unavailable, "staging refusal not exercised");
+            check(before == fingerprint(tree), "staging refusal changed live state");
+        }
+        auto p = prepare();
+        int stage_calls = 0, reads = 0, converted = 0;
+        for (const auto & unit : image->units()) {
+            const auto & layer = tree.get_swa()->layers[unit.logical_unit/2];
+            const auto * t = (unit.logical_unit&1) ? layer.v : layer.k;
+            vbr_downward_recipe recipe;
+            vbr_downward_resolve_recipe(ggml_type(unit.generation.current_type), t->type, t->type, true, recipe);
+            if (recipe.n_edges) { ++converted; stage_calls += 1+recipe.n_edges; }
+            const auto & cells = p->destination_cells();
+            for (size_t i = 0; i < cells.size();) {
+                size_t end = i+1;
+                while (end < cells.size() && cells[end] == cells[end-1]+1) { ++end; }
+                reads += ((end-i)*t->nb[1]+65535)/65536; i = end;
+            }
+        }
+        p.reset();
+        check(converted > 0, "downward gate executed no conversion");
+        size_t free_start, total;
+        backend->sync_device(pool.device);
+        backend->get_device_memory(pool.device, &free_start, &total);
+        for (int stop : {2, 4, stage_calls+2, stage_calls+reads+4, stage_calls+2*reads+3}) {
+            int remaining = stop;
+            install.continue_install = cancel_transfer; install.continue_context = &remaining;
+            const auto result = vbr_install_swa_window(ctx, prepare(), install);
+            check(result == (stop <= stage_calls+reads+2 ? vbr_swa_window_status::cancelled : vbr_swa_window_status::rolled_back),
+                  "downward cancellation missed intended phase");
+            check(before == fingerprint(tree), "downward cancellation changed live state");
+            check(entries == tree.get_swa()->vbr_generation_tracker_get()->extent_store().live_entries(), "downward extent leak");
+            check(!vbr_recovery_owned_by(tree.get_base()->vbr_instance_id()) &&
+                  !vbr_recovery_owned_by(tree.get_swa()->vbr_instance_id()), "downward recovery leak");
+        }
+        backend->sync_device(pool.device);
+        size_t free_end;
+        backend->get_device_memory(pool.device, &free_end, &total);
+        fprintf(stderr, "WINDOW DOWNWARD FAILURE PASS units=%d edges=%d gpu_free_before=%zu after=%zu\n",
+                converted, stage_calls-converted, free_start, free_end);
+    }
+    static void verify_payload_rows(const llama_kv_cache & cache, const vbr_swa_window_image & image,
+                                    const std::vector<uint32_t> & rows, bool compare_encoding = false) {
+        size_t padding_differences = 0;
+        for (const auto & unit : image.units()) {
+            auto * t = (unit.logical_unit&1) ? cache.layers[unit.logical_unit/2].v : cache.layers[unit.logical_unit/2].k;
+            std::vector<uint8_t> bytes(unit.row_bytes);
+            const bool tcq = t->type == GGML_TYPE_TURBO3_TCQ || t->type == GGML_TYPE_TURBO2_TCQ || t->type == GGML_TYPE_TURBO1_TCQ;
+            const size_t block_bytes = ggml_type_size(t->type);
+            for (size_t i = 0; i < rows.size(); ++i) {
+                ggml_backend_tensor_get(t, bytes.data(), rows[i]*unit.row_bytes, unit.row_bytes);
+                const auto expected = unit.payload.begin()+i*unit.row_bytes;
+                for (size_t offset = 0; offset < bytes.size(); ++offset) {
+                    if (bytes[offset] == expected[offset]) { continue; }
+                    // ggml-common.h: each TCQ block ends with one alignment pad
+                    // byte. Its encoder writes norm+qs, not pad; an in-place live
+                    // transcode leaves different old bytes there than compaction.
+                    // Equal-tier copy tests still compare EVERY byte.
+                    if (compare_encoding && tcq && offset%block_bytes == block_bytes-1) {
+                        ++padding_differences;
+                        continue;
+                    }
+                    fprintf(stderr, "WINDOW BYTE MISMATCH unit=%u type=%s logical=%d physical=%u offset=%zu\n",
+                        unit.logical_unit, ggml_type_name(t->type), image.rows()[i].position, rows[i], offset);
+                    check(false, "installed bytes differ");
+                }
+            }
+        }
+        if (compare_encoding) { fprintf(stderr, "WINDOW DOWNWARD alignment_pad_differences=%zu (norm+qs require exact equality)\n", padding_differences); }
+    }
+
+    static void degrade_swa_to_floor(llama_kv_cache & cache, size_t max_steps) {
+        // Use the live controller/adjacent transcode machinery, not metadata
+        // edits or a second implementation of the codec ladder.
+        for (size_t step = 0; step < std::min(max_steps, cache.layers.size()*12); ++step) {
+            bool at_floor = true;
+            for (const auto & layer : cache.layers) {
+                at_floor = at_floor && layer.k->type == GGML_TYPE_TURBO1_TCQ && layer.v->type == GGML_TYPE_TURBO1_TCQ;
+            }
+            if (at_floor) { check(cache.vbr_capture_settle(), "floor settle failed"); return; }
+            check(cache.vbr_degrade_next(cache.vbr_watermark_cells(0)) == llama_kv_cache::vbr_degrade_result::applied,
+                  "controller did not reach floor");
+        }
+        check(cache.vbr_capture_settle(), "degrade-step settle failed");
+    }
+
     static std::array<uint8_t, 32> required_bytes(const llama_kv_cache_iswa & tree, llama_seq_id seq) {
         llama_sha256 hash;
         for (auto * cache : {tree.get_base(), tree.get_swa()}) {
@@ -151,14 +263,7 @@ struct llama_kv_cache_vbr_epoch_test {
             check(extent && extent->family == vbr_mutation_family::import && extent->seq_id == 1,
                   "missing committed import provenance");
         }
-        for (const auto & unit : image->units()) {
-            auto * t = (unit.logical_unit&1) ? swa.layers[unit.logical_unit/2].v : swa.layers[unit.logical_unit/2].k;
-            std::vector<uint8_t> bytes(unit.row_bytes);
-            for (size_t i = 0; i < rows.size(); ++i) {
-                ggml_backend_tensor_get(t, bytes.data(), rows[i]*unit.row_bytes, unit.row_bytes);
-                check(std::equal(bytes.begin(), bytes.end(), unit.payload.begin()+i*unit.row_bytes), "installed bytes differ");
-            }
-        }
+        verify_payload_rows(swa, *image, rows);
         std::vector<uint32_t> indexed;
         check(swa.vbr_ownership_->enumerate_owned(0, 1, indexed), "installed ownership unavailable");
         auto expected = rows;
@@ -378,8 +483,67 @@ static void long_frontier_gate(llama_model * model, llama_context_params cp, con
     fprintf(stderr, "WINDOW LONG-FRONTIER PASS beyond-physical-pool/source-release/continuation\n");
 }
 
+static void downward_gate(llama_model * model, llama_context_params cp, const std::vector<llama_token> & tokens,
+                          vbr_swa_window_capture_request capture, size_t max_steps) {
+    std::shared_ptr<const vbr_swa_window_image> initial, reference;
+    constexpr int frontier = 1191;
+    capture.frontier = frontier;
+    for (int pass = 0; pass < 2; ++pass) {
+        llama_context_ptr ctx(llama_init_from_model(model, cp));
+        check(bool(ctx), "downward context failed");
+        auto & tree = *dynamic_cast<llama_kv_cache_iswa *>(llama_get_memory(ctx.get()));
+        for (int p = 0; p < frontier;) {
+            const int n = std::min(512, frontier-p);
+            decode(ctx.get(), tokens, p, n); p += n;
+        }
+        auto sealed = vbr_capture_swa_window(*ctx, capture);
+        check(sealed.status == vbr_swa_window_status::ok, "downward source capture failed");
+        if (pass == 0) { initial = sealed.image; }
+        else {
+            for (size_t u = 0; u < initial->units().size(); ++u) {
+                check(initial->units()[u].payload == sealed.image->units()[u].payload, "downward initial anchor not exact");
+            }
+            for (int p = frontier; p < frontier+2048; ++p) { decode(ctx.get(), tokens, p, 1); }
+        }
+        llama_kv_cache_vbr_epoch_test::degrade_swa_to_floor(*tree.get_swa(), max_steps);
+        if (pass == 0) {
+            auto lower = vbr_capture_swa_window(*ctx, capture);
+            check(lower.status == vbr_swa_window_status::ok, "live lower reference capture failed");
+            reference = lower.image;
+            continue;
+        }
+        vbr_swa_window_plan_request request;
+        request.source_epoch = capture.sequence_epoch; request.destination = 1; request.destination_epoch = 1;
+        request.execution_identity = capture.execution_identity; request.representation = capture.representation;
+        const auto before = llama_kv_cache_vbr_epoch_test::fingerprint(tree);
+        auto plan = vbr_prepare_swa_window(*ctx, sealed.image, request);
+        fprintf(stderr, "WINDOW DOWNWARD plan=%d source=%s steps=%zu\n", int(plan.status),
+                ggml_type_name(ggml_type(sealed.image->units().front().generation.current_type)), max_steps);
+        check(plan.status == vbr_swa_window_status::ok, "downward prepare failed");
+        check(before == llama_kv_cache_vbr_epoch_test::fingerprint(tree), "downward planning mutated source");
+        llama_kv_cache_vbr_epoch_test::downward_failure_gates(*ctx, tree, sealed.image, request);
+        const auto rows = plan.plan->destination_cells();
+        const auto source_bytes = llama_kv_cache_vbr_epoch_test::required_bytes(tree, 0);
+        vbr_swa_window_install_request install {request.source_epoch, 1, request.execution_identity};
+        check(vbr_install_swa_window(*ctx, std::move(plan.plan), install) == vbr_swa_window_status::ok, "downward install failed");
+        check(source_bytes == llama_kv_cache_vbr_epoch_test::required_bytes(tree, 0), "downward restore changed source");
+        llama_kv_cache_vbr_epoch_test::verify_payload_rows(*tree.get_swa(), *reference, rows, true);
+        for (int i = 0; i < 16; ++i) {
+            decode(ctx.get(), tokens, frontier+i, 1, 1);
+            decode(ctx.get(), tokens, frontier+2048+i, 1, 0);
+            const auto * logits = llama_get_logits_ith(ctx.get(), -1);
+            check(std::all_of(logits, logits+llama_vocab_n_tokens(llama_model_get_vocab(model)),
+                [](float v) { return std::isfinite(v); }), "downward continuation nonfinite");
+        }
+        fprintf(stderr, "WINDOW DOWNWARD PASS exact-live-chain-bytes/source-preserved/continuations\n");
+    }
+}
+
 int main(int argc, char ** argv) {
     try {
+        const bool downward_only = argc > 1 && std::string(argv[1]).rfind("--downward-only", 0) == 0;
+        const size_t max_steps = downward_only && std::string(argv[1]).size() > 15 ? std::stoul(argv[1]+16) : SIZE_MAX;
+        if (downward_only) { --argc; ++argv; }
         common_params params;
         if (!common_params_parse(argc, argv, params, LLAMA_EXAMPLE_COMMON)) { return 1; }
         params.kv_unified = true;
@@ -403,6 +567,14 @@ int main(int argc, char ** argv) {
         std::string text;
         for (int i = 0; i < 1500; ++i) { text += " The river flows past the old stone bridge."; }
         auto tokens = common_tokenize(ctx.get(), text, true, true);
+
+        if (downward_only) {
+            ctx.reset();
+            budget->limit = 64*1024*1024; // three independently retained control images
+            downward_gate(model.get(), cp, tokens, request, max_steps);
+            check(budget->used == 0, "downward image charge leaked");
+            return 0;
+        }
 
         // The Gemma4 E2B fixture has SWA512 and physical protected prefix128.
         decode(ctx.get(), tokens, 0, 64);

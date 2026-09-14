@@ -64,6 +64,7 @@ enum class vbr_swa_window_status {
     backing_unavailable,
     operation_refused,
     rolled_back,
+    staging_unavailable,
 };
 
 class vbr_swa_window_image {
@@ -154,7 +155,7 @@ struct vbr_swa_window_plan_result {
     std::unique_ptr<vbr_swa_window_plan> plan;
 };
 
-// Equal-representation planning only. No live state edits, transfers, mapping,
+// Equal-representation or adjacent-downward planning. No live state edits, transfers, mapping,
 // callbacks or implicit settlement. Unsettled/busy contexts decline. No server
 // caller until the separate transactional install and accounting gates pass.
 vbr_swa_window_plan_result vbr_prepare_swa_window(
@@ -169,7 +170,8 @@ struct vbr_swa_window_install_request {
     bool (*continue_install)(void *) noexcept = nullptr;
 };
 
-// Consumes the proposal on ALL outcomes. Initial equal-tier implementation uses
+// Consumes the proposal on ALL outcomes. Equal-tier copies and adjacent downward
+// conversion use the existing codec implementations. This implementation uses
 // already mapped backing only; missing backing declines without mapping/growing
 // the live pool. Cancellation after a write restores saved bytes before return
 // (rolled_back); backend-fatal transfer errors retain their fatal semantics.
