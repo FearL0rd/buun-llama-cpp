@@ -473,13 +473,13 @@ struct common_speculative_impl_draft_simple : public common_speculative_impl {
                 continue;
             }
 
-            llama_memory_seq_rm(llama_get_memory(ctx_dft), seq_id, dp.n_past, -1);
+            llama_memory_seq_rm(llama_get_memory(ctx_dft), seq_id, dp.pos0, -1);
 
             n_drafting++;
             drafting[seq_id] = true;
             common_sampler_reset(smpls[seq_id].get());
 
-            common_batch_add(batch, dp.id_last, dp.n_past, { seq_id }, true);
+            common_batch_add(batch, dp.id_last, dp.pos0, { seq_id }, true);
         }
 
         int ret = llama_decode(ctx_dft, batch);
@@ -539,7 +539,7 @@ struct common_speculative_impl_draft_simple : public common_speculative_impl {
                     continue;
                 }
 
-                common_batch_add(batch, id, dp.n_past + i + 1, { seq_id }, true);
+                common_batch_add(batch, id, dp.pos0 + i + 1, { seq_id }, true);
             }
 
             if (batch.n_tokens == 0) {
@@ -2200,14 +2200,14 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             }
 
             auto & pstate = positions[seq_id];
-            llama_pos n_local = dp.n_past - pstate.target_base;
+            llama_pos n_local = dp.pos0 - pstate.target_base;
             const llama_pos pos_max = llama_memory_seq_pos_max(
                     llama_get_memory(ctx_dft), seq_id);
             // A multimodal prompt-cache entry can restore compact drafter cells into a
             // different slot without restoring this lightweight offset. Recover it from
             // the only valid frontier relation before constructing the next noise block.
             if (!stash[seq_id].pending && pos_max >= 0 && n_local > pos_max + 1) {
-                pstate.target_base = dp.n_past - (pos_max + 1);
+                pstate.target_base = dp.pos0 - (pos_max + 1);
                 pstate.rebased = true;
                 n_local = pos_max + 1;
                 LOG_DBG("%s: seq %d recovered drafter base %d from cached frontier\n",
@@ -2215,7 +2215,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             }
             if (n_local < 0 || n_local > INT32_MAX) {
                 LOG_WRN("%s: seq %d cannot map target frontier %d from base %d\n",
-                        __func__, (int) seq_id, (int) dp.n_past,
+                        __func__, (int) seq_id, (int) dp.pos0,
                         (int) pstate.target_base);
                 continue;
             }
@@ -2965,14 +2965,14 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
             // Truncate stale draft positions: process() only cleans sequences
             // present in the verify batch, so a previous draft() may have
-            // advanced this sequence past dp.n_past.
-            llama_memory_seq_rm(llama_get_memory(ctx_dft), seq_id, dp.n_past, -1);
+            // advanced this sequence past dp.pos0.
+            llama_memory_seq_rm(llama_get_memory(ctx_dft), seq_id, dp.pos0, -1);
 
             n_drafting++;
             drafting[seq_id] = true;
             common_sampler_reset(smpls[seq_id].get());
 
-            common_batch_add(batch, dp.id_last, dp.n_past, { seq_id }, true);
+            common_batch_add(batch, dp.id_last, dp.pos0, { seq_id }, true);
             std::memcpy(batch.embd + (size_t) (batch.n_tokens - 1) * n_embd, carry, row_bytes);
 
             i_last[seq_id] = batch.n_tokens - 1;
@@ -2986,16 +2986,16 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         while (n_drafting > 0) {
             // each step decodes under a different head, i.e. a different decoder layer, and
-            // KV is per layer. process() filled this layer's KV only for positions < n_past
+            // KV is per layer. process() filled this layer's KV only for positions < pos0
             // (prompt + accepted prefix) — nothing in the draft region yet. so reset the
-            // draft region (the seq_rm lower bound is n_past, leaving the prompt KV intact)
+            // draft region (the seq_rm lower bound is pos0, leaving the prompt KV intact)
             // and select head i so it rebuilds its own layer's KV there; decoding just the
             // latest token would leave its attention reading cells only another head wrote.
             if (chain_heads) {
                 auto * mem_dft = llama_get_memory(ctx_dft);
                 for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
                     if (drafting[seq_id]) {
-                        llama_memory_seq_rm(mem_dft, seq_id, dparams[seq_id].n_past, -1);
+                        llama_memory_seq_rm(mem_dft, seq_id, dparams[seq_id].pos0, -1);
                     }
                 }
                 llama_set_nextn_layer_offset(ctx_dft, i);
@@ -3065,17 +3065,17 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                     const int n_rows = (int) result.size() + 1; // id_last + tokens drafted so far
                     for (int t = 0; t < n_rows; ++t) {
                         const llama_token tok = (t == 0) ? dp.id_last : result[t - 1];
-                        common_batch_add(batch, tok, dp.n_past + t, { seq_id }, t == n_rows - 1);
+                        common_batch_add(batch, tok, dp.pos0 + t, { seq_id }, t == n_rows - 1);
                         std::memcpy(batch.embd + (size_t) (batch.n_tokens - 1) * n_embd,
                                     chain_h[seq_id].data() + (size_t) t * n_embd, row_bytes);
                     }
                 } else if (is_mem_shared) {
                     // note: with shared memory (e.g. Gemma4 assistants) we use the same position for all draft tokens
                     // ref: https://github.com/huggingface/transformers/blob/effde20942e3f82a1b97449f60b3a48c5ff96145/docs/source/en/model_doc/gemma4_assistant.md?plain=1#L36-L37
-                    common_batch_add(batch, id, dp.n_past, { seq_id }, true);
+                    common_batch_add(batch, id, dp.pos0, { seq_id }, true);
                     std::memcpy(batch.embd + (size_t) (batch.n_tokens - 1) * n_embd, h_row, row_bytes);
                 } else {
-                    common_batch_add(batch, id, dp.n_past + i + 1, { seq_id }, true);
+                    common_batch_add(batch, id, dp.pos0 + i + 1, { seq_id }, true);
                     std::memcpy(batch.embd + (size_t) (batch.n_tokens - 1) * n_embd, h_row, row_bytes);
                 }
 
@@ -6446,7 +6446,7 @@ llama_tokens common_speculative_draft(
     dp.drafting = true;
     dp.n_max    = params.n_max;
     // M-RoPE: actual positions may exceed text token count due to image spatial dims
-    dp.n_past   = n_past_override >= 0 ? n_past_override : (llama_pos)prompt_tgt.size();
+    dp.pos0   = n_past_override >= 0 ? n_past_override : (llama_pos)prompt_tgt.size();
     dp.id_last  = id_last;
     dp.prompt   = &prompt_tgt;
     dp.result   = &result;

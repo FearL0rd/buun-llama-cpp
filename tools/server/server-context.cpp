@@ -17287,7 +17287,7 @@ private:
                 auto & dp   = common_speculative_get_draft_params(spec.get(), slot.id);
                 dp.drafting = true;
                 dp.n_max    = n_draft_max;
-                dp.n_past   = slot.prompt.tokens.pos_next();
+                dp.pos0   = slot.prompt.tokens.pos_next();
                 dp.id_last  = slot.sampled;
                 dp.prompt   = &cached_text_tokens;
                 dp.result   = &batched_drafts[slot.id];
@@ -17349,7 +17349,7 @@ private:
                     auto & dp   = common_speculative_get_draft_params(spec.get(), slot.id);
                     dp.drafting = true;
                     dp.n_max    = n_draft_max;
-                    dp.n_past   = slot.prompt.tokens.pos_next();
+                    dp.pos0   = slot.prompt.tokens.pos_next();
                     dp.id_last  = slot.sampled;
                     dp.prompt   = &cached_text_tokens;
                     dp.result   = &draft;
