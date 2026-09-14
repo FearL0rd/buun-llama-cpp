@@ -1986,6 +1986,89 @@ static size_t server_prompt_cache_effective_token_limit(
     size_t cache_bytes,
     size_t cache_tokens) noexcept;
 
+struct server_prompt_cache::active_storage_state {
+    size_t bytes = 0, tokens = 0;
+    llama_cache_acct_ledger * ledger = nullptr;
+    std::list<llama_cache_acct_op_id> ops;
+};
+
+void server_prompt_cache::detach_active_storage_accounting() noexcept {
+    if (!active_storage_ || !active_storage_->ledger) { return; }
+    for (auto & op : active_storage_->ops) {
+        if (op) { (void) active_storage_->ledger->abort(op); }
+        op = {};
+    }
+    // A reader may outlive the cache AND the accounting owner. Its local
+    // capacity lease remains independent, with no callback into either owner.
+    active_storage_->ledger = nullptr;
+}
+
+size_t server_prompt_cache::active_storage_bytes() const noexcept {
+    return active_storage_ ? active_storage_->bytes : 0;
+}
+
+size_t server_prompt_cache::active_storage_tokens() const noexcept {
+    return active_storage_ ? active_storage_->tokens : 0;
+}
+
+bool server_prompt_cache::fits_bytes(size_t host_bytes) const noexcept {
+    const size_t reserved = active_storage_bytes();
+    return host_bytes <= SIZE_MAX-reserved &&
+        (limit_size == 0 || (reserved <= limit_size && host_bytes <= limit_size-reserved));
+}
+
+size_t server_prompt_cache::effective_host_token_limit(size_t host_bytes, size_t host_tokens) const noexcept {
+    const size_t bytes = active_storage_bytes(), tokens = active_storage_tokens();
+    if (host_bytes > SIZE_MAX-bytes || host_tokens > SIZE_MAX-tokens) { return 0; }
+    const size_t effective = server_prompt_cache_effective_token_limit(
+        limit_size, limit_tokens, host_bytes+bytes, host_tokens+tokens);
+    return effective > tokens ? effective-tokens : 0;
+}
+
+std::shared_ptr<void> server_prompt_cache::reserve_active_storage(size_t bytes, size_t tokens) {
+    size_t current_bytes = size();
+    const size_t current_tokens = n_tokens();
+    if (quality_anchor_budget_enabled) {
+        const auto measured = server_prompt_cache_measure_budgets(states, acct);
+        if (!measured.exact) { return {}; }
+        current_bytes = measured.compact; // quality anchors have their own envelope
+    }
+    if (!bytes || bytes > SIZE_MAX-current_bytes || tokens > SIZE_MAX-current_tokens ||
+        current_tokens+tokens > SIZE_MAX-active_storage_tokens() ||
+        !fits_bytes(current_bytes+bytes) ||
+        (limit_tokens && current_tokens+tokens > effective_host_token_limit(current_bytes+bytes, current_tokens+tokens))) {
+        return {};
+    }
+    if (!active_storage_) { active_storage_ = std::make_shared<active_storage_state>(); }
+    struct charge {
+        std::shared_ptr<active_storage_state> state;
+        size_t bytes, tokens;
+        std::list<llama_cache_acct_op_id>::iterator op;
+        charge(std::shared_ptr<active_storage_state> s, size_t b, size_t t) : state(std::move(s)), bytes(b), tokens(t) {
+            op = state->ops.insert(state->ops.end(), llama_cache_acct_op_id{});
+            state->bytes += bytes; state->tokens += tokens;
+        }
+        ~charge() {
+            if (state->ledger && *op) { (void) state->ledger->abort(*op); }
+            state->ops.erase(op);
+            state->bytes -= bytes; state->tokens -= tokens;
+        }
+    };
+    auto result = std::make_shared<charge>(active_storage_, bytes, tokens);
+    active_storage_->ledger = acct;
+    if (acct) {
+        // Keep the capacity quote RESERVED for the lease lifetime. There is no
+        // fictitious physical allocation, staged peak or committed publication;
+        // the physical-headroom coordinator accounts for this reservation once.
+        *result->op = acct->reserve(
+            tokens ? llama_cache_acct_category::checkpoint_state_payload : llama_cache_acct_category::transfer_staging,
+            llama_cache_acct_resource_domain::non_device(llama_cache_acct_residency::pageable_host),
+            {}, 0, bytes);
+        if (!*result->op) { return {}; }
+    }
+    return result;
+}
+
 struct server_prompt_cache_vbr_pressure_plan {
     std::array<server_prompt_cache_state *, 2> victims {};
     std::array<llama_cache_acct_artifact_id, 2> artifacts {};
@@ -2087,11 +2170,10 @@ bool server_prompt_cache::prepare_vbr_publication_capacity(
     }
 
     const auto fits = [&](size_t bytes, size_t tokens) {
-        if (limit_size > 0 && bytes > limit_size) {
+        if (!fits_bytes(bytes)) {
             return false;
         }
-        const size_t effective = server_prompt_cache_effective_token_limit(
-            limit_size, limit_tokens, bytes, tokens);
+        const size_t effective = effective_host_token_limit(bytes, tokens);
         return limit_tokens == 0 || tokens <= effective;
     };
     // No victim can make a singleton fit if the incoming artifact itself
@@ -2412,7 +2494,7 @@ std::list<server_prompt_cache_state> server_prompt_cache::stage(const server_pro
         state_size_tgt + state_size_dft + checkpoints_size;
 
     // this state can't be cached at all; report failure (the caller keeps the live slot)
-    if (limit_size > 0 && state_size_new > limit_size) {
+    if (!fits_bytes(state_size_new)) {
         SRV_WRN(" - prompt state size %.3f MiB exceeds cache size limit %.3f MiB, skipping\n",
                 state_size_new / (1024.0 * 1024.0), limit_size / (1024.0 * 1024.0));
         return {};
@@ -2859,8 +2941,7 @@ server_prompt_cache::refresh_vbr_compact(
             const size_t compact_bytes = fixed_bytes +
                 size_t(vbr.compact_resident_bytes);
             result.measured = true;
-            result.compact_fits =
-                limit_size == 0 || compact_bytes <= limit_size;
+            result.compact_fits = fits_bytes(compact_bytes);
             result.anchor_fits = !value.vbr_has_quality_anchor() ||
                 (quality_anchor_budget_enabled &&
                  vbr.anchor_resident_bytes <= limit_anchor_size);
@@ -2970,7 +3051,7 @@ bool server_prompt_cache::preview_vbr_compact_refresh_capacity(
         const uint64_t base = committed >= replaceable
             ? committed-replaceable : committed;
         return incoming_compact_bytes <= UINT64_MAX-base &&
-            base+incoming_compact_bytes <= limit_size;
+            fits_bytes(base+incoming_compact_bytes);
     } catch (...) {
         return false;
     }
@@ -3551,7 +3632,7 @@ std::list<server_prompt_cache_state> server_prompt_cache::stage_vbr(
     }
     const size_t payload_size = payload.size();
     if (payload_size == 0 ||
-        (limit_size > 0 && payload_size > limit_size) ||
+        !fits_bytes(payload_size) ||
         (limit_size == 0 && limit_tokens > 0 &&
          size_t(prompt.n_tokens()) > limit_tokens)) {
         return {};
@@ -6077,8 +6158,7 @@ static bool server_prompt_cache_plan_vbr_pressure(
     cache.lease_obs->lifecycle_point();
 
     if (cache.states.size() > 1) {
-        const bool byte_pressure = cache.limit_size > 0 &&
-            projected_bytes > cache.limit_size;
+        const bool byte_pressure = !cache.fits_bytes(projected_bytes);
         const auto reason = byte_pressure
             ? server_cache_destruction_reason::host_capacity
             : server_cache_destruction_reason::host_token_limit;
@@ -6181,10 +6261,9 @@ static bool server_prompt_cache_plan_vbr_pressure(
         const size_t after_tokens = first_tokens > projected_tokens
             ? 0 : projected_tokens - first_tokens;
         const auto fits = [&](size_t bytes, size_t tokens) {
-            return (cache.limit_size == 0 || bytes <= cache.limit_size) &&
+            return cache.fits_bytes(bytes) &&
                 (cache.limit_tokens == 0 ||
-                 tokens <= server_prompt_cache_effective_token_limit(
-                    cache.limit_size, cache.limit_tokens, bytes, tokens));
+                 tokens <= cache.effective_host_token_limit(bytes, tokens));
         };
         plan.victims[0] = &*selected->victim;
         plan.artifacts[0] = selected->ranking.artifact_id;
@@ -6197,7 +6276,7 @@ static bool server_prompt_cache_plan_vbr_pressure(
         // decisions only. A token-only second step can have a different retention-capacity
         // order and remains an explicit unsupported shape.
         if (max_victims < 2 || !byte_pressure ||
-            cache.limit_size == 0 || after_bytes <= cache.limit_size ||
+            cache.fits_bytes(after_bytes) ||
             !selected->ranking.artifact_id.v) {
             plan = {};
             return false;
@@ -6297,12 +6376,10 @@ static bool server_prompt_cache_plan_vbr_pressure(
         ? 0 : projected_bytes - size_t(released_bytes);
     const size_t after_tokens = released_tokens > projected_tokens
         ? 0 : projected_tokens - released_tokens;
-    if (cache.limit_size > 0 && after_bytes > cache.limit_size) {
+    if (!cache.fits_bytes(after_bytes)) {
         return false;
     }
-    const size_t effective = server_prompt_cache_effective_token_limit(
-        cache.limit_size, cache.limit_tokens,
-        after_bytes, after_tokens);
+    const size_t effective = cache.effective_host_token_limit(after_bytes, after_tokens);
     if (cache.limit_tokens != 0 && after_tokens > effective) {
         return false;
     }
@@ -7906,7 +7983,7 @@ bool server_prompt_cache::publish_impl(
             staged.size() - size_t(staged_anchor);
         const size_t staged_budget_bytes = quality_anchor_budget_enabled
             ? staged_compact : staged.size();
-        if ((limit_size > 0 && staged_budget_bytes > limit_size) ||
+        if (!fits_bytes(staged_budget_bytes) ||
             (limit_size == 0 && limit_tokens > 0 &&
              size_t(staged.prompt.n_tokens()) > limit_tokens)) {
             return false;
@@ -7952,7 +8029,7 @@ bool server_prompt_cache::publish_impl(
             }
         }
         const bool anchor_exact_needed = quality_anchor_budget_enabled &&
-            ((limit_size > 0 && total_bytes > limit_size) ||
+            (!fits_bytes(total_bytes) ||
              total_anchor_bytes > limit_anchor_size);
         if (anchor_exact_needed) {
             try {
@@ -7985,7 +8062,7 @@ bool server_prompt_cache::publish_impl(
             total_bytes = fixed_bytes +
                 size_t(budgets.compact_resident_bytes);
             total_anchor_bytes = size_t(budgets.anchor_resident_bytes);
-        } else if (limit_size > 0 && total_bytes > limit_size && acct) {
+        } else if (!fits_bytes(total_bytes) && acct) {
             try {
                 payloads.reserve(states.size() + 1);
                 fixed_states.clear();
@@ -8022,11 +8099,9 @@ bool server_prompt_cache::publish_impl(
                 // Keep the conservative allocation-free upper bound.
             }
         }
-        const size_t effective_token_limit =
-            server_prompt_cache_effective_token_limit(
-                limit_size, limit_tokens, total_bytes, total_tokens);
+        const size_t effective_token_limit = effective_host_token_limit(total_bytes, total_tokens);
         const bool requires_pressure =
-            (limit_size > 0 && total_bytes > limit_size) ||
+            !fits_bytes(total_bytes) ||
             (limit_tokens > 0 && total_tokens > effective_token_limit);
         if (requires_pressure &&
             !staged.payload.vbr_retirement_exclusive() &&
@@ -9609,7 +9684,7 @@ bool server_prompt_cache::update_impl(
         // work is needed only close enough to a byte boundary that shared VBR
         // allocations or fixed checkpoint planes can change the decision.
         const bool pressure_plausible =
-            (limit_size > 0 && cache_bytes > limit_size) ||
+            !fits_bytes(cache_bytes) ||
             (quality_anchor_budget_enabled &&
              anchor_bytes > limit_anchor_size);
         if (!pressure_plausible) {
@@ -9688,7 +9763,7 @@ bool server_prompt_cache::update_impl(
         measure_cache();
     }
     if (limit_size > 0) {
-        while (!states.empty() && cache_bytes > limit_size) {
+        while (!states.empty() && !fits_bytes(cache_bytes)) {
             begin_pressure_wave();
             SRV_WRN(" - cache size limit reached (size = %.3f MiB)\n",
                     cache_bytes / (1024.0 * 1024.0));
@@ -9799,9 +9874,7 @@ bool server_prompt_cache::update_impl(
     // average size per token
     // Dynamically increase the token limit if the measured physical payload
     // fits in the byte limit. Publication preflight uses this exact helper.
-    const size_t limit_tokens_cur =
-        server_prompt_cache_effective_token_limit(
-            limit_size, limit_tokens, cache_bytes, cache_tokens);
+    const size_t limit_tokens_cur = effective_host_token_limit(cache_bytes, cache_tokens);
 
     if (limit_tokens > 0) {
         while (!states.empty() && cache_tokens > limit_tokens_cur) {

@@ -8084,6 +8084,15 @@ static void test_prompt_cache_vbr_pressure_retires_physical_union() {
         std::move(anchor_stage), &prompt, source_slot, &anchor_state));
     CHECK(cache.anchor_size() == anchor_marginal_bytes);
     CHECK(cache.size() == anchor_payload_bytes);
+    {
+        // The independently priced anchor cannot consume an active window's
+        // compact envelope, nor disable ordinary publication authority.
+        cache.limit_size = compact_payload_bytes + 1;
+        auto window = cache.reserve_active_storage(1);
+        CHECK(window && !cache.reserve_active_storage(1));
+        window.reset();
+        cache.limit_size = compact_payload_bytes;
+    }
     const auto retention_capacity_before_anchor =
         authority.destruction.host_trade_retention_capacity_executed;
     cache.update();
@@ -9472,6 +9481,10 @@ int main(int argc, char ** argv) {
         return failures == 0 ? 0 : 1;
     }
 #ifdef VBR_PROMPT_CACHE_PUBLICATION_TEST
+    if (argc == 2 && strcmp(argv[1], "--host-pressure-only") == 0) {
+        test_prompt_cache_vbr_pressure_retires_physical_union();
+        return failures == 0 ? 0 : 1;
+    }
     if (server_fault("vbr_prompt_cache_pair_prepare_fail")) {
         test_prompt_cache_vbr_pressure_retires_physical_union();
         if (failures != 0) {

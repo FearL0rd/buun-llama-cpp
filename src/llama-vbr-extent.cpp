@@ -176,6 +176,17 @@ std::unique_ptr<vbr_ownership_index> vbr_ownership_index::clone() const {
     return result;
 }
 
+size_t vbr_ownership_index::clone_storage_bytes(uint32_t stream, llama_seq_id destination) const {
+    size_t bytes = sizeof(*this) + views_.size()*sizeof(seq_view);
+    for (const auto & view : views_) {
+        bytes += view.page_masks.size()*sizeof(uint64_t) + view.fenwick.size()*sizeof(uint32_t);
+    }
+    if (!find_view(stream, destination)) {
+        bytes += size_t(n_pages_)*MASK_WORDS_PER_PAGE*sizeof(uint64_t) + (size_t(n_positions_)+1)*sizeof(uint32_t);
+    }
+    return bytes;
+}
+
 namespace {
 
 void fenwick_update(std::vector<uint32_t> & tree, uint32_t pos, int32_t delta) {

@@ -164,6 +164,8 @@ class vbr_ownership_index {
     // Off-side transaction copy: preserves unavailable views as unavailable.
     // Allocation may throw; the original index is untouched.
     std::unique_ptr<vbr_ownership_index> clone() const;
+    // Logical owned bytes of a clone, including a previously unused destination.
+    size_t clone_storage_bytes(uint32_t stream, llama_seq_id destination) const;
 
     uint32_t position_capacity() const { return n_positions_; }
 

@@ -106,6 +106,9 @@ struct vbr_swa_window_capture_result {
     std::shared_ptr<const vbr_swa_window_image> image;
 };
 
+// Static topology qualification, without synchronization, transfer or allocation.
+bool vbr_swa_window_supported(llama_context & ctx);
+
 // Requires the caller's exclusive scheduler boundary for this context, as do
 // other llama memory operations. Synchronizes submitted compute. Not a lock
 // allowing concurrent decode; callbacks must not reenter the context.
@@ -118,6 +121,8 @@ struct vbr_swa_window_plan_request {
     uint64_t destination_epoch = 0;
     std::array<uint8_t, 32> execution_identity {};
     vbr_explicit_representation_policy representation;
+    void * capacity_context = nullptr;
+    std::shared_ptr<void> (*reserve)(void *, size_t bytes) = nullptr;
 };
 
 struct vbr_swa_window_membership_removal {
@@ -139,6 +144,7 @@ public:
     const std::vector<uint32_t> & base_cells() const;
     const std::vector<vbr_swa_window_membership_removal> & removals() const;
     uint32_t required_watermark() const;
+    size_t retained_bytes() const;
     // Caller supplies current logical slot lifetimes. Requires the same exclusive,
     // synchronized scheduler boundary as prepare; does not synchronize or mutate.
     bool current(llama_context & ctx, uint64_t source_epoch, uint64_t destination_epoch,
@@ -155,9 +161,10 @@ struct vbr_swa_window_plan_result {
     std::unique_ptr<vbr_swa_window_plan> plan;
 };
 
-// Equal-representation or adjacent-downward planning. No live state edits, transfers, mapping,
-// callbacks or implicit settlement. Unsettled/busy contexts decline. No server
-// caller until the separate transactional install and accounting gates pass.
+// Equal-representation or adjacent-downward planning. No live state edits, transfers, mapping
+// or implicit settlement. The required reservation callback must not reenter the
+// context. Unsettled/busy contexts decline. A successful plan is not proof that
+// the separately reserved install workspace/backing is available.
 vbr_swa_window_plan_result vbr_prepare_swa_window(
     llama_context & ctx, std::shared_ptr<const vbr_swa_window_image> image,
     const vbr_swa_window_plan_request & request);
@@ -168,6 +175,8 @@ struct vbr_swa_window_install_request {
     // Boundary cancellation only; must not reenter or mutate the context.
     void * continue_context = nullptr;
     bool (*continue_install)(void *) noexcept = nullptr;
+    void * capacity_context = nullptr;
+    std::shared_ptr<void> (*reserve)(void *, size_t bytes) = nullptr;
 };
 
 // Consumes the proposal on ALL outcomes. Equal-tier copies and adjacent downward

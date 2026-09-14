@@ -30,6 +30,7 @@
 #include "../../src/llama-memory-hybrid-idx.h"
 #include "../../src/llama-sha256.h"
 #include "../../src/llama-vbr-qsa-index.h"
+#include "../../src/llama-vbr-swa-window.h"
 #include "log.h"
 #include "sampling.h"
 #include "speculative.h"
@@ -1505,6 +1506,11 @@ struct server_vbr_idle_refusal_witness {
     bool valid = false;
 };
 
+struct server_swa_window_checkpoint {
+    uint64_t sequence_epoch = 0;
+    std::shared_ptr<const vbr_swa_window_image> image;
+};
+
 struct server_slot {
     int id;
 
@@ -1656,6 +1662,9 @@ struct server_slot {
     slot_state state = SLOT_STATE_IDLE;
 
     server_prompt prompt;
+    // Active-request-only typed companions, never legacy PARTIAL_ONLY bytes
+    // or portable host artifacts. Shared image ownership keeps its budget lease.
+    std::list<server_swa_window_checkpoint> swa_windows;
 
     // Read-only  range qualification shared by the VBR controller and the
     // three legacy reclaim skip guards. A missing sidecar/identity cannot
@@ -1923,6 +1932,7 @@ struct server_slot {
             checkpoint_ring_changed();
         }
         prompt.clear();
+        swa_windows.clear();
         cache_family = {};
         vbr_reuse_capture_frontier = 0;
         vbr_idle_capture_source_reset();
@@ -2775,6 +2785,7 @@ struct server_slot {
     }
 
     void release() {
+        swa_windows.clear();
         if (is_processing()) {
             GGML_ASSERT(task);
 
@@ -3524,6 +3535,7 @@ static void server_wire_standalone_retention_metadata(
 }
 
 struct server_context_impl {
+    friend struct server_swa_window_selection_test;
     friend struct server_context;
     friend server_rejected_prompt_preservation_result
         server_rejected_prompt_preservation_for_test();
@@ -3631,6 +3643,8 @@ private:
     // Checkpoints are never portable across this random model-instance key;
     // slot-file restore explicitly invalidates them below.
     std::string frontier_execution_identity;
+    std::array<uint8_t, 32> swa_window_execution_identity {};
+    int32_t swa_window_checkpoint_limit = 0;
     // Stable across server restarts, unlike frontier_execution_identity.  It
     // exists only when slot-file persistence is enabled and binds the optional
     // logits companion to the exact model/execution configuration.
@@ -5342,6 +5356,57 @@ private:
                media_identity == frontier.media_content_identity;
     }
 
+    bool swa_window_eligible(const server_slot & slot) const {
+        return swa_window_checkpoint_limit > 0 && prompt_cache && slots.size() > 1 &&
+            params_base.kv_unified && !params_base.ctx_shift && params_base.n_cache_reuse == 0 &&
+            params_base.cache_plan_authority == common_cache_plan_authority_level::off &&
+            !ctx_dft && !slot.can_speculate() && !slot.diff_self_spec && slot.lora.empty() &&
+            slot.task && slot.task->type == SERVER_TASK_TYPE_COMPLETION && slot.task->params.cache_prompt &&
+            !slot.task->is_parent() && !slot.task->is_child() &&
+            !slot.task->tokens.has_media() && !slot.prompt.tokens.has_media() &&
+            std::all_of(params_base.speculative.types.begin(), params_base.speculative.types.end(),
+                [](auto type) { return type == COMMON_SPECULATIVE_TYPE_NONE; });
+    }
+
+    static std::shared_ptr<void> reserve_swa_staging(void * opaque, size_t bytes) {
+        return static_cast<server_prompt_cache *>(opaque)->reserve_active_storage(bytes);
+    }
+
+    vbr_explicit_representation_policy swa_window_representation() const {
+        return {frontier_execution_identity.data(), frontier_execution_identity.size()};
+    }
+
+    void capture_swa_window(server_slot & slot, int64_t frontier) {
+        if (frontier <= 0 || frontier > INT32_MAX || slot.prompt.tokens.pos_next(frontier) != frontier ||
+            (!slot.swa_windows.empty() && slot.swa_windows.back().image->frontier() == frontier)) { return; }
+        const int64_t start = ggml_time_us();
+        try {
+            struct reservation { server_prompt_cache * cache; size_t tokens; } budget {prompt_cache.get(), size_t(frontier)};
+            vbr_swa_window_capture_request capture;
+            capture.sequence = slot.id; capture.frontier = frontier;
+            capture.sequence_epoch = ensure_frontier_sequence_epoch(slot.prompt);
+            capture.execution_identity = swa_window_execution_identity;
+            capture.representation = swa_window_representation();
+            capture.capacity_context = &budget;
+            capture.reserve = [](void * opaque, size_t bytes) -> std::shared_ptr<void> {
+                auto & b = *static_cast<reservation *>(opaque);
+                if (bytes > SIZE_MAX-sizeof(server_swa_window_checkpoint)) { return {}; }
+                return b.cache->reserve_active_storage(bytes+sizeof(server_swa_window_checkpoint), b.tokens);
+            };
+            auto result = vbr_capture_swa_window(*ctx_tgt, capture);
+            if (result.status != vbr_swa_window_status::ok) {
+                SLT_DBG(slot, "SWA window capture skipped: status=%d frontier=%" PRId64 "\n", int(result.status), frontier);
+                return;
+            }
+            slot.swa_windows.push_back({capture.sequence_epoch, std::move(result.image)});
+            while (slot.swa_windows.size() > size_t(swa_window_checkpoint_limit)) { slot.swa_windows.pop_front(); }
+            SLT_INF(slot, "SWA window captured: frontier=%" PRId64 " windows=%zu host_bytes=%zu capture_ms=%.3f\n",
+                    frontier, slot.swa_windows.size(), prompt_cache->active_storage_bytes(), (ggml_time_us()-start)/1000.0);
+        } catch (const std::bad_alloc &) {
+            SLT_WRN(slot, "%s", "SWA window capture skipped: host allocation unavailable\n");
+        }
+    }
+
     // Late fallback only: normal live/host/checkpoint selection and its approved
     // clearing have already left an empty destination. Never displace a hit or
     // change a pre-mutation authoritative plan. The source and any borrowed
@@ -5366,9 +5431,8 @@ private:
         if (mtp != bool(ctx_dft) || mtp != dst.can_speculate()) {
             return;
         }
-        // Attention-only SWA needs no recurrent checkpoint. Its currently
-        // retained historical window is usable at the current VBR tiers;
-        // missing/recycled rows are a normal miss, never reconstructed here.
+        // Retained attention windows use zero-copy sharing. Recycled windows
+        // may use the separately qualified typed historical companion.
         const bool live_attention = server_vbr_dynamic_active(params_base) &&
             n_swa > 0 && !llama_model_is_hybrid(model_tgt) && !mtp;
 
@@ -5376,12 +5440,16 @@ private:
         common_cache_plan_candidate * row = nullptr;
         bool installed = false;
         try {
+            const int64_t start = ggml_time_us();
             struct candidate {
                 const server_slot * source = nullptr;
                 const common_prompt_checkpoint * checkpoint = nullptr;
                 int64_t n_tokens = 0;
                 std::vector<llama_pos> rows;
+                size_t window_bytes = 0;
             } best;
+            std::vector<std::pair<const server_slot *, const server_swa_window_checkpoint *>> windows;
+            std::optional<server_tokens> installed_prefix;
             const auto adapter = lora_config_identity(dst.lora);
             const auto mem = llama_get_memory(ctx_tgt);
             const auto provider = live_attention
@@ -5419,6 +5487,13 @@ private:
                             continue;
                         }
                     } else if (!mem->can_share_live_prefix(source.id, dst.id, llama_pos(lcp))) {
+                        if (swa_window_eligible(dst) && swa_window_eligible(source)) {
+                            for (auto it = source.swa_windows.rbegin(); it != source.swa_windows.rend(); ++it) {
+                                if (it->image->frontier() > int64_t(lcp) || it->image->frontier() <= best.n_tokens ||
+                                    it->sequence_epoch != source.prompt.sequence_epoch) { continue; }
+                                windows.emplace_back(&source, &*it);
+                            }
+                        }
                         continue;
                     }
                     best = { &source, nullptr, int64_t(lcp), std::move(rows) };
@@ -5479,6 +5554,39 @@ private:
                     best = { &source, &cp, cp.n_tokens, std::move(rows) };
                 }
             }
+            // Rank metadata first. A failed/larger proposal must not retain a
+            // reservation that prevents a better candidate, or discard an
+            // already feasible live hit. Live sharing wins equal-length ties.
+            std::stable_sort(windows.begin(), windows.end(), [](const auto & a, const auto & b) {
+                return a.second->image->frontier() > b.second->image->frontier();
+            });
+            bool synchronized = false;
+            for (const auto & candidate : windows) {
+                const auto & source = *candidate.first;
+                const auto & image = candidate.second->image;
+                if (image->frontier() <= best.n_tokens) { break; }
+                if (!synchronized) {
+                    llama_synchronize(ctx_tgt);
+                    synchronized = true;
+                }
+                auto prefix = dst.task->tokens.clone_cached_prefix(image->frontier());
+                vbr_swa_window_plan_request request;
+                request.source_epoch = source.prompt.sequence_epoch;
+                request.destination = dst.id;
+                request.destination_epoch = ensure_frontier_sequence_epoch(dst.prompt);
+                request.execution_identity = swa_window_execution_identity;
+                request.representation = swa_window_representation();
+                request.capacity_context = prompt_cache.get(); request.reserve = reserve_swa_staging;
+                auto plan = vbr_prepare_swa_window(*ctx_tgt, image, request);
+                if (plan.status != vbr_swa_window_status::ok) { continue; }
+                vbr_swa_window_install_request install {request.source_epoch, request.destination_epoch, request.execution_identity};
+                install.capacity_context = prompt_cache.get(); install.reserve = reserve_swa_staging;
+                if (vbr_install_swa_window(*ctx_tgt, std::move(plan.plan), install) != vbr_swa_window_status::ok) { continue; }
+                installed = true;
+                installed_prefix.emplace(std::move(prefix));
+                best = {&source, nullptr, image->frontier(), {}, image->retained_bytes()};
+                break;
+            }
             if (rec) {
                 // Only the selected active prefix is recorded, not a complete
                 // cost-planner inventory of every sibling/source considered here.
@@ -5499,26 +5607,26 @@ private:
                                          dst.id, rec->selection) : nullptr;
             if (row) {
                 row->lcp_tokens = llama_cache_acct_value::measured(n_tokens);
-                row->payload_bytes = llama_cache_acct_value::measured(cp ? cp->size() : 0);
+                row->payload_bytes = llama_cache_acct_value::measured(cp ? cp->size() : best.window_bytes);
                 rec->select(provider, row);
             }
-            const int64_t start = ggml_time_us();
-            auto prefix = dst.task->tokens.clone_cached_prefix(n_tokens);
+            auto prefix = installed_prefix ? std::move(*installed_prefix) : dst.task->tokens.clone_cached_prefix(n_tokens);
             // Media capability belongs to the slot, not this request. A text
             // completion can be followed by an image after erase/ID reuse.
             prefix.has_mtmd = dst.prompt.tokens.has_mtmd;
             std::string status = live_attention ? "shared active attention prefix" : "restored active context checkpoint";
-            llama_synchronize(ctx_tgt);
+            if (best.window_bytes) { status = "restored historical SWA window"; }
+            if (!synchronized) { llama_synchronize(ctx_tgt); }
             if (ctx_dft) {
                 llama_synchronize(ctx_dft.get());
             }
-            const bool shared = live_attention
+            const bool shared = installed || (live_attention
                 ? (best.rows.empty() ? mem->try_share_live_prefix(best.source->id, dst.id, next_pos)
                                     : mem->try_share_live_prefix_rows(best.source->id, dst.id, next_pos, best.rows))
                 : !best.rows.empty()
                     ? mem->try_share_attn_prefix_rows(best.source->id, dst.id,
                         cp->computation_frontier.next_position, best.rows)
-                    : llama_memory_try_share_attn_prefix(mem, best.source->id, dst.id, n_tokens);
+                    : llama_memory_try_share_attn_prefix(mem, best.source->id, dst.id, n_tokens));
             if (!shared) {
                 if (row) { row->note_reject(COMMON_CACHE_PLAN_REASON_COVERAGE_INSUFFICIENT); }
                 return;
@@ -5641,6 +5749,7 @@ private:
         // destroyed after it; close every dependency explicitly while the
         // storage callback target is still alive.
         for (auto & slot : slots) {
+            slot.swa_windows.clear();
             slot.cache_plan_destruction_recovery_pin = {};
             if (slot.retention_obs) {
                 slot.retention_obs->release_lineage_ticket(
@@ -8142,8 +8251,15 @@ private:
             //     hybrid+iSWA case, whose checkpoints carry tier-sensitive attention bytes.
             if (params_base.n_ctx_checkpoints > 0 &&
                 llama_model_n_swa(model_tgt) > 0) {
+                if (vbr_swa_window_supported(*ctx_tgt)) {
+                    swa_window_checkpoint_limit = params_base.n_ctx_checkpoints;
+                    llama_sha256 hash;
+                    hash.update(frontier_execution_identity.data(), frontier_execution_identity.size());
+                    swa_window_execution_identity = hash.finish();
+                }
                 params_base.n_ctx_checkpoints = 0;
-                SRV_WRN("%s\n", "context checkpoints are not supported by dynamic VBR on SWA models (the SWA attention KV is part of the checkpoint), they will be disabled");
+                SRV_WRN("legacy serialized SWA checkpoints disabled under dynamic VBR; typed active-window limit = %d\n",
+                        swa_window_checkpoint_limit);
             }
         }
 
@@ -8600,13 +8716,14 @@ private:
                     host_domain, measure, 0);
             }
 
-            // Host-cache absence is itself an observed zero. Initialize all three
+            // Host-cache absence is itself an observed zero. Initialize the
             // transactional leaves before an optional cache attaches; later C
             // transactions update these same resident/reserved cells.
             for (const auto cat : {
                     llama_cache_acct_category::full_snapshot_payload,
                     llama_cache_acct_category::checkpoint_state_payload,
-                    llama_cache_acct_category::typed_accelerator_payload }) {
+                    llama_cache_acct_category::typed_accelerator_payload,
+                    llama_cache_acct_category::transfer_staging }) {
                 for (const auto measure : {
                         llama_cache_acct_measure::logical_payload,
                         llama_cache_acct_measure::resident_allocated,
@@ -18587,7 +18704,11 @@ private:
                         alora_disabled_id = enabled_loras[0];
                     }
 
-                    bool do_checkpoint = params_base.n_ctx_checkpoints > 0;
+                    const bool typed_swa_checkpoint = swa_window_eligible(slot);
+                    bool do_checkpoint = params_base.n_ctx_checkpoints > 0 || typed_swa_checkpoint;
+                    const int64_t last_checkpoint = typed_swa_checkpoint
+                        ? (slot.swa_windows.empty() ? -1 : slot.swa_windows.back().image->frontier())
+                        : (slot.prompt.checkpoints.empty() ? -1 : slot.prompt.checkpoints.back().n_tokens);
 
                     // make checkpoints only for completion tasks
                     do_checkpoint = do_checkpoint && slot.task->type == SERVER_TASK_TYPE_COMPLETION;
@@ -18713,9 +18834,7 @@ private:
                         // break at the last user message, or at user messages at least min step past the last checkpoint
                         if (do_checkpoint && spans.is_user_start(slot.prompt.n_tokens())) {
                             const auto pos = slot.prompt.n_tokens();
-                            const auto & checkpoints = slot.prompt.checkpoints;
-
-                            if (pos == last_user_pos || checkpoints.empty() || pos > checkpoints.back().n_tokens + params_base.checkpoint_min_step) {
+                            if (pos == last_user_pos || last_checkpoint < 0 || pos > last_checkpoint + params_base.checkpoint_min_step) {
                                 break;
                             }
                         }
@@ -18795,9 +18914,9 @@ private:
 
                     // no need to create checkpoints that are too close together, unless it's the last user message
                     do_checkpoint = do_checkpoint && (
-                            slot.prompt.checkpoints.empty() ||
+                            last_checkpoint < 0 ||
                             is_last_user_message || near_prompt_end ||
-                            n_tokens_start > slot.prompt.checkpoints.back().n_tokens + params_base.checkpoint_min_step);
+                            n_tokens_start > last_checkpoint + params_base.checkpoint_min_step);
 
                     const bool checkpoint_exact_frontier =
                         llama_model_is_recurrent(model_tgt) || llama_model_is_hybrid(model_tgt);
@@ -18822,6 +18941,10 @@ private:
                     //       yet processed and therefore it is not part of the checkpoint.
                     const int ckpt_id_task = slot.task->id;
                     const int64_t ckpt_n_tokens = slot.prompt.n_tokens() - n_tokens_cur;
+                    if (do_checkpoint && typed_swa_checkpoint) {
+                        capture_swa_window(slot, ckpt_n_tokens);
+                        do_checkpoint = false; // never route a typed window through legacy serialization
+                    }
                     const llama_pos ckpt_pos_min = checkpoint_exact_frontier ? pos_max : pos_min;
                     llama_memory_vbr_state_data vbr_now = {};
                     if (do_checkpoint) {

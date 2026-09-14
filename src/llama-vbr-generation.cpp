@@ -236,6 +236,19 @@ struct vbr_tracker_cell_update::impl {
 vbr_tracker_cell_update::vbr_tracker_cell_update() = default;
 vbr_tracker_cell_update::~vbr_tracker_cell_update() = default;
 
+size_t vbr_generation_tracker::cell_update_storage_bytes() const {
+    size_t bytes = sizeof(vbr_tracker_cell_update::impl) + streams_.size()*sizeof(vbr_generation_stream_state);
+    const auto add = [&](const auto & values) { bytes += values.size()*sizeof(values[0]); };
+    for (const auto & stream : streams_) {
+        add(stream.page_event_gen); add(stream.page_last_destructive_gen); add(stream.page_last_import_gen);
+        add(stream.page_event_serial); add(stream.cell_last_dependency_gen); add(stream.cell_last_membership_gen);
+        add(stream.cell_dependency_provenance); add(stream.cell_membership_provenance); add(stream.cell_last_membership_seq);
+        add(stream.cell_dependency_extent); add(stream.cell_membership_extent);
+        add(stream.cell_dependency_in_range); add(stream.cell_membership_in_range);
+    }
+    return bytes;
+}
+
 static void resize_stream_state(
         vbr_generation_stream_state & stream,
         uint32_t n_pages, uint32_t n_cells) {

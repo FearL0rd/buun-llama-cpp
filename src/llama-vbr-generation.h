@@ -280,6 +280,7 @@ class vbr_generation_tracker {
     // Refusal does not invalidate the live shadow or reset any generation.
     bool prepare_cell_update(const std::vector<vbr_cell_update_event> & events,
                              vbr_operation_id operation, vbr_tracker_cell_update & output);
+    size_t cell_update_storage_bytes() const;
     bool cell_update_installable(const vbr_tracker_cell_update & update,
                                  vbr_operation_id operation) const;
     void install_cell_update(vbr_tracker_cell_update & update, vbr_operation_id operation) noexcept;

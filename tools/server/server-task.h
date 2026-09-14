@@ -1342,6 +1342,22 @@ bool server_prompt_retention_publish_exact_prefix(
 struct server_prompt_cache {
     server_prompt_cache(int32_t limit_size_mib, size_t limit_tokens);
 
+    // Scheduler-owned, non-evicting reservation for process-local active
+    // companions and restore staging. Readers share one charge; the last
+    // reader releases it, even after this cache has been destroyed. Ordinary
+    // host publications include these reservations in their capacity checks.
+    std::shared_ptr<void> reserve_active_storage(size_t bytes, size_t tokens = 0);
+    size_t active_storage_bytes() const noexcept;
+    size_t active_storage_tokens() const noexcept;
+    bool fits_bytes(size_t host_bytes) const noexcept;
+    size_t effective_host_token_limit(size_t host_bytes, size_t host_tokens) const noexcept;
+
+private:
+    struct active_storage_state;
+    std::shared_ptr<active_storage_state> active_storage_;
+    void detach_active_storage_accounting() noexcept;
+public:
+
     std::list<server_prompt_cache_state> states;
     using iterator = std::list<server_prompt_cache_state>::iterator;
     using const_iterator = std::list<server_prompt_cache_state>::const_iterator;
@@ -1696,6 +1712,7 @@ public:
     bool host_trade_substrate_warned = false;
 
     ~server_prompt_cache() {
+        detach_active_storage_accounting();
         clear_accounting();
     }
 

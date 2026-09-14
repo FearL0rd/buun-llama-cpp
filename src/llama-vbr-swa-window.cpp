@@ -33,6 +33,18 @@ class vbr_swa_window_capture {
     }
 
 public:
+    static bool supported(llama_context & ctx) {
+        auto * tree = dynamic_cast<llama_kv_cache_iswa *>(llama_get_memory(&ctx));
+        if (!tree) { return false; }
+        const auto & base = *tree->get_base();
+        const auto & swa = *tree->get_swa();
+        return !base.other && !swa.other && base.n_stream == 1 && swa.n_stream == 1 &&
+            !swa.v_trans && swa.swa_type == LLAMA_SWA_TYPE_STANDARD && swa.n_swa > 0 &&
+            base.n_swa == 0 && base.vbr_pools_.size() == 1 && swa.vbr_pools_.size() == 1 &&
+            base.vbr_pools_[0].device >= 0 && base.vbr_pools_[0].device == swa.vbr_pools_[0].device &&
+            base.vbr_vmm_active() && swa.vbr_vmm_active();
+    }
+
     static bool matches(const vbr_swa_window_image & image, llama_context & ctx,
                         uint64_t epoch, const std::array<uint8_t, 32> & execution) {
         auto * tree = dynamic_cast<llama_kv_cache_iswa *>(llama_get_memory(&ctx));
@@ -58,13 +70,7 @@ public:
         }
         auto & base = *tree->get_base();
         auto & swa = *tree->get_swa();
-        if (base.other || swa.other || base.n_stream != 1 || swa.n_stream != 1 ||
-            swa.v_trans || swa.swa_type != LLAMA_SWA_TYPE_STANDARD || swa.n_swa == 0 ||
-            base.n_swa != 0 || base.vbr_pools_.size() != 1 || swa.vbr_pools_.size() != 1 ||
-            base.vbr_pools_[0].device < 0 || base.vbr_pools_[0].device != swa.vbr_pools_[0].device ||
-            !base.vbr_vmm_active() || !swa.vbr_vmm_active()) {
-            return fail(status::unsupported);
-        }
+        if (!supported(ctx)) { return fail(status::unsupported); }
         if (!request.reserve) { return fail(status::capacity_refused); }
         llama_synchronize(&ctx);
         const vbr_controller_instance_id instances[] = {base.vbr_instance_id(), swa.vbr_instance_id()};
@@ -185,6 +191,10 @@ bool vbr_swa_window_image::source_matches(llama_context & ctx, uint64_t epoch,
     return vbr_swa_window_capture::matches(*this, ctx, epoch, execution);
 }
 
+bool vbr_swa_window_supported(llama_context & ctx) {
+    return vbr_swa_window_capture::supported(ctx);
+}
+
 vbr_swa_window_capture_result vbr_capture_swa_window(
         llama_context & ctx, const vbr_swa_window_capture_request & request) {
     try {
@@ -195,6 +205,8 @@ vbr_swa_window_capture_result vbr_capture_swa_window(
 }
 
 struct vbr_swa_window_plan::impl {
+    std::shared_ptr<void> capacity;
+    size_t retained_bytes = 0;
     struct boundary {
         uint64_t controller, mutation, representation, destination_content;
         uint32_t head, watermark;
@@ -301,6 +313,27 @@ public:
         const auto proceed = [&] { return !request.continue_install || request.continue_install(request.continue_context); };
         if (!proceed()) { return status::cancelled; }
 
+        // Reserve the transaction's logical host footprint before cloning cells,
+        // provenance, ownership or payload. GPU staging is separately recoverable
+        // and temporary. The caller uses the same budget as the sealed image.
+        size_t bytes = sizeof(vbr_cell_update_event)*3;
+        for (const auto * cache : {&base, &swa}) {
+            if (!add_bytes(bytes, 1, cache->v_cells[0].copy_storage_bytes()) ||
+                !add_bytes(bytes, 1, cache->vbr_ownership_->clone_storage_bytes(0, plan.destination)) ||
+                !add_bytes(bytes, 1, cache->vbr_generation_tracker_get()->cell_update_storage_bytes())) { return status::capacity_refused; }
+        }
+        if (!add_bytes(bytes, plan.base_cells.size()+plan.destination_cells.size()+plan.removals.size(), sizeof(vbr_cell_update_stamp)) ||
+            !add_bytes(bytes, plan.base_cells.size()+plan.destination_cells.size(), sizeof(std::pair<llama_pos, uint32_t>)) ||
+            !add_bytes(bytes, plan.image->units().size(), 2*sizeof(void *)+2*sizeof(std::vector<uint8_t>))) { return status::capacity_refused; }
+        for (const auto & unit : plan.image->units()) {
+            const auto & layer = swa.layers[unit.logical_unit/2];
+            const auto * t = (unit.logical_unit&1) ? layer.v : layer.k;
+            const size_t copies = plan.recipes[unit.logical_unit].n_edges ? 2 : 1;
+            if (!add_bytes(bytes, copies*plan.destination_cells.size(), t->nb[1])) { return status::capacity_refused; }
+        }
+        auto capacity = request.reserve ? request.reserve(request.capacity_context, bytes) : nullptr;
+        if (!capacity) { return status::capacity_refused; }
+
         // All allocating membership/index edits happen on copies. Preserve even
         // unavailable ownership views; rebuilding them would change other slots.
         auto base_cells = base.v_cells[0];
@@ -313,6 +346,9 @@ public:
         vbr_cell_update_event share {vbr_mutation_registrant::seq_cp, vbr_operation_class::prompt_share, {}};
         vbr_cell_update_event remove {vbr_mutation_registrant::seq_rm, vbr_operation_class::state_api, {}};
         vbr_cell_update_event import {vbr_mutation_registrant::window_install, vbr_operation_class::checkpoint_restore, {}};
+        share.stamps.reserve(plan.base_cells.size());
+        remove.stamps.reserve(plan.removals.size());
+        import.stamps.reserve(plan.destination_cells.size());
         for (auto cell : plan.base_cells) {
             const auto pos = base_cells.pos_get(cell);
             base_cells.seq_add(cell, plan.destination);
@@ -343,8 +379,11 @@ public:
         for (llama_seq_id seq = 0; seq < LLAMA_MAX_SEQ; ++seq) {
             if (swa_changed[seq] && swa_cells.seq_pos_min(seq) < 0) { swa_owners->clear_seq(0, seq); }
         }
-        const std::vector<vbr_cell_update_event> base_events {std::move(share)};
+        std::vector<vbr_cell_update_event> base_events;
+        base_events.reserve(1);
+        base_events.push_back(std::move(share));
         std::vector<vbr_cell_update_event> swa_events;
+        swa_events.reserve(2);
         // Empty placement needs no removal target or authenticated remove event.
         if (!remove.stamps.empty()) { swa_events.push_back(std::move(remove)); }
         swa_events.push_back(std::move(import));
@@ -535,13 +574,29 @@ public:
             return fail(status::destination_unavailable);
         }
         if (base.vbr_stash_dirty_ || swa.vbr_stash_dirty_) { return fail(status::unavailable); }
+        size_t memberships = 0;
+        for (uint32_t cell = 0; cell < swa.v_cells[0].size(); ++cell) {
+            swa.v_cells[0].seq_for_each(cell, [&](llama_seq_id) { ++memberships; });
+        }
+        size_t bytes = sizeof(state)+sizeof(vbr_swa_window_plan);
+        if (!add_bytes(bytes, request.representation.build_identity_len+1, 1) ||
+            !add_bytes(bytes, image->units().size(), sizeof(vbr_downward_recipe)) ||
+            !add_bytes(bytes, image->rows().size()+size_t(image->frontier()), sizeof(uint32_t)) ||
+            !add_bytes(bytes, memberships, sizeof(vbr_swa_window_membership_removal))) { return fail(status::capacity_refused); }
+        auto capacity = request.reserve ? request.reserve(request.capacity_context, bytes) : nullptr;
+        if (!capacity) { return fail(status::capacity_refused); }
         auto result = std::unique_ptr<vbr_swa_window_plan>(new vbr_swa_window_plan);
         auto & plan = *result->impl_;
+        plan.capacity = std::move(capacity);
+        plan.retained_bytes = bytes;
         plan.image = std::move(image);
         plan.destination = request.destination;
         plan.destination_epoch = request.destination_epoch;
         plan.build_identity.assign(request.representation.build_identity, request.representation.build_identity_len);
         plan.children = {boundary(base, request.destination), boundary(swa, request.destination)};
+        plan.recipes.reserve(plan.image->units().size());
+        plan.removals.reserve(memberships);
+        plan.base_cells.reserve(plan.image->frontier());
         if (!representation_matches(plan, swa, &plan.recipes)) { return fail(status::representation_mismatch); }
 
         const auto & cells = swa.v_cells[0];
@@ -611,6 +666,7 @@ const std::vector<uint32_t> & vbr_swa_window_plan::destination_cells() const { r
 const std::vector<uint32_t> & vbr_swa_window_plan::base_cells() const { return impl_->base_cells; }
 const std::vector<vbr_swa_window_membership_removal> & vbr_swa_window_plan::removals() const { return impl_->removals; }
 uint32_t vbr_swa_window_plan::required_watermark() const { return impl_->required_watermark; }
+size_t vbr_swa_window_plan::retained_bytes() const { return impl_->retained_bytes; }
 bool vbr_swa_window_plan::current(llama_context & ctx, uint64_t source_epoch, uint64_t destination_epoch,
                                 const std::array<uint8_t, 32> & execution) const {
     try {

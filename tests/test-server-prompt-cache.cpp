@@ -354,6 +354,7 @@ void configure_host_accounting(
             llama_cache_acct_category::full_snapshot_payload,
             llama_cache_acct_category::checkpoint_state_payload,
             llama_cache_acct_category::typed_accelerator_payload,
+            llama_cache_acct_category::transfer_staging,
             llama_cache_acct_category::artifact_descriptor_metadata }) {
         if (!with_sidecar && category ==
                 llama_cache_acct_category::artifact_descriptor_metadata) {
@@ -522,6 +523,120 @@ server_prompt_cache::iterator publish_indexed_host_from_live(
     CHECK(published != cache.states.end());
     retention.retire(server_retention_instance_key::for_slot(slot_id));
     return published;
+}
+
+void test_active_storage_budget() {
+    server_prompt_cache cache(0, 0);
+    cache.limit_size = 100;
+    server_prompt prompt;
+    prompt.tokens = server_tokens(llama_tokens {1, 2, 3}, false);
+    CHECK(cache.publish(cache.stage(prompt, 40, 0, "incumbent")));
+    auto image = cache.reserve_active_storage(60, 3);
+    CHECK(image && cache.active_storage_bytes() == 60);
+    CHECK(cache.fits_bytes(40) && !cache.fits_bytes(41));
+    CHECK(!cache.reserve_active_storage(1));
+    CHECK(cache.states.size() == 1); // refusal cannot evict an incumbent
+    auto reader = image;
+    image.reset();
+    CHECK(cache.active_storage_bytes() == 60);
+    CHECK(cache.stage(prompt, 41, 0, "too-large").empty());
+    // Existing host pressure still operates inside the remaining envelope.
+    CHECK(cache.publish(cache.stage(prompt, 40, 0, "replacement")));
+    CHECK(cache.size() == 40 && cache.states.size() == 1);
+    reader.reset();
+    CHECK(cache.active_storage_bytes() == 0 && cache.active_storage_tokens() == 0);
+    CHECK(cache.fits_bytes(100) && !cache.fits_bytes(SIZE_MAX));
+
+    server_prompt_cache token_cache(0, 10);
+    auto token_image = token_cache.reserve_active_storage(50, 8);
+    CHECK(token_image && token_cache.effective_host_token_limit(1, 2) == 2);
+    CHECK(!token_cache.reserve_active_storage(1, 3));
+    CHECK(token_cache.publish(token_cache.stage(prompt, 1, 0, "token-pressure")) == false);
+    CHECK(token_cache.states.empty());
+    token_image.reset();
+    CHECK(token_cache.effective_host_token_limit(1, 3) == 10);
+
+    std::shared_ptr<void> detached;
+    {
+        server_prompt_cache owner(0, 0);
+        detached = owner.reserve_active_storage(100, 20);
+        CHECK(detached);
+    }
+    detached.reset(); // charge has no pointer to the destroyed cache
+
+    server_cache_authority authority;
+    configure_host_accounting(authority);
+    const auto check_admission = [&] {
+        llama_cache_budget_config config;
+        CHECK(authority.sample_budget(config));
+        CHECK(config.host.pageable_state == llama_cache_budget_capacity_state::known);
+        server_prompt_cache ordinary(0, 0);
+        ordinary.acct = &authority.ledger;
+        ordinary.publish_authority = &authority;
+        CHECK(ordinary.publish(ordinary.stage(prompt, 16, 0, "ordinary-publication")));
+    };
+    check_admission();
+
+    server_cache_authority failed_authority;
+    configure_host_accounting(failed_authority);
+    failed_authority.ledger.mark_unavailable(
+        llama_cache_acct_category::checkpoint_state_payload,
+        llama_cache_acct_resource_domain::non_device(llama_cache_acct_residency::pageable_host),
+        llama_cache_acct_measure::reserved);
+    server_prompt_cache failed_cache(0, 0);
+    failed_cache.acct = &failed_authority.ledger;
+    CHECK(!failed_cache.reserve_active_storage(20, 1));
+    CHECK(failed_cache.active_storage_bytes() == 0 && failed_authority.ledger.snapshot().live_ops == 0);
+    {
+        server_prompt_cache observed(0, 0);
+        observed.acct = &authority.ledger;
+        auto sealed = observed.reserve_active_storage(60, 3);
+        auto transient = observed.reserve_active_storage(40);
+        CHECK(sealed && transient && authority.ledger.snapshot().live_ops == 2);
+        const auto snapshot = authority.ledger.snapshot();
+        uint64_t reserved = 0;
+        for (const auto & row : snapshot.cells) {
+            const auto value = row.cell.measures[size_t(llama_cache_acct_measure::reserved)];
+            if (value.state == llama_cache_acct_known::known) { reserved += value.value; }
+        }
+        CHECK(reserved == 100 && snapshot.allocations.empty());
+        check_admission();
+        for (const auto & row : snapshot.completeness) {
+            if (row.producer == llama_cache_acct_producer::host_cache) {
+                CHECK(row.state == llama_cache_acct_known::known);
+            }
+        }
+        detached = sealed;
+        sealed.reset();
+        CHECK(observed.active_storage_bytes() == 100);
+        transient.reset();
+        CHECK(observed.active_storage_bytes() == 60);
+        detached.reset();
+        CHECK(observed.active_storage_bytes() == 0);
+        CHECK(authority.ledger.snapshot().live_ops == 0);
+        detached = observed.reserve_active_storage(20, 1);
+    }
+    CHECK(authority.ledger.snapshot().live_ops == 0);
+    detached.reset(); // detached reader has no pointer to the accounting owner
+    CHECK(authority.ledger.snapshot().live_ops == 0);
+    check_admission();
+    {
+        server_cache_authority temporary_authority;
+        configure_host_accounting(temporary_authority);
+        server_prompt_cache temporary_owner(0, 0);
+        temporary_owner.acct = &temporary_authority.ledger;
+        detached = temporary_owner.reserve_active_storage(20, 1);
+        CHECK(detached);
+    }
+    detached.reset(); // both accounting owner and cache have now been destroyed
+
+    // Separately budgeted anchors must not disable otherwise affordable windows.
+    server_prompt_cache split_budget(0, 0);
+    split_budget.limit_size = 100;
+    split_budget.quality_anchor_budget_enabled = true;
+    CHECK(split_budget.publish(split_budget.stage(prompt, 40, 0, "compact")));
+    auto split_image = split_budget.reserve_active_storage(60, 3);
+    CHECK(split_image && !split_budget.reserve_active_storage(1));
 }
 
 void test_typed_host_payload_boundary() {
@@ -5431,6 +5546,7 @@ int main(int argc, char ** argv) {
         return failures == 0 ? 0 : 1;
     }
     test_lifecycle_full_cache_rotates();
+    test_active_storage_budget();
     CHECK(server_active_prefix_retention_for_test());
     test_idle_capture_session_cancellation();
     test_idle_capture_refuses_active_queue_yield();

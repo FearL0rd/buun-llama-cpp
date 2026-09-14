@@ -55,6 +55,7 @@ struct llama_kv_cache_vbr_epoch_test {
         const auto before = fingerprint(tree);
         const auto entries = tree.get_swa()->vbr_generation_tracker_get()->extent_store().live_entries();
         vbr_swa_window_install_request install {request.source_epoch, request.destination_epoch, request.execution_identity};
+        install.reserve = request.reserve; install.capacity_context = request.capacity_context;
         // Replace only the private test pool's callback table, never the global
         // backend or a production environment gate. Restore before any check.
         for (bool workspace : {false, true}) {
@@ -178,6 +179,7 @@ struct llama_kv_cache_vbr_epoch_test {
             const vbr_swa_window_plan_request & placement) {
         vbr_swa_window_install_request install {placement.source_epoch, placement.destination_epoch,
                                                placement.execution_identity};
+        install.reserve = placement.reserve; install.capacity_context = placement.capacity_context;
         auto prepare = [&] {
             auto result = vbr_prepare_swa_window(ctx, image, placement);
             check(result.status == vbr_swa_window_status::ok, "install gate prepare failed");
@@ -417,11 +419,13 @@ static void shared_owner_gate(llama_model * model, llama_context_params cp, cons
     request.source_epoch = capture.sequence_epoch;
     request.destination = 1; request.destination_epoch = 1;
     request.execution_identity = capture.execution_identity; request.representation = capture.representation;
+    request.reserve = capture.reserve; request.capacity_context = capture.capacity_context;
     auto plan = vbr_prepare_swa_window(*ctx, sealed.image, request);
     check(plan.status == vbr_swa_window_status::ok, "three-owner prepare failed");
     const size_t removals = plan.plan->removals().size();
     check(removals >= 2*sealed.image->rows().size(), "test did not replace shared old memberships");
     vbr_swa_window_install_request install {request.source_epoch, 1, request.execution_identity};
+    install.reserve = request.reserve; install.capacity_context = request.capacity_context;
     check(vbr_install_swa_window(*ctx, std::move(plan.plan), install) == vbr_swa_window_status::ok, "three-owner install failed");
     check(paused_bytes == llama_kv_cache_vbr_epoch_test::required_bytes(tree, 2), "install changed paused owner bytes");
     for (int i = 0; i < 16; ++i) {
@@ -463,10 +467,12 @@ static void long_frontier_gate(llama_model * model, llama_context_params cp, con
     vbr_swa_window_plan_request request;
     request.source_epoch = capture.sequence_epoch; request.destination = 1; request.destination_epoch = 1;
     request.execution_identity = capture.execution_identity; request.representation = capture.representation;
+    request.reserve = capture.reserve; request.capacity_context = capture.capacity_context;
     auto plan = vbr_prepare_swa_window(*ctx, sealed.image, request);
     check(plan.status == vbr_swa_window_status::ok, "long-frontier prepare failed");
     const auto source_bytes = llama_kv_cache_vbr_epoch_test::required_bytes(tree, 0);
     vbr_swa_window_install_request install {request.source_epoch, 1, request.execution_identity};
+    install.reserve = request.reserve; install.capacity_context = request.capacity_context;
     const auto result = vbr_install_swa_window(*ctx, std::move(plan.plan), install);
     fprintf(stderr, "WINDOW LONG-FRONTIER result=%d frontier=%d physical=%u\n", int(result), frontier, tree.get_swa()->get_size());
     check(result == vbr_swa_window_status::ok, "long-frontier install failed");
@@ -515,6 +521,7 @@ static void downward_gate(llama_model * model, llama_context_params cp, const st
         vbr_swa_window_plan_request request;
         request.source_epoch = capture.sequence_epoch; request.destination = 1; request.destination_epoch = 1;
         request.execution_identity = capture.execution_identity; request.representation = capture.representation;
+        request.reserve = capture.reserve; request.capacity_context = capture.capacity_context;
         const auto before = llama_kv_cache_vbr_epoch_test::fingerprint(tree);
         auto plan = vbr_prepare_swa_window(*ctx, sealed.image, request);
         fprintf(stderr, "WINDOW DOWNWARD plan=%d source=%s steps=%zu\n", int(plan.status),
@@ -525,6 +532,7 @@ static void downward_gate(llama_model * model, llama_context_params cp, const st
         const auto rows = plan.plan->destination_cells();
         const auto source_bytes = llama_kv_cache_vbr_epoch_test::required_bytes(tree, 0);
         vbr_swa_window_install_request install {request.source_epoch, 1, request.execution_identity};
+        install.reserve = request.reserve; install.capacity_context = request.capacity_context;
         check(vbr_install_swa_window(*ctx, std::move(plan.plan), install) == vbr_swa_window_status::ok, "downward install failed");
         check(source_bytes == llama_kv_cache_vbr_epoch_test::required_bytes(tree, 0), "downward restore changed source");
         llama_kv_cache_vbr_epoch_test::verify_payload_rows(*tree.get_swa(), *reference, rows, true);
@@ -636,6 +644,7 @@ int main(int argc, char ** argv) {
         placement.source_epoch = 1; placement.destination = 1; placement.destination_epoch = 1;
         placement.execution_identity = request.execution_identity;
         placement.representation = request.representation;
+        placement.reserve = request.reserve; placement.capacity_context = request.capacity_context;
         const auto before_plan = llama_kv_cache_vbr_epoch_test::fingerprint(*tree);
         auto fresh_plan = vbr_prepare_swa_window(*ctx, reader, placement);
         // Only 345 empty cells remain in this 1536-cell fixture. Reusing any
@@ -659,6 +668,23 @@ int main(int argc, char ** argv) {
         check(reader->source_matches(*ctx, 1, request.execution_identity), "recycling invalidated sealed window");
         check(vbr_capture_swa_window(*ctx, request).status == vbr_swa_window_status::unavailable, "captured stale frontier");
         const auto before_recycled_plan = llama_kv_cache_vbr_epoch_test::fingerprint(*tree);
+        budget->limit = budget->used;
+        check(vbr_prepare_swa_window(*ctx, reader, placement).status == vbr_swa_window_status::capacity_refused,
+              "plan ignored host capacity");
+        check(budget->used == retained, "refused plan leaked capacity");
+        budget->limit = 16*1024*1024;
+        {
+            auto limited = vbr_prepare_swa_window(*ctx, reader, placement);
+            check(limited.status == vbr_swa_window_status::ok, "quota test preparation failed");
+            budget->limit = budget->used;
+            vbr_swa_window_install_request install {1, 1, request.execution_identity};
+            install.reserve = request.reserve; install.capacity_context = request.capacity_context;
+            check(vbr_install_swa_window(*ctx, std::move(limited.plan), install) == vbr_swa_window_status::capacity_refused,
+                  "restore ignored host capacity");
+        }
+        check(budget->used == retained && before_recycled_plan == llama_kv_cache_vbr_epoch_test::fingerprint(*tree),
+              "quota refusal changed live state or leaked capacity");
+        budget->limit = 16*1024*1024;
         const size_t reserve_attempts = budget->attempts;
         const auto plan_start = std::chrono::steady_clock::now();
         auto recycled = vbr_prepare_swa_window(*ctx, reader, placement);
@@ -671,7 +697,8 @@ int main(int argc, char ** argv) {
         llama_kv_cache_vbr_epoch_test::verify_plan(*tree, *recycled.plan, *reader);
         check(!recycled.plan->removals().empty(), "full-pool placement did not reuse occupied rows");
         llama_kv_cache_vbr_epoch_test::check_capacity_refusal(*ctx, *tree->get_swa(), reader, placement);
-        check(reserve_attempts == budget->attempts && budget->used == retained, "planning duplicated image charge");
+        check(reserve_attempts < budget->attempts && budget->used == retained+recycled.plan->retained_bytes(),
+              "planning failed to charge metadata or duplicated image charge");
         check(before_recycled_plan == llama_kv_cache_vbr_epoch_test::fingerprint(*tree), "recycled planning changed live state");
         fprintf(stderr, "WINDOW PLAN prepared rows=%zu removals=%zu base=%zu endpoint=%u ms=%.3f\n",
             recycled.plan->destination_cells().size(), recycled.plan->removals().size(),
@@ -722,6 +749,7 @@ int main(int argc, char ** argv) {
         check(empty_plan.status == vbr_swa_window_status::ok && empty_plan.plan->removals().empty(),
               "empty-row fixture did not select only empty cells");
         vbr_swa_window_install_request empty_install {1, 1, request.execution_identity};
+        empty_install.reserve = request.reserve; empty_install.capacity_context = request.capacity_context;
         check(vbr_install_swa_window(*ctx, std::move(empty_plan.plan), empty_install) == vbr_swa_window_status::ok,
               "empty-row installation failed");
         check(source_bytes == llama_kv_cache_vbr_epoch_test::required_bytes(*tree, 0), "empty-row restore changed source");
@@ -733,10 +761,11 @@ int main(int argc, char ** argv) {
         check(!reader->source_matches(*ctx, 1, request.execution_identity), "reused source slot accepted");
         check(!recycled.plan->current(*ctx, 1, 1, request.execution_identity), "recycled plan survived source reuse");
         ctx.reset();
-        check(budget->used == retained && !reader->units().front().payload.empty(), "image did not outlive context");
+        const auto with_plan = retained+recycled.plan->retained_bytes();
+        check(budget->used == with_plan && !reader->units().front().payload.empty(), "image did not outlive context");
         const bool test_shared = reader->units().front().generation.current_type == GGML_TYPE_TURBO4_0;
         reader.reset();
-        check(budget->used == retained, "plan did not retain image ownership");
+        check(budget->used == with_plan, "plan did not retain image ownership");
         recycled.plan.reset();
         check(budget->used == 0, "last reader did not release charge");
         if (test_shared) {

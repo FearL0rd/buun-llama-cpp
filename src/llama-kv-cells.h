@@ -133,6 +133,16 @@ class llama_kv_cells {
 public:
     using seq_set_t = std::bitset<LLAMA_MAX_SEQ>;
 
+    // Logical allocation quote for a transaction copy; excludes allocator
+    // overhead/tree-node links, like the host cache's payload byte accounting.
+    size_t copy_storage_bytes() const {
+        size_t bytes = sizeof(*this) + pos.size()*sizeof(llama_pos) +
+            ext.size()*sizeof(llama_kv_cell_ext) + shift.size()*sizeof(llama_pos) +
+            seq.size()*sizeof(seq_set_t) + ((pos.size()+63)/64)*sizeof(uint64_t);
+        for (const auto & positions : seq_pos) { bytes += positions.size()*sizeof(*positions.begin()); }
+        return bytes;
+    }
+
     void reset() {
         for (uint32_t i = 0; i < pos.size(); ++i) {
             pos[i]   = -1;
