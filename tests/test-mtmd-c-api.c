@@ -1,6 +1,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#undef NDEBUG // this executable validates API contracts in Release builds too
 #include <assert.h>
 
 #include "mtmd.h"
@@ -88,6 +89,15 @@ int main(void) {
         assert(buf != NULL);
         rc = mtmd_input_chunk_save(chunk, buf, expected_len, NULL);
         assert(rc == 0);
+
+        // Version 2 adds image lead padding; do not interpret a v1 payload as v2.
+        uint64_t version;
+        memcpy(&version, buf, sizeof(version));
+        assert(version == 2);
+        const uint64_t old_version = 1;
+        memcpy(buf, &old_version, sizeof(old_version));
+        assert(mtmd_input_chunk_load(buf, expected_len) == NULL);
+        memcpy(buf, &version, sizeof(version));
 
         // loading from a truncated buffer must fail gracefully, not crash
         if (expected_len > 1) {
