@@ -5376,9 +5376,7 @@ private:
     }
 
     bool swa_window_eligible(const server_slot & slot) const {
-        return swa_window_checkpoint_limit > 0 && prompt_cache && slots.size() > 1 &&
-            params_base.kv_unified && !params_base.ctx_shift && params_base.n_cache_reuse == 0 &&
-            params_base.cache_plan_authority == common_cache_plan_authority_level::off &&
+        return swa_window_checkpoint_limit > 0 && active_prefix_enabled() &&
             !ctx_dft && !slot.can_speculate() && !slot.diff_self_spec && slot.lora.empty() &&
             slot.task && slot.task->type == SERVER_TASK_TYPE_COMPLETION && slot.task->params.cache_prompt &&
             !slot.task->is_parent() && !slot.task->is_child() &&

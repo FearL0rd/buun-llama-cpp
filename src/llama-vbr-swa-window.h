@@ -41,7 +41,7 @@ struct vbr_swa_window_capture_request {
     // owning lease that releases the charge at destruction. The image retains
     // it across all shared readers. A null lease declines BEFORE payload reads.
     // Server integration must bind this to its host-cache budget, not a second
-    // unaccounted allowance. No server caller is enabled by this module.
+    // unaccounted allowance.
     void * capacity_context = nullptr;
     std::shared_ptr<void> (*reserve)(void *, size_t bytes) = nullptr;
     void * continue_context = nullptr;

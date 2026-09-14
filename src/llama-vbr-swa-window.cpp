@@ -680,7 +680,7 @@ public:
         plan.required_watermark = std::min<uint64_t>(cells.size(),
             ((uint64_t(last_used)+pad-1)/pad)*pad);
         // This is a required endpoint, NOT proof of mapping or byte capacity.
-        // P2's write adapter must preflight actual backing at this endpoint.
+        // The installer must preflight actual backing at this endpoint.
         const auto & base_cells = base.v_cells[0];
         for (uint32_t cell = 0; cell < base_cells.size(); ++cell) {
             if (base_cells.pos_in(cell, 0, plan.image->frontier_) && base_cells.seq_has(cell, plan.image->sequence_)) {

@@ -418,7 +418,7 @@ public:
     }
 
     // check if the cell contains seq_id
-    // Iterate the sequences ACTUALLY occupying cell i — O(occupants), not O(LLAMA_MAX_SEQ).
+    // Iterate the sequences occupying cell i, in ascending order.
     // Ownership-index maintenance walks this per touched cell on whole-cache edits.
     template <typename F>
     void seq_for_each(uint32_t i, F && f) const {
@@ -429,9 +429,10 @@ public:
             f((llama_seq_id) s);
         }
 #else
-        for (size_t s = 0; s < set.size(); ++s) {
+        for (size_t s = 0, remaining = set.count(); remaining && s < set.size(); ++s) {
             if (set.test(s)) {
                 f((llama_seq_id) s);
+                --remaining;
             }
         }
 #endif
