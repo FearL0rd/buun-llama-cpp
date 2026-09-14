@@ -335,11 +335,7 @@ static ggml_cuda_device_info ggml_cuda_init() {
 
         info.default_tensor_split[id] = total_vram;
         total_vram += device_vram;
-#if defined(GGML_USE_HIP)
-        info.devices[id].integrated = prop.integrated;
-#else
         info.devices[id].integrated = false; // Temporarily disabled due to issues with corrupted output (e.g. #15034)
-#endif
         info.devices[id].nsm        = prop.multiProcessorCount;
         info.devices[id].smpb       = prop.sharedMemPerBlock;
         info.devices[id].warp_size  = prop.warpSize;
@@ -2443,24 +2439,29 @@ static bool ggml_cuda_mul_mat_bf16_residual_rms(
 #endif
 
 static void ggml_cuda_mul_mat_cublas(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+    const int cc = ggml_cuda_info().devices[ctx.device].cc;
     ggml_type compute_type = src0->type;
     if (compute_type == GGML_TYPE_F8_E4M3) {
         // Channel-scaled E4M3 stores large unscaled values and applies its
         // per-output-channel scale after the matrix product. FP16 accumulation
         // can overflow before that scale is applied, so retain the FP32-range
         // exponent of BF16 where available.
-        compute_type = bf16_mma_hardware_available(ggml_cuda_info().devices[ctx.device].cc)
+        compute_type = bf16_mma_hardware_available(cc)
             ? GGML_TYPE_BF16
             : GGML_TYPE_F32;
     } else if (ggml_is_quantized(compute_type)) {
         // BF16 inputs with F32 accumulation beat the F16 path on both speed
         // and fidelity where BF16 MMA exists (GPTQ Q4_1: 3340 vs 3134 PP2048,
         // KLD 0.0102 vs 0.0103).
-        const int cc = ggml_cuda_info().devices[ctx.device].cc;
         compute_type = bf16_mma_hardware_available(cc) ? GGML_TYPE_BF16 :
                        fast_fp16_hardware_available(cc) ? GGML_TYPE_F16 : GGML_TYPE_F32;
-    } else if (compute_type == GGML_TYPE_F16 && !fast_fp16_hardware_available(ggml_cuda_info().devices[ctx.device].cc)) {
+    } else if (compute_type == GGML_TYPE_F16 && !fast_fp16_hardware_available(cc)) {
         compute_type = GGML_TYPE_F32;
+    } else if (compute_type == GGML_TYPE_BF16 && !fast_bf16_hardware_available(cc)) {
+        if ((GGML_CUDA_CC_IS_AMD(cc) && src1->ne[1] > 32) ||
+            (GGML_CUDA_CC_IS_NVIDIA(cc) && src1->ne[1] > (cc >= GGML_CUDA_CC_VOLTA ? 8 : 128))) {
+            compute_type = GGML_TYPE_F32;
+        }
     }
     if (dst->op_params[0] == GGML_PREC_F32) {
         compute_type = GGML_TYPE_F32;
