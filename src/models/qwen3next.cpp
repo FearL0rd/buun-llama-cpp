@@ -2,7 +2,7 @@
 #include "llama-memory-recurrent.h"
 
 void llama_model_qwen3next::load_arch_hparams(llama_model_loader & ml) {
-    ml.get_key(LLM_KV_EXPERT_FEED_FORWARD_LENGTH,        hparams.n_ff_exp, false);
+    ml.get_key_or_arr(LLM_KV_EXPERT_FEED_FORWARD_LENGTH, hparams.n_ff_exp_arr, hparams.n_layer_all, false);
     ml.get_key(LLM_KV_EXPERT_SHARED_FEED_FORWARD_LENGTH, hparams.n_ff_shexp, false);
     ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS,       hparams.f_norm_rms_eps);
 
@@ -50,8 +50,6 @@ void llama_model_qwen3next::load_arch_tensors(llama_model_loader & ml) {
         output = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), { n_embd, n_vocab }, TENSOR_DUPLICATED);
     }
 
-    const int64_t n_ff_exp = hparams.n_ff_exp ? hparams.n_ff_exp : n_ff / n_expert_used;
-
     // Calculate dimensions from hyperparameters
     const int64_t head_k_dim = hparams.ssm_d_state;
     const int64_t head_v_dim = hparams.ssm_d_state;
@@ -67,6 +65,7 @@ void llama_model_qwen3next::load_arch_tensors(llama_model_loader & ml) {
 
     auto load_block_trunk = [&](int il, int flags) {
         auto & layer = layers[il];
+        const uint32_t n_ff_exp = hparams.n_ff_exp(il) ? hparams.n_ff_exp(il) : hparams.n_ff(il) / hparams.n_expert_used(il);
         const uint32_t n_ff_shexp = hparams.n_ff_shexp > 0 ? hparams.n_ff_shexp : hparams.n_ff(il);
 
         layer.attn_norm      = create_tensor(tn(LLM_TENSOR_ATTN_NORM,      "weight", il), { n_embd }, flags);
@@ -577,7 +576,7 @@ ggml_tensor * llama_model_qwen3next::graph::build_layer_ffn(ggml_tensor * cur, c
                 model.layers[il].ffn_gate_exps,
                 model.layers[il].ffn_down_exps,
                 nullptr,
-                n_expert, n_expert_used,
+                n_expert, cparams.warmup ? n_expert : hparams.n_expert_used(il),
                 LLM_FFN_SILU, true,
                 hparams.expert_weights_scale,
                 LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX, il,
@@ -768,7 +767,7 @@ llama_model_qwen3next::graph_mtp::graph_mtp(const llama_model & model, const llm
             layer.ffn_gate_exps,
             layer.ffn_down_exps,
             nullptr,
-            n_expert, n_expert_used,
+            n_expert, cparams.warmup ? n_expert : hparams.n_expert_used(il),
             LLM_FFN_SILU, true,
             hparams.expert_weights_scale,
             LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX, il,
