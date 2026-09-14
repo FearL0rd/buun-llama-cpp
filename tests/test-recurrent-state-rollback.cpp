@@ -1,6 +1,8 @@
 #include "arg.h"
 #include "common.h"
+#include "ggml-backend.h"
 #include "llama-batch.h"
+#include "llama-io.h"
 #include "llama-memory-hybrid-idx.h"
 #include "llama-memory-hybrid-iswa.h"
 #include "llama-memory-hybrid.h"
@@ -15,8 +17,58 @@
 #include <cstdlib>
 #include <cstdio>
 #include <limits>
+#include <set>
 #include <string>
 #include <vector>
+
+static bool cache_pattern_fill = false;
+
+struct cache_buffer_collector : llama_io_write_i {
+    std::set<ggml_backend_buffer_t> buffers;
+    size_t size = 0;
+
+    void write(const void *, size_t n) override { size += n; }
+    void write_tensor(ggml_tensor * tensor, size_t, size_t n) override {
+        buffers.insert(tensor->buffer);
+        size += n;
+    }
+    size_t n_bytes() override { return size; }
+};
+
+static llama_context_ptr init_ctx(llama_model * model, llama_context_params cparams) {
+    llama_context_ptr ctx(llama_init_from_model(model, cparams));
+    if (!ctx || !cache_pattern_fill) {
+        return ctx;
+    }
+
+    // Discover buffers after a full ubatch, preserving the prefill allocation size.
+    const uint32_t count = llama_n_ubatch(ctx.get());
+    llama_batch batch = llama_batch_init(count, 0, 1);
+    for (uint32_t pos = 0; pos < count; ++pos) {
+        common_batch_add(batch, 0, pos, { 0 }, pos + 1 == count);
+    }
+    const bool ok = llama_decode(ctx.get(), batch) == 0;
+    llama_batch_free(batch);
+    if (!ok) {
+        return nullptr;
+    }
+    llama_synchronize(ctx.get());
+    cache_buffer_collector collector;
+    llama_get_memory(ctx.get())->state_write(collector);
+    llama_memory_clear(llama_get_memory(ctx.get()), true);
+    if (collector.buffers.empty()) {
+        fprintf(stderr, "%s : no cache buffers found\n", __func__);
+        return nullptr;
+    }
+    for (auto * buffer : collector.buffers) {
+        ggml_backend_buffer_clear(buffer, 0x3e);
+    }
+    return ctx;
+}
+
+static float logit_diff(float a, float b) {
+    return std::isfinite(a) && std::isfinite(b) ? std::fabs(a - b) : std::numeric_limits<float>::infinity();
+}
 
 static llama_context_ptr make_ctx(const common_params & params, llama_model * model, uint32_t n_seq_max = 1) {
     auto cparams = common_context_params_to_llama(params);
@@ -24,7 +76,7 @@ static llama_context_ptr make_ctx(const common_params & params, llama_model * mo
     cparams.n_rs_seq  = 8;
     cparams.n_batch   = std::max(cparams.n_batch,  n_seq_max * (cparams.n_rs_seq + 1));
     cparams.n_ubatch  = std::max(cparams.n_ubatch, n_seq_max * (cparams.n_rs_seq + 1));
-    return llama_context_ptr(llama_init_from_model(model, cparams));
+    return init_ctx(model, cparams);
 }
 
 static llama_memory_recurrent * get_recurrent(llama_context * ctx) {
@@ -983,7 +1035,7 @@ static bool test_multi_seq_split_replay(const common_params & params, llama_mode
         cparams.n_batch    = 256;
         cparams.n_ubatch   = n_ubatch;
         cparams.kv_unified = false;
-        return llama_context_ptr(llama_init_from_model(model, cparams));
+        return init_ctx(model, cparams);
     };
 
     auto ctx_roll = make_ctx_multi();
@@ -1069,7 +1121,7 @@ static bool test_multi_seq_split_replay(const common_params & params, llama_mode
             return false;
         }
         for (int t = 0; t < n_vocab; ++t) {
-            const float diff = std::fabs(l_roll[t] - l_ref[t]);
+            const float diff = logit_diff(l_roll[t], l_ref[t]);
             if (diff > eps && pos_first < 0) {
                 seq_first = i/n_replay;
                 pos_first = p0 + (int32_t) (i%n_replay);
@@ -1116,7 +1168,7 @@ static bool test_multi_seq_split_replay(const common_params & params, llama_mode
         const float * l_ref  = llama_get_logits_ith(ctx_ref.get(),  0);
         ok = l_roll != nullptr && l_ref != nullptr;
         for (int t = 0; ok && t < n_vocab; ++t) {
-            diff_tail = std::max(diff_tail, std::fabs(l_roll[t] - l_ref[t]));
+            diff_tail = std::max(diff_tail, logit_diff(l_roll[t], l_ref[t]));
         }
     }
 
@@ -1174,6 +1226,11 @@ int main(int argc, char ** argv) {
     common_init();
 
     std::vector<std::string> parser_args(argv, argv + argc);
+    const auto fill_arg = std::find(parser_args.begin(), parser_args.end(), "--cache-pattern-fill");
+    cache_pattern_fill = fill_arg != parser_args.end();
+    if (cache_pattern_fill) {
+        parser_args.erase(fill_arg);
+    }
     const auto shared_swa_arg = std::find(parser_args.begin(), parser_args.end(), "--shared-swa-wrap-only");
     const bool shared_swa_only = shared_swa_arg != parser_args.end();
     if (shared_swa_only) {

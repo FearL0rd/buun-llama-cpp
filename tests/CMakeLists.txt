@@ -458,6 +458,16 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
         FIXTURES_REQUIRED generate-models
     )
 
+    foreach (MODEL qwen35-dense nemotron_h-dense deepseek4-moe kimi-k3-moe)
+        llama_test(
+            test-recurrent-state-rollback
+            NAME test-recurrent-state-pattern-${MODEL}
+            LABEL main
+            ARGS -m "${MODEL_DIR}/${MODEL}.gguf" --cache-pattern-fill)
+        set_tests_properties(test-recurrent-state-pattern-${MODEL} PROPERTIES
+            FIXTURES_REQUIRED generate-models)
+    endforeach()
+
     # Test state save/load functionality across all architectures, using the generated dummy models
     llama_test(
         test-save-load-state

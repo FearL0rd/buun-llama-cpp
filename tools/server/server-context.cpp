@@ -19492,8 +19492,24 @@ private:
                                 checkpoint_publication_allowed = false;
                             }
                         } else if (!slot.lifecycle_authority) {
-                            int64_t last = -1;
+                            // The incoming image is already captured. Supersede only an
+                            // identical frontier, not merely an equal token count from
+                            // another request/adapter/media or VBR representation.
                             for (auto it = slot.prompt.checkpoints.begin(); it != slot.prompt.checkpoints.end(); ) {
+                                const auto & incoming = staged.back();
+                                if (it->pos_min == incoming.pos_min && it->pos_max == incoming.pos_max &&
+                                    server_cache_checkpoint_bounded_replay(*it, incoming, 0)) {
+                                    it = slot.checkpoint_drop(
+                                        it, std::next(it),
+                                        server_cache_destruction_reason::checkpoint_thin);
+                                } else {
+                                    ++it;
+                                }
+                            }
+                            int64_t last = -1;
+                            for (auto it = slot.prompt.checkpoints.begin();
+                                 slot.prompt.checkpoints.size() + 1 >= (size_t) params_base.n_ctx_checkpoints &&
+                                 it != slot.prompt.checkpoints.end(); ) {
                                 if (it->id_task != ckpt_id_task && last >= 0 &&
                                     it->n_tokens <= last + params_base.checkpoint_min_step) {
                                     SLT_TRC(slot,
