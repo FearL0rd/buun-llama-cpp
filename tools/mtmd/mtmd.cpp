@@ -129,7 +129,7 @@ void clip_image_f32_batch::serialize(mtmd_serialization & ser) const {
 void clip_image_f32_batch::deserialize(mtmd_serialization & ser) {
     is_audio = ser.read<bool>();
     uint64_t n = ser.read<uint64_t>();
-    constexpr size_t min_entry_bytes = sizeof(uint8_t) * 2 + sizeof(int32_t) * 2;
+    constexpr size_t min_entry_bytes = sizeof(uint8_t) * 2 + sizeof(int32_t) * 3;
     if (n > (ser.data.size() - ser.read_pos) / min_entry_bytes) {
         throw std::runtime_error("entries count exceeds buffer size");
     }
