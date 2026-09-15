@@ -1173,7 +1173,11 @@ void llama_safetensors_quant_adapters::validate() {
                      group->format == llama_safetensors_quant_format::MXFP8);
                 if (!fp8_group) {
                     if (tensor.dtype == llama_safetensors_dtype::F8_E4M3) {
-                        if (config_.ignored(module)) {
+                        // EXL3's catch-all rule describes trellis projections;
+                        // dense FP8 weights (e.g. embeddings) are stored unscaled.
+                        if (config_.ignored(module) ||
+                            (group != nullptr && group->format == llama_safetensors_quant_format::EXL3 &&
+                             !format_applies(module, *group))) {
                             continue;
                         }
                         throw std::runtime_error("quantization contract does not match source tensor '" + tensor.name + "'");

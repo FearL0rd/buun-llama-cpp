@@ -835,6 +835,68 @@ int main(int argc, char ** argv) {
     }
 
     {
+        // EXL3 quantizes projections, but can store a plain FP8 embedding next
+        // to ordinary dense norms. Neither needs EXL3 sign vectors or FP8 scales.
+        const auto path = dir.path / "exl3-dense-fp8";
+        const std::string embedding = "model.language_model.embed_tokens";
+        const std::string projection = "model.language_model.layers.0.mlp.gate_proj";
+        std::vector<uint8_t> embedding_bytes(256);
+        for (size_t i = 0; i < embedding_bytes.size(); ++i) {
+            embedding_bytes[i] = uint8_t(i);  // Preserve every source bit pattern.
+        }
+        std::vector<tensor_fixture> tensors = {
+            { embedding + ".weight", "F8_E4M3", {2, 128}, embedding_bytes },
+            { "model.language_model.norm.weight", "BF16", {2}, {0, 0, 0x80, 0x3f} },
+            { "dense_f16.weight", "F16", {2}, {0, 0, 0, 0x3c} },
+            { "dense_f32.weight", "F32", {1}, f32_bytes(1.0f) },
+            { projection + ".trellis", "I16", {8, 8, 32}, std::vector<uint8_t>(4096) },
+            { projection + ".suh", "F16", {128}, std::vector<uint8_t>(256) },
+            { projection + ".svh", "F16", {128}, std::vector<uint8_t>(256) },
+        };
+        write_single_shard_model(path, tensors);
+        write_text(path / "tokenizer.json", "{}");
+        const json config = {
+            {"model_type", "qwen3_5_text"}, {"num_hidden_layers", 64},
+            {"linear_num_key_heads", 1}, {"linear_num_value_heads", 1},
+            {"linear_key_head_dim", 128}, {"linear_value_head_dim", 128},
+            {"quantization_config", {{"quant_method", "exl3"}}},
+        };
+        for (auto mode : {llama_safetensors_io_mode::BUFFERED, llama_safetensors_io_mode::MMAP}) {
+            const auto registry = llama_safetensors_registry::load(path, mode);
+            llama_safetensors_quant_adapters adapters(config, registry);
+            require(!adapters.applies(embedding) &&
+                        !adapters.bind(embedding, llama_safetensors_quant_role::WEIGHT),
+                    "EXL3 claimed a plain FP8 embedding");
+            require(adapters.applies(projection) && adapters.summary().exl3 == 1,
+                    "plain FP8 exception disabled EXL3 projection validation");
+            llama_safetensors_qwen35_importer importer(path, config, mode);
+            ggml_type type;
+            std::array<int64_t, GGML_MAX_DIMS> ne;
+            require(importer.describe("token_embd.weight", type, ne) &&
+                        type == GGML_TYPE_F8_E4M3 && ne[0] == 128 && ne[1] == 2,
+                    "EXL3 plain FP8 embedding descriptor changed");
+            require(importer.materialize("token_embd.weight", type, 256) == embedding_bytes,
+                    "EXL3 plain FP8 embedding bytes changed");
+            require(importer.describe("output_norm.weight", type, ne) && type == GGML_TYPE_F32,
+                    "EXL3 dense BF16 norm did not use ordinary F32 conversion");
+            const auto norm = importer.materialize("output_norm.weight", type, 8);
+            float values[2];
+            std::memcpy(values, norm.data(), sizeof(values));
+            require(values[0] == 1.0f && values[1] == 2.0f, "EXL3 offset norm values changed");
+            require_rejected([&] { (void) llama_safetensors_quant_adapters(json::object(), registry); },
+                             "raw FP8 without a supported contract was accepted");
+            require_rejected([&] { (void) llama_safetensors_quant_adapters(json::parse(fp8_block_config), registry); },
+                             "scaled FP8 without required scales was accepted");
+        }
+        tensors.pop_back();  // The dense exception must not hide a missing EXL3 svh.
+        const auto malformed = dir.path / "exl3-dense-fp8-missing-svh";
+        write_single_shard_model(malformed, tensors);
+        const auto registry = llama_safetensors_registry::load(malformed);
+        require_rejected([&] { (void) llama_safetensors_quant_adapters(config, registry); },
+                         "EXL3 with a missing sign vector was accepted");
+    }
+
+    {
         // Streamed stacked experts must retain exact expert order. The PLE
         // table has a different (already canonical) on-disk layout.
         const auto path = dir.path / "qwen-streamed-exl3";
