@@ -1225,6 +1225,34 @@ int main(int argc, char ** argv) {
                 "naive-quantized channel-FP8 group was not recognized");
     }
 
+    // A module-class fallback must not shadow a named mixed-precision exception,
+    // even when the producer declares Linear first (Syv's INT8 embeddings).
+    {
+        auto config = llama_safetensors_json::parse(packed_int4_symmetric_config);
+        auto & groups = config["quantization_config"]["config_groups"];
+        groups["int4"]["targets"] = { "Linear" };
+        groups["embedding"] = groups["int4"];
+        groups["embedding"]["targets"] = { "re:.*embed_tokens$" };
+        groups["embedding"]["weights"]["num_bits"] = 8;
+        config["quantization_config"]["ignore"] = { "ignored" };
+        auto parsed = llama_safetensors_quant_config::from_json(config);
+        require(parsed.match("model.language_model.embed_tokens")->num_bits == 8,
+                "Linear class fallback shadows the INT8 embedding exception");
+        require(parsed.match("model.layers.0.self_attn.q_proj")->num_bits == 4,
+                "Linear class fallback no longer binds ordinary projections");
+        require(parsed.match("ignored") == nullptr, "class fallback bypasses ignore rules");
+        // An explicit wildcard is a named regex, not the Linear class fallback.
+        groups["int4"]["targets"] = { "re:.*" };
+        parsed = llama_safetensors_quant_config::from_json(config);
+        require(parsed.match("model.language_model.embed_tokens")->num_bits == 4,
+                "named regex declaration precedence changed");
+        groups["int4"]["targets"] = { "Linear" };
+        groups["embedding"]["targets"] = { "model.language_model.embed_tokens" };
+        parsed = llama_safetensors_quant_config::from_json(config);
+        require(parsed.match("model.language_model.embed_tokens")->num_bits == 8,
+                "Linear class fallback shadows an exact module name");
+    }
+
     // AutoRound/INC publishes the same group-32 MXFP tensors as
     // compressed-tensors under a compact flat config. Both schemas must bind
     // to the same canonical types, including its per-module FP16 exceptions.
@@ -2815,6 +2843,39 @@ int main(int argc, char ** argv) {
         constexpr size_t block_size = sizeof(uint16_t) + 128;
         require(repacked.size() == rows * (cols / 128) * block_size,
                 "compressed-tensors INT8 exact repack has the wrong size");
+        ggml_backend_load_all();
+        ggml_backend_ptr cpu(ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr));
+        for (bool offset_view : { false, true }) {
+            if (!cpu) {
+                std::cout << "CPU packed INT8 embedding lookup SKIPPED (no CPU backend)\n";
+                break;
+            }
+            ggml_context_ptr ctx(ggml_init({ 1024 * 1024, nullptr, false }));
+            auto * table = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_Q8_0_G128, cols, rows);
+            std::memcpy(table->data, repacked.data(), repacked.size());
+            const int first_row = offset_view ? 1 : 0;
+            if (offset_view) {
+                table = ggml_view_2d(ctx.get(), table, cols, rows - 1, table->nb[1], table->nb[1]);
+            }
+            const std::array<int32_t, 5> row_ids = { 1, 0, 1, 0, 1 };
+            auto * ids = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_I32, row_ids.size());
+            std::memcpy(ids->data, row_ids.data(), sizeof(row_ids));
+            auto * output = ggml_get_rows(ctx.get(), table, ids);
+            auto * graph = ggml_new_graph(ctx.get());
+            ggml_build_forward_expand(graph, output);
+            require(ggml_backend_graph_compute(cpu.get(), graph) == GGML_STATUS_SUCCESS,
+                    "CPU packed INT8 embedding lookup failed");
+            const auto * values = static_cast<const float *>(output->data);
+            for (size_t i = 0; i < row_ids.size(); ++i) {
+                const int row = row_ids[i] + first_row;
+                for (size_t col = 0; col < cols; ++col) {
+                    const int code = int((17 * row + col) % 256) - 128;
+                    const float scale = 0.5f + 0.5f * ((row + col / 128) % 3);
+                    require(values[i * cols + col] == code * scale,
+                            "CPU packed INT8 embedding lookup changed a row/lane value");
+                }
+            }
+        }
         for (size_t row = 0; row < rows; ++row) {
             for (size_t block = 0; block < cols / 128; ++block) {
                 const float expected_scale = 0.5f + 0.5f * ((row + block) % 3);

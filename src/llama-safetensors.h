@@ -119,7 +119,8 @@ struct llama_safetensors_quant_group {
 };
 
 // Parsed compressed-tensors contracts from config.json. Matching preserves the
-// producer's declaration order and anchors regex matching at the module start.
+// producer's declaration order among named rules, before the Linear class
+// fallback, and anchors regex matching at the module start.
 class llama_safetensors_quant_config {
   public:
     static llama_safetensors_quant_config load(const std::filesystem::path & model_dir);

@@ -1589,11 +1589,9 @@ llama_safetensors_quant_config llama_safetensors_quant_config::from_json(const l
             if (!target.is_string()) {
                 throw std::runtime_error("non-string target in quantization group '" + name + "'");
             }
-            const std::string declared_target = target.get<std::string>();
-            // compressed-tensors uses module class names as selectors in
-            // older single-format checkpoints. Importers ask this registry
-            // only about projection modules, so Linear is their catch-all.
-            const std::string target_name = declared_target == "Linear" ? "re:.*" : declared_target;
+            // Keep class selectors distinct from named regexes: Linear is a
+            // projection fallback, not a wildcard that shadows explicit rules.
+            const std::string target_name = target.get<std::string>();
             const auto existing = std::find_if(result.rules_.begin(), result.rules_.end(), [&](const rule & item) {
                 return item.target == target_name;
             });
@@ -1632,12 +1630,17 @@ const llama_safetensors_quant_group * llama_safetensors_quant_config::match_unca
     if (ignored(module_name)) {
         return nullptr;
     }
+    const llama_safetensors_quant_group * linear = nullptr;
     for (const rule & candidate : rules_) {
+        if (candidate.target == "Linear") {
+            linear = &groups_.at(candidate.group);
+            continue;
+        }
         if (rule_matches(candidate, module_name)) {
             return &groups_.at(candidate.group);
         }
     }
-    return nullptr;
+    return linear;
 }
 
 const llama_safetensors_quant_group * llama_safetensors_quant_config::match(const std::string & module_name) const {

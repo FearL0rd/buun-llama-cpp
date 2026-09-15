@@ -2783,15 +2783,16 @@ static void test_dflash_loader_exact_identity() {
     }
 }
 
-static file_ptr make_qwen35_mtp_sidecar(const ggml_type d2t_type, const size_t seed) {
+static file_ptr make_qwen35_mtp_sidecar(const ggml_type d2t_type, const size_t seed,
+        const bool fused_qkv = false, const llm_arch arch = LLM_ARCH_QWEN35) {
     GGML_ASSERT(d2t_type == GGML_TYPE_I32 || d2t_type == GGML_TYPE_I64);
     file_ptr file = make_test_tmpfile();
     if (!file) {
         return file;
     }
 
-    gguf_context_ptr source_gguf = get_gguf_ctx(LLM_ARCH_QWEN35, false);
-    llama_model_saver source_meta(LLM_ARCH_QWEN35, source_gguf.get());
+    gguf_context_ptr source_gguf = get_gguf_ctx(arch, arch == LLM_ARCH_QWEN35MOE);
+    llama_model_saver source_meta(arch, source_gguf.get());
     source_meta.add_kv(LLM_KV_NEXTN_PREDICT_LAYERS, uint32_t(1));
 
     llama_model_params source_params = llama_model_default_params();
@@ -2808,10 +2809,12 @@ static file_ptr make_qwen35_mtp_sidecar(const ggml_type d2t_type, const size_t s
     }
 
     // Write a genuine MTP-only sidecar: omit the trunk and the optional full-vocab
-    // NextN embedding/head so the normal loader must select tok_embd/output+d2t.
+    // NextN embedding/head so the normal loader must select tok_embd/output
+    // (with d2t for the compact-head fixture).
     gguf_context_ptr sidecar_gguf(gguf_init_empty());
     gguf_set_kv(sidecar_gguf.get(), source_gguf.get());
-    llama_model_saver saver(LLM_ARCH_QWEN35, sidecar_gguf.get());
+    llama_model_saver saver(arch, sidecar_gguf.get());
+    const auto & mtp_layer = source->layers[source->hparams.n_layer()];
     for (const auto & entry : llama_internal_get_tensor_map(source.get())) {
         const std::string & name = entry.first;
         if (name.rfind("blk.0.", 0) == 0 ||
@@ -2820,19 +2823,45 @@ static file_ptr make_qwen35_mtp_sidecar(const ggml_type d2t_type, const size_t s
                 name == "output.weight") {
             continue;
         }
+        if (fused_qkv && (entry.second == mtp_layer.wq ||
+                         entry.second == mtp_layer.wk || entry.second == mtp_layer.wv ||
+                         entry.second == mtp_layer.wq_s || entry.second == mtp_layer.wk_s ||
+                         entry.second == mtp_layer.wv_s)) {
+            continue;
+        }
         saver.add_tensor(entry.second);
     }
 
     ggml_init_params tensor_params = {
-        /*.mem_size   =*/ 64*1024,
+        /*.mem_size   =*/ 128*1024 + (fused_qkv ? ggml_nbytes(mtp_layer.wq) +
+                ggml_nbytes(mtp_layer.wk) + ggml_nbytes(mtp_layer.wv) : 0),
         /*.mem_buffer =*/ nullptr,
         /*.no_alloc   =*/ false,
     };
     ggml_context_ptr tensor_ctx(ggml_init(tensor_params));
-    ggml_tensor * output = ggml_new_tensor_2d(tensor_ctx.get(), GGML_TYPE_F16, 256, 32);
+    if (fused_qkv) {
+        auto * qkv = ggml_new_tensor_2d(tensor_ctx.get(), mtp_layer.wq->type,
+                mtp_layer.wq->ne[0], mtp_layer.wq->ne[1] + mtp_layer.wk->ne[1] + mtp_layer.wv->ne[1]);
+        const std::string name = "blk." + std::to_string(source->hparams.n_layer()) + ".attn_qkv.weight";
+        ggml_set_name(qkv, name.c_str());
+        size_t offset = 0;
+        for (auto * part : { mtp_layer.wq, mtp_layer.wk, mtp_layer.wv }) {
+            ggml_backend_tensor_get(part, static_cast<char *>(qkv->data) + offset, 0, ggml_nbytes(part));
+            offset += ggml_nbytes(part);
+        }
+        saver.add_tensor(qkv);
+    }
+    ggml_tensor * output = ggml_new_tensor_2d(tensor_ctx.get(), GGML_TYPE_F16, 256, fused_qkv ? 128 : 32);
     ggml_set_name(output, "output.weight");
     memset(output->data, 0, ggml_nbytes(output));
     saver.add_tensor(output);
+
+    if (fused_qkv) {
+        saver.save(file.get());
+        fflush(file.get());
+        rewind(file.get());
+        return file;
+    }
 
     ggml_tensor * d2t = ggml_new_tensor_1d(tensor_ctx.get(), d2t_type, 32);
     ggml_set_name(d2t, "d2t");
@@ -2883,6 +2912,33 @@ static std::pair<llama_model_ptr, llama_context_ptr> load_qwen35_mtp_sidecar(FIL
         throw std::runtime_error("failed to create Qwen3.5 MTP context");
     }
     return std::make_pair(std::move(model), std::move(ctx));
+}
+
+static void test_qwen35_mtp_fused_qkv(const size_t seed, const llm_arch arch) {
+    file_ptr file = make_qwen35_mtp_sidecar(GGML_TYPE_I32, seed, true, arch);
+    if (!file) {
+        printf("Qwen3.5 MTP fused QKV test SKIPPED (tmpfile unavailable)\n");
+        return;
+    }
+    auto model_and_ctx = load_qwen35_mtp_sidecar(file.get());
+    const auto & model = *model_and_ctx.first;
+    const int il = model.hparams.n_layer();
+    const auto & layer = model.layers[il];
+    GGML_ASSERT(layer.wqkv && !layer.wq && !layer.wk && !layer.wv);
+
+    for (const int n_tokens : { 1, 4 }) {
+        auto * gf = llama_graph_reserve(model_and_ctx.second.get(), n_tokens, 1, 1);
+        GGML_ASSERT(gf);
+        const std::string suffix = "-" + std::to_string(il);
+        auto * q = ggml_graph_get_tensor(gf, ("mtp_Qcur_full" + suffix).c_str());
+        auto * v = ggml_graph_get_tensor(gf, ("mtp_Vcur" + suffix).c_str());
+        GGML_ASSERT(q && v);
+        GGML_ASSERT(q->ne[2] == n_tokens && v->ne[2] == n_tokens);
+        const size_t token_stride = layer.wqkv->ne[1] * ggml_element_size(q);
+        GGML_ASSERT(q->nb[2] == token_stride && v->nb[2] == token_stride);
+        GGML_ASSERT(q->view_src == v->view_src);
+    }
+    printf("Qwen3.5 MTP fused QKV graph test OK (%s)\n", llm_arch_name(arch));
 }
 
 static void test_qwen35_mtp_d2t_contract(const size_t seed) {
@@ -4163,7 +4219,11 @@ int main(int argc, char ** argv) {
             return save_models(arch, seed, verbosity, out);
         }
         if (arch == LLM_ARCH_UNKNOWN || arch == LLM_ARCH_QWEN35) {
+            test_qwen35_mtp_fused_qkv(seed, LLM_ARCH_QWEN35);
             test_qwen35_mtp_d2t_contract(seed);
+        }
+        if (arch == LLM_ARCH_UNKNOWN || arch == LLM_ARCH_QWEN35MOE) {
+            test_qwen35_mtp_fused_qkv(seed, LLM_ARCH_QWEN35MOE);
         }
         if (arch == LLM_ARCH_UNKNOWN || arch == LLM_ARCH_QWEN4EXP) {
             test_qwen4_ple_recurrent_resize(seed);
