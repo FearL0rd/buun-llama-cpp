@@ -254,6 +254,36 @@ static void test(void) {
     }
 
     {
+        // Parameter projection only: these opaque device identities are never dereferenced.
+        const auto dev0 = reinterpret_cast<ggml_backend_dev_t>(uintptr_t(1));
+        const auto dev1 = reinterpret_cast<ggml_backend_dev_t>(uintptr_t(2));
+        common_params base;
+        base.devices = { dev0, dev1, nullptr };
+        base.split_mode = LLAMA_SPLIT_MODE_TENSOR;
+        base.speculative.draft.mparams.path = "draft.gguf";
+
+        const auto inherited = common_base_params_to_speculative(base);
+        assert(inherited.devices == base.devices);
+        assert(inherited.split_mode == LLAMA_SPLIT_MODE_TENSOR);
+
+        base.speculative.draft.devices = { dev1, nullptr };
+        const auto pinned = common_base_params_to_speculative(base);
+        assert(pinned.devices == base.speculative.draft.devices);
+        assert(pinned.split_mode == LLAMA_SPLIT_MODE_LAYER);
+        assert(base.split_mode == LLAMA_SPLIT_MODE_TENSOR);
+
+        base.speculative.draft.devices = { dev1, dev0, nullptr };
+        const auto multi = common_base_params_to_speculative(base);
+        assert(multi.devices == base.speculative.draft.devices);
+        assert(multi.split_mode == LLAMA_SPLIT_MODE_TENSOR);
+
+        base.speculative.draft.devices = { nullptr };
+        const auto cpu = common_base_params_to_speculative(base);
+        assert(cpu.devices == base.speculative.draft.devices);
+        assert(cpu.split_mode == LLAMA_SPLIT_MODE_TENSOR);
+    }
+
+    {
         common_params_speculative spec;
         spec.types = { COMMON_SPECULATIVE_TYPE_DRAFT_MTP };
         assert(!spec.has_non_mtp_model_drafter());
