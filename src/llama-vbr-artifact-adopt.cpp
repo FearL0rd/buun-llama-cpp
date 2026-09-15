@@ -1298,7 +1298,7 @@ class vbr_kv_import_session {
         GGML_ASSERT(armed_ && image_ready_ && !published_);
         GGML_ASSERT(mapped_prefixes_complete());
         for (size_t i = 0; i < final_cells_.size(); ++i) {
-            std::swap(cache_->v_cells[i], final_cells_[i]);
+            cache_->v_cells[i].swap(final_cells_[i]);
         }
         cache_->v_heads.swap(final_heads_);
         cache_->vbr_ownership_.swap(final_ownership_);

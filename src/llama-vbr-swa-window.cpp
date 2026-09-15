@@ -560,8 +560,8 @@ public:
         static_assert(std::is_nothrow_swappable<llama_kv_cells>::value, "cell publication must not allocate");
         base_tracker->install_cell_update(base_update, operation.id());
         swa_tracker->install_cell_update(swa_update, operation.id());
-        std::swap(base.v_cells[0], base_cells);
-        std::swap(swa.v_cells[0], swa_cells);
+        base.v_cells[0].swap(base_cells);
+        swa.v_cells[0].swap(swa_cells);
         base.vbr_ownership_.swap(base_owners);
         swa.vbr_ownership_.swap(swa_owners);
         swa.v_heads[0] = plan.destination_cells.back()+1;

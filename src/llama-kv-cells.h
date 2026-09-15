@@ -133,6 +133,24 @@ class llama_kv_cells {
 public:
     using seq_set_t = std::bitset<LLAMA_MAX_SEQ>;
 
+    // Publish prepared metadata without move-constructing the position trees:
+    // MSVC's std::set move constructor allocates a new sentinel.
+    void swap(llama_kv_cells & other) noexcept {
+        std::swap(has_shift, other.has_shift);
+        std::swap(used, other.used);
+        pos.swap(other.pos);
+        ext.swap(other.ext);
+        shift.swap(other.shift);
+        seq.swap(other.seq);
+        for (uint32_t s = 0; s < LLAMA_MAX_SEQ; ++s) {
+            seq_pos[s].swap(other.seq_pos[s]);
+        }
+    }
+
+    friend void swap(llama_kv_cells & a, llama_kv_cells & b) noexcept {
+        a.swap(b);
+    }
+
     // Logical allocation quote for a transaction copy; excludes allocator
     // overhead/tree-node links, like the host cache's payload byte accounting.
     size_t copy_storage_bytes() const {
