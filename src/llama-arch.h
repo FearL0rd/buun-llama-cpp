@@ -544,11 +544,13 @@ enum llm_tensor {
     LLM_TENSOR_SSM_BETA,            // kimi: beta mixing coefficient and qwen3.5
     LLM_TENSOR_SSM_G_A,             // kimi: output gate projection A
     LLM_TENSOR_SSM_G_B,             // kimi: output gate projection B
-    LLM_TENSOR_SSM_G = 252,               // kimi-k3: full-rank KDA gate
-    LLM_TENSOR_ATTN_RES_SCORE = 253,      // kimi-k3: fused res_norm*res_proj (pre-attn)
-    LLM_TENSOR_FFN_RES_SCORE = 254,       // kimi-k3: fused res_norm*res_proj (pre-ffn)
-    LLM_TENSOR_OUTPUT_RES_SCORE = 255,    // kimi-k3: fused res_norm*res_proj (final)
-    LLM_TENSOR_FFN_ROUTED_DOWN = 256,     // kimi-k3: latent MoE down
+    // Move colliding incoming IDs beyond the fork's existing schema IDs.
+    // 252..256 are already used by the fork selector and conv tensors.
+    LLM_TENSOR_SSM_G = 284,               // kimi-k3: full-rank KDA gate
+    LLM_TENSOR_ATTN_RES_SCORE = 285,      // kimi-k3: fused res_norm*res_proj (pre-attn)
+    LLM_TENSOR_FFN_RES_SCORE = 286,       // kimi-k3: fused res_norm*res_proj (pre-ffn)
+    LLM_TENSOR_OUTPUT_RES_SCORE = 287,    // kimi-k3: fused res_norm*res_proj (final)
+    LLM_TENSOR_FFN_ROUTED_DOWN = 288,     // kimi-k3: latent MoE down
     LLM_TENSOR_FFN_ROUTED_UP = 257,       // kimi-k3: latent MoE up
     LLM_TENSOR_FFN_ROUTED_NORM = 258,     // kimi-k3: latent MoE norm
     LLM_TENSOR_TIME_MIX_W0 = 96,

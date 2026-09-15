@@ -728,6 +728,18 @@ static std::vector<float> get_logits(
 static void test_dflash_selector_family_contract() {
     using family = llm_dflash_selector_family;
 
+    // Enum-to-enum checks alone miss collisions with unrelated architecture
+    // tensors. Verify the wire names that the loader will actually request.
+    const LLM_TN tn(LLM_ARCH_DFLASH);
+    GGML_ASSERT(tn(LLM_TENSOR_DFLASH2_SELECTOR_HIDDEN, "weight").str() == "selector.hidden_proj.weight");
+    GGML_ASSERT(tn(LLM_TENSOR_DFLASH2_SELECTOR_PRED).str() == "selector.pred_codebook");
+    GGML_ASSERT(tn(LLM_TENSOR_DFLASH2_SELECTOR_SUCC).str() == "selector.succ_codebook");
+    GGML_ASSERT(tn(LLM_TENSOR_DFLASH2_ATTN_CONV_BASE, 0).str() == "blk.0.attn_conv.base");
+    GGML_ASSERT(tn(LLM_TENSOR_DFLASH2_ATTN_CONV_PROJ, "weight", 0).str() == "blk.0.attn_conv.proj.weight");
+    GGML_ASSERT(tn(LLM_TENSOR_DFLASH2_FFN_CONV_BASE, 0).str() == "blk.0.ffn_conv.base");
+    GGML_ASSERT(tn(LLM_TENSOR_DFLASH2_FFN_CONV_PROJ, "weight", 0).str() == "blk.0.ffn_conv.proj.weight");
+    GGML_ASSERT(tn(LLM_TENSOR_SSM_G, 0).str() == "blk.0.ssm_g");
+
     GGML_ASSERT(llm_dflash_selector_family_from_identity(false, false, false) == family::none);
     GGML_ASSERT(llm_dflash_selector_family_from_identity(true,  false, false) == family::unidentified);
     GGML_ASSERT(llm_dflash_selector_family_from_identity(false, true,  false) == family::fork_dflash2);
