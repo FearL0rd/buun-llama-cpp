@@ -4432,6 +4432,57 @@ int main(int argc, char ** argv) {
         adapters.validate_complete();
     }
     {
+        const auto path = dir.path / "nvfp4-qwen35-projection-scales";
+        // Separate projection globals cannot be represented by concatenating
+        // just the packed rows. Exercise recurrent QKV|Z and full-attention Q/K/V.
+        const std::array<std::string, 5> modules = {
+            "model.layers.0.linear_attn.in_proj_qkv", "model.layers.0.linear_attn.in_proj_z",
+            "model.layers.3.self_attn.q_proj", "model.layers.3.self_attn.k_proj",
+            "model.layers.3.self_attn.v_proj",
+        };
+        const std::array<int64_t, 5> rows = { 256, 128, 128, 64, 64 };
+        const std::array<float, 5> globals = { 0.125f, 0.25f, 0.5f, 1.0f, 2.0f };
+        std::vector<tensor_fixture> tensors;
+        for (size_t i = 0; i < modules.size(); ++i) {
+            tensors.push_back({ modules[i] + ".weight", "U8", { rows[i], 64 },
+                                std::vector<uint8_t>(size_t(rows[i])*64, 0x22) });
+            tensors.push_back({ modules[i] + ".weight_scale", "F8_E4M3", { rows[i], 8 },
+                                std::vector<uint8_t>(size_t(rows[i])*8, 0x38) });
+            tensors.push_back({ modules[i] + ".weight_scale_2", "F32", {}, f32_bytes(globals[i]) });
+        }
+        write_single_shard_model(path, tensors);
+        write_text(path / "generation_config.json", "{}");
+        write_text(path / "tokenizer.json", "{}");
+        llama_safetensors_json config = {
+            { "model_type", "qwen3_5_text" }, { "num_hidden_layers", 24 },
+            { "mtp_num_hidden_layers", 0 }, { "linear_num_key_heads", 2 },
+            { "linear_num_value_heads", 4 }, { "linear_key_head_dim", 32 },
+            { "linear_value_head_dim", 32 },
+        };
+        config["quantization_config"] =
+            llama_safetensors_json::parse(modelopt_w4a16_nvfp4_config).at("quantization_config");
+        llama_safetensors_qwen35_importer importer(path, config);
+        ggml_type type;
+        std::array<int64_t, GGML_MAX_DIMS> ne;
+        require(!importer.describe("blk.3.attn_qkv.weight", type, ne),
+                "NVFP4 full-attention projections lost their separate global scales");
+        const std::array<std::string, 5> targets = {
+            "blk.0.attn_qkv", "blk.0.attn_gate", "blk.3.attn_q", "blk.3.attn_k", "blk.3.attn_v",
+        };
+        for (size_t i = 0; i < targets.size(); ++i) {
+            require(importer.describe(targets[i] + ".weight", type, ne) && type == GGML_TYPE_NVFP4 &&
+                        ne == std::array<int64_t, GGML_MAX_DIMS>{128, rows[i], 1, 1},
+                    "NVFP4 projection was incorrectly row-fused");
+            importer.bind(targets[i] + ".weight");
+            require(importer.describe(targets[i] + ".scale", type, ne) && type == GGML_TYPE_F32 && ne[0] == 1,
+                    "NVFP4 projection global scale is missing");
+            require(importer.materialize(targets[i] + ".scale", type, sizeof(float)) == f32_bytes(globals[i]),
+                    "NVFP4 projection global scale changed");
+            importer.bind(targets[i] + ".scale");
+        }
+        importer.validate_complete();
+    }
+    {
         const auto path = dir.path / "modelopt-w4a16-nvfp4-experts";
         write_single_shard_model(path, {
             { "module.weight",         "U8",       { 2, 2, 32 }, std::vector<uint8_t>(128) },
