@@ -6061,7 +6061,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             q_view->nb[1] == k_view->nb[1] && q_view->nb[2] == k_view->nb[2] &&
             q_view->nb[3] == k_view->nb[3] && ggml_is_contiguous(q_norm) &&
             ggml_is_contiguous(k_norm) && q_params.eps == k_params.eps && q_params.rms == k_params.rms &&
-            q_params.post_scale == k_params.post_scale &&
+            q_params.post_scale == k_params.post_scale && q_params.sum_eps == k_params.sum_eps &&
             !(q_norm->flags & GGML_TENSOR_FLAG_OUTPUT) &&
             !(k_norm->flags & GGML_TENSOR_FLAG_OUTPUT) &&
             ggml_node_get_use_count(cgraph, k_view_idx) == 1 &&

@@ -3,6 +3,8 @@
 #include "gated_delta_net_fla_ptx.cuh"
 #include "ggml-cuda/common.cuh"
 
+#include <type_traits>
+
 // RDNA3 wants 1 block/SM here: with 2 blocks/SM the compiler is forced under
 // ~128 VGPR/lane and spills on this kernel. 1 block/SM raises the per-lane
 // VGPR budget to ~256 and eliminates the spill entirely. CUDA keeps 2.
@@ -16,7 +18,7 @@
 #define GGML_GDN_MIN_BLOCKS_PER_SM 2
 #endif
 
-template <int S_v, bool KDA, bool keep_rs_t>
+template <int S_v, bool KDA, bool keep_rs_t, bool sum_eps_t>
 __global__ void __launch_bounds__((ggml_cuda_get_physical_warp_size() < S_v ? ggml_cuda_get_physical_warp_size() : S_v) * 4, GGML_GDN_MIN_BLOCKS_PER_SM)
 gated_delta_net_cuda(const float * q,
                                      const float * k,
@@ -99,9 +101,8 @@ gated_delta_net_cuda(const float * q,
 #if !defined(GGML_USE_HIP)
         // HIP normalizes in the preceding paired kernel and never defers it.
         // Keep this unused branch out of its recurrent token loop.
-        // Deferred q/k normalization retains the graph's formula, including its
-        // RMS + SCALE stages, with the paired kernel's reduction order.
-        if (l2_norm.eps >= 0.0f) {
+        // Deferred q/k normalization retains the graph's epsilon convention.
+        if (sum_eps_t || l2_norm.eps >= 0.0f) {
             float sum_q = 0.0f;
             float sum_k = 0.0f;
 #pragma unroll
@@ -111,14 +112,15 @@ gated_delta_net_cuda(const float * q,
             }
             sum_q = warp_reduce_sum<warp_size>(sum_q);
             sum_k = warp_reduce_sum<warp_size>(sum_k);
-            const float scale_q = l2_norm.inverse(sum_q, S_v);
-            const float scale_k = l2_norm.inverse(sum_k, S_v);
+            const float scale_q = sum_eps_t ? rsqrtf(sum_q + l2_norm.eps) : l2_norm.inverse(sum_q, S_v);
+            const float scale_k = sum_eps_t ? rsqrtf(sum_k + l2_norm.eps) : l2_norm.inverse(sum_k, S_v);
 #pragma unroll
             for (int r = 0; r < rows_per_lane; r++) {
-                q_reg[r] = l2_norm.apply(q_reg[r], scale_q);
-                k_reg[r] = l2_norm.apply(k_reg[r], scale_k);
+                q_reg[r] = sum_eps_t ? q_reg[r] * scale_q : l2_norm.apply(q_reg[r], scale_q);
+                k_reg[r] = sum_eps_t ? k_reg[r] * scale_k : l2_norm.apply(k_reg[r], scale_k);
             }
         }
+
 #else
         GGML_UNUSED(l2_norm);
 #endif
@@ -229,37 +231,50 @@ static void launch_gated_delta_net(
     const uint3 rq3_magic   = init_fastdiv_values(rq3);
 
     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(grid_dims, block_dims, 0, stream);
-    switch (S_v) {
-        case 16:
-            ggml_cuda_kernel_launch(gated_delta_net_cuda<16, KDA, keep_rs_t>, launch_params,
-                q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H,
-                n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-                sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K, l2_norm);
-            break;
-        case 32:
-            ggml_cuda_kernel_launch(gated_delta_net_cuda<32, KDA, keep_rs_t>, launch_params,
-                q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H,
-                n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-                sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K, l2_norm);
-            break;
-        case 64: {
-            ggml_cuda_kernel_launch(gated_delta_net_cuda<64, KDA, keep_rs_t>, launch_params,
-                q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H,
-                n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-                sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K, l2_norm);
-            break;
+    // Select canonical normalization once, outside the recurrent token loop.
+    const auto launch = [&](auto sum_eps_tag) {
+        constexpr bool sum_eps_t = decltype(sum_eps_tag)::value;
+        switch (S_v) {
+            case 16:
+                ggml_cuda_kernel_launch(gated_delta_net_cuda<16, KDA, keep_rs_t, sum_eps_t>, launch_params,
+                    q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H,
+                    n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
+                    sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K, l2_norm);
+                break;
+            case 32:
+                ggml_cuda_kernel_launch(gated_delta_net_cuda<32, KDA, keep_rs_t, sum_eps_t>, launch_params,
+                    q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H,
+                    n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
+                    sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K, l2_norm);
+                break;
+            case 64: {
+                ggml_cuda_kernel_launch(gated_delta_net_cuda<64, KDA, keep_rs_t, sum_eps_t>, launch_params,
+                    q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H,
+                    n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
+                    sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K, l2_norm);
+                break;
+            }
+            case 128: {
+                ggml_cuda_kernel_launch(gated_delta_net_cuda<128, KDA, keep_rs_t, sum_eps_t>, launch_params,
+                    q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H,
+                    n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
+                    sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K, l2_norm);
+                break;
+            }
+            default:
+                GGML_ABORT("fatal error");
+                break;
         }
-        case 128: {
-            ggml_cuda_kernel_launch(gated_delta_net_cuda<128, KDA, keep_rs_t>, launch_params,
-                q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H,
-                n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-                sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K, l2_norm);
-            break;
-        }
-        default:
-            GGML_ABORT("fatal error");
-            break;
+    };
+#if defined(GGML_USE_HIP)
+    launch(std::false_type{});
+#else
+    if (l2_norm.sum_eps) {
+        launch(std::true_type{});
+    } else {
+        launch(std::false_type{});
     }
+#endif
 }
 
 static void ggml_cuda_op_gated_delta_net_impl(
@@ -304,7 +319,7 @@ static void ggml_cuda_op_gated_delta_net_impl(
     const ggml_tensor * packed_q = defer_q_l2 ? ggml_cuda_gdn_norm_input(src_q, l2_norm) : src_q;
     const ggml_tensor * packed_k = defer_k_l2 ? ggml_cuda_gdn_norm_input(src_k, k_norm) : src_k;
     GGML_ASSERT(packed_q && packed_k);
-    GGML_ASSERT(l2_norm.eps == k_norm.eps && l2_norm.rms == k_norm.rms &&
+    GGML_ASSERT(l2_norm.eps == k_norm.eps && l2_norm.rms == k_norm.rms && l2_norm.sum_eps == k_norm.sum_eps &&
                 l2_norm.post_scale == k_norm.post_scale);
 
     const float * q_d = (const float *) packed_q->data;

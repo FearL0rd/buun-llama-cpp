@@ -1058,7 +1058,7 @@ void ggml_cuda_op_l2_norm_pair(
     GGML_ASSERT(ggml_are_same_shape(q, k) && ggml_are_same_shape(q_dst, k_dst));
     GGML_ASSERT(q->ne[0] < 1024);
 
-    GGML_ASSERT(q_norm.eps == k_norm.eps && q_norm.rms == k_norm.rms &&
+    GGML_ASSERT(q_norm.eps == k_norm.eps && q_norm.rms == k_norm.rms && q_norm.sum_eps == k_norm.sum_eps &&
                 q_norm.post_scale == k_norm.post_scale);
 
     const size_t ts = sizeof(float);

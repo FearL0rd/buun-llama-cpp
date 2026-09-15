@@ -5068,15 +5068,17 @@ struct test_gated_delta_net : public test_case {
 struct test_gated_delta_net_norm : public test_gated_delta_net {
     const float amplitude;
     const bool deferred;
+    const float scale_multiplier;
 
     bool run_whole_graph() override { return true; }
 
-    test_gated_delta_net_norm(int64_t tokens, float amplitude, bool deferred)
-        : test_gated_delta_net(GGML_TYPE_F32, 2, 128, tokens, 1, 3),
-          amplitude(amplitude), deferred(deferred) {}
+    test_gated_delta_net_norm(int64_t tokens, float amplitude, bool deferred,
+                             int64_t width = 128, float scale_multiplier = 1.0f, int64_t snapshots = 1)
+        : test_gated_delta_net(GGML_TYPE_F32, 2, width, tokens, 1, 3, false, false, snapshots),
+          amplitude(amplitude), deferred(deferred), scale_multiplier(scale_multiplier) {}
 
     std::string vars() override {
-        return test_gated_delta_net::vars() + ",rms_sum_eps=1," + VARS_TO_STR2(amplitude, deferred);
+        return test_gated_delta_net::vars() + ",rms_sum_eps=1," + VARS_TO_STR3(amplitude, deferred, scale_multiplier);
     }
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
@@ -5091,7 +5093,7 @@ struct test_gated_delta_net_norm : public test_gated_delta_net {
         };
         const auto norm = [&](ggml_tensor * x) {
             return ggml_scale(ctx, ggml_rms_norm(ctx, x, 1e-6f/head_size),
-                              1.0f/sqrtf(float(head_size)));
+                              scale_multiplier/sqrtf(float(head_size)));
         };
         ggml_tensor * q = norm(view(head_count, 0));
         ggml_tensor * k = norm(view(head_count, head_count*head_size));
@@ -5105,7 +5107,7 @@ struct test_gated_delta_net_norm : public test_gated_delta_net {
         ggml_set_name(g, "g");
         ggml_set_name(beta, "beta");
         ggml_set_name(state, "state");
-        return ggml_gated_delta_net(ctx, q, k, v, g, beta, state, 1);
+        return ggml_gated_delta_net(ctx, q, k, v, g, beta, state, K);
     }
 
     void initialize_tensors(ggml_context * ctx) override {
@@ -12599,6 +12601,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             for (bool deferred : {false, true}) {
                 test_cases.emplace_back(new test_gated_delta_net_norm(tokens, amplitude, deferred));
             }
+        }
+    }
+
+    // Canonical normalization also reaches the smaller recurrent kernels and
+    // speculative snapshot path. Noncanonical scales must keep RMS semantics.
+    for (int64_t width : {16, 32, 64, 128}) {
+        test_cases.emplace_back(new test_gated_delta_net_norm(4, 1e-4f, true, width, 1.0f, 3));
+    }
+    for (int64_t tokens : {1, 4}) {
+        for (bool deferred : {false, true}) {
+            test_cases.emplace_back(new test_gated_delta_net_norm(tokens, 1e-4f, deferred, 128, 0.75f));
         }
     }
 

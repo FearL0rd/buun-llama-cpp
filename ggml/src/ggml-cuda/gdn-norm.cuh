@@ -2,19 +2,23 @@
 
 #include "common.cuh"
 
-// Deferred normalization must retain the graph's formula, not just its epsilon.
-// Legacy L2 clamps the norm; GDN uses RMS(eps / width) followed by a scale.
+// Legacy L2 clamps the norm. GDN adds epsilon to the sum of squares, expressed
+// in the graph as RMS(eps / width) followed by a scale.
 struct ggml_cuda_gdn_norm {
     float eps = -1.0f;
     float post_scale = 1.0f;
     bool rms = false;
+    bool sum_eps = false;
 
     __device__ float inverse(float sum, int width) const {
+        if (sum_eps) {
+            return rsqrtf(sum + eps);
+        }
         return rms ? rsqrtf(sum / width + eps) : rsqrtf(fmaxf(sum, eps * eps));
     }
 
     __device__ float apply(float value, float inverse) const {
-        return (inverse * value) * post_scale;
+        return rms && !sum_eps ? (inverse * value) * post_scale : inverse * value;
     }
 };
 
@@ -39,5 +43,13 @@ static inline const ggml_tensor * ggml_cuda_gdn_norm_input(
         return nullptr;
     }
     norm.eps = ggml_get_op_params_f32(base, 0);
+    // Evaluate canonical GDN as x*rsqrt(sum(x*x)+eps), avoiding the intermediate
+    // rounding of RMS(eps/width)*1/sqrt(width). Other RMS scales stay unchanged.
+    const int64_t width = base->ne[0];
+    if (norm.rms && width > 0 && norm.post_scale == 1.0f/sqrtf(float(width))) {
+        norm.sum_eps = true;
+        norm.eps *= float(width);
+        norm.post_scale = 1.0f;
+    }
     return norm.eps >= 0.0f && std::isfinite(norm.eps) ? base->src[0] : nullptr;
 }
