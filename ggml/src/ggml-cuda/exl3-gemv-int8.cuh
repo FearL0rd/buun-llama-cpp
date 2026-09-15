@@ -277,6 +277,10 @@ __global__ void __launch_bounds__(THREADS) gemv_int8_kernel(const uint8_t * __re
     // Measured dense mul1 crossover: retain vector dots for one/two rows.
     // Other row counts/precisions and grouped MoE retain their existing executor.
     constexpr bool WMMA = INT8 && !GROUPED && bits >= 2 && bits <= 4 && (M == 3 || M == 4 || M == 8);
+#elif !defined(GGML_USE_HIP) && __CUDA_ARCH__ == 860
+    // Measured sm86 code-target crossover; plain 4-bit M3 still favors vector dots.
+    constexpr bool WMMA = INT8 && !GROUPED && bits >= 2 && bits <= 4 && (M == 3 || M == 4 || M == 8) &&
+                          !(bits == 4 && M == 3 && !RESID);
 #else
     constexpr bool WMMA = false;
 #endif
@@ -353,6 +357,13 @@ __global__ void __launch_bounds__(THREADS) gemv_int8_kernel(const uint8_t * __re
         }
         __syncthreads();
     }
+    auto splat_index = [&](int p, int i) {
+#if !defined(GGML_USE_HIP) && __CUDA_ARCH__ == 860
+        // Spread MMA activation planes across banks without padding the allocation.
+        if constexpr (WMMA) i ^= (p & 7) * 4;
+#endif
+        return p * nrows_max * 16 + i;
+    };
     // quantize inline while staging the splats; exact int sums per plane
     if constexpr (INT8) {
         int sum[NACC];
@@ -366,13 +377,13 @@ __global__ void __launch_bounds__(THREADS) gemv_int8_kernel(const uint8_t * __re
                 const float q  = sh_q[p0];
                 int v = __float2int_rn(a / q);
                 v = max(-127, min(127, v));
-                sh_as[p0 * nrows_max * 16 + i] = uint32_t(uint8_t(int8_t(v))) * 0x01010101u;
+                sh_as[splat_index(p0, i)] = uint32_t(uint8_t(int8_t(v))) * 0x01010101u;
                 sum[p0] += v;
                 if constexpr (RESID) {
                     const float rr = a - q * float(v);
                     int v2 = __float2int_rn(rr / sh_q[p0 + 1]);
                     v2 = max(-127, min(127, v2));
-                    sh_as[(p0 + 1) * nrows_max * 16 + i] = uint32_t(uint8_t(int8_t(v2))) * 0x01010101u;
+                    sh_as[splat_index(p0 + 1, i)] = uint32_t(uint8_t(int8_t(v2))) * 0x01010101u;
                     sum[p0 + 1] += v2;
                 }
             }
@@ -399,44 +410,115 @@ __global__ void __launch_bounds__(THREADS) gemv_int8_kernel(const uint8_t * __re
 
     const int n_tiles = n / 16;
     if constexpr (WMMA) {
+        static_assert(bits >= 2 && bits <= 4 && NACC <= 16);
+        const int nt = blockIdx.x * 16 + warp * 2;
 #if defined(GGML_USE_HIP) && defined(RDNA4)
         using i2 = int __attribute__((ext_vector_type(2)));
         using i8 = int __attribute__((ext_vector_type(8)));
-        static_assert(NACC <= 16);
-        const int nt = blockIdx.x * 16 + warp * 2;
         i8 acc[2] = {};
-        for (int kb = 0; kb < nrows; ++kb) {
+#elif !defined(GGML_USE_HIP) && __CUDA_ARCH__ == 860
+        constexpr int PLANES = (NACC + 7) / 8;
+        int acc[2][PLANES][4] = {};
+#endif
+        // Each lane loads one packed word per tile. Prefetch four K tiles, then
+        // shuffle word pairs and extract nearby windows together for the matrix core.
+        constexpr int RING = 4;
+        uint32_t words[2][RING] = {};
+        auto load_word = [&](int tile, int kb) {
+            return nt + tile < n_tiles && lane < TWORDS && kb < nrows
+                ? exl3::load_streaming(B32 + (size_t(nt + tile) * kslices + kb0 + kb) * TWORDS + lane) : 0u;
+        };
 #pragma unroll
-            for (int j0 = 0; j0 < 16; j0 += 4) {
-                i2 b;
+        for (int tile = 0; tile < 2; ++tile) {
 #pragma unroll
-                for (int l = 0; l < 2; ++l) {
-                    const int j = j0 + 2 * (lane / 16) + l;
-                    b[l] = lq < NACC ? int(sh_as[lq * nrows_max * 16 + kb * 16 + j]) : 0;
-                }
+            for (int d = 0; d < RING; ++d) words[tile][d] = load_word(tile, d);
+        }
+        for (int base = 0; base < nrows; base += RING) {
+#pragma unroll
+            for (int drow = 0; drow < RING; ++drow) {
+                const int kb = base + drow;
+                if (kb >= nrows) break;
+#if defined(GGML_USE_HIP) && defined(RDNA4)
+                i2 decoded[2][4];
 #pragma unroll
                 for (int tile = 0; tile < 2; ++tile) {
-                    i2 a;
+                    const uint32_t current = words[tile][drow];
+                    words[tile][drow] = load_word(tile, kb + RING);
+#pragma unroll
+                    for (int g = 0; g < 2; ++g) {
+                        // RDNA4 fragment: four consecutive trellis windows per group.
+                        const int t = (lq % 8) * 32 + (lane / 16) * 8 + (lq / 8) * 4 + g * 16;
+                        const int end = (t + 257 + 3) * bits;
+                        const int first = (end - 3 * bits - 16) / 32, last = (end - 1) / 32;
+                        const uint32_t lo = __shfl_sync(0xffffffffu, current, last % TWORDS);
+                        const uint32_t hi = __shfl_sync(0xffffffffu, current, first % TWORDS);
+#pragma unroll
+                        for (int s = 0; s < 4; ++s) {
+                            const uint32_t w = exl3::fshift(lo, hi, (last + 1) * 32 - end + (3 - s) * bits) & 65535u;
+                            decoded[tile][g + 2 * (s / 2)][s & 1] = int(w * 0x83DCD12Du);
+                        }
+                    }
+                }
+#pragma unroll
+                for (int j0 = 0; j0 < 16; j0 += 4) {
+                    i2 b;
 #pragma unroll
                     for (int l = 0; l < 2; ++l) {
                         const int j = j0 + 2 * (lane / 16) + l;
-                        // Inverse of the trellis tile's (column, K) permutation.
-                        const int t = (lq % 8) * 32 + (j % 8) / 2 * 8 + (lq / 8) * 4 + (j / 8) * 2 + (j % 2);
-                        const int end = (t + 257) * bits;
-                        const int first = (end - 16) / 32, last = (end - 1) / 32;
-                        uint32_t w = 0;
-                        if (nt + tile < n_tiles) {
-                            const uint32_t * ptr = B32 + (size_t(nt + tile) * kslices + kb0 + kb) * TWORDS;
-                            w = exl3::fshift(ptr[last % TWORDS], ptr[first % TWORDS], (last + 1) * 32 - end) & 65535u;
-                        }
-                        a[l] = int(w * 0x83DCD12Du);
+                        b[l] = lq < NACC ? int(sh_as[lq * nrows_max * 16 + kb * 16 + j]) : 0;
                     }
-                    // Four unsigned product bytes times the signed activation splat
-                    // reproduce dp4a_us exactly; residual planes occupy extra rows.
-                    acc[tile] = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12(false, a, true, b, acc[tile], false);
+#pragma unroll
+                    for (int tile = 0; tile < 2; ++tile) {
+                        const i2 a = decoded[tile][j0 / 4];
+                        // Unsigned product bytes times signed activation splats:
+                        // the same integer dot as dp4a_us, including residual planes.
+                        acc[tile] = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12(false, a, true, b, acc[tile], false);
+                    }
                 }
+#elif !defined(GGML_USE_HIP) && __CUDA_ARCH__ == 860
+                uint32_t current[2];
+#pragma unroll
+                for (int tile = 0; tile < 2; ++tile) {
+                    current[tile] = words[tile][drow];
+                    words[tile][drow] = load_word(tile, kb + RING);
+                }
+#pragma unroll
+                for (int tile = 0; tile < 2; ++tile) {
+                    uint32_t decoded[2][4];
+#pragma unroll
+                    for (int g = 0; g < 2; ++g) {
+                        // Ampere fragment: four stride-two windows per group.
+                        const int t = (lane / 4) * 32 + ((lane % 4) / 2) * 8 + (lane & 1) + g * 16;
+                        const int end = (t + 257 + 6) * bits;
+                        const int first = (end - 6 * bits - 16) / 32, last = (end - 1) / 32;
+                        const uint32_t lo = __shfl_sync(0xffffffffu, current[tile], last % TWORDS);
+                        const uint32_t hi = __shfl_sync(0xffffffffu, current[tile], first % TWORDS);
+#pragma unroll
+                        for (int s = 0; s < 4; ++s) {
+                            const uint32_t w = exl3::fshift(lo, hi, (last + 1) * 32 - end + (6 - 2 * s) * bits) & 65535u;
+                            decoded[s & 1][2 * g + s / 2] = w * 0x83DCD12Du;
+                        }
+                    }
+#pragma unroll
+                    for (int j0 = 0; j0 < 16; j0 += 8) {
+                        const uint32_t * a = decoded[j0 / 8];
+#pragma unroll
+                        for (int plane = 0; plane < PLANES; ++plane) {
+                            const int p = plane * 8 + lane / 4;
+                            const int j = j0 + lane % 4;
+                            const uint32_t b0 = p < NACC ? sh_as[splat_index(p, kb * 16 + j)] : 0;
+                            const uint32_t b1 = p < NACC ? sh_as[splat_index(p, kb * 16 + j + 4)] : 0;
+                            int * d = acc[tile][plane];
+                            asm("mma.sync.aligned.m16n8k32.row.col.s32.u8.s8.s32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+                                : "+r"(d[0]), "+r"(d[1]), "+r"(d[2]), "+r"(d[3])
+                                : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+                        }
+                    }
+                }
+#endif
             }
         }
+#if defined(GGML_USE_HIP) && defined(RDNA4)
 #pragma unroll
         for (int tile = 0; tile < 2; ++tile) {
 #pragma unroll
@@ -452,6 +534,26 @@ __global__ void __launch_bounds__(THREADS) gemv_int8_kernel(const uint8_t * __re
                     if constexpr (RESID) v += sh_q[lq + 1] * (k_inv * float(second) + cbias * float(sh_s[lq + 1]));
                     const int r = RESID ? lq / 2 : lq;
                     partials[(size_t(blockIdx.y) * M + r) * n + (nt + tile) * 16 + 8 * (lane / 16) + l] = v;
+                }
+            }
+        }
+#elif !defined(GGML_USE_HIP) && __CUDA_ARCH__ == 860
+#pragma unroll
+        for (int tile = 0; tile < 2; ++tile) {
+#pragma unroll
+            for (int plane = 0; plane < PLANES; ++plane) {
+#pragma unroll
+                for (int l = 0; l < 4; ++l) {
+                    // MMA C layout: adjacent registers are adjacent activation planes.
+                    // In residual mode even registers own the primary/residual pair.
+                    const int p = plane * 8 + (lane % 4) * 2 + l % 2;
+                    const int c = lane / 4 + (l / 2) * 8;
+                    if (nt + tile < n_tiles && p < NACC && (!RESID || !(l & 1))) {
+                        float v = sh_q[p] * (k_inv * float(acc[tile][plane][l]) + cbias * float(sh_s[p]));
+                        if constexpr (RESID) v += sh_q[p + 1] * (k_inv * float(acc[tile][plane][l + 1]) + cbias * float(sh_s[p + 1]));
+                        const int r = RESID ? p / 2 : p;
+                        partials[(size_t(blockIdx.y) * M + r) * n + (nt + tile) * 16 + c] = v;
+                    }
                 }
             }
         }
