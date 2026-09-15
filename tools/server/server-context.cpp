@@ -2618,16 +2618,17 @@ struct server_slot {
         }
     }
 
-    void init_sampler() const {
-        common_sampler_reset(smpl.get());
-
-        if (can_speculate()) {
-            common_speculative_set_rng_seed(
-                get_spec(), id, common_sampler_get_seed(smpl.get()));
+    void init_speculative_sampling() const {
+        if (can_speculate() && task && smpl) {
             auto sampling = task->params.sampling;
             sampling.seed = common_sampler_get_seed(smpl.get());
-            common_speculative_set_mtp_sampling(get_spec(), id, sampling);
+            common_speculative_set_sampling(get_spec(), spec ? 0 : id, sampling);
         }
+    }
+
+    void init_sampler() const {
+        common_sampler_reset(smpl.get());
+        init_speculative_sampling();
 
         if (!task->need_sampling()) {
             return;
@@ -5974,6 +5975,8 @@ private:
             slot.vbr_prompt_cache_enabled = params_base.vbr_prompt_cache;
             if (shared_spec) {
                 common_speculative_set_seq_id(shared_spec, slot.id);
+                // Recreated after a media swap; do not reset target history.
+                slot.init_speculative_sampling();
             }
         }
     }
@@ -20491,29 +20494,25 @@ private:
                 }
             }
 
-            bool accepted_from_dflash_q = false;
+            bool accepted_from_proposal = false;
             if (!accepted_from_synth && !accepted_from_target_argmax) {
+                const llama_seq_id seq_id = slot.spec ? 0 : slot.id;
                 const common_speculative_proposal * proposal =
-                    common_speculative_get_proposal(slot.get_spec(), slot.id);
-                if (proposal && proposal->exact_q &&
-                        proposal->seq_id == slot.id &&
-                        proposal->q_covered_tokens > 0 &&
-                        proposal->q_covered_tokens <= slot.spec_draft.size() &&
-                        proposal->selected.size() == proposal->q_covered_tokens &&
-                        std::equal(proposal->selected.begin(), proposal->selected.end(),
-                            slot.spec_draft.begin())) {
-                    accepted_from_dflash_q = common_sampler_sample_and_accept_n_q(
+                    common_speculative_get_proposal(slot.get_spec(), seq_id);
+                const size_t q_covered = proposal ? proposal->matching_prefix_size(seq_id, slot.spec_draft) : 0;
+                if (q_covered > 0) {
+                    accepted_from_proposal = common_sampler_sample_and_accept_n_q(
                         slot.smpl.get(), ctx_tgt, slot.spec_i_batch, slot.spec_draft,
                         proposal->top_k, proposal->candidate_ids, proposal->q_rows,
-                        proposal->q_covered_tokens, ids);
-                    if (accepted_from_dflash_q) {
+                        q_covered, ids);
+                    if (accepted_from_proposal) {
                         SLT_TRC(slot, "verified %zu-token draft with %zu exact q rows\n",
-                            slot.spec_draft.size(), proposal->q_covered_tokens);
+                            slot.spec_draft.size(), q_covered);
                     }
                 }
             }
             if (!accepted_from_synth && !accepted_from_target_argmax &&
-                    !accepted_from_dflash_q) {
+                    !accepted_from_proposal) {
                 ids = common_sampler_sample_and_accept_n(
                     slot.smpl.get(), ctx_tgt,
                     slot.spec_i_batch, slot.spec_draft);

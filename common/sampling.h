@@ -109,10 +109,18 @@ std::vector<llama_token> common_sampler_accept_draft(
 // assume idxs == [ 0, 1, 2, ..., draft.size() ]
 std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sampler * gsmpl, struct llama_context * ctx, const llama_tokens & draft, bool grammar_first = false);
 
+// Form a temperature/top-p proposal from descending-logit candidates. Writes
+// candidates.size() probabilities into q, including zeroes beyond the nucleus.
+// Returns LLAMA_TOKEN_NULL for invalid inputs. uniform must be in [0, 1).
+llama_token common_sampler_proposal_row(
+        const llama_token_data_array & candidates,
+        float temp, float top_p, double uniform, float * q);
+
 // Distribution-preserving speculative verification for a sparse proposal q.
 // The first q_covered rows describe draft[0..q_covered), each as top_k token
 // IDs followed by its normalized probabilities. Returns false without touching
-// sampler state when the configured target sampler is not supported.
+// sampler state when the configured target sampler is not supported. Extra
+// trailing rows are ignored when the server shortened the original draft.
 bool common_sampler_sample_and_accept_n_q(
         struct common_sampler *      gsmpl,
         struct llama_context *       ctx,

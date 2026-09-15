@@ -21,7 +21,6 @@
 #include <iomanip>
 #include <map>
 #include <unordered_map>
-#include <cmath>
 #include <cinttypes>
 #include <limits>
 #include <queue>
@@ -276,6 +275,26 @@ using common_speculative_draft_params_vec = std::vector<common_speculative_draft
 //
 // each implementation has a unique type and a state that is implementation-specific
 // in a subclass of common_speculative_impl
+void common_speculative_proposal::clear() {
+    selected.clear();
+    candidate_ids.clear();
+    q_rows.clear();
+    top_k = 0;
+    q_covered_tokens = 0;
+    seq_id = -1;
+    exact_q = false;
+}
+
+size_t common_speculative_proposal::matching_prefix_size(
+        llama_seq_id seq, const llama_tokens & draft) const {
+    const size_t count = std::min(q_covered_tokens, draft.size());
+    if (!exact_q || seq_id != seq || selected.size() != q_covered_tokens ||
+            !std::equal(selected.begin(), selected.begin() + count, draft.begin())) {
+        return 0;
+    }
+    return count;
+}
+
 struct common_speculative_impl {
     const common_speculative_type type;
 
@@ -316,6 +335,9 @@ struct common_speculative_impl {
     virtual void draft(common_speculative_draft_params_vec & dparams) = 0;
 
     virtual void accept(llama_seq_id seq_id, uint16_t n_accepted, bool is_other) = 0;
+
+    virtual void configure_sampling(llama_seq_id, const common_params_sampling &) {}
+    virtual const common_speculative_proposal * get_proposal(llama_seq_id) const { return nullptr; }
 
     // (optional) serialize/restore per-seq internal state (e.g. eagle3's deferred boundary).
     virtual bool get_state(llama_seq_id /*seq_id*/, std::vector<uint8_t> & /*data*/) const { return false; }
@@ -1653,6 +1675,14 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         return true;
     }
 
+    void configure_sampling(llama_seq_id seq_id, const common_params_sampling & sampling) override {
+        set_rng_seed(seq_id, sampling.seed);
+    }
+
+    const common_speculative_proposal * get_proposal(llama_seq_id seq_id) const override {
+        return proposals[seq_id].exact_q ? &proposals[seq_id] : nullptr;
+    }
+
     void set_rng_seed(llama_seq_id seq_id, uint32_t seed) {
         if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
             return;
@@ -2591,58 +2621,79 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     common_params_speculative_draft params; // reuses the draft-model params slot (ctx_tgt/ctx_dft)
 
-    // Temporary experiment control; the original path remains the A/B control.
-    bool sampled_proposals = std::getenv("BUUN_EXP_MTP_Q") != nullptr;
-    std::vector<common_params_sampling> proposal_sampling;
+    struct proposal_policy {
+        int top_k = 0; // zero retains legacy greedy drafting
+        float temp = 1;
+        float top_p = 1;
+    };
+    std::vector<proposal_policy> proposal_sampling;
     std::vector<std::mt19937> proposal_rngs;
     std::vector<common_speculative_proposal> proposals;
 
-    void configure_sampling(llama_seq_id seq_id, const common_params_sampling & sampling) {
+    void configure_sampling(llama_seq_id seq_id, const common_params_sampling & sampling) override {
         if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
             return;
         }
-        proposal_sampling[seq_id] = sampling;
+        // The proposal may differ from the target's filtered distribution: the
+        // verifier uses the actual q and the full target sampling chain. Keep
+        // threshold confidence and unqualified MTP architectures unchanged.
+        const bool eligible = !is_mem_shared && !chain_heads && params.p_min == 0 &&
+            std::isfinite(sampling.temp) && sampling.temp > 0 &&
+            sampling.top_k > 0 && sampling.top_k <= 64 &&
+            sampling.top_p > 0 && sampling.top_p <= 1 && sampling.mirostat == 0 &&
+            std::find(sampling.samplers.begin(), sampling.samplers.end(),
+                COMMON_SAMPLER_TYPE_ADAPTIVE_P) == sampling.samplers.end();
+        const int top_k = eligible ? sampling.top_k : 0;
+        const int old_width = proposal_sampling[seq_id].top_k ? proposal_sampling[seq_id].top_k : 10;
+        const int width = top_k ? top_k : 10;
+        proposal_sampling[seq_id] = { top_k, sampling.temp, sampling.top_p };
         proposal_rngs[seq_id].seed(sampling.seed ^ 0x85ebca6bU);
-        proposals[seq_id] = {};
-        if (sampled_proposals) {
-            SPC_INF("MTP q experiment seq=%d temp=%.3f top_k=%d top_p=%.3f p_min=%.3f\n",
-                seq_id, sampling.temp, sampling.top_k, sampling.top_p, params.p_min);
+        proposals[seq_id].clear();
+        if (width != old_width) {
+            configure_candidates(seq_id, width);
+        }
+        SPC_TRC("MTP seq=%d proposal=%s top_k=%d temp=%.3f top_p=%.3f\n",
+                seq_id, top_k ? "sampled" : "greedy", width, sampling.temp, sampling.top_p);
+    }
+
+    const common_speculative_proposal * get_proposal(llama_seq_id seq_id) const override {
+        return proposals[seq_id].exact_q ? &proposals[seq_id] : nullptr;
+    }
+
+    void configure_candidates(llama_seq_id seq_id, int width) {
+        common_params_sampling sampling;
+        sampling.no_perf = false;
+        sampling.top_k = width;
+        sampling.samplers = { COMMON_SAMPLER_TYPE_TOP_K };
+        smpls[seq_id].reset(common_sampler_init(llama_get_model(params.ctx_dft), sampling));
+
+        auto * & chain = backend_chains[seq_id];
+        if (chain) {
+            llama_set_sampler(params.ctx_dft, seq_id, nullptr);
+            llama_sampler_free(chain);
+            chain = nullptr;
+        }
+        if (params.backend_sampling) {
+            chain = llama_sampler_chain_init(llama_sampler_chain_default_params());
+            llama_sampler_chain_add(chain, llama_sampler_init_top_k(width));
+            if (!llama_set_sampler(params.ctx_dft, seq_id, chain)) {
+                SPC_WRN("backend offload failed for seq_id=%d; using CPU sampler\n", (int) seq_id);
+                llama_sampler_free(chain);
+                chain = nullptr;
+            }
         }
     }
 
     llama_token sample_proposal(llama_seq_id seq_id, const llama_token_data_array & candidates) {
         const auto & sampling = proposal_sampling[seq_id];
-        const int k = std::min(sampling.top_k, (int) candidates.size);
-        std::vector<float> q(k);
-        double sum = 0.0;
-        for (int i = 0; i < k; ++i) {
-            q[i] = std::exp((candidates.data[i].logit - candidates.data[0].logit) / sampling.temp);
-            sum += q[i];
-        }
-        double cumulative = 0.0;
-        int keep = k;
-        for (int i = 0; i < k; ++i) {
-            cumulative += q[i] / sum;
-            if (cumulative >= sampling.top_p) {
-                keep = i + 1;
-                break;
-            }
-        }
-        sum = 0.0;
-        for (int i = 0; i < keep; ++i) {
-            sum += q[i];
-        }
-        for (int i = 0; i < k; ++i) {
-            q[i] = i < keep ? q[i] / sum : 0.0f;
-        }
-        double u = std::generate_canonical<double, 53>(proposal_rngs[seq_id]);
-        int selected = keep - 1;
-        for (int i = 0; i < keep; ++i) {
-            u -= q[i];
-            if (u < 0.0) {
-                selected = i;
-                break;
-            }
+        auto row = candidates;
+        row.size = std::min((size_t) sampling.top_k, candidates.size);
+        const int k = row.size;
+        float q[64];
+        const llama_token token = common_sampler_proposal_row(row, sampling.temp, sampling.top_p,
+                std::generate_canonical<double, 53>(proposal_rngs[seq_id]), q);
+        if (token == LLAMA_TOKEN_NULL) {
+            return token;
         }
         auto & proposal = proposals[seq_id];
         proposal.seq_id = seq_id;
@@ -2651,7 +2702,6 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             proposal.candidate_ids.push_back(candidates.data[i].id);
             proposal.q_rows.push_back(q[i]);
         }
-        const llama_token token = candidates.data[selected].id;
         proposal.selected.push_back(token);
         proposal.q_covered_tokens = proposal.selected.size();
         proposal.exact_q = true;
@@ -2719,9 +2769,6 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         GGML_ASSERT(n_embd == llama_model_n_embd_out(llama_get_model(ctx_tgt)) &&
                 "MTP input row width must match the target h_nextn width");
         n_mtp_layers = std::max(1, (int) llama_model_n_layer_nextn(llama_get_model(ctx_dft)));
-        // Keep the original top-10 confidence normalization for unqualified
-        // thresholded drafting; this prototype measures the p_min=0 case.
-        sampled_proposals = sampled_proposals && this->params.p_min == 0.0f;
 
         SPC_TRC("%s", "adding speculative implementation 'draft-mtp'\n");
         SPC_TRC("- n_max=%d, n_min=%d, p_min=%.2f, n_embd=%d, backend_sampling=%d\n", this->params.n_max, this->params.n_min, this->params.p_min, n_embd, (int) this->params.backend_sampling);
@@ -2743,28 +2790,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         proposal_rngs.resize(n_seq);
         proposals.resize(n_seq);
         smpls.resize(n_seq);
-        for (auto & s : smpls) {
-            common_params_sampling sparams;
-            sparams.no_perf  = false;
-            sparams.top_k    = sampled_proposals ? 64 : 10;
-            sparams.samplers = { COMMON_SAMPLER_TYPE_TOP_K };
-            s.reset(common_sampler_init(llama_get_model(ctx_dft), sparams));
-        }
-
-        // offload draft sampling to the backend
         backend_chains.assign(n_seq, nullptr);
-        if (this->params.backend_sampling) {
-            for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
-                llama_sampler * chain = llama_sampler_chain_init(llama_sampler_chain_default_params());
-                llama_sampler_chain_add(chain, llama_sampler_init_top_k(sampled_proposals ? 64 : 10));
-
-                if (!llama_set_sampler(ctx_dft, seq_id, chain)) {
-                    SPC_WRN("backend offload failed for seq_id=%d; using CPU sampler\n", (int) seq_id);
-                    llama_sampler_free(chain);
-                    chain = nullptr;
-                }
-                backend_chains[seq_id] = chain;
-            }
+        for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+            configure_candidates(seq_id, 10);
         }
 
         llama_set_embeddings_nextn(ctx_tgt, true, /*masked*/ false);
@@ -2826,6 +2854,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     }
 
     void begin(llama_seq_id seq_id, const llama_tokens & prompt) override {
+        proposals[seq_id].clear();
         const int32_t N = (int32_t) prompt.size();
         if (N <= 0) {
             return;
@@ -3030,7 +3059,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 continue;
             }
 
-            proposals[seq_id] = {};
+            proposals[seq_id].clear();
             const float * carry = pending_h_lifecycle[seq_id].draft_carry(
                     pending_h[seq_id].data());
             if (carry == nullptr) {
@@ -3113,12 +3142,13 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                     continue;
                 }
 
-                const auto & sampling = proposal_sampling[seq_id];
-                const bool use_q = sampled_proposals && !is_mem_shared && !chain_heads &&
-                    params.p_min == 0.0f && sampling.temp > 0.0f &&
-                    sampling.top_k > 0 && sampling.top_k <= 64 &&
-                    sampling.top_p > 0.0f && sampling.top_p <= 1.0f;
+                const bool use_q = proposal_sampling[seq_id].top_k > 0;
                 const llama_token id = use_q ? sample_proposal(seq_id, *cur_p) : cur_p->data[0].id;
+                if (id == LLAMA_TOKEN_NULL) {
+                    drafting[seq_id] = false;
+                    n_drafting--;
+                    continue;
+                }
 
                 common_sampler_accept(smpl, id, true);
 
@@ -3127,9 +3157,12 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
                 result.push_back(id);
 
-                const int32_t n_max_eff = adaptive_recursive_depth
+                int32_t n_max_eff = adaptive_recursive_depth
                     ? std::min(params.n_max, adaptive_cap[seq_id])
                     : params.n_max;
+                if (dp.n_max > 0) {
+                    n_max_eff = std::min(n_max_eff, dp.n_max);
+                }
                 if (n_max_eff <= (int) result.size()) {
                     drafting[seq_id] = false;
                     n_drafting--;
@@ -3231,6 +3264,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
             return false;
         }
+        proposals[seq_id].clear();
         return common_speculative_mtp_carry_state_load(
             pending_h_lifecycle[seq_id], pending_h[seq_id], data);
     }
@@ -3243,6 +3277,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         }
 
         pending_h_lifecycle[seq_id].sequence_transition(event);
+        proposals[seq_id].clear();
         verify_h_rows[seq_id] = 0;
         i_last[seq_id] = -1;
         adaptive_last_draft_size[seq_id] = 0;
@@ -6496,30 +6531,14 @@ void common_speculative_set_seq_id(common_speculative * spec, llama_seq_id seq_i
     }
 }
 
-void common_speculative_set_rng_seed(
-        common_speculative * spec,
-        llama_seq_id         seq_id,
-        uint32_t             seed) {
-    if (spec == nullptr) {
-        return;
-    }
-    for (auto & impl : spec->impls) {
-        if (impl->type == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH) {
-            static_cast<common_speculative_impl_draft_dflash *>(impl.get())->set_rng_seed(seq_id, seed);
-        }
-    }
-}
-
-void common_speculative_set_mtp_sampling(
+void common_speculative_set_sampling(
         common_speculative * spec, llama_seq_id seq_id,
         const common_params_sampling & sampling) {
     if (!spec) {
         return;
     }
     for (auto & impl : spec->impls) {
-        if (impl->type == COMMON_SPECULATIVE_TYPE_DRAFT_MTP) {
-            static_cast<common_speculative_impl_draft_mtp *>(impl.get())->configure_sampling(seq_id, sampling);
-        }
+        impl->configure_sampling(seq_id, sampling);
     }
 }
 
@@ -6746,16 +6765,7 @@ const common_speculative_proposal * common_speculative_get_proposal(
     if (!impl) {
         return nullptr;
     }
-    if (impl->type == COMMON_SPECULATIVE_TYPE_DRAFT_MTP) {
-        const auto & proposal = static_cast<const common_speculative_impl_draft_mtp *>(impl)->proposals[seq_id];
-        return proposal.exact_q ? &proposal : nullptr;
-    }
-    if (impl->type != COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH) {
-        return nullptr;
-    }
-    const auto * dfl = static_cast<const common_speculative_impl_draft_dflash *>(impl);
-    const auto & proposal = dfl->proposals[seq_id];
-    return proposal.exact_q ? &proposal : nullptr;
+    return impl->get_proposal(seq_id);
 }
 
 void common_speculative_accept(common_speculative * spec, uint16_t n_accepted) {

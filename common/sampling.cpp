@@ -983,6 +983,53 @@ llama_token common_sampler_speculative_sample_residual(
     throw std::runtime_error("failed to sample speculative residual distribution");
 }
 
+llama_token common_sampler_proposal_row(
+        const llama_token_data_array & candidates,
+        float temp, float top_p, double uniform, float * q) {
+    if (!q || !candidates.data || candidates.size == 0 ||
+            !std::isfinite(temp) || temp <= 0 || !(top_p > 0 && top_p <= 1) ||
+            !(uniform >= 0 && uniform < 1)) {
+        return LLAMA_TOKEN_NULL;
+    }
+    const float max_logit = candidates.data[0].logit;
+    if (!std::isfinite(max_logit)) {
+        return LLAMA_TOKEN_NULL;
+    }
+    double sum = 0;
+    for (size_t i = 0; i < candidates.size; ++i) {
+        const float logit = candidates.data[i].logit;
+        // Unmapped sidecar vocabulary entries have -inf logits (zero mass).
+        if (std::isnan(logit) || logit > max_logit) {
+            return LLAMA_TOKEN_NULL;
+        }
+        q[i] = std::exp((logit - max_logit) / temp);
+        sum += q[i];
+    }
+    double cumulative = 0;
+    size_t keep = candidates.size;
+    for (size_t i = 0; i < candidates.size; ++i) {
+        cumulative += q[i] / sum;
+        if (cumulative >= top_p) {
+            keep = i + 1;
+            break;
+        }
+    }
+    sum = 0;
+    for (size_t i = 0; i < keep; ++i) {
+        sum += q[i];
+    }
+    for (size_t i = 0; i < candidates.size; ++i) {
+        q[i] = i < keep ? q[i] / sum : 0;
+    }
+    for (size_t i = 0; i < keep; ++i) {
+        uniform -= q[i];
+        if (uniform < 0) {
+            return candidates.data[i].id;
+        }
+    }
+    return candidates.data[keep - 1].id;
+}
+
 bool common_sampler_sample_and_accept_n_q(
         struct common_sampler *      gsmpl,
         struct llama_context *       ctx,
@@ -995,8 +1042,8 @@ bool common_sampler_sample_and_accept_n_q(
         std::vector<llama_token> &   result) {
     if (!gsmpl || !ctx || idxs.size() != draft.size() + 1 ||
             top_k <= 0 || q_covered == 0 || q_covered > draft.size() ||
-            candidate_ids.size() != q_covered * (size_t) top_k ||
-            q_rows.size() != candidate_ids.size()) {
+            q_covered > candidate_ids.size() / (size_t) top_k ||
+            q_rows.size() != candidate_ids.size() || candidate_ids.size() % top_k != 0) {
         return false;
     }
 

@@ -54,6 +54,19 @@ For the full and up-to-date list of supported models, see #18039.
 
 ### Native MTP (`draft-mtp`)
 
+For single-head MTP with a separate draft cache (such as Qwen3.5/3.6/3.8),
+`llama-server` samples draft proposals at the request's temperature and verifies
+their probabilities against the target distribution. This is automatic for
+nonzero temperature, `top_k` from 1 to 64, and `--spec-draft-p-min 0` (the default).
+It uses the same runtime for embedded GGUF MTP, native safetensors MTP, and MTP
+sidecars, and works with adaptive draft depth. No additional flag is needed.
+
+Greedy requests, positive draft-confidence thresholds, Mirostat/adaptive-p,
+and shared-cache or chained-head MTP retain the existing drafting path. The
+probability-aware path preserves the target sampling distribution, not the exact
+seeded text of non-speculative decoding. Target penalties and filters still apply
+during verification; the draft need not use an identical sampling chain.
+
 Qwen3.5, Qwen3.6, and Qwen3.8 27B models can use their native next-token-prediction
 layer as an external MTP sidecar. For a standalone Qwen-27B MTP GGUF with a full
 output head, `llama-server` automatically creates a smaller derived sidecar in the
@@ -66,8 +79,8 @@ MIT-licensed [public balanced map](https://huggingface.co/Avifenesh/memra-bench/
 from Avifenesh/memra-bench, built from a reproducible 50/50 code-prose corpus for
 the Qwen3.6/3.8 tokenizer family. The target
 model still verifies every proposed token over its complete vocabulary, so speculative
-decoding remains lossless; an omitted draft token can reduce acceptance but cannot
-change accepted target output.
+decoding remains lossless; an omitted draft token can reduce acceptance but does
+not restrict the target's output vocabulary or sampling distribution.
 
 ```bash
 llama-server -m Qwen3.8-27B.gguf -md mtp-Qwen3.8-27B.gguf \

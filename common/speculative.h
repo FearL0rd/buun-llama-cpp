@@ -23,6 +23,10 @@ struct common_speculative_proposal {
     size_t q_covered_tokens = 0;
     llama_seq_id seq_id = -1;
     bool exact_q = false;
+
+    void clear();
+    // A server may shorten a draft or append CopySpec tokens after these rows.
+    size_t matching_prefix_size(llama_seq_id seq, const llama_tokens & draft) const;
 };
 
 // comma separated list the provided types
@@ -251,12 +255,8 @@ void common_speculative_accept(common_speculative * spec, uint16_t n_accepted);
 
 // fork: DFlash slot routing
 void common_speculative_set_seq_id(common_speculative * spec, llama_seq_id seq_id);
-void common_speculative_set_rng_seed(
-        common_speculative * spec,
-        llama_seq_id         seq_id,
-        uint32_t             seed);
-
-void common_speculative_set_mtp_sampling(
+// Configure request-local proposal sampling, using the target's resolved seed.
+void common_speculative_set_sampling(
         common_speculative * spec, llama_seq_id seq_id,
         const common_params_sampling & sampling);
 
@@ -281,7 +281,7 @@ void common_speculative_draft_batch(
 // at least one decode on a linked draft-model context.
 bool common_speculative_last_draft_model_decode_succeeded(const common_speculative * spec);
 
-// Proposal distribution owned by the DFlash state that produced the most
+// Proposal distribution owned by the implementation that produced the most
 // recent draft. Null means the current draft has no verified proposal payload.
 const common_speculative_proposal * common_speculative_get_proposal(
         const common_speculative * spec,
