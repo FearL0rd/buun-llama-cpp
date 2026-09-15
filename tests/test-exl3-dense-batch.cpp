@@ -94,6 +94,7 @@ int main() {
     }
     bool ok = true;
     for (int bits = 1; bits <= 8; ++bits) {
+        ok &= check_batch(backend, bits, 128, 128, false);  // single K split, half a column block
         ok &= check_batch(backend, bits, 5120, 640, false);  // partial N tile, many K slices
         ok &= check_batch(backend, bits, 2048, 6144, false);
         ok &= check_batch(backend, bits, 4096, 151936, true); // cap-limited split, head residual

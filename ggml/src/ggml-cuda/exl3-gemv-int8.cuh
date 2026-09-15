@@ -273,6 +273,13 @@ __global__ void __launch_bounds__(THREADS) gemv_int8_kernel(const uint8_t * __re
     constexpr bool INT8 = cb == 2;
     static_assert(INT8 || !RESID, "residual pass is an int8-mode feature");
     constexpr int NACC = (RESID ? 2 : 1) * M;
+#if defined(GGML_USE_HIP) && defined(RDNA4)
+    // Measured dense mul1 crossover: retain vector dots for one/two rows.
+    // Other row counts/precisions and grouped MoE retain their existing executor.
+    constexpr bool WMMA = INT8 && !GROUPED && bits >= 2 && bits <= 4 && (M == 3 || M == 4 || M == 8);
+#else
+    constexpr bool WMMA = false;
+#endif
     if constexpr (GROUPED) {
         // this block's (token, expert slot) pair selects the expert's weights, scales and rows
         const int pair = blockIdx.z;
@@ -391,7 +398,65 @@ __global__ void __launch_bounds__(THREADS) gemv_int8_kernel(const uint8_t * __re
     const uint32_t * B32 = reinterpret_cast<const uint32_t *>(B);
 
     const int n_tiles = n / 16;
-    if constexpr (WIDE) {
+    if constexpr (WMMA) {
+#if defined(GGML_USE_HIP) && defined(RDNA4)
+        using i2 = int __attribute__((ext_vector_type(2)));
+        using i8 = int __attribute__((ext_vector_type(8)));
+        static_assert(NACC <= 16);
+        const int nt = blockIdx.x * 16 + warp * 2;
+        i8 acc[2] = {};
+        for (int kb = 0; kb < nrows; ++kb) {
+#pragma unroll
+            for (int j0 = 0; j0 < 16; j0 += 4) {
+                i2 b;
+#pragma unroll
+                for (int l = 0; l < 2; ++l) {
+                    const int j = j0 + 2 * (lane / 16) + l;
+                    b[l] = lq < NACC ? int(sh_as[lq * nrows_max * 16 + kb * 16 + j]) : 0;
+                }
+#pragma unroll
+                for (int tile = 0; tile < 2; ++tile) {
+                    i2 a;
+#pragma unroll
+                    for (int l = 0; l < 2; ++l) {
+                        const int j = j0 + 2 * (lane / 16) + l;
+                        // Inverse of the trellis tile's (column, K) permutation.
+                        const int t = (lq % 8) * 32 + (j % 8) / 2 * 8 + (lq / 8) * 4 + (j / 8) * 2 + (j % 2);
+                        const int end = (t + 257) * bits;
+                        const int first = (end - 16) / 32, last = (end - 1) / 32;
+                        uint32_t w = 0;
+                        if (nt + tile < n_tiles) {
+                            const uint32_t * ptr = B32 + (size_t(nt + tile) * kslices + kb0 + kb) * TWORDS;
+                            w = exl3::fshift(ptr[last % TWORDS], ptr[first % TWORDS], (last + 1) * 32 - end) & 65535u;
+                        }
+                        a[l] = int(w * 0x83DCD12Du);
+                    }
+                    // Four unsigned product bytes times the signed activation splat
+                    // reproduce dp4a_us exactly; residual planes occupy extra rows.
+                    acc[tile] = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12(false, a, true, b, acc[tile], false);
+                }
+            }
+        }
+#pragma unroll
+        for (int tile = 0; tile < 2; ++tile) {
+#pragma unroll
+            for (int l = 0; l < 8; ++l) {
+                // RDNA4 accumulator layout: lane%16 is the activation plane;
+                // 8*(lane/16)+l is the output column within this 16-column tile.
+                int second = 0;
+                if constexpr (RESID) second = __shfl_down_sync(0xffffffffu, acc[tile][l], 1);
+                if (nt + tile < n_tiles && lq < NACC && (!RESID || !(lq & 1))) {
+                    // Move the integer residual before folding; shuffling rounded
+                    // residual floats here would change the original rounding order.
+                    float v = sh_q[lq] * (k_inv * float(acc[tile][l]) + cbias * float(sh_s[lq]));
+                    if constexpr (RESID) v += sh_q[lq + 1] * (k_inv * float(second) + cbias * float(sh_s[lq + 1]));
+                    const int r = RESID ? lq / 2 : lq;
+                    partials[(size_t(blockIdx.y) * M + r) * n + (nt + tile) * 16 + 8 * (lane / 16) + l] = v;
+                }
+            }
+        }
+#endif
+    } else if constexpr (WIDE) {
         const int nt = blockIdx.x * 16 + warp * 2 + (lane >> 4);
         const bool active = nt < n_tiles;   // partial last block: warps beyond n idle (whole warp)
         const uint32_t * bp = B32 + (size_t(nt) * kslices + kb0) * TWORDS + 2 * lq;
