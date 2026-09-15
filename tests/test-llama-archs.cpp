@@ -598,11 +598,6 @@ static void test_qwen4_ple_recurrent_resize(const size_t seed) {
     };
     ple_ctx.reset(ggml_init(tensor_params));
     GGML_ASSERT(ple_ctx != nullptr);
-    auto make_1d = [&](int64_t ne0, const char * name) {
-        ggml_tensor * tensor = ggml_new_tensor_1d(ple_ctx.get(), GGML_TYPE_F32, ne0);
-        ggml_set_name(tensor, name);
-        return tensor;
-    };
     auto make_2d = [&](int64_t ne0, int64_t ne1, const char * name) {
         ggml_tensor * tensor = ggml_new_tensor_2d(ple_ctx.get(), GGML_TYPE_F32, ne0, ne1);
         ggml_set_name(tensor, name);
@@ -611,9 +606,9 @@ static void test_qwen4_ple_recurrent_resize(const size_t seed) {
     model->per_layer_tok_embd      = make_2d(256, 128, "per_layer_token_embd.weight");
     model->layers[0].ple_key        = make_2d(256, 1024, "blk.0.ple_key.weight");
     model->layers[0].ple_value      = make_2d(256, 256, "blk.0.ple_value.weight");
-    model->layers[0].ple_norm_key   = make_1d(1024, "blk.0.ple_norm_key.weight");
-    model->layers[0].ple_norm_query = make_1d(1024, "blk.0.ple_norm_query.weight");
-    model->layers[0].ple_norm_conv  = make_1d(1024, "blk.0.ple_norm_conv.weight");
+    model->layers[0].ple_norm_key   = make_2d(hp.n_embd, hp.dsv4_hc_mult, "blk.0.ple_norm_key.weight");
+    model->layers[0].ple_norm_query = make_2d(hp.n_embd, hp.dsv4_hc_mult, "blk.0.ple_norm_query.weight");
+    model->layers[0].ple_norm_conv  = make_2d(hp.n_embd, hp.dsv4_hc_mult, "blk.0.ple_norm_conv.weight");
     model->layers[0].ple_conv1d     = make_2d(2, 1024, "blk.0.ple_conv1d.weight");
     ple_buf.reset(ggml_backend_alloc_ctx_tensors_from_buft(ple_ctx.get(), ggml_backend_cpu_buffer_type()));
     GGML_ASSERT(ple_buf != nullptr);
