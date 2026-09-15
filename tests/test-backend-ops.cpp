@@ -5069,6 +5069,8 @@ struct test_gated_delta_net_norm : public test_gated_delta_net {
     const float amplitude;
     const bool deferred;
 
+    bool run_whole_graph() override { return true; }
+
     test_gated_delta_net_norm(int64_t tokens, float amplitude, bool deferred)
         : test_gated_delta_net(GGML_TYPE_F32, 2, 128, tokens, 1, 3),
           amplitude(amplitude), deferred(deferred) {}
@@ -5112,7 +5114,7 @@ struct test_gated_delta_net_norm : public test_gated_delta_net {
         std::vector<float> data(ggml_nelements(conv));
         for (size_t i = 0; i < data.size(); ++i) {
             // V remains ordinary-sized while only Q/K approach zero.
-            const float scale = i % conv->ne[0] < 2*head_count*head_size ? amplitude : 1.0f;
+            const float scale = i % size_t(conv->ne[0]) < size_t(2*head_count*head_size) ? amplitude : 1.0f;
             data[i] = scale * float(int(i % 31) - 15) / 15.0f;
         }
         ggml_backend_tensor_set(conv, data.data(), 0, ggml_nbytes(conv));
