@@ -96,6 +96,9 @@ gated_delta_net_cuda(const float * q,
             k_reg[r] = k_t[i];
             q_reg[r] = q_t[i];
         }
+#if !defined(GGML_USE_HIP)
+        // HIP normalizes in the preceding paired kernel and never defers it.
+        // Keep this unused branch out of its recurrent token loop.
         // Deferred q/k normalization retains the graph's formula, including its
         // RMS + SCALE stages, with the paired kernel's reduction order.
         if (l2_norm.eps >= 0.0f) {
@@ -116,6 +119,9 @@ gated_delta_net_cuda(const float * q,
                 k_reg[r] = l2_norm.apply(k_reg[r], scale_k);
             }
         }
+#else
+        GGML_UNUSED(l2_norm);
+#endif
 
         if constexpr (!KDA) {
             const float g_val = GDN_EXPF(*g_t);
