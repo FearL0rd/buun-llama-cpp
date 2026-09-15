@@ -403,6 +403,7 @@ public:
     bool get_has_shift() const;
 
     ggml_type type_k() const;
+    // GGML_TYPE_COUNT denotes an absent V side (key-only / MLA cache).
     ggml_type type_v() const;
 
     std::vector<uint32_t> get_layer_ids() const;

@@ -1209,9 +1209,9 @@ static void test_qwen4_indexed_cache_admission(const size_t seed) {
         constexpr uint64_t n_index_values    = 128;
         constexpr uint64_t bytes_f16         = 2;
         constexpr uint64_t ref_attn_f16      = n_attn_layers * 2 * n_kv_values_side * bytes_f16 * n_ctx_train;
-        constexpr uint64_t ref_index_generic = n_attn_layers * 2 * n_index_values * bytes_f16 * n_ctx_train;
+        constexpr uint64_t ref_index_generic = n_attn_layers * n_index_values * bytes_f16 * n_ctx_train;
         GGML_ASSERT(ref_attn_f16 == 6ULL * 1024 * 1024 * 1024);
-        GGML_ASSERT(ref_index_generic == 1536ULL * 1024 * 1024);
+        GGML_ASSERT(ref_index_generic == 768ULL * 1024 * 1024);
 
         auto * memory = dynamic_cast<llama_memory_hybrid_idx *>(llama_get_memory(model_and_ctx.second.get()));
         GGML_ASSERT(memory != nullptr);
@@ -1219,7 +1219,7 @@ static void test_qwen4_indexed_cache_admission(const size_t seed) {
         GGML_ASSERT(memory->get_mem_recr() != nullptr);
         GGML_ASSERT(memory->get_mem_idx()  != nullptr);
         GGML_ASSERT(memory->get_mem_idx()->type_k() == GGML_TYPE_F16);
-        GGML_ASSERT(memory->get_mem_idx()->type_v() == GGML_TYPE_F16);
+        GGML_ASSERT(memory->get_mem_idx()->type_v() == GGML_TYPE_COUNT);
 
         const auto merge = [](auto dst, const auto & src) {
             for (const auto & [buft, size] : src) {
@@ -1266,7 +1266,7 @@ static void test_qwen4_indexed_cache_admission(const size_t seed) {
         GGML_ASSERT(indexed_memory != nullptr);
         GGML_ASSERT(indexed_memory->get_mem_idx() != nullptr);
         GGML_ASSERT(indexed_memory->get_mem_idx()->type_k() == GGML_TYPE_F16);
-        GGML_ASSERT(indexed_memory->get_mem_idx()->type_v() == GGML_TYPE_F16);
+        GGML_ASSERT(indexed_memory->get_mem_idx()->type_v() == GGML_TYPE_COUNT);
         return memory;
     };
 
@@ -1348,7 +1348,7 @@ static void test_qwen4_indexed_cache_admission(const size_t seed) {
         GGML_ASSERT(q8_indexed->get_mem_attn()->type_k() == GGML_TYPE_Q8_0);
         GGML_ASSERT(q8_indexed->get_mem_attn()->type_v() == GGML_TYPE_Q8_0);
         GGML_ASSERT(q8_indexed->get_mem_idx()->type_k() == GGML_TYPE_F16);
-        GGML_ASSERT(q8_indexed->get_mem_idx()->type_v() == GGML_TYPE_F16);
+        GGML_ASSERT(q8_indexed->get_mem_idx()->type_v() == GGML_TYPE_COUNT);
         GGML_ASSERT(q8_indexed->memory_breakdown_vbr_managed() ==
                     q8_indexed->get_mem_attn()->memory_breakdown_vbr_managed());
     }
@@ -1718,7 +1718,7 @@ static void test_qwen4_vbr_cuda(const size_t seed) {
         GGML_ASSERT(memory->get_mem_attn()->type_k() == tier);
         GGML_ASSERT(memory->get_mem_attn()->type_v() == tier);
         GGML_ASSERT(memory->get_mem_idx()->type_k() == GGML_TYPE_F16);
-        GGML_ASSERT(memory->get_mem_idx()->type_v() == GGML_TYPE_F16);
+        GGML_ASSERT(memory->get_mem_idx()->type_v() == GGML_TYPE_COUNT);
         decode_range(ctx.get(), 0, 4);
         const double tier_nmse = nmse(static_ref_logits, last_logits(ctx.get()));
         GGML_ASSERT(std::isfinite(tier_nmse));
@@ -2084,7 +2084,7 @@ static void test_qwen4_vbr_cuda(const size_t seed) {
     GGML_ASSERT(llama_kv_cache_vbr_epoch_test::n_stream(attn) == 1);
     GGML_ASSERT(llama_kv_cache_vbr_epoch_test::n_stream(idx) == 1);
     GGML_ASSERT(llama_kv_cache_vbr_epoch_test::map_seed_watermark(attn));
-    GGML_ASSERT(idx->type_k() == GGML_TYPE_F16 && idx->type_v() == GGML_TYPE_F16);
+    GGML_ASSERT(idx->type_k() == GGML_TYPE_F16 && idx->type_v() == GGML_TYPE_COUNT);
 
     // Entry and floor queries use the same bits-per-context-token unit. This pins the fit's
     // fractional-floor denominator against accidentally returning aggregate bits/value.
@@ -2155,7 +2155,7 @@ static void test_qwen4_vbr_cuda(const size_t seed) {
             }
         }
         decode_range(ctx.get(), next_pos++, 1);
-        GGML_ASSERT(idx->type_k() == GGML_TYPE_F16 && idx->type_v() == GGML_TYPE_F16);
+        GGML_ASSERT(idx->type_k() == GGML_TYPE_F16 && idx->type_v() == GGML_TYPE_COUNT);
     }
     GGML_ASSERT(std::all_of(
         seen_tier.begin(), seen_tier.end(), [](bool seen) { return seen; }));
@@ -2168,7 +2168,7 @@ static void test_qwen4_vbr_cuda(const size_t seed) {
     GGML_ASSERT(trace.score_nodes > 0 && trace.top_k_nodes > 0);
     GGML_ASSERT(attn->seq_pos_max(0) == 319);
     GGML_ASSERT(idx ->seq_pos_max(0) == 319);
-    GGML_ASSERT(idx->type_k() == GGML_TYPE_F16 && idx->type_v() == GGML_TYPE_F16);
+    GGML_ASSERT(idx->type_k() == GGML_TYPE_F16 && idx->type_v() == GGML_TYPE_COUNT);
 
     llama_batch two_seq = llama_batch_init(2, 0, 2);
     common_batch_add(two_seq, 3, 320, { 0 }, true);
@@ -2253,6 +2253,23 @@ static void test_qwen4_vbr_cuda(const size_t seed) {
         std::unique_ptr<vbr_parsed_companion_image> refused;
         GGML_ASSERT(!vbr_parse_qsa_index_companion(
             nullptr, wrong_version, qsa_chain, qsa_target, refused));
+        GGML_ASSERT(!refused);
+    }
+
+    // A legacy two-sided index image must not be read as key-only state. The
+    // native header's V-type field distinguishes these storage layouts even
+    // when model identity and all K dimensions match.
+    {
+        auto two_sided = qsa_bytes;
+        const size_t v_type_offset = 4*sizeof(uint32_t) + sizeof(ggml_type);
+        const ggml_type legacy_v_type = GGML_TYPE_F16;
+        GGML_ASSERT(v_type_offset + sizeof(legacy_v_type) <= two_sided.size());
+        std::memcpy(two_sided.data() + v_type_offset, &legacy_v_type, sizeof(legacy_v_type));
+        artifact_segment_chain legacy_chain(two_sided.size());
+        GGML_ASSERT(legacy_chain.append(two_sided.data(), two_sided.size()));
+        std::unique_ptr<vbr_parsed_companion_image> refused;
+        GGML_ASSERT(!vbr_parse_qsa_index_companion(
+            nullptr, qsa_descriptor, legacy_chain, qsa_target, refused));
         GGML_ASSERT(!refused);
     }
 
