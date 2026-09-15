@@ -540,18 +540,6 @@ static vbr_artifact_package make_package(fixture_storage & storage) {
     reference.stash_reference.covered_sink_pages = { make_page(0x3) };
     manifest.unit_references.push_back(reference);
 
-    const vbr_artifact_portable_domain device0 {
-        llama_cache_acct_residency::device,
-        llama_cache_acct_domain_kind::device_topology,
-        0,
-        0,
-    };
-    const vbr_artifact_portable_domain device1 {
-        llama_cache_acct_residency::device,
-        llama_cache_acct_domain_kind::device_topology,
-        0,
-        1,
-    };
     const vbr_artifact_portable_domain host {
         llama_cache_acct_residency::pageable_host,
         llama_cache_acct_domain_kind::not_applicable,
@@ -561,19 +549,11 @@ static vbr_artifact_package make_package(fixture_storage & storage) {
     manifest.accounting = {
         {
             vbr_artifact_accounting_role::unit_payload,
-            device0, 4, 4, llama_cache_acct_attr_kind::artifact,
-        },
-        {
-            vbr_artifact_accounting_role::unit_payload,
-            device1, 4, 4, llama_cache_acct_attr_kind::artifact,
+            host, 8, 8, llama_cache_acct_attr_kind::artifact,
         },
         {
             vbr_artifact_accounting_role::clean_stash_payload,
-            device0, 8, 8, llama_cache_acct_attr_kind::artifact,
-        },
-        {
-            vbr_artifact_accounting_role::clean_stash_payload,
-            device1, 8, 8, llama_cache_acct_attr_kind::artifact,
+            host, 16, 16, llama_cache_acct_attr_kind::artifact,
         },
         {
             vbr_artifact_accounting_role::descriptor_metadata,
@@ -601,6 +581,7 @@ static void test_golden_and_native_lineage() {
               package, encoded, 1024*1024) ==
           vbr_artifact_status::ok);
     CHECK(!encoded.empty());
+    if (encoded.size() < 8) { return; }
     CHECK(package.topologies[0].digest ==
           llama_cache_acct_compute_topology_digest(package.topologies[0]));
     CHECK(hex(package.unit_blobs[0].unit_version_id.bytes()) ==
@@ -614,10 +595,10 @@ static void test_golden_and_native_lineage() {
     CHECK(hex(package.manifest.token_block.digest.bytes()) ==
           "9635811050104e380f761c837ec49756986867248fab5e94877adbb7be90ad68");
     CHECK(hex(package.manifest.manifest_digest.bytes()) ==
-          "e19f919b9369b41afad3c6506c7c6a3159c02dd4961b9f883ba79eff41c989c8");
+          "efe4f18ffe975a527ab6c71f423a809dae7d92f36f2a88b3dd02e8365f652083");
     CHECK(hex(digest_of(encoded)) ==
-          "098e00421a46ec5e2a8680db85814bd960deb61f6db53597d762124cb21cfc5d");
-    CHECK(encoded.size() == 2370);
+          "4c7827cd6572cae6da3b15efcb93686f0b4d93d15b68174daa1af7d306cba12d");
+    CHECK(encoded.size() == 2290);
     CHECK(encoded[0] == 0x56 && encoded[1] == 0x42 &&
           encoded[2] == 0x52 && encoded[3] == 0x32);
     CHECK(encoded[4] == 3 && encoded[5] == 0 &&
@@ -663,10 +644,11 @@ static void test_v1_decode_and_v2_restore_metadata() {
     std::vector<uint8_t> bytes;
     CHECK(vbr_artifact_encode_vector(legacy, bytes, 1024*1024) ==
           vbr_artifact_status::ok);
+    if (bytes.size() < 8) { return; }
     CHECK(bytes[4] == 1);
-    CHECK(bytes.size() == 2254);
+    CHECK(bytes.size() == 2174);
     CHECK(hex(digest_of(bytes)) ==
-          "b8ba3cb1191ca5be00720d5ab77a2b8c49406b9c5957b39f52c932e2c6c68e8d");
+          "409cfe01c6569b1166176005546a787deaa321cb22e797c2dfee3a00660ccddb");
     vbr_artifact_package decoded;
     CHECK(vbr_artifact_decode_vector(bytes, limits(1024*1024), decoded) ==
           vbr_artifact_status::ok);
@@ -683,10 +665,11 @@ static void test_v1_decode_and_v2_restore_metadata() {
     bytes.clear();
     CHECK(vbr_artifact_encode_vector(v2, bytes, 1024*1024) ==
           vbr_artifact_status::ok);
+    if (bytes.size() < 8) { return; }
     CHECK(bytes[4] == 2);
-    CHECK(bytes.size() == 2358);
+    CHECK(bytes.size() == 2278);
     CHECK(hex(digest_of(bytes)) ==
-          "085b609eb67c847f5086ccd8ae44c9a8cc0243d0ce279bee5c617c63298f03dd");
+          "a33429b7d8afd68aab79cb656ccb0ccd24f51eb87ecedc54235de6c4c39a264a");
     decoded = {};
     CHECK(vbr_artifact_decode_vector(bytes, limits(1024*1024), decoded) ==
           vbr_artifact_status::ok);
@@ -1260,12 +1243,7 @@ static void test_stream_larger_than_capture_ring() {
     package.manifest.accounting = {
         {
             vbr_artifact_accounting_role::unit_payload,
-            {
-                llama_cache_acct_residency::device,
-                llama_cache_acct_domain_kind::device_topology,
-                0,
-                0,
-            },
+            vbr_artifact_payload_storage_domain(),
             generated.size,
             generated.size,
             llama_cache_acct_attr_kind::artifact,
@@ -1400,6 +1378,8 @@ struct catalog_fixture {
             initialize(
                 llama_cache_acct_category::rolling_window_tape,
                 binding.domain, false);
+            initialize(llama_cache_acct_category::transfer_staging, binding.domain, true);
+            initialize(llama_cache_acct_category::codec_workspace, binding.domain, true);
         }
         CHECK(ledger.certify_complete(
             host, llama_cache_acct_producer::retention_sidecar));
@@ -1719,13 +1699,17 @@ static void test_catalog_streaming_protocol() {
             snapshot,
             llama_cache_acct_category::unit_version_payload,
             binding.domain,
-            llama_cache_acct_measure::resident_allocated).value == 4);
+            llama_cache_acct_measure::resident_allocated).value == 0);
         CHECK(catalog_cell(
             snapshot,
             llama_cache_acct_category::clean_stash_payload,
             binding.domain,
-            llama_cache_acct_measure::resident_allocated).value == 8);
+            llama_cache_acct_measure::resident_allocated).value == 0);
     }
+    CHECK(catalog_cell(snapshot, llama_cache_acct_category::unit_version_payload,
+        f.host, llama_cache_acct_measure::resident_allocated).value == 8);
+    CHECK(catalog_cell(snapshot, llama_cache_acct_category::clean_stash_payload,
+        f.host, llama_cache_acct_measure::resident_allocated).value == 16);
     CHECK(catalog_cell(
         snapshot,
         llama_cache_acct_category::artifact_descriptor_metadata,
@@ -2050,13 +2034,17 @@ static void test_catalog_charge_once_and_retire() {
             snapshot,
             llama_cache_acct_category::unit_version_payload,
             binding.domain,
-            llama_cache_acct_measure::resident_allocated).value == 4);
+            llama_cache_acct_measure::resident_allocated).value == 0);
         CHECK(catalog_cell(
             snapshot,
             llama_cache_acct_category::clean_stash_payload,
             binding.domain,
-            llama_cache_acct_measure::resident_allocated).value == 8);
+            llama_cache_acct_measure::resident_allocated).value == 0);
     }
+    CHECK(catalog_cell(snapshot, llama_cache_acct_category::unit_version_payload,
+        f.host, llama_cache_acct_measure::resident_allocated).value == 8);
+    CHECK(catalog_cell(snapshot, llama_cache_acct_category::clean_stash_payload,
+        f.host, llama_cache_acct_measure::resident_allocated).value == 16);
     CHECK(catalog_cell(
         snapshot,
         llama_cache_acct_category::artifact_descriptor_metadata,
@@ -2081,13 +2069,17 @@ static void test_catalog_charge_once_and_retire() {
             snapshot,
             llama_cache_acct_category::unit_version_payload,
             binding.domain,
-            llama_cache_acct_measure::resident_allocated).value == 4);
+            llama_cache_acct_measure::resident_allocated).value == 0);
         CHECK(catalog_cell(
             snapshot,
             llama_cache_acct_category::clean_stash_payload,
             binding.domain,
-            llama_cache_acct_measure::resident_allocated).value == 8);
+            llama_cache_acct_measure::resident_allocated).value == 0);
     }
+    CHECK(catalog_cell(snapshot, llama_cache_acct_category::unit_version_payload,
+        f.host, llama_cache_acct_measure::resident_allocated).value == 8);
+    CHECK(catalog_cell(snapshot, llama_cache_acct_category::clean_stash_payload,
+        f.host, llama_cache_acct_measure::resident_allocated).value == 16);
     CHECK(catalog_cell(
         snapshot,
         llama_cache_acct_category::artifact_reference_metadata,
@@ -2105,8 +2097,8 @@ static void test_catalog_charge_once_and_retire() {
     CHECK(catalog_cell(
         snapshot,
         llama_cache_acct_category::unit_version_payload,
-        f.bindings[0].domain,
-        llama_cache_acct_measure::resident_allocated).value == 4);
+        f.host,
+        llama_cache_acct_measure::resident_allocated).value == 8);
     CHECK(catalog_cell(
         snapshot,
         llama_cache_acct_category::artifact_reference_metadata,
@@ -2119,12 +2111,12 @@ static void test_catalog_charge_once_and_retire() {
     CHECK(catalog_cell(
         snapshot,
         llama_cache_acct_category::unit_version_payload,
-        f.bindings[0].domain,
+        f.host,
         llama_cache_acct_measure::resident_allocated).value == 0);
     CHECK(catalog_cell(
         snapshot,
         llama_cache_acct_category::clean_stash_payload,
-        f.bindings[0].domain,
+        f.host,
         llama_cache_acct_measure::resident_allocated).value == 0);
     CHECK(catalog_cell(
         snapshot,
@@ -2557,8 +2549,10 @@ static void test_catalog_full_id_interning_and_stash_dedup() {
             accounting,
             llama_cache_acct_category::clean_stash_payload,
             binding.domain,
-            llama_cache_acct_measure::resident_allocated).value == 8);
+            llama_cache_acct_measure::resident_allocated).value == 0);
     }
+    CHECK(catalog_cell(accounting, llama_cache_acct_category::clean_stash_payload,
+        f.host, llama_cache_acct_measure::resident_allocated).value == 16);
     CHECK(f.catalog->retire(first.reference_artifact) == vbr_artifact_retire_status::retired);
     CHECK(f.catalog->retire(second.reference_artifact) == vbr_artifact_retire_status::retired);
 }
@@ -2578,6 +2572,10 @@ static void test_catalog_capacity_sequential_and_temporaries() {
           llama_vbr_artifact_publish_status::published);
 
     fixture_storage changed_storage;
+    // Retained payloads and metadata are on the host. Leave room for the
+    // existing unit/stash/descriptor/reference, but not another publication.
+    f.budget.host.pageable_cap = 8 + 16 + 512 + 256;
+    f.budget.host.pageable_state = llama_cache_budget_capacity_state::known;
     changed_storage.payload0.bytes[0] ^= 1;
     auto changed = make_package(changed_storage);
     const auto refused =
@@ -3963,7 +3961,7 @@ static void test_manifest_validator_matrix() {
             CHECK(leaf.reserve_resident != 0);
         }
     }
-    CHECK(existing_leaves == 5);
+    CHECK(existing_leaves == 3); // aggregated host unit, stash and recurrent companion
     CHECK(fresh_metadata_leaves == 2);
     CHECK(native.proof->tracker_install().children[0].transition ==
           vbr_tracker_install_transition::native_clone);
@@ -4852,6 +4850,8 @@ static void test_manifest_validator_matrix() {
     }
 
     auto restrictive = f.base.budget;
+    restrictive.host.pageable_cap = 0;
+    restrictive.host.pageable_state = llama_cache_budget_capacity_state::known;
     for (auto & device : restrictive.devices) {
         device.configured_cache_cap = 0;
         device.cache_cap_state = llama_cache_budget_capacity_state::known;
