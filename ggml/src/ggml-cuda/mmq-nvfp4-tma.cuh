@@ -97,7 +97,9 @@ static __device__ __forceinline__ void nvfp4_tma_dot(const int * x, const int * 
 #endif
 
 static __global__ __launch_bounds__(256, 1) void mul_mat_nvfp4_tma(
-#ifdef BLACKWELL_MMA_AVAILABLE
+// Keep the aligned descriptor grid-constant in the host pass too (MSVC C2719).
+// Pascal device compilation cannot use __grid_constant__; this kernel never runs there.
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= GGML_CUDA_CC_VOLTA
         const __grid_constant__ CUtensorMap map,
 #else
         const CUtensorMap map,
