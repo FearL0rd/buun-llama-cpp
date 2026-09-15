@@ -2624,6 +2624,9 @@ struct server_slot {
         if (can_speculate()) {
             common_speculative_set_rng_seed(
                 get_spec(), id, common_sampler_get_seed(smpl.get()));
+            auto sampling = task->params.sampling;
+            sampling.seed = common_sampler_get_seed(smpl.get());
+            common_speculative_set_mtp_sampling(get_spec(), id, sampling);
         }
 
         if (!task->need_sampling()) {

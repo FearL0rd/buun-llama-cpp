@@ -2,6 +2,8 @@
 #include "llama.h"
 #include "sampling.h"
 
+#include <random>
+
 #ifdef NDEBUG
 #undef NDEBUG
 #endif
@@ -402,6 +404,34 @@ static void test_speculative_coupling() {
             threw = true;
         }
         GGML_ASSERT(threw);
+    }
+
+    {
+        // A sampled, truncated draft distribution need not share the target's
+        // support. Verify the complete accept/residual mixture, not only each
+        // helper in isolation. Token 3 exists only in q and token 2 only in p.
+        auto p = make_distribution(storage, { 0.1f, 0.3f, 0.6f, 0.0f });
+        const int32_t q_ids[] = { 0, 1, 3 };
+        const float q[] = { 0.5f, 0.25f, 0.25f };
+        std::mt19937 rng(20260915);
+        std::discrete_distribution<int> propose(q, q + 3);
+        int counts[4] = {};
+        constexpr int n = 200000;
+        for (int i = 0; i < n; ++i) {
+            llama_token token = q_ids[propose(rng)];
+            const double accept = common_sampler_speculative_acceptance_probability(&p, token, q_ids, q, 3);
+            if (std::generate_canonical<double, 53>(rng) >= accept) {
+                token = common_sampler_speculative_sample_residual(
+                    &p, q_ids, q, 3, std::generate_canonical<double, 53>(rng));
+            }
+            GGML_ASSERT(token >= 0 && token < 4);
+            ++counts[token];
+        }
+        const double expected[] = { 0.1, 0.3, 0.6, 0.0 };
+        for (int i = 0; i < 4; ++i) {
+            GGML_ASSERT(std::abs(double(counts[i]) / n - expected[i]) < 0.005);
+        }
+        GGML_ASSERT(counts[3] == 0);
     }
 }
 

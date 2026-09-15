@@ -2591,6 +2591,73 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     common_params_speculative_draft params; // reuses the draft-model params slot (ctx_tgt/ctx_dft)
 
+    // Temporary experiment control; the original path remains the A/B control.
+    bool sampled_proposals = std::getenv("BUUN_EXP_MTP_Q") != nullptr;
+    std::vector<common_params_sampling> proposal_sampling;
+    std::vector<std::mt19937> proposal_rngs;
+    std::vector<common_speculative_proposal> proposals;
+
+    void configure_sampling(llama_seq_id seq_id, const common_params_sampling & sampling) {
+        if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
+            return;
+        }
+        proposal_sampling[seq_id] = sampling;
+        proposal_rngs[seq_id].seed(sampling.seed ^ 0x85ebca6bU);
+        proposals[seq_id] = {};
+        if (sampled_proposals) {
+            SPC_INF("MTP q experiment seq=%d temp=%.3f top_k=%d top_p=%.3f p_min=%.3f\n",
+                seq_id, sampling.temp, sampling.top_k, sampling.top_p, params.p_min);
+        }
+    }
+
+    llama_token sample_proposal(llama_seq_id seq_id, const llama_token_data_array & candidates) {
+        const auto & sampling = proposal_sampling[seq_id];
+        const int k = std::min(sampling.top_k, (int) candidates.size);
+        std::vector<float> q(k);
+        double sum = 0.0;
+        for (int i = 0; i < k; ++i) {
+            q[i] = std::exp((candidates.data[i].logit - candidates.data[0].logit) / sampling.temp);
+            sum += q[i];
+        }
+        double cumulative = 0.0;
+        int keep = k;
+        for (int i = 0; i < k; ++i) {
+            cumulative += q[i] / sum;
+            if (cumulative >= sampling.top_p) {
+                keep = i + 1;
+                break;
+            }
+        }
+        sum = 0.0;
+        for (int i = 0; i < keep; ++i) {
+            sum += q[i];
+        }
+        for (int i = 0; i < k; ++i) {
+            q[i] = i < keep ? q[i] / sum : 0.0f;
+        }
+        double u = std::generate_canonical<double, 53>(proposal_rngs[seq_id]);
+        int selected = keep - 1;
+        for (int i = 0; i < keep; ++i) {
+            u -= q[i];
+            if (u < 0.0) {
+                selected = i;
+                break;
+            }
+        }
+        auto & proposal = proposals[seq_id];
+        proposal.seq_id = seq_id;
+        proposal.top_k = k;
+        for (int i = 0; i < k; ++i) {
+            proposal.candidate_ids.push_back(candidates.data[i].id);
+            proposal.q_rows.push_back(q[i]);
+        }
+        const llama_token token = candidates.data[selected].id;
+        proposal.selected.push_back(token);
+        proposal.q_covered_tokens = proposal.selected.size();
+        proposal.exact_q = true;
+        return token;
+    }
+
     llama_batch batch;
 
     std::vector<common_sampler_ptr> smpls;
@@ -2652,6 +2719,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         GGML_ASSERT(n_embd == llama_model_n_embd_out(llama_get_model(ctx_tgt)) &&
                 "MTP input row width must match the target h_nextn width");
         n_mtp_layers = std::max(1, (int) llama_model_n_layer_nextn(llama_get_model(ctx_dft)));
+        // Keep the original top-10 confidence normalization for unqualified
+        // thresholded drafting; this prototype measures the p_min=0 case.
+        sampled_proposals = sampled_proposals && this->params.p_min == 0.0f;
 
         SPC_TRC("%s", "adding speculative implementation 'draft-mtp'\n");
         SPC_TRC("- n_max=%d, n_min=%d, p_min=%.2f, n_embd=%d, backend_sampling=%d\n", this->params.n_max, this->params.n_min, this->params.p_min, n_embd, (int) this->params.backend_sampling);
@@ -2669,11 +2739,14 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         // TODO: fix, how to call without malloc
         batch.token = (llama_token *) malloc(sizeof(llama_token) * n_b);
 
+        proposal_sampling.resize(n_seq);
+        proposal_rngs.resize(n_seq);
+        proposals.resize(n_seq);
         smpls.resize(n_seq);
         for (auto & s : smpls) {
             common_params_sampling sparams;
             sparams.no_perf  = false;
-            sparams.top_k    = 10;
+            sparams.top_k    = sampled_proposals ? 64 : 10;
             sparams.samplers = { COMMON_SAMPLER_TYPE_TOP_K };
             s.reset(common_sampler_init(llama_get_model(ctx_dft), sparams));
         }
@@ -2683,7 +2756,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         if (this->params.backend_sampling) {
             for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
                 llama_sampler * chain = llama_sampler_chain_init(llama_sampler_chain_default_params());
-                llama_sampler_chain_add(chain, llama_sampler_init_top_k(10));
+                llama_sampler_chain_add(chain, llama_sampler_init_top_k(sampled_proposals ? 64 : 10));
 
                 if (!llama_set_sampler(ctx_dft, seq_id, chain)) {
                     SPC_WRN("backend offload failed for seq_id=%d; using CPU sampler\n", (int) seq_id);
@@ -2957,6 +3030,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 continue;
             }
 
+            proposals[seq_id] = {};
             const float * carry = pending_h_lifecycle[seq_id].draft_carry(
                     pending_h[seq_id].data());
             if (carry == nullptr) {
@@ -3031,9 +3105,6 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                             common_token_to_piece(ctx_dft, cur_p->data[k].id).c_str());
                 }
 
-                // add drafted token for each sequence
-                const llama_token id = cur_p->data[0].id;
-
                 // only collect very high-confidence draft tokens
                 if (cur_p->data[0].p < params.p_min) {
                     drafting[seq_id] = false;
@@ -3041,6 +3112,13 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
                     continue;
                 }
+
+                const auto & sampling = proposal_sampling[seq_id];
+                const bool use_q = sampled_proposals && !is_mem_shared && !chain_heads &&
+                    params.p_min == 0.0f && sampling.temp > 0.0f &&
+                    sampling.top_k > 0 && sampling.top_k <= 64 &&
+                    sampling.top_p > 0.0f && sampling.top_p <= 1.0f;
+                const llama_token id = use_q ? sample_proposal(seq_id, *cur_p) : cur_p->data[0].id;
 
                 common_sampler_accept(smpl, id, true);
 
@@ -6432,6 +6510,19 @@ void common_speculative_set_rng_seed(
     }
 }
 
+void common_speculative_set_mtp_sampling(
+        common_speculative * spec, llama_seq_id seq_id,
+        const common_params_sampling & sampling) {
+    if (!spec) {
+        return;
+    }
+    for (auto & impl : spec->impls) {
+        if (impl->type == COMMON_SPECULATIVE_TYPE_DRAFT_MTP) {
+            static_cast<common_speculative_impl_draft_mtp *>(impl.get())->configure_sampling(seq_id, sampling);
+        }
+    }
+}
+
 llama_tokens common_speculative_draft(
         common_speculative              * spec,
         const common_params_speculative & params,
@@ -6652,7 +6743,14 @@ const common_speculative_proposal * common_speculative_get_proposal(
         return nullptr;
     }
     const auto * impl = spec->impl_last[seq_id];
-    if (!impl || impl->type != COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH) {
+    if (!impl) {
+        return nullptr;
+    }
+    if (impl->type == COMMON_SPECULATIVE_TYPE_DRAFT_MTP) {
+        const auto & proposal = static_cast<const common_speculative_impl_draft_mtp *>(impl)->proposals[seq_id];
+        return proposal.exact_q ? &proposal : nullptr;
+    }
+    if (impl->type != COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH) {
         return nullptr;
     }
     const auto * dfl = static_cast<const common_speculative_impl_draft_dflash *>(impl);

@@ -256,6 +256,10 @@ void common_speculative_set_rng_seed(
         llama_seq_id         seq_id,
         uint32_t             seed);
 
+void common_speculative_set_mtp_sampling(
+        common_speculative * spec, llama_seq_id seq_id,
+        const common_params_sampling & sampling);
+
 // fork: single-seq draft (returns tokens)
 llama_tokens common_speculative_draft(
         common_speculative              * spec,
