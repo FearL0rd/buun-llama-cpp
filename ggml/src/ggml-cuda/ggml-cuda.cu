@@ -1019,6 +1019,11 @@ static void ggml_cuda_canonicalize_unserved_marlin_weights(
     bool restored = false;
     for (int i = 0; i < cgraph->n_nodes; ++i) {
         const ggml_tensor * node = cgraph->nodes[i];
+        // No-output prefill can include an empty output projection. It does
+        // not read its weight; let the next nonempty consumer decide layout.
+        if (ggml_is_empty(node)) {
+            continue;
+        }
         for (int s = 0; s < GGML_MAX_SRC; ++s) {
             ggml_tensor * src = node->src[s];
             if (src == nullptr || (src->type != GGML_TYPE_Q4_A32 && src->type != GGML_TYPE_Q8_0_G128)) {
