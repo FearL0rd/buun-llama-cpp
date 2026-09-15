@@ -580,7 +580,7 @@ static void test_golden_and_native_lineage() {
     CHECK(vbr_artifact_encode_vector(
               package, encoded, 1024*1024) ==
           vbr_artifact_status::ok);
-    CHECK(!encoded.empty());
+    CHECK(encoded.size() >= 8);
     if (encoded.size() < 8) { return; }
     CHECK(package.topologies[0].digest ==
           llama_cache_acct_compute_topology_digest(package.topologies[0]));
@@ -644,6 +644,7 @@ static void test_v1_decode_and_v2_restore_metadata() {
     std::vector<uint8_t> bytes;
     CHECK(vbr_artifact_encode_vector(legacy, bytes, 1024*1024) ==
           vbr_artifact_status::ok);
+    CHECK(bytes.size() >= 8);
     if (bytes.size() < 8) { return; }
     CHECK(bytes[4] == 1);
     CHECK(bytes.size() == 2174);
@@ -665,6 +666,7 @@ static void test_v1_decode_and_v2_restore_metadata() {
     bytes.clear();
     CHECK(vbr_artifact_encode_vector(v2, bytes, 1024*1024) ==
           vbr_artifact_status::ok);
+    CHECK(bytes.size() >= 8);
     if (bytes.size() < 8) { return; }
     CHECK(bytes[4] == 2);
     CHECK(bytes.size() == 2278);

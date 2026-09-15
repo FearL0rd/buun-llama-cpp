@@ -4440,7 +4440,7 @@ int main(int argc, char ** argv) {
             "model.layers.3.self_attn.q_proj", "model.layers.3.self_attn.k_proj",
             "model.layers.3.self_attn.v_proj",
         };
-        const std::array<int64_t, 5> rows = { 256, 128, 128, 64, 64 };
+        const std::array<uint64_t, 5> rows = { 256, 128, 128, 64, 64 };
         const std::array<float, 5> globals = { 0.125f, 0.25f, 0.5f, 1.0f, 2.0f };
         std::vector<tensor_fixture> tensors;
         for (size_t i = 0; i < modules.size(); ++i) {
@@ -4471,7 +4471,7 @@ int main(int argc, char ** argv) {
         };
         for (size_t i = 0; i < targets.size(); ++i) {
             require(importer.describe(targets[i] + ".weight", type, ne) && type == GGML_TYPE_NVFP4 &&
-                        ne == std::array<int64_t, GGML_MAX_DIMS>{128, rows[i], 1, 1},
+                        ne == std::array<int64_t, GGML_MAX_DIMS>{128, int64_t(rows[i]), 1, 1},
                     "NVFP4 projection was incorrectly row-fused");
             importer.bind(targets[i] + ".weight");
             require(importer.describe(targets[i] + ".scale", type, ne) && type == GGML_TYPE_F32 && ne[0] == 1,
