@@ -5062,6 +5062,63 @@ struct test_gated_delta_net : public test_case {
     }
 };
 
+// Qwen's RMS+scale normalization, including the shared convolution layout used
+// by paired/deferred CUDA normalization. Small rows distinguish sum+epsilon
+// from the legacy L2 clamp; zero rows must stay finite in both paths.
+struct test_gated_delta_net_norm : public test_gated_delta_net {
+    const float amplitude;
+    const bool deferred;
+
+    test_gated_delta_net_norm(int64_t tokens, float amplitude, bool deferred)
+        : test_gated_delta_net(GGML_TYPE_F32, 2, 128, tokens, 1, 3),
+          amplitude(amplitude), deferred(deferred) {}
+
+    std::string vars() override {
+        return test_gated_delta_net::vars() + ",rms_sum_eps=1," + VARS_TO_STR2(amplitude, deferred);
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t v_heads = head_count * v_repeat;
+        const int64_t channels = head_size * (2*head_count + v_heads);
+        ggml_tensor * conv = ggml_new_tensor_2d(ctx, type, channels, n_seq_tokens);
+        ggml_set_name(conv, "conv_qkv");
+        const auto view = [&](int64_t heads, int64_t offset) {
+            return ggml_view_4d(ctx, conv, head_size, heads, n_seq_tokens, 1,
+                head_size*sizeof(float), channels*sizeof(float),
+                channels*n_seq_tokens*sizeof(float), offset*sizeof(float));
+        };
+        const auto norm = [&](ggml_tensor * x) {
+            return ggml_scale(ctx, ggml_rms_norm(ctx, x, 1e-6f/head_size),
+                              1.0f/sqrtf(float(head_size)));
+        };
+        ggml_tensor * q = norm(view(head_count, 0));
+        ggml_tensor * k = norm(view(head_count, head_count*head_size));
+        if (!deferred) {
+            return ggml_add(ctx, q, k);
+        }
+        ggml_tensor * v = view(v_heads, 2*head_count*head_size);
+        ggml_tensor * g = ggml_new_tensor_4d(ctx, type, 1, v_heads, n_seq_tokens, 1);
+        ggml_tensor * beta = ggml_new_tensor_4d(ctx, type, 1, v_heads, n_seq_tokens, 1);
+        ggml_tensor * state = ggml_new_tensor_4d(ctx, type, head_size, head_size, v_heads, 1);
+        ggml_set_name(g, "g");
+        ggml_set_name(beta, "beta");
+        ggml_set_name(state, "state");
+        return ggml_gated_delta_net(ctx, q, k, v, g, beta, state, 1);
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        test_gated_delta_net::initialize_tensors(ctx);
+        ggml_tensor * conv = ggml_get_tensor(ctx, "conv_qkv");
+        std::vector<float> data(ggml_nelements(conv));
+        for (size_t i = 0; i < data.size(); ++i) {
+            // V remains ordinary-sized while only Q/K approach zero.
+            const float scale = i % conv->ne[0] < 2*head_count*head_size ? amplitude : 1.0f;
+            data[i] = scale * float(int(i % 31) - 15) / 15.0f;
+        }
+        ggml_backend_tensor_set(conv, data.data(), 0, ggml_nbytes(conv));
+    }
+};
+
 // GGML_OP_GATED_DELTA_NET + GGML_OP_CPY (recurrent cache fusion)
 struct test_gated_delta_net_cache_fusion : public test_case {
     const ggml_type type;
@@ -12534,6 +12591,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // overflow: n_tokens > K — only the last K snapshots kept.
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 32,   8, 1, 1, false, false, /*K=*/3));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64,  16, 2, 1, false, false, /*K=*/4));
+
+    for (int64_t tokens : {1, 4, 512}) {
+        for (float amplitude : {0.0f, 1e-4f, 1.0f}) {
+            for (bool deferred : {false, true}) {
+                test_cases.emplace_back(new test_gated_delta_net_norm(tokens, amplitude, deferred));
+            }
+        }
+    }
 
     // gdn + cache cpy fusion (K > 1)
     test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 4, 32,   2, 1, 2));
