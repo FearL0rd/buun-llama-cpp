@@ -824,7 +824,7 @@ static void test_active_checkpoint_delivery(common_cache_plan_provider provider,
     rec.outcome = common_cache_plan_outcome::restored;
     const auto wire = common_cache_plan_record_json(rec);
     CHECK(wire["chosen"] == name);
-    CHECK(wire["delivered_chain"] == nlohmann::json::array({ name }));
+    CHECK(wire["delivered_chain"] == nlohmann::ordered_json::array({ name }));
     CHECK(wire["candidates"][0]["source_id"] == 0);
     CHECK(wire["candidates"][0]["target_slot_id"] == 1);
     rec.revoke_deliveries();
