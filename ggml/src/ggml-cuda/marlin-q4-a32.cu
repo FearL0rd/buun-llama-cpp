@@ -155,6 +155,55 @@ __global__ void assemble_q4_a32_canonical(
     }
 }
 
+__global__ void gather_q4_a32_canonical(
+        const uint32_t * weight, const uint16_t * scale, const uint32_t * zero,
+        block_q4_a32 * canonical, uint32_t n, uint32_t k) {
+    // Transpose a 128x64 tile through shared memory: contiguous Marlin word
+    // loads, then contiguous stores within each canonical block. No arithmetic
+    // on weights or scales, including negative scales and asymmetric zeros.
+    __shared__ block_q4_a32 tile[64];
+    const uint32_t row0 = blockIdx.x * 64;
+    const uint32_t kb = blockIdx.y;
+#pragma unroll
+    for (uint32_t offset = threadIdx.x; offset < 1024; offset += 256) {
+        const uint32_t kt = offset / 128;
+        const uint32_t local = offset % 128;
+        const uint32_t thread = local / 4;
+        const uint32_t warp = local % 4;
+        const uint32_t row = warp * 16 + thread / 4;
+        const uint32_t pair = kt * 8 + thread % 4;
+        const uint64_t src = (uint64_t(kb * 8 + kt) * (n / 64) + blockIdx.x) * 128 + local;
+        const uint32_t word = weight[src];
+#pragma unroll
+        for (uint32_t half = 0; half < 2; ++half) {
+#pragma unroll
+            for (uint32_t hi = 0; hi < 2; ++hi) {
+                const uint32_t i = half * 2 + hi;
+                tile[row + half * 8].qs[pair + hi * 4] = ((word >> (4 * i)) & 15) |
+                    (((word >> (4 * (i + 4))) & 15) << 4);
+            }
+        }
+    }
+    const uint32_t row = threadIdx.x % 64;
+    const uint32_t g = threadIdx.x / 64;
+    const uint32_t group = kb * 4 + g;
+    const uint32_t sr = scale_source_row(row0 + row);
+    tile[row].d[g] = scale[uint64_t(group) * n + sr];
+    if ((g & 1) == 0) {
+        const uint32_t lane = sr & 7;
+        const uint32_t sub = (lane & 1) ? 4 + lane / 2 : lane / 2;
+        const uint32_t z0 = zero[uint64_t(group) * (n / 8) + sr / 8];
+        const uint32_t z1 = zero[uint64_t(group + 1) * (n / 8) + sr / 8];
+        tile[row].z[g / 2] = ((z0 >> (4 * sub)) & 15) | (((z1 >> (4 * sub)) & 15) << 4);
+    }
+    __syncthreads();
+    constexpr uint32_t halves = sizeof(block_q4_a32) / sizeof(uint16_t);
+    for (uint32_t i = threadIdx.x; i < 64 * halves; i += 256) {
+        auto * dst = reinterpret_cast<uint16_t *>(&canonical[uint64_t(row0 + i / halves) * (k / 128) + kb]);
+        dst[i % halves] = reinterpret_cast<const uint16_t *>(tile)[i];
+    }
+}
+
 using marlin_fn = void (*)(MARLIN_KERNEL_PARAMS);
 
 template<int M_BLOCKS, bool M_BLOCK_8, int N_BLOCKS, int K_BLOCKS, int THREADS, bool C_F32>
@@ -252,6 +301,18 @@ void ggml_cuda_marlin_q4_a32_unrepack(
         static_cast<block_q4_a32 *>(canonical), n, k);
     CUDA_CHECK(cudaStreamSynchronize(stream));
     CUDA_CHECK(cudaFree(raw_weight));
+}
+
+void ggml_cuda_marlin_q4_a32_canonical_async(
+        const void * storage, void * canonical, int64_t n, int64_t k, cudaStream_t stream) {
+    const size_t weight_size = size_t(n) * k / 2;
+    const size_t scale_size = size_t(n) * k / QG4_A32 * sizeof(nv_bfloat16);
+    gather_q4_a32_canonical<<<dim3(n / 64, k / 128), 256, 0, stream>>>(
+        static_cast<const uint32_t *>(storage),
+        reinterpret_cast<const uint16_t *>(static_cast<const char *>(storage) + weight_size),
+        reinterpret_cast<const uint32_t *>(static_cast<const char *>(storage) + weight_size + scale_size),
+        static_cast<block_q4_a32 *>(canonical), n, k);
+    CUDA_CHECK(cudaGetLastError());
 }
 
 void ggml_cuda_marlin_q4_a32_prepare(

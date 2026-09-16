@@ -5715,9 +5715,11 @@ struct test_mul_mat_dynamic_i4 : public test_case {
 struct test_mul_mat_q4_a32_residual_chain : public test_case {
     static constexpr int64_t k = 256;
     static constexpr int64_t n = 256;
-    static constexpr int64_t m = 17;
+    const int64_t m;
 
-    std::string vars() override { return "k=256,n=256,m=17"; }
+    explicit test_mul_mat_q4_a32_residual_chain(int64_t m = 17) : m(m) {}
+
+    std::string vars() override { return "k=256,n=256,m=" + std::to_string(m); }
     std::string op_desc(ggml_tensor *) override { return "MUL_MAT_Q4_A32_RESIDUAL_CHAIN"; }
     bool run_whole_graph() override { return true; }
 
@@ -11373,6 +11375,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat_dynamic_i4());
     test_cases.emplace_back(new test_mul_mat_dynamic_i4(true));
     test_cases.emplace_back(new test_mul_mat_q4_a32_residual_chain());
+    test_cases.emplace_back(new test_mul_mat_q4_a32_residual_chain(257));
+    test_cases.emplace_back(new test_mul_mat_quant_glu_chain(GGML_TYPE_Q4_A32, 257));
     test_cases.emplace_back(new test_mul_mat_quant_glu_chain(GGML_TYPE_Q4_A32, 1));
     test_cases.emplace_back(new test_mul_mat_quant_glu_chain(GGML_TYPE_Q8_0_G128, 1));
     test_cases.emplace_back(new test_mul_mat_quant_glu_chain(GGML_TYPE_Q8_0_G128, 17));
@@ -11423,6 +11427,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // Native Marlin Q4-A32 path (output rows and reduction width satisfy its
     // 256/128 alignment contract; batch 17 avoids MMVQ).
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_A32, GGML_TYPE_F32, 256, 17, 256, {1, 1}, {1, 1}));
+    // Hybrid MMQ prefill threshold and ragged tile tail; small batches retain Marlin.
+    for (int64_t batch : { 255, 256, 257, 512 }) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_A32, GGML_TYPE_F32, 512, batch, 1152, {1, 1}, {1, 1}));
+    }
     // Ampere Marlin small-M tile boundaries: N <= 8192 and K divisible by
     // 256 take the deeper K tile; the other cases take the wider N tile.
     for (int64_t rows : { 8192, 8448 }) {

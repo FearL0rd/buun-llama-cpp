@@ -5,6 +5,7 @@
 #include "unary.cuh"
 #include "vecdotq.cuh"
 #if !defined(GGML_USE_HIP)
+#include "mmq.cuh"
 #include "humming-fp8.cuh"
 #include "humming-fp8-block.cuh"
 #include "marlin-q4-a32.cuh"
@@ -262,7 +263,40 @@ bool ggml_cuda_mul_mat_marlin_q4_a32(
         }
         return true;
     }
-    if (m >= ggml_cuda_marlin::gemm_min_m()) {
+    // SM86 prefill: canonicalize one projection at a time for grouped INT8 MMQ.
+    // Smaller batches keep Marlin: the conversion costs more than MMQ saves.
+    // Bound workspace and leave the large vocabulary projection unchanged.
+    if (cc == 860 && m >= 256 && ggml_nbytes(src0) <= 64 * 1024 * 1024 &&
+            ggml_backend_buffer_get_usage(src0->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS &&
+            (gate == nullptr || ggml_backend_buffer_get_usage(gate->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS)) {
+        ggml_cuda_pool_alloc<char> canonical(ctx.pool(), ggml_nbytes(src0));
+        ggml_cuda_pool_alloc<float> input_f32(ctx.pool(), size_t(m) * k);
+        ggml_cuda_pool_alloc<float> result_f32(ctx.pool());
+        if (!direct_f32) {
+            result_f32.alloc(size_t(m) * n);
+        }
+        ggml_cuda_humming_fp8_output_bf16_to_f32(input, nullptr, input_f32.get(), size_t(m) * k, stream);
+        ggml_tensor x = *src1;
+        x.data = input_f32.get();
+        auto project = [&](const ggml_tensor * weight, nv_bfloat16 * result) {
+            ggml_cuda_marlin_q4_a32_canonical_async(weight->data, canonical.get(), n, k, stream);
+            ggml_tensor w = *weight;
+            w.data = canonical.get();
+            ggml_tensor y = *dst;
+            y.data = direct_f32 ? dst->data : result_f32.get();
+            ggml_cuda_mul_mat_q(ctx, &w, &x, nullptr, &y);
+            if (!direct_f32) {
+                ggml_cuda_humming_fp8_input_f32_to_bf16(result_f32.get(), result, size_t(m) * n, stream);
+            }
+        };
+        project(src0, output);
+        if (gate != nullptr) {
+            project(gate, gate_output.get());
+        }
+        if (direct_f32) {
+            return true;
+        }
+    } else if (m >= ggml_cuda_marlin::gemm_min_m()) {
         ggml_cuda_marlin_gemm_bf16(ctx, ggml_cuda_marlin_q4_a32_dequant_bf16, src0->data, input,
             direct_f32 ? dst->data : static_cast<void *>(output), direct_f32 ? CUDA_R_32F : CUDA_R_16BF, n, k, m, stream);
         if (gate != nullptr) {
