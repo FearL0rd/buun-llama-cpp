@@ -278,9 +278,13 @@ __global__ void __launch_bounds__(THREADS) gemv_int8_kernel(const uint8_t * __re
     // Other row counts/precisions and grouped MoE retain their existing executor.
     constexpr bool WMMA = INT8 && !GROUPED && bits >= 2 && bits <= 4 && (M == 3 || M == 4 || M == 8);
 #elif !defined(GGML_USE_HIP) && __CUDA_ARCH__ == 860
-    // Measured sm86 code-target crossover; plain 4-bit M3 still favors vector dots.
-    constexpr bool WMMA = INT8 && !GROUPED && bits >= 2 && bits <= 4 && (M == 3 || M == 4 || M == 8) &&
-                          !(bits == 4 && M == 3 && !RESID);
+    // SM86: matrix cores help dense verify batches; plain K4 M3 favors vector dots.
+    // K6 residual batches cover the vocabulary head without dropping its correction.
+    constexpr bool WMMA = INT8 && !GROUPED && (
+            (bits >= 2 && bits <= 4 &&
+             (M == 3 || M == 4 || M == 8 || (bits == 4 && (M == 5 || M == 6 || M == 7 || (M == 13 && !RESID)))) &&
+             !(bits == 4 && M == 3 && !RESID)) ||
+            (bits == 6 && RESID && M >= 3 && M <= 8));
 #else
     constexpr bool WMMA = false;
 #endif
@@ -410,7 +414,7 @@ __global__ void __launch_bounds__(THREADS) gemv_int8_kernel(const uint8_t * __re
 
     const int n_tiles = n / 16;
     if constexpr (WMMA) {
-        static_assert(bits >= 2 && bits <= 4 && NACC <= 16);
+        static_assert(bits >= 2 && bits <= 6 && NACC <= 16);
         const int nt = blockIdx.x * 16 + warp * 2;
 #if defined(GGML_USE_HIP) && defined(RDNA4)
         using i2 = int __attribute__((ext_vector_type(2)));
@@ -420,18 +424,22 @@ __global__ void __launch_bounds__(THREADS) gemv_int8_kernel(const uint8_t * __re
         constexpr int PLANES = (NACC + 7) / 8;
         int acc[2][PLANES][4] = {};
 #endif
-        // Each lane loads one packed word per tile. Prefetch four K tiles, then
+        // Each lane loads one packed word per tile (two for K6). Prefetch four K tiles, then
         // shuffle word pairs and extract nearby windows together for the matrix core.
         constexpr int RING = 4;
         uint32_t words[2][RING] = {};
-        auto load_word = [&](int tile, int kb) {
-            return nt + tile < n_tiles && lane < TWORDS && kb < nrows
-                ? exl3::load_streaming(B32 + (size_t(nt + tile) * kslices + kb0 + kb) * TWORDS + lane) : 0u;
+        uint32_t words_hi[2][RING] = {};
+        auto load_word = [&](int tile, int kb, int extra = 0) {
+            return nt + tile < n_tiles && lane + extra < TWORDS && kb < nrows
+                ? exl3::load_streaming(B32 + (size_t(nt + tile) * kslices + kb0 + kb) * TWORDS + lane + extra) : 0u;
         };
 #pragma unroll
         for (int tile = 0; tile < 2; ++tile) {
 #pragma unroll
-            for (int d = 0; d < RING; ++d) words[tile][d] = load_word(tile, d);
+            for (int d = 0; d < RING; ++d) {
+                words[tile][d] = load_word(tile, d);
+                if constexpr (bits > 4) words_hi[tile][d] = load_word(tile, d, 32);
+            }
         }
         for (int base = 0; base < nrows; base += RING) {
 #pragma unroll
@@ -477,10 +485,15 @@ __global__ void __launch_bounds__(THREADS) gemv_int8_kernel(const uint8_t * __re
                 }
 #elif !defined(GGML_USE_HIP) && __CUDA_ARCH__ == 860
                 uint32_t current[2];
+                uint32_t current_hi[2] = {};
 #pragma unroll
                 for (int tile = 0; tile < 2; ++tile) {
                     current[tile] = words[tile][drow];
                     words[tile][drow] = load_word(tile, kb + RING);
+                    if constexpr (bits > 4) {
+                        current_hi[tile] = words_hi[tile][drow];
+                        words_hi[tile][drow] = load_word(tile, kb + RING, 32);
+                    }
                 }
 #pragma unroll
                 for (int tile = 0; tile < 2; ++tile) {
@@ -489,14 +502,35 @@ __global__ void __launch_bounds__(THREADS) gemv_int8_kernel(const uint8_t * __re
                     for (int g = 0; g < 2; ++g) {
                         // Ampere fragment: four stride-two windows per group.
                         const int t = (lane / 4) * 32 + ((lane % 4) / 2) * 8 + (lane & 1) + g * 16;
-                        const int end = (t + 257 + 6) * bits;
-                        const int first = (end - 6 * bits - 16) / 32, last = (end - 1) / 32;
-                        const uint32_t lo = __shfl_sync(0xffffffffu, current[tile], last % TWORDS);
-                        const uint32_t hi = __shfl_sync(0xffffffffu, current[tile], first % TWORDS);
+                        if constexpr (bits > 4) {
+                            // Four stride-two K6 windows can span three packed words.
+                            // Decode pairs so each funnel shift covers adjacent words.
 #pragma unroll
-                        for (int s = 0; s < 4; ++s) {
-                            const uint32_t w = exl3::fshift(lo, hi, (last + 1) * 32 - end + (6 - 2 * s) * bits) & 65535u;
-                            decoded[s & 1][2 * g + s / 2] = w * 0x83DCD12Du;
+                            for (int pair = 0; pair < 2; ++pair) {
+                                const int end = (t + 257 + 4 * pair + 2) * bits;
+                                const int first = (end - 2 * bits - 16) / 32, last = (end - 1) / 32;
+                                const int ilo = last % TWORDS, ihi = first % TWORDS;
+                                const uint32_t lo0 = __shfl_sync(0xffffffffu, current[tile], ilo & 31);
+                                const uint32_t hi0 = __shfl_sync(0xffffffffu, current[tile], ihi & 31);
+                                const uint32_t lo1 = __shfl_sync(0xffffffffu, current_hi[tile], ilo & 31);
+                                const uint32_t hi1 = __shfl_sync(0xffffffffu, current_hi[tile], ihi & 31);
+                                const uint32_t lo = ilo < 32 ? lo0 : lo1, hi = ihi < 32 ? hi0 : hi1;
+#pragma unroll
+                                for (int s = 0; s < 2; ++s) {
+                                    const uint32_t w = exl3::fshift(lo, hi, (last + 1) * 32 - end + (2 - 2 * s) * bits) & 65535u;
+                                    decoded[s][2 * g + pair] = w * 0x83DCD12Du;
+                                }
+                            }
+                        } else {
+                            const int end = (t + 257 + 6) * bits;
+                            const int first = (end - 6 * bits - 16) / 32, last = (end - 1) / 32;
+                            const uint32_t lo = __shfl_sync(0xffffffffu, current[tile], last % TWORDS);
+                            const uint32_t hi = __shfl_sync(0xffffffffu, current[tile], first % TWORDS);
+#pragma unroll
+                            for (int s = 0; s < 4; ++s) {
+                                const uint32_t w = exl3::fshift(lo, hi, (last + 1) * 32 - end + (6 - 2 * s) * bits) & 65535u;
+                                decoded[s & 1][2 * g + s / 2] = w * 0x83DCD12Du;
+                            }
                         }
                     }
 #pragma unroll

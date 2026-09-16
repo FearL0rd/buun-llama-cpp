@@ -203,7 +203,10 @@ template <int bits, int cb, int M, bool RESID, bool GROUPED>
 void exl3_gemv_int8_launch(ggml_backend_cuda_context & ctx, const uint8_t * B, const float * x, const half * suh, const half * svh,
         float * y, int k, int n, int pairs, exl3_int8::grouped_args ga, cudaStream_t stream) {
     const auto kernel = exl3_int8::gemv_int8_kernel<bits, cb, M, RESID, GROUPED>;
-    const size_t cap = exl3_int8_smem_cap(ctx.device);
+    const size_t cap = M > exl3_int8::MAX_M
+        ? std::min(exl3_int8_smem_cap(ctx.device),
+                size_t(ggml_cuda_info().devices[ctx.device].smpbo) - size_t(M) * exl3_int8::COLS * sizeof(float) - 4096)
+        : exl3_int8_smem_cap(ctx.device);
     // function attributes are per device: opt this instantiation in once on each
     static bool attr_set[GGML_CUDA_MAX_DEVICES] = {};
     if (!attr_set[ctx.device]) {
@@ -217,7 +220,11 @@ void exl3_gemv_int8_launch(ggml_backend_cuda_context & ctx, const uint8_t * B, c
     // Grouped launches size the split by pair count for occupancy; their activation scales can
     // therefore differ across batches. The fixed dense geometry does not apply to this grouped path.
     int ksplit, nrows; size_t smem;
-    exl3_int8_geometry(bits, nacc, M, k, colblocks, pairs, cap, ksplit, nrows, smem);
+    // Keep activation scales and partial-sum order identical to smaller batches.
+    // Larger specializations are admitted only when this geometry fits their cap.
+    exl3_int8_geometry(bits, nacc, M, k, colblocks, pairs,
+            exl3_int8_smem_cap(ctx.device), ksplit, nrows, smem);
+    GGML_ASSERT(smem <= cap);
     ggml_cuda_pool_alloc<float> partials(ctx.pool(), size_t(ksplit) * M * pairs * n);
     int * counters = exl3_int8_counters(ctx);
     kernel<<<dim3(colblocks, ksplit, pairs), exl3_int8::THREADS, smem, stream>>>(
@@ -333,6 +340,19 @@ void ggml_cuda_mul_mat_exl3(ggml_backend_cuda_context & ctx, const ggml_tensor *
         const uint8_t * B = static_cast<const uint8_t *>(src0->data);
         const float * x = static_cast<const float *>(src1->data);
         const bool resid = exl3_int8_resid(bits, strcmp(src0->name, "output.weight") == 0);
+        if (ggml_cuda_info().devices[ctx.device].cc == 860 && bits == 4 &&
+                m == 13 && n <= 32768 && !resid) {
+            const size_t cap = std::min(exl3_int8_smem_cap(ctx.device),
+                    size_t(ggml_cuda_info().devices[ctx.device].smpbo) - 13 * exl3_int8::COLS * sizeof(float) - 4096);
+            int ksplit, nrows; size_t smem;
+            exl3_int8_geometry(bits, 13, 13, k, (n + exl3_int8::COLS - 1) / exl3_int8::COLS,
+                    1, exl3_int8_smem_cap(ctx.device), ksplit, nrows, smem);
+            if (smem <= cap) {
+                exl3_gemv_int8_launch<4, 2, 13, false, false>(
+                        ctx, B, x, suh, svh, y, k, n, 1, {}, stream);
+                return;
+            }
+        }
         for (int row = 0; row < m; row += exl3_int8::MAX_M) {
             const int rows = std::min(exl3_int8::MAX_M, m - row);
             const float * x_rows = x + size_t(row) * k;
