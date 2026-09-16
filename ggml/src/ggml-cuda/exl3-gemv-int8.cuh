@@ -321,6 +321,15 @@ __global__ void __launch_bounds__(THREADS) gemv_int8_kernel(const uint8_t * __re
         column_block = index % columns;
         k_block = index / columns;
     }
+    // Visit adjacent K slices first for dense single-row SM86 decode. Keep the
+    // same slice boundaries/scales and ordered reduction; only CTA order changes.
+#if !defined(GGML_USE_HIP) && __CUDA_ARCH__ == 860
+    if constexpr (M == 1 && !GROUPED && !BUNDLE) {
+        const int linear_block = blockIdx.y * gridDim.x + blockIdx.x;
+        column_block = linear_block / gridDim.y;
+        k_block = linear_block % gridDim.y;
+    }
+#endif
     constexpr int TWORDS = 8 * bits;
     constexpr bool WIDE = bits == 4;   // uint2-per-lane block pair; other K use pointer extraction
     constexpr bool INT8 = cb == 2;
