@@ -20506,7 +20506,7 @@ private:
                         proposal->top_k, proposal->candidate_ids, proposal->q_rows,
                         q_covered, ids);
                     if (accepted_from_proposal) {
-                        SLT_TRC(slot, "verified %zu-token draft with %zu exact q rows\n",
+                        SLT_DBG(slot, "verified %zu-token draft with %zu exact q rows\n",
                             slot.spec_draft.size(), q_covered);
                     }
                 }
