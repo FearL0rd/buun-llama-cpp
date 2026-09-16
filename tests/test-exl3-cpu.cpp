@@ -196,7 +196,8 @@ static bool run(ggml_backend_t backend, int bits, int cb, bool grouped, int toke
     }
     // Standalone GPU mul1 uses quantized activations, unlike the exact CPU/cache
     // path. Its separate batch/policy gates require exact repeated execution.
-    ok &= worst < (gpu_executor ? 1e-2 : 2e-5);
+    const bool quantized_activations = gpu_executor && (grouped || tokens <= 16);
+    ok &= worst < (quantized_activations ? 1e-2 : 2e-5);
     // The cache provider accepts at most ten tokens; larger cases above still
     // exercise CPU transform sharing/fallback and exact thread-count agreement.
     if (cache_gpu && grouped && !windowed && tokens <= 10 && topk*tokens <= 64) {
@@ -301,6 +302,15 @@ int main(int argc, char ** argv) {
     // absent experts and multiple output tiles per worker at real MoE shapes.
     ok &= run(backend, 2, 2, false, 64, 1);
     ok &= run(backend, 2, 2, false, 65, 1);
+    if (gpu_executor) {
+        // Dense tiled prefill: admission boundary, partial token tiles, and
+        // the short/long tile crossover. Compare to the independent scalar
+        // oracle and require identical repeated execution, as above.
+        for (int tokens : {16, 17, 18, 31, 32, 33, 63, 64, 65, 127, 128, 129, 255, 256, 257}) {
+            ok &= run(backend, 4, 2, false, tokens, 1);
+        }
+        ok &= run(backend, 4, 2, false, 129, 1, false, 5120, 640);
+    }
     ok &= run(backend, 2, 2, true, 21, 1);
     ok &= run(backend, 2, 2, true, 22, 3);
     ok &= run(backend, 2, 2, true, 22, 3, true);

@@ -32,6 +32,9 @@
 #include "exl3-gemv.cuh"
 #include "exl3-gemv-int8.cuh"
 #include "exl3-int8-warpk.cuh"
+#if !defined(GGML_USE_HIP)
+#include "exl3-gemm.cuh"
+#endif
 
 namespace {
 
@@ -585,6 +588,22 @@ void ggml_cuda_mul_mat_exl3(ggml_backend_cuda_context & ctx, const ggml_tensor *
     ggml_cuda_pool_alloc<half> xh(ctx.pool(), size_t(m) * k);
     exl3_had_in_kernel<<<dim3(k / 128, m), 32, 0, stream>>>(
         static_cast<const float *>(src1->data), suh, xh.get(), k);
+
+#if !defined(GGML_USE_HIP)
+    // Measured SM86 dense mul1 path: consume shared decoded tiles rather than
+    // reconstructing the entire projection before GEMM. Other formats/devices
+    // retain the qualified fallback below.
+    if (ggml_cuda_info().devices[ctx.device].cc == 860 && bits == 4 && cb == 2 && m >= 17) {
+        const uint8_t * weights = static_cast<const uint8_t *>(src0->data);
+        if (m <= 128) {
+            exl3_gemm_kernel<4, 2, 64><<<dim3(n / 64, (m + 63) / 64), 256, 0, stream>>>(weights, xh.get(), y, k, n, m);
+        } else {
+            exl3_gemm_kernel<4, 2, 128><<<dim3(n / 64, (m + 127) / 128), 256, 0, stream>>>(weights, xh.get(), y, k, n, m);
+        }
+        exl3_had_out_kernel<<<dim3(n / 128, m), 32, 0, stream>>>(y, svh, n);
+        return;
+    }
+#endif
 
 #if !defined(GGML_USE_HIP)
     if (m <= EXL3_GEMV_MAX_M && ampere_mma_available(ggml_cuda_info().devices[ctx.device].cc)) {
