@@ -264,10 +264,41 @@ struct grouped_args {
 };
 
 // cb == 2 (mul1): int8 activations, dp4a; other codebooks: F16 activations, decoded weights, fp32 FMA.
-template <int bits, int cb, int M, bool RESID, bool GROUPED>
+// Independent second projection for a paired dense launch. Each projection keeps
+// its own input signs, scales, K-slices and ordered partial reduction.
+struct bundle_args {
+    const uint8_t * weights;
+    const half * suh;
+    const half * svh;
+    float * output;
+    float * partials;
+    int * counters;
+    int n, nrows, ksplit, first_blocks, second_blocks;
+};
+
+template <int bits, int cb, int M, bool RESID, bool GROUPED, bool BUNDLE = false>
 __global__ void __launch_bounds__(THREADS) gemv_int8_kernel(const uint8_t * __restrict__ B,
         const float * __restrict__ x, const half * __restrict__ suh, const half * __restrict__ svh, float * __restrict__ y,
-        float * __restrict__ partials, int * __restrict__ counters, int k, int n, int nrows_max, grouped_args ga) {
+        float * __restrict__ partials, int * __restrict__ counters, int k, int n, int nrows_max, grouped_args ga, bundle_args bundle = {}) {
+    int column_block = blockIdx.x, k_block = blockIdx.y, k_blocks = gridDim.y;
+    if constexpr (BUNDLE) {
+        static_assert(!GROUPED);
+        // Alternate independent projection blocks; append any unmatched tail.
+        const int paired = min(bundle.first_blocks, bundle.second_blocks);
+        const int flat = blockIdx.x;
+        const bool second = flat < 2 * paired ? (flat & 1) : bundle.second_blocks > bundle.first_blocks;
+        const int index = flat < 2 * paired ? flat / 2 : flat - paired;
+        if (second) {
+            B = bundle.weights; suh = bundle.suh; svh = bundle.svh;
+            y = bundle.output; partials = bundle.partials; counters = bundle.counters;
+            n = bundle.n; nrows_max = bundle.nrows; k_blocks = bundle.ksplit;
+        } else {
+            k_blocks = bundle.first_blocks / ((n + COLS - 1) / COLS);
+        }
+        const int columns = (n + COLS - 1) / COLS;
+        column_block = index % columns;
+        k_block = index / columns;
+    }
     constexpr int TWORDS = 8 * bits;
     constexpr bool WIDE = bits == 4;   // uint2-per-lane block pair; other K use pointer extraction
     constexpr bool INT8 = cb == 2;
@@ -301,7 +332,7 @@ __global__ void __launch_bounds__(THREADS) gemv_int8_kernel(const uint8_t * __re
         suh += size_t(expert) * k;
         x   += size_t(t) * ga.x_nb2 + (ga.ne11 == 1 ? 0 : size_t(e) * ga.x_nb1);
         y   += size_t(pair) * n;
-        partials += size_t(pair) * gridDim.y * M * n;
+        partials += size_t(pair) * k_blocks * M * n;
         counters += size_t(pair) * gridDim.x;
     }
     extern __shared__ uint32_t sh_as[];   // [NACC][nrows_max * 16] splats, then [M][nrows_max * 16] F16 xh
@@ -316,7 +347,7 @@ __global__ void __launch_bounds__(THREADS) gemv_int8_kernel(const uint8_t * __re
 
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, lq = lane & 15;
     const int kslices = k / 16;
-    const int kb0   = blockIdx.y * nrows_max;
+    const int kb0   = k_block * nrows_max;
     const int nrows = min(nrows_max, kslices - kb0);
     const int kn    = nrows * 16;
 
@@ -415,7 +446,7 @@ __global__ void __launch_bounds__(THREADS) gemv_int8_kernel(const uint8_t * __re
     const int n_tiles = n / 16;
     if constexpr (WMMA) {
         static_assert(bits >= 2 && bits <= 6 && NACC <= 16);
-        const int nt = blockIdx.x * 16 + warp * 2;
+        const int nt = column_block * 16 + warp * 2;
 #if defined(GGML_USE_HIP) && defined(RDNA4)
         using i2 = int __attribute__((ext_vector_type(2)));
         using i8 = int __attribute__((ext_vector_type(8)));
@@ -567,7 +598,7 @@ __global__ void __launch_bounds__(THREADS) gemv_int8_kernel(const uint8_t * __re
                     float v = sh_q[lq] * (k_inv * float(acc[tile][l]) + cbias * float(sh_s[lq]));
                     if constexpr (RESID) v += sh_q[lq + 1] * (k_inv * float(second) + cbias * float(sh_s[lq + 1]));
                     const int r = RESID ? lq / 2 : lq;
-                    partials[(size_t(blockIdx.y) * M + r) * n + (nt + tile) * 16 + 8 * (lane / 16) + l] = v;
+                    partials[(size_t(k_block) * M + r) * n + (nt + tile) * 16 + 8 * (lane / 16) + l] = v;
                 }
             }
         }
@@ -586,14 +617,14 @@ __global__ void __launch_bounds__(THREADS) gemv_int8_kernel(const uint8_t * __re
                         float v = sh_q[p] * (k_inv * float(acc[tile][plane][l]) + cbias * float(sh_s[p]));
                         if constexpr (RESID) v += sh_q[p + 1] * (k_inv * float(acc[tile][plane][l + 1]) + cbias * float(sh_s[p + 1]));
                         const int r = RESID ? p / 2 : p;
-                        partials[(size_t(blockIdx.y) * M + r) * n + (nt + tile) * 16 + c] = v;
+                        partials[(size_t(k_block) * M + r) * n + (nt + tile) * 16 + c] = v;
                     }
                 }
             }
         }
 #endif
     } else if constexpr (WIDE) {
-        const int nt = blockIdx.x * 16 + warp * 2 + (lane >> 4);
+        const int nt = column_block * 16 + warp * 2 + (lane >> 4);
         const bool active = nt < n_tiles;   // partial last block: warps beyond n idle (whole warp)
         const uint32_t * bp = B32 + (size_t(nt) * kslices + kb0) * TWORDS + 2 * lq;
         const int c2 = (lane & 1) ? 4 : 0;
@@ -681,7 +712,7 @@ __global__ void __launch_bounds__(THREADS) gemv_int8_kernel(const uint8_t * __re
                     o0 = facc0[r];
                     o1 = facc1[r];
                 }
-                float * part = partials + (size_t(blockIdx.y) * M + r) * n;
+                float * part = partials + (size_t(k_block) * M + r) * n;
                 part[n0]     = o0;
                 part[n0 + 8] = o1;
             }
@@ -693,7 +724,7 @@ __global__ void __launch_bounds__(THREADS) gemv_int8_kernel(const uint8_t * __re
         constexpr bool REG   = bits == 2 || bits == 3;
         constexpr bool STAGE = stage_smem(bits);         // cp.async pair rows into warp-private smem
         constexpr bool REGW  = bits >= 5 && !STAGE;      // two words per lane per tile
-        const int ntA = blockIdx.x * 16 + warp * 2;
+        const int ntA = column_block * 16 + warp * 2;
         const bool active = ntA < n_tiles;   // partial last block: idle warps skip loads and stores
         const uint32_t * bpA = B32 + (size_t(ntA) * kslices + kb0) * TWORDS;
         const uint32_t * bpB = B32 + (size_t(ntA + 1) * kslices + kb0) * TWORDS;
@@ -867,7 +898,7 @@ __global__ void __launch_bounds__(THREADS) gemv_int8_kernel(const uint8_t * __re
                 } else {
                     oa0 = fa0[r]; oa1 = fa1[r]; ob0 = fb0[r]; ob1 = fb1[r];
                 }
-                float * part = partials + (size_t(blockIdx.y) * M + r) * n;
+                float * part = partials + (size_t(k_block) * M + r) * n;
                 part[cA] = oa0; part[cA + 8] = oa1;
                 part[cB] = ob0; part[cB + 8] = ob1;
             }
@@ -878,18 +909,18 @@ __global__ void __launch_bounds__(THREADS) gemv_int8_kernel(const uint8_t * __re
     __threadfence();
     __syncthreads();
     if (threadIdx.x == 0) {
-        sh_last = atomicAdd(counters + blockIdx.x, 1) == int(gridDim.y) - 1;
+        sh_last = atomicAdd(counters + column_block, 1) == int(k_blocks) - 1;
     }
     __syncthreads();
     if (!sh_last) return;
     __threadfence();
 
-    const int col = blockIdx.x * COLS + threadIdx.x;
+    const int col = column_block * COLS + threadIdx.x;
 #pragma unroll
     for (int r = 0; r < M; ++r) {
         float v = 0.0f;
         if (col < n) {
-            for (int sl = 0; sl < int(gridDim.y); ++sl) {
+            for (int sl = 0; sl < int(k_blocks); ++sl) {
 #if defined(GGML_USE_HIP)
                 // Read other blocks' published partials through an agent-scope load.
                 v += __hip_atomic_load(partials + (size_t(sl) * M + r) * n + col,
@@ -901,16 +932,16 @@ __global__ void __launch_bounds__(THREADS) gemv_int8_kernel(const uint8_t * __re
         }
         sh_y[r][threadIdx.x] = v;
     }
-    if (threadIdx.x == 0) counters[blockIdx.x] = 0;
+    if (threadIdx.x == 0) counters[column_block] = 0;
     __syncthreads();
     // output Hadamard: 2 x 128-blocks per row, one warp each
     for (int b = warp; b < 2 * M; b += THREADS / 32) {
         const int r = b >> 1;
         const int c = (b & 1) * 128 + lane * 4;
-        if (blockIdx.x * COLS + (b & 1) * 128 >= n) continue;   // partial block: second 128-half absent
+        if (column_block * COLS + (b & 1) * 128 >= n) continue;   // partial block: second 128-half absent
         float v0 = sh_y[r][c], v1 = sh_y[r][c + 1], v2 = sh_y[r][c + 2], v3 = sh_y[r][c + 3];
         exl3_had::had128(v0, v1, v2, v3, lane);
-        const int gc = blockIdx.x * COLS + c;
+        const int gc = column_block * COLS + c;
         const half2 s01 = *reinterpret_cast<const half2 *>(svh + gc);
         const half2 s23 = *reinterpret_cast<const half2 *>(svh + gc + 2);
         float4 o;

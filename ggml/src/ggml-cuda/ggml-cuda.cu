@@ -5829,9 +5829,21 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             return 1;
         }
     }
-    // EXL3 projections have their own executor (Hadamard + trellis gemv); no matcher applies.
+    // EXL3 projections retain independent input signs even when sharing a launch.
     if ((node->op == GGML_OP_MUL_MAT || node->op == GGML_OP_MUL_MAT_ID) &&
             node->src[0] != nullptr && ggml_cuda_is_exl3(node->src[0]->type)) {
+        if (node->op == GGML_OP_MUL_MAT && i + 1 < cgraph->n_nodes &&
+                cgraph->nodes[i + 1]->op == GGML_OP_MUL_MAT &&
+                (node->ne[1] <= 8 || node->ne[1] == 13) &&
+                ggml_cuda_info().devices[cuda_ctx->device].cc == 860) {
+            const ggml_op ops[] = { GGML_OP_MUL_MAT, GGML_OP_MUL_MAT };
+            const int outputs[] = { i, i + 1 };
+            if (ggml_can_fuse_subgraph(cgraph, i, 2, ops, outputs, 2) &&
+                    ggml_cuda_check_fusion_memory_ranges(cgraph, i, 2, outputs, 2) &&
+                    ggml_cuda_exl3_bundle(*cuda_ctx, node, cgraph->nodes[i + 1])) {
+                return 1;
+            }
+        }
         return 0;
     }
 #if !defined(GGML_USE_HIP)

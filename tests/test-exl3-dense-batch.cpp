@@ -15,7 +15,7 @@
 #include <vector>
 
 // Compare every row of each projection with that row executed alone.
-// SM86 also covers the wider per-bit-width batches, using two launches.
+// SM86 also covers wider verify batches, including the single-launch K4 M13 path.
 // Rows deliberately have different scales/outliers: sharing an activation max
 // across rows must not accidentally satisfy this test.
 static bool check_batch(ggml_backend_t backend, int bits, int k, int n, bool head, int max_m) {
@@ -87,6 +87,72 @@ static bool check_batch(ggml_backend_t backend, int bits, int k, int n, bool hea
     return ok;
 }
 
+// The joint graph may bundle projections, while each one-node graph cannot.
+// Independent signs and unequal output widths catch accidental row concatenation.
+static bool check_pair(ggml_backend_t backend, int n0, int n1, int m, bool shared_input) {
+    constexpr int k = 5120;
+    auto * ctx = ggml_init({1024*1024, nullptr, true});
+    auto * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, m);
+    auto * x2 = shared_input ? x : ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, m);
+    ggml_tensor * w[2], * suh[2], * svh[2], * y[2];
+    ggml_cgraph * single[2];
+    auto * together = ggml_new_graph_custom(ctx, 16, false);
+    for (int i = 0; i < 2; ++i) {
+        const int n = i == 0 ? n0 : n1;
+        w[i] = ggml_new_tensor_2d(ctx, ggml_exl3_type(4, 2), k, n);
+        suh[i] = ggml_new_tensor_1d(ctx, GGML_TYPE_F16, k);
+        svh[i] = ggml_new_tensor_1d(ctx, GGML_TYPE_F16, n);
+        y[i] = ggml_mul_mat(ctx, w[i], i == 0 ? x : x2);
+        y[i]->src[2] = svh[i];
+        y[i]->src[3] = suh[i];
+        ggml_set_output(y[i]);
+        single[i] = ggml_new_graph_custom(ctx, 16, false);
+        ggml_build_forward_expand(single[i], y[i]);
+        ggml_build_forward_expand(together, y[i]);
+    }
+    auto * buffer = ggml_backend_alloc_ctx_tensors(ctx, backend);
+    GGML_ASSERT(buffer);
+    unsigned rng = 456789;
+    auto next = [&]() { return rng = rng*1664525u + 1013904223u; };
+    std::vector<float> input(k*m);
+    for (auto & v : input) v = float(int(next() >> 16) - 32768)/32768.f;
+    ggml_backend_tensor_set(x, input.data(), 0, ggml_nbytes(x));
+    if (!shared_input) {
+        for (auto & v : input) v *= -2.f;
+        ggml_backend_tensor_set(x2, input.data(), 0, ggml_nbytes(x2));
+    }
+    for (int i = 0; i < 2; ++i) {
+        std::vector<unsigned char> weights(ggml_nbytes(w[i]));
+        for (auto & v : weights) v = next() >> 24;
+        ggml_backend_tensor_set(w[i], weights.data(), 0, weights.size());
+        std::vector<ggml_fp16_t> signs(k), scales(svh[i]->ne[0]);
+        for (auto & v : signs) v = ggml_fp32_to_fp16(next() & 256 ? 1.f : -1.f);
+        for (auto & v : scales) v = ggml_fp32_to_fp16(next() & 256 ? .01f : -.02f);
+        ggml_backend_tensor_set(suh[i], signs.data(), 0, ggml_nbytes(suh[i]));
+        ggml_backend_tensor_set(svh[i], scales.data(), 0, ggml_nbytes(svh[i]));
+    }
+    std::vector<float> expected[2];
+    bool ok = true;
+    for (int i = 0; i < 2; ++i) {
+        GGML_ASSERT(ggml_backend_graph_compute(backend, single[i]) == GGML_STATUS_SUCCESS);
+        expected[i].resize(ggml_nelements(y[i]));
+        ggml_backend_tensor_get(y[i], expected[i].data(), 0, ggml_nbytes(y[i]));
+        for (float v : expected[i]) ok &= std::isfinite(v);
+    }
+    for (int pass = 0; pass < 4; ++pass) {
+        GGML_ASSERT(ggml_backend_graph_compute(backend, together) == GGML_STATUS_SUCCESS);
+        for (int i = 0; i < 2; ++i) {
+            std::vector<float> actual(expected[i].size());
+            ggml_backend_tensor_get(y[i], actual.data(), 0, ggml_nbytes(y[i]));
+            ok &= memcmp(actual.data(), expected[i].data(), ggml_nbytes(y[i])) == 0;
+        }
+    }
+    ggml_backend_buffer_free(buffer);
+    ggml_free(ctx);
+    printf("pair N%d/%d M%d shared=%d: %s\n", n0, n1, m, shared_input, ok ? "PASS" : "FAIL");
+    return ok;
+}
+
 int main() {
     auto * reg = ggml_backend_cuda_reg();
     if (ggml_backend_reg_dev_count(reg) == 0) return 77;
@@ -109,6 +175,13 @@ int main() {
         ok &= check_batch(backend, bits, 5120, 640, false, max_m);  // partial N tile, many K slices
         ok &= check_batch(backend, bits, 2048, 6144, false, max_m);
         ok &= check_batch(backend, bits, 4096, 151936, true, max_m); // cap-limited split, head residual
+    }
+    for (int m : {1, 4, 7, 8, 13}) {
+        if (m > 8 && !sm86) continue;
+        ok &= check_pair(backend, 12288, 6144, m, true);
+        ok &= check_pair(backend, 640, 128, m, true);
+        ok &= check_pair(backend, 17408, 17408, m, true);
+        ok &= check_pair(backend, 12288, 6144, m, false);
     }
     ggml_backend_free(backend);
     return ok ? 0 : 1;

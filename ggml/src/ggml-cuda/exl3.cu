@@ -228,7 +228,7 @@ void exl3_gemv_int8_launch(ggml_backend_cuda_context & ctx, const uint8_t * B, c
     ggml_cuda_pool_alloc<float> partials(ctx.pool(), size_t(ksplit) * M * pairs * n);
     int * counters = exl3_int8_counters(ctx);
     kernel<<<dim3(colblocks, ksplit, pairs), exl3_int8::THREADS, smem, stream>>>(
-        B, x, suh, svh, y, partials.get(), counters, k, n, nrows, ga);
+        B, x, suh, svh, y, partials.get(), counters, k, n, nrows, ga, {});
 }
 
 template <int bits, bool RESID>
@@ -294,6 +294,67 @@ bool exl3_int8_applicable(int bits, int m, int k, int n, int cc) {
 }
 
 } // namespace
+
+template <int M>
+static bool exl3_int8_bundle_launch(ggml_backend_cuda_context & ctx, ggml_tensor * a, ggml_tensor * b) {
+    const auto kernel = exl3_int8::gemv_int8_kernel<4, 2, M, false, false, true>;
+    const int k = a->src[0]->ne[0], n0 = a->ne[0], n1 = b->ne[0];
+    const int c0 = (n0 + exl3_int8::COLS - 1) / exl3_int8::COLS;
+    const int c1 = (n1 + exl3_int8::COLS - 1) / exl3_int8::COLS;
+    const size_t cap = std::min(exl3_int8_smem_cap(ctx.device),
+            size_t(ggml_cuda_info().devices[ctx.device].smpbo) - M * exl3_int8::COLS * sizeof(float) - 4096);
+    int s0, r0, s1, r1;
+    size_t sm0, sm1;
+    exl3_int8_geometry(4, M, M, k, c0, 1, exl3_int8_smem_cap(ctx.device), s0, r0, sm0);
+    exl3_int8_geometry(4, M, M, k, c1, 1, exl3_int8_smem_cap(ctx.device), s1, r1, sm1);
+    if (std::max(sm0, sm1) > cap) {
+        return false;
+    }
+    static bool attr_set[GGML_CUDA_MAX_DEVICES] = {};
+    if (!attr_set[ctx.device]) {
+        CUDA_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, int(cap)));
+        attr_set[ctx.device] = true;
+    }
+    ggml_cuda_pool_alloc<float> partials(ctx.pool(), size_t(M) * (size_t(s0) * n0 + size_t(s1) * n1));
+    int * counters = exl3_int8_counters(ctx);
+    const exl3_int8::bundle_args args {
+        static_cast<const uint8_t *>(b->src[0]->data), static_cast<const half *>(b->src[3]->data),
+        static_cast<const half *>(b->src[2]->data), static_cast<float *>(b->data),
+        partials.get() + size_t(M) * s0 * n0, counters + c0, n1, r1, s1, c0 * s0, c1 * s1,
+    };
+    kernel<<<c0 * s0 + c1 * s1, exl3_int8::THREADS, std::max(sm0, sm1), ctx.stream()>>>(
+        static_cast<const uint8_t *>(a->src[0]->data), static_cast<const float *>(a->src[1]->data),
+        static_cast<const half *>(a->src[3]->data), static_cast<const half *>(a->src[2]->data),
+        static_cast<float *>(a->data), partials.get(), counters, k, n0, r0, {}, args);
+    return true;
+}
+
+bool ggml_cuda_exl3_bundle(ggml_backend_cuda_context & ctx, ggml_tensor * a, ggml_tensor * b) {
+    // Measured SM86 mul1/plain-int8 shapes. Each source keeps its own signs;
+    // concatenating these weights into an ordinary projection is not equivalent.
+    if (ggml_cuda_info().devices[ctx.device].cc != 860 ||
+            exl3_int8_mode() == 0 || exl3_int8_mode() == 1 ||
+            a->src[1] != b->src[1] || a->src[0]->type != ggml_exl3_type(4, 2) ||
+            b->src[0]->type != ggml_exl3_type(4, 2) ||
+            !ggml_cuda_exl3_supports_mul_mat(a) || !ggml_cuda_exl3_supports_mul_mat(b) ||
+            !a->src[2] || !a->src[3] || !b->src[2] || !b->src[3] ||
+            a->ne[0] > 32768 || b->ne[0] > 32768 ||
+            strcmp(a->src[0]->name, "output.weight") == 0 || strcmp(b->src[0]->name, "output.weight") == 0) {
+        return false;
+    }
+    // Wide equal-width M13 pairs lost to separate launches in the shape sweep.
+    if (a->ne[1] == 13 && a->ne[0] == b->ne[0]) {
+        return false;
+    }
+    switch (a->ne[1]) {
+        case 1:  return exl3_int8_bundle_launch<1>(ctx, a, b);
+        case 4:  return exl3_int8_bundle_launch<4>(ctx, a, b);
+        case 7:  return exl3_int8_bundle_launch<7>(ctx, a, b);
+        case 8:  return exl3_int8_bundle_launch<8>(ctx, a, b);
+        case 13: return exl3_int8_bundle_launch<13>(ctx, a, b);
+        default: return false;
+    }
+}
 
 bool ggml_cuda_exl3_supports_mul_mat(const ggml_tensor * dst) {
     const ggml_tensor * w   = dst->src[0];
