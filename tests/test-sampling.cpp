@@ -609,10 +609,62 @@ static void test_mtp_adaptive() {
     }
 }
 
+static void test_copyspec_owner() {
+    // No model needed: unavailable model drafters are omitted, leaving CopySpec
+    // to exercise the same factory ownership and per-sequence lifecycle.
+    for (auto type : {COMMON_SPECULATIVE_TYPE_DRAFT_MTP, COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH}) {
+        common_params_speculative params;
+        params.types = {COMMON_SPECULATIVE_TYPE_COPYSPEC, type};
+        params.copyspec_gamma = 2;
+        params.n_max = params.draft.n_max = 3;
+        common_speculative_ptr shared(common_speculative_init(params, uint32_t(2)));
+        common_speculative_ptr local(common_speculative_init(params, (llama_context *) nullptr));
+        GGML_ASSERT(shared && !local);
+
+        llama_tokens prompts[2] = {{10, 11, 12, 13, 14, 15, 16, 17},
+                                  {20, 21, 22, 23, 24, 25, 26, 27}};
+        llama_tokens prefixes[2] = {{10}, {20}};
+        llama_tokens drafts[2];
+        for (llama_seq_id seq = 0; seq < 2; ++seq) {
+            common_speculative_begin(shared.get(), seq, prompts[seq]);
+            auto & dp = common_speculative_get_draft_params(shared.get(), seq);
+            dp.drafting = true;
+            dp.n_max = 3;
+            dp.id_last = prompts[seq][1];
+            dp.prompt = &prefixes[seq];
+            dp.result = &drafts[seq];
+        }
+        // An inactive descriptor can outlive its result in the server. Even
+        // with valid storage here, it must not receive a CopySpec extension.
+        common_speculative_get_draft_params(shared.get(), 1).drafting = false;
+        drafts[1] = {22};
+        common_speculative_draft(shared.get());
+        GGML_ASSERT(drafts[1] == llama_tokens({22}));
+        for (llama_seq_id seq = 0; seq < 2; ++seq) {
+            drafts[seq].clear();
+            common_speculative_get_draft_params(shared.get(), seq).drafting = true;
+        }
+        common_speculative_draft(shared.get());
+        for (llama_seq_id seq = 0; seq < 2; ++seq) {
+            GGML_ASSERT(drafts[seq] == llama_tokens(prompts[seq].begin() + 2, prompts[seq].begin() + 5));
+            GGML_ASSERT(common_speculative_get_proposal(shared.get(), seq) == nullptr);
+            common_speculative_accept(shared.get(), seq, 3);
+        }
+    }
+
+    // Standalone CopySpec retains its legacy slot-local owner.
+    common_params_speculative params;
+    params.types = {COMMON_SPECULATIVE_TYPE_COPYSPEC};
+    common_speculative_ptr shared(common_speculative_init(params, uint32_t(2)));
+    common_speculative_ptr local(common_speculative_init(params, (llama_context *) nullptr));
+    GGML_ASSERT(!shared && local);
+}
+
 int main(void) {
     test_mtp_adaptive();
     ggml_time_init();
 
+    test_copyspec_owner();
     test_speculative_coupling();
     test_proposal_rows();
     test_dist_singleton_rng();

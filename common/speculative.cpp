@@ -5846,6 +5846,14 @@ common_speculative_output_limits common_speculative_get_output_limits(
     };
 }
 
+// CopySpec must share its model drafter's owner: proposal lookup, acceptance,
+// and checkpoint state all follow that owner, not just draft generation.
+static bool common_speculative_copyspec_is_shared(const common_params_speculative & params) {
+    return params.has_type(COMMON_SPECULATIVE_TYPE_COPYSPEC) &&
+        (params.has_type(COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH) ||
+         params.has_type(COMMON_SPECULATIVE_TYPE_DRAFT_MTP));
+}
+
 // initialization of the speculative decoding system
 //
 common_speculative * common_speculative_init(common_params_speculative & params, uint32_t n_seq) {
@@ -5865,17 +5873,16 @@ common_speculative * common_speculative_init(common_params_speculative & params,
 
         // when adding a new type - update here the logic above
         // SUFFIX/RECYCLE/legacy DFLASH remain per-slot. CopySpec is also hosted
-        // here when paired with shared multi-seq DFlash2 so both implementations
+        // here when paired with shared multi-seq DFlash2/MTP so both implementations
         // have one owner and one per-sequence acceptance lifecycle.
         static_assert(COMMON_SPECULATIVE_TYPE_COUNT == 15);
 
         // this list here defines the priority of the speculators
         // the one with highest priority are listed first
-        const bool has_dflash2 = params.has_type(COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH);
-        // Unlike legacy DFlash, keep this explicit for DFlash2. Copy-heavy
+        // Unlike legacy DFlash, keep this explicit for shared drafters. Copy-heavy
         // prompts can win substantially, but CopySpec's extra extensions can
         // perturb an already strong DFlash2 cycle on ordinary generated code.
-        if (has_dflash2 && params.has_type(COMMON_SPECULATIVE_TYPE_COPYSPEC)) {
+        if (common_speculative_copyspec_is_shared(params)) {
             configs.emplace_back(COMMON_SPECULATIVE_TYPE_COPYSPEC, params);
         }
         add_config_if_enabled(COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE);
@@ -6107,6 +6114,14 @@ void common_speculative_draft(common_speculative * spec) {
         }
     }
 
+    common_speculative_impl_copyspec * copyspec = nullptr;
+    for (auto & impl : spec->impls) {
+        if (impl->type == COMMON_SPECULATIVE_TYPE_COPYSPEC) {
+            copyspec = static_cast<common_speculative_impl_copyspec *>(impl.get());
+            break;
+        }
+    }
+
     for (auto & impl : spec->impls) {
         {
             common_time_meas tm(impl->t_draft_us, !impl->gen_perf);
@@ -6146,6 +6161,19 @@ void common_speculative_draft(common_speculative * spec) {
 
                     impl->n_gen_drafts++;
                     impl->n_gen_tokens += result.size();
+
+                    // Extend only a freshly produced draft: inactive descriptors
+                    // may still point to a result from an earlier server cycle.
+                    // Keep the model as acceptance owner, including its exact-q
+                    // prefix and adaptive accounting for its own proposed rows.
+                    if (copyspec && impl.get() != copyspec && dp.n_max > (int32_t) result.size()) {
+                        const size_t n_before = result.size();
+                        copyspec->extend(seq_id, *dp.prompt, dp.id_last, result, dp.n_max);
+                        if (result.size() > n_before) {
+                            copyspec->n_gen_drafts++;
+                            copyspec->n_gen_tokens += result.size() - n_before;
+                        }
+                    }
                 }
             }
 
@@ -6156,34 +6184,6 @@ void common_speculative_draft(common_speculative * spec) {
 
         if (n_drafting == 0) {
             break;
-        }
-    }
-
-    // A model draft can end on a sequence that appears verbatim in the
-    // existing context. Let CopySpec extend that draft without changing the
-    // implementation that owns acceptance (and, for DFlash2, its exact-q
-    // prefix). This is the multi-sequence equivalent of the legacy per-slot
-    // composition below.
-    common_speculative_impl_copyspec * copyspec = nullptr;
-    for (auto & impl : spec->impls) {
-        if (impl->type == COMMON_SPECULATIVE_TYPE_COPYSPEC) {
-            copyspec = static_cast<common_speculative_impl_copyspec *>(impl.get());
-            break;
-        }
-    }
-    if (copyspec) {
-        for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) dparams.size(); ++seq_id) {
-            auto & dp = dparams[seq_id];
-            if (spec->impl_last[seq_id] == copyspec || !dp.result || dp.result->empty() ||
-                    !dp.prompt || dp.n_max <= (int32_t) dp.result->size()) {
-                continue;
-            }
-            const size_t n_before = dp.result->size();
-            copyspec->extend(seq_id, *dp.prompt, dp.id_last, *dp.result, dp.n_max);
-            if (dp.result->size() > n_before) {
-                copyspec->n_gen_drafts++;
-                copyspec->n_gen_tokens += dp.result->size() - n_before;
-            }
         }
     }
 
@@ -6407,7 +6407,7 @@ common_speculative * common_speculative_init(
     {
         bool has_suffix   = params.has_type(COMMON_SPECULATIVE_TYPE_SUFFIX);
         bool has_copyspec = params.has_type(COMMON_SPECULATIVE_TYPE_COPYSPEC) &&
-            !params.has_type(COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH);
+            !common_speculative_copyspec_is_shared(params);
         bool has_recycle  = params.has_type(COMMON_SPECULATIVE_TYPE_RECYCLE);
         bool has_dflash   = params.has_type(COMMON_SPECULATIVE_TYPE_DFLASH);
 

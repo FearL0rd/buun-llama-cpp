@@ -119,6 +119,12 @@ PLE convolution histories are included in partial rollback. For byte-for-byte
 speculative/non-speculative comparisons, also pass `--ctx-checkpoints 0` so server
 prompt-checkpoint recomputation does not introduce an independent numerical change.
 
+CopySpec can also be combined with MTP using `--spec-type draft-mtp,copyspec`.
+Both use the same per-sequence lifecycle, including with multiple server slots.
+Copied suffixes do not count as MTP predictions when adjusting adaptive depth;
+MTP's sampled proposal probabilities still apply to its own prefix. CopySpec is
+explicit rather than automatic, since its benefit depends on input repetition.
+
 ### DFlash (`draft-dflash`)
 
 DFlash produces an entire block of draft tokens in a single forward pass (block diffusion) and
