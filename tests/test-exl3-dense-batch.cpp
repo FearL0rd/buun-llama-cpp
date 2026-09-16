@@ -4,17 +4,21 @@
 #include "ggml-cuda.h"
 #include "test-exl3-gpu-common.h"
 
+#ifdef EXL3_TEST_CUDA
+#include <cuda_runtime_api.h>
+#endif
+
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <vector>
 
-// Compare every row of each M=1..8 projection with that row executed alone.
+// Compare every row of each projection with that row executed alone.
+// SM86 also covers the wider per-bit-width batches, using two launches.
 // Rows deliberately have different scales/outliers: sharing an activation max
 // across rows must not accidentally satisfy this test.
-static bool check_batch(ggml_backend_t backend, int bits, int k, int n, bool head) {
-    constexpr int max_m = 8;
+static bool check_batch(ggml_backend_t backend, int bits, int k, int n, bool head, int max_m) {
     auto * ctx = ggml_init({1024*1024, nullptr, true});
     auto * compute = ggml_init({4*1024*1024, nullptr, true});
     auto * w = ggml_new_tensor_2d(ctx, ggml_exl3_type(bits, 2), k, n);
@@ -22,7 +26,7 @@ static bool check_batch(ggml_backend_t backend, int bits, int k, int n, bool hea
     auto * svh = ggml_new_tensor_1d(ctx, GGML_TYPE_F16, n);
     auto * suh = ggml_new_tensor_1d(ctx, GGML_TYPE_F16, k);
     ggml_set_name(w, head ? "output.weight" : "probe.weight");
-    auto * graph = ggml_new_graph_custom(compute, 256, false);
+    auto * graph = ggml_new_graph_custom(compute, 512, false);
     auto project = [&](int m, int row) {
         auto * v = ggml_view_2d(compute, x, k, m, x->nb[1], row*x->nb[1]);
         auto * y = ggml_mul_mat(compute, w, v);
@@ -32,7 +36,7 @@ static bool check_batch(ggml_backend_t backend, int bits, int k, int n, bool hea
         ggml_build_forward_expand(graph, y);
         return y;
     };
-    ggml_tensor * single[max_m], * batch[max_m];
+    std::vector<ggml_tensor *> single(max_m), batch(max_m);
     for (int row = 0; row < max_m; ++row) single[row] = project(1, row);
     for (int m = 1; m <= max_m; ++m) batch[m-1] = project(m, 0);
     auto * buffer = ggml_backend_alloc_ctx_tensors(ctx, backend);
@@ -44,11 +48,11 @@ static bool check_batch(ggml_backend_t backend, int bits, int k, int n, bool hea
     for (auto & v : weights) v = next() >> 24;
     ggml_backend_tensor_set(w, weights.data(), 0, weights.size());
     std::vector<float> input(k*max_m);
-    const float scales[max_m] = {1.0f, 0.0f, 0.001f, 100.0f, 0.1f, 10.0f, 1.0f, 0.01f};
+    const float scales[] = {1.0f, 0.0f, 0.001f, 100.0f, 0.1f, 10.0f, 1.0f, 0.01f};
     for (size_t i = 0; i < input.size(); ++i) {
         float v = 0;
         for (int j = 0; j < 6; ++j) v += float(next() >> 8)/16777216.0f - 0.5f;
-        input[i] = v*scales[i/k]*(i%127 == 0 ? 8.0f : 1.0f);
+        input[i] = v*scales[(i/k)%8]*(i%127 == 0 ? 8.0f : 1.0f);
     }
     ggml_backend_tensor_set(x, input.data(), 0, ggml_nbytes(x));
     std::vector<ggml_fp16_t> signs(k), output_scales(n);
@@ -92,12 +96,19 @@ int main() {
         ggml_backend_free(backend);
         return 77;
     }
+    bool sm86 = false;
+#ifdef EXL3_TEST_CUDA
+    cudaDeviceProp props{};
+    GGML_ASSERT(cudaGetDeviceProperties(&props, 0) == cudaSuccess);
+    sm86 = props.major == 8 && props.minor == 6;
+#endif
     bool ok = true;
     for (int bits = 1; bits <= 8; ++bits) {
-        ok &= check_batch(backend, bits, 128, 128, false);  // single K split, half a column block
-        ok &= check_batch(backend, bits, 5120, 640, false);  // partial N tile, many K slices
-        ok &= check_batch(backend, bits, 2048, 6144, false);
-        ok &= check_batch(backend, bits, 4096, 151936, true); // cap-limited split, head residual
+        const int max_m = sm86 && bits >= 2 ? (bits <= 4 ? 16 : 13) : 8;
+        ok &= check_batch(backend, bits, 128, 128, false, max_m);  // single K split, half a column block
+        ok &= check_batch(backend, bits, 5120, 640, false, max_m);  // partial N tile, many K slices
+        ok &= check_batch(backend, bits, 2048, 6144, false, max_m);
+        ok &= check_batch(backend, bits, 4096, 151936, true, max_m); // cap-limited split, head residual
     }
     ggml_backend_free(backend);
     return ok ? 0 : 1;

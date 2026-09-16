@@ -136,7 +136,7 @@ void exl3_reconstruct_launch(const uint8_t * data, half * dst, int k, int n0, in
     exl3_reconstruct_kernel<bits, cb><<<unsigned((tiles + 7) / 8), 256, 0, stream>>>(data, dst, k, n0 / 16, n1 / 16);
 }
 
-// ---- int8 activation path (m <= MAX_M) ---------------------------------------------------
+// ---- int8 activation path (up to MAX_M rows per launch) ---------------------------------
 // GGML_EXL3_INT8: 0 = off (fp16 tensor-core gemv), 1 = int8 + error-feedback residual everywhere,
 // 2 = plain int8 (residual only for the head), unset = per-tensor rule: plain for K <= 6, residual for K >= 7.
 // The residual limits additional activation error for high-bit weights. Plain activations at lower
@@ -275,8 +275,14 @@ bool exl3_mul_mat_id_fast_shape(const ggml_tensor * dst) {
         dst->src[3] != nullptr && dst->src[4] != nullptr;
 }
 
-bool exl3_int8_applicable(int bits, int m, int k, int n) {
-    return exl3_int8_mode() != 0 && bits >= 1 && bits <= 8 && m >= 1 && m <= exl3_int8::MAX_M &&
+bool exl3_int8_applicable(int bits, int m, int k, int n, int cc) {
+    // SM86: bounded speculative batches reuse the existing eight-row kernels
+    // instead of reconstructing the entire weight matrix above eight rows.
+    // Dense/head sweeps retain M<=16 for K2..4 and M<=13 for K5..8;
+    // wider high-bit batches and K1 residual heads can lose to reconstruction.
+    // Keep other architectures at their measured crossover.
+    const int max_m = cc == 860 && bits >= 2 ? (bits <= 4 ? 16 : 13) : exl3_int8::MAX_M;
+    return exl3_int8_mode() != 0 && bits >= 1 && bits <= 8 && m >= 1 && m <= max_m &&
         n % 128 == 0 && k % 128 == 0 && size_t(n) <= EXL3_INT8_MAX_N;
 }
 
@@ -322,18 +328,23 @@ void ggml_cuda_mul_mat_exl3(ggml_backend_cuda_context & ctx, const ggml_tensor *
     float * y = static_cast<float *>(dst->data);
 
     // the int8 path relies on the mul1 codebook being affine in the byte sum
-    if (cb == 2 && exl3_int8_applicable(bits, m, k, n)) {
+    if (cb == 2 && exl3_int8_applicable(bits, m, k, n, ggml_cuda_info().devices[ctx.device].cc)) {
         // int8 activation path: fused input transform, per-slice quantization, fused output transform
         const uint8_t * B = static_cast<const uint8_t *>(src0->data);
         const float * x = static_cast<const float *>(src1->data);
         const bool resid = exl3_int8_resid(bits, strcmp(src0->name, "output.weight") == 0);
-        switch (bits) {
-#define EXL3_INT8_CASE(K) case K: resid ? exl3_int8_run<K, true>(ctx, x, suh, B, svh, y, m, k, n, stream) \
-                                       : exl3_int8_run<K, false>(ctx, x, suh, B, svh, y, m, k, n, stream); break;
-            EXL3_INT8_CASE(1) EXL3_INT8_CASE(2) EXL3_INT8_CASE(3) EXL3_INT8_CASE(4)
-            EXL3_INT8_CASE(5) EXL3_INT8_CASE(6) EXL3_INT8_CASE(7) EXL3_INT8_CASE(8)
+        for (int row = 0; row < m; row += exl3_int8::MAX_M) {
+            const int rows = std::min(exl3_int8::MAX_M, m - row);
+            const float * x_rows = x + size_t(row) * k;
+            float * y_rows = y + size_t(row) * n;
+            switch (bits) {
+#define EXL3_INT8_CASE(K) case K: resid ? exl3_int8_run<K, true>(ctx, x_rows, suh, B, svh, y_rows, rows, k, n, stream) \
+                                       : exl3_int8_run<K, false>(ctx, x_rows, suh, B, svh, y_rows, rows, k, n, stream); break;
+                EXL3_INT8_CASE(1) EXL3_INT8_CASE(2) EXL3_INT8_CASE(3) EXL3_INT8_CASE(4)
+                EXL3_INT8_CASE(5) EXL3_INT8_CASE(6) EXL3_INT8_CASE(7) EXL3_INT8_CASE(8)
 #undef EXL3_INT8_CASE
-            default: GGML_ABORT("EXL3 int8 path: unsupported bit width %d", bits);
+                default: GGML_ABORT("EXL3 int8 path: unsupported bit width %d", bits);
+            }
         }
         return;
     }
