@@ -266,10 +266,16 @@ bool ggml_cuda_mul_mat_marlin_q4_a32(
     // SM86 prefill: canonicalize one projection at a time for grouped INT8 MMQ.
     // Smaller batches keep Marlin: the conversion costs more than MMQ saves.
     // Bound workspace and leave the large vocabulary projection unchanged.
-    if (cc == 860 && m >= 256 && ggml_nbytes(src0) <= 64 * 1024 * 1024 &&
+    const size_t canonical_bytes = ggml_nbytes(src0);
+    // MMQ loads full K tiles, including padding after the last weight row.
+    const size_t canonical_padding = ggml_row_size(src0->type, GGML_PAD(k, MATRIX_ROW_PADDING) - k);
+    if (cc == 860 && m >= 256 && canonical_bytes + canonical_padding <= 64 * 1024 * 1024 &&
             ggml_backend_buffer_get_usage(src0->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS &&
             (gate == nullptr || ggml_backend_buffer_get_usage(gate->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS)) {
-        ggml_cuda_pool_alloc<char> canonical(ctx.pool(), ggml_nbytes(src0));
+        ggml_cuda_pool_alloc<char> canonical(ctx.pool(), canonical_bytes + canonical_padding);
+        if (canonical_padding != 0) {
+            CUDA_CHECK(cudaMemsetAsync(canonical.get() + canonical_bytes, 0, canonical_padding, stream));
+        }
         ggml_cuda_pool_alloc<float> input_f32(ctx.pool(), size_t(m) * k);
         ggml_cuda_pool_alloc<float> result_f32(ctx.pool());
         if (!direct_f32) {

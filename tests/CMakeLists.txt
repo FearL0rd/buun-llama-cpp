@@ -558,6 +558,7 @@ endif()
 # The full suite runs explicitly in ci/run.sh. Keep focused fork CTest cases below.
 # TODO: decouple the operator tool from libllama [TAG_TESTS_LLAMA_LINK].
 llama_build(test-backend-ops.cpp)
+target_include_directories(test-backend-ops PRIVATE ../ggml/src)
 # Metadata ABI gate needs no model or device backend.
 add_executable(test-mul-mat-params test-mul-mat-params.cpp)
 target_include_directories(test-mul-mat-params PRIVATE ../ggml/src)

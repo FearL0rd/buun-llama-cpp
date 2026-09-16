@@ -19,6 +19,7 @@
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
 #include "ggml-cpp.h"
+#include "ggml-quants.h"
 
 #include <algorithm>
 #include <atomic>
@@ -5432,6 +5433,47 @@ struct test_mul_mat : public test_case {
     }
 };
 
+// Real weight buffers are required for the SM86 hybrid prefill dispatch.
+struct test_mul_mat_q4_a32_prefill : public test_mul_mat {
+    test_mul_mat_q4_a32_prefill(int64_t batch, int64_t width) :
+        test_mul_mat(GGML_TYPE_Q4_A32, GGML_TYPE_F32, 512, batch, width, {1, 1}, {1, 1}) {}
+
+    bool use_weight_context() override { return true; }
+    std::string vars() override { return test_mul_mat::vars() + ",weights=1"; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override { return build_graph(ctx, ctx); }
+
+    ggml_tensor * build_graph(ggml_context * ctx, ggml_context * ctx_weights) override {
+        ggml_tensor * weight = ggml_new_tensor_2d(ctx_weights, type_a, k, m);
+        ggml_tensor * input  = ggml_new_tensor_2d(ctx, type_b, k, n);
+        return ggml_mul_mat(ctx, weight, input);
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->type != GGML_TYPE_Q4_A32) {
+                init_tensor_uniform(t);
+                continue;
+            }
+            std::vector<block_q4_a32> blocks(ggml_nelements(t) / QK4_A32);
+            for (size_t i = 0; i < blocks.size(); ++i) {
+                auto & block = blocks[i];
+                for (int g = 0; g < QK4_A32 / QG4_A32; ++g) {
+                    const float scale = 0.03125f * (g + 1) * ((i + g) % 2 ? -1.0f : 1.0f);
+                    block.d[g] = ggml_fp32_to_bf16(scale).bits;
+                }
+                for (size_t j = 0; j < sizeof(block.z); ++j) {
+                    block.z[j] = uint8_t((i + j) % 16 | ((3 * i + j) % 16) << 4);
+                }
+                for (size_t j = 0; j < sizeof(block.qs); ++j) {
+                    block.qs[j] = uint8_t(17 * i + 29 * j);
+                }
+            }
+            ggml_backend_tensor_set(t, blocks.data(), 0, ggml_nbytes(t));
+        }
+    }
+};
+
 struct test_mul_mat_static_fp8 : public test_case {
     static constexpr int64_t k = 32;
     static constexpr int64_t n = 4;
@@ -5722,10 +5764,13 @@ struct test_mul_mat_q4_a32_residual_chain : public test_case {
     std::string vars() override { return "k=256,n=256,m=" + std::to_string(m); }
     std::string op_desc(ggml_tensor *) override { return "MUL_MAT_Q4_A32_RESIDUAL_CHAIN"; }
     bool run_whole_graph() override { return true; }
+    bool use_weight_context() override { return true; }
 
-    ggml_tensor * build_graph(ggml_context * ctx) override {
-        ggml_tensor * weight_0   = ggml_new_tensor_2d(ctx, GGML_TYPE_Q4_A32, k, n);
-        ggml_tensor * weight_1   = ggml_new_tensor_2d(ctx, GGML_TYPE_Q4_A32, n, n);
+    ggml_tensor * build_graph(ggml_context * ctx) override { return build_graph(ctx, ctx); }
+
+    ggml_tensor * build_graph(ggml_context * ctx, ggml_context * ctx_weights) override {
+        ggml_tensor * weight_0   = ggml_new_tensor_2d(ctx_weights, GGML_TYPE_Q4_A32, k, n);
+        ggml_tensor * weight_1   = ggml_new_tensor_2d(ctx_weights, GGML_TYPE_Q4_A32, n, n);
         ggml_tensor * input      = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, m);
         ggml_tensor * residual   = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n, m);
         ggml_tensor * norm_scale = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n);
@@ -5798,12 +5843,15 @@ struct test_mul_mat_quant_glu_chain : public test_case {
     }
     std::string op_desc(ggml_tensor *) override { return "MUL_MAT_QUANT_GLU_CHAIN"; }
     bool run_whole_graph() override { return true; }
+    bool use_weight_context() override { return true; }
 
-    ggml_tensor * build_graph(ggml_context * ctx) override {
-        ggml_tensor * gate_weight = ggml_new_tensor_2d(ctx, weight_type, k, n_ff);
-        ggml_tensor * up_weight   = ggml_new_tensor_2d(ctx, weight_type, k, n_ff);
+    ggml_tensor * build_graph(ggml_context * ctx) override { return build_graph(ctx, ctx); }
+
+    ggml_tensor * build_graph(ggml_context * ctx, ggml_context * ctx_weights) override {
+        ggml_tensor * gate_weight = ggml_new_tensor_2d(ctx_weights, weight_type, k, n_ff);
+        ggml_tensor * up_weight   = ggml_new_tensor_2d(ctx_weights, weight_type, k, n_ff);
         ggml_tensor * down_weight = include_down ?
-            ggml_new_tensor_2d(ctx, weight_type, n_ff, n_out) : nullptr;
+            ggml_new_tensor_2d(ctx_weights, weight_type, n_ff, n_out) : nullptr;
         ggml_tensor * input       = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, strided_input ? 2 * k : k, m);
         ggml_set_name(input,       "q4_a32_glu_input");
         if (strided_input) {
@@ -11430,6 +11478,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // Hybrid MMQ prefill threshold and ragged tile tail; small batches retain Marlin.
     for (int64_t batch : { 255, 256, 257, 512 }) {
         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_A32, GGML_TYPE_F32, 512, batch, 1152, {1, 1}, {1, 1}));
+        for (int64_t width : { 128, 512, 1152 }) {
+            test_cases.emplace_back(new test_mul_mat_q4_a32_prefill(batch, width));
+        }
     }
     // Ampere Marlin small-M tile boundaries: N <= 8192 and K divisible by
     // 256 take the deeper K tile; the other cases take the wider N tile.
