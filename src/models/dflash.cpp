@@ -1192,15 +1192,17 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
     // provides a drafter-schedulable model.output; the fallback is not device-safe)
     auto * output   = model.output;
     auto * output_s = model.output_s;
+    auto * output_in_s = model.output_in_s;
     if (output == nullptr) {
         GGML_ASSERT(cparams.ctx_other != nullptr);
         const auto * model_other = llama_get_model(cparams.ctx_other);
         GGML_ASSERT(model_other->output != nullptr && "DFlash decoder requires the target model's output projection");
         output   = model_other->output;
         output_s = model_other->output_s;
+        output_in_s = model_other->output_in_s;
     }
 
-    cur = build_lora_mm(output, cur, output_s);
+    cur = build_lora_mm(output, cur, output_s, output_in_s);
 
     // reduced-draft-vocab exports: scatter the draft logits to the target vocabulary via d2t
     if (model.d2t) {
@@ -1420,15 +1422,17 @@ llama_model_dflash::graph_dsv4::graph_dsv4(const llama_model & model, const llm_
     // provides a drafter-schedulable model.output; the fallback is not device-safe)
     auto * output   = model.output;
     auto * output_s = model.output_s;
+    auto * output_in_s = model.output_in_s;
     if (output == nullptr) {
         GGML_ASSERT(cparams.ctx_other != nullptr);
         const auto * model_other = llama_get_model(cparams.ctx_other);
         GGML_ASSERT(model_other->output != nullptr && "DSpark decoder requires the target model's output projection");
         output   = model_other->output;
         output_s = model_other->output_s;
+        output_in_s = model_other->output_in_s;
     }
 
-    cur = build_lora_mm(output, cur, output_s);
+    cur = build_lora_mm(output, cur, output_s, output_in_s);
     cb(cur, "result_output", -1);
     res->t_logits = cur;
 

@@ -3425,10 +3425,6 @@ static void test_qwen4_mtp_sidecar_contract(const size_t seed) {
     target_model->output = target_output;
     GGML_ASSERT(tied_shared_model != nullptr);
     GGML_ASSERT(tied_shared_model->output == target_model->tok_embd);
-    GGML_ASSERT(!llama_model_shared_output_needs_separate_copy(true, true, true));
-    GGML_ASSERT(llama_model_shared_output_needs_separate_copy(true, true, false));
-    GGML_ASSERT(llama_model_shared_output_needs_separate_copy(false, true, true));
-    GGML_ASSERT(!llama_model_shared_output_needs_separate_copy(true, false, true));
 
     llama_context_ptr shared_ctx(llama_init_from_model(shared_model.get(), ctx_params));
     GGML_ASSERT(shared_ctx != nullptr);

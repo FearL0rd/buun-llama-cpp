@@ -3683,11 +3683,6 @@ float llama_model_rope_freq_scale_train(const llama_model * model) {
     return model->hparams.rope_freq_scale_train;
 }
 
-bool llama_model_shared_output_needs_separate_copy(
-        bool copy_embedding, bool copy_output, bool tied_output) {
-    return copy_output && !(copy_embedding && tied_output);
-}
-
 void llama_model_share_tensors(llama_model * dst, const llama_model * src) {
     // Only normalize tensors that this drafter actually shares with the target:
     // omitted tensors have not been attached yet, while borrowed tensors already
@@ -3701,8 +3696,20 @@ void llama_model_share_tensors(llama_model * dst, const llama_model * src) {
         return;
     }
 
-    const ggml_tensor * src_embd = share_embd ? src->tok_embd : nullptr;
-    const ggml_tensor * src_out  = share_out  ? src->output   : nullptr;
+    // A quantized head is a weight plus its auxiliary tensors. Apply the same
+    // placement rules to every member, including when only an auxiliary needs
+    // gathering. A self-contained drafter keeps its own head and auxiliaries.
+    struct attachment {
+        ggml_tensor ** dst;
+        ggml_tensor * src;
+        bool share;
+    };
+    const attachment attachments[] = {
+        { &dst->tok_embd,    src->tok_embd,    share_embd },
+        { &dst->output,      src->output,      share_out  },
+        { &dst->output_s,    src->output_s,    share_out  },
+        { &dst->output_in_s, src->output_in_s, share_out  },
+    };
 
     // a target tensor can be shared by pointer only if the drafter can schedule it: host
     // buffers and buffers on one of the drafter's own devices. Meta (tensor-sharded)
@@ -3730,14 +3737,15 @@ void llama_model_share_tensors(llama_model * dst, const llama_model * src) {
         }
         return true;
     };
-    const bool copy_embd = needs_copy(src_embd);
-    const bool copy_out  = needs_copy(src_out);
-    if (!copy_embd && !copy_out) {
-        if (share_embd) {
-            dst->tok_embd = src->tok_embd;
-        }
-        if (share_out) {
-            dst->output = src->output;
+    bool copying = false;
+    for (const auto & a : attachments) {
+        copying |= a.share && needs_copy(a.src);
+    }
+    if (!copying) {
+        for (const auto & a : attachments) {
+            if (a.share) {
+                *a.dst = a.src;
+            }
         }
         return;
     }
@@ -3749,22 +3757,19 @@ void llama_model_share_tensors(llama_model * dst, const llama_model * src) {
         ? ggml_backend_cpu_buffer_type()
         : ggml_backend_dev_buffer_type(dst->devices[0].dev);
 
-    ggml_init_params ip = { /*.mem_size =*/ 2*ggml_tensor_overhead(), /*.mem_buffer =*/ nullptr, /*.no_alloc =*/ true };
+    ggml_init_params ip = { /*.mem_size =*/ 4*ggml_tensor_overhead(), /*.mem_buffer =*/ nullptr, /*.no_alloc =*/ true };
     ggml_context_ptr ctx_ptr { ggml_init(ip) };
     ggml_context * ctx = ctx_ptr.get();
 
-    auto declare_copy = [&](const ggml_tensor * t) {
-        ggml_tensor * out = ggml_new_tensor(ctx, t->type, ggml_n_dims(t), t->ne);
-        ggml_set_name(out, t->name);
-        return out;
-    };
-    ggml_tensor * embd_cp = copy_embd ? declare_copy(src_embd) : nullptr;
-    const bool tied_output = src_out != nullptr && src_out == src_embd;
-    const bool copy_out_separately = llama_model_shared_output_needs_separate_copy(
-            copy_embd, copy_out, tied_output);
-    ggml_tensor * out_cp = copy_out_separately
-        ? declare_copy(src_out)
-        : (copy_out ? embd_cp : nullptr);
+    // Deduplicate tied weights (and any shared auxiliaries) by tensor identity.
+    std::map<const ggml_tensor *, ggml_tensor *> copies;
+    for (const auto & a : attachments) {
+        if (a.share && needs_copy(a.src) && copies.count(a.src) == 0) {
+            ggml_tensor * out = ggml_new_tensor(ctx, a.src->type, ggml_n_dims(a.src), a.src->ne);
+            ggml_set_name(out, a.src->name);
+            copies.emplace(a.src, out);
+        }
+    }
     const size_t copy_bytes = ggml_backend_alloc_ctx_tensors_from_buft_size(ctx, buft);
 
     ggml_backend_buffer_t buf;
@@ -3773,17 +3778,14 @@ void llama_model_share_tensors(llama_model * dst, const llama_model * src) {
         // or copying the weights. This is the same dummy-buffer contract used by
         // llama_model::load_tensors() under no_alloc.
         buf = ggml_backend_buft_alloc_buffer(buft, 0);
-        if (embd_cp != nullptr) {
-            embd_cp->buffer = buf;
-        }
-        if (out_cp != nullptr) {
-            out_cp->buffer = buf;
+        for (const auto & copy : copies) {
+            copy.second->buffer = buf;
         }
     } else {
         buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft);
     }
     if (buf == nullptr) {
-        GGML_ABORT("failed to allocate device-local tok_embd/output copies for the drafter "
+        GGML_ABORT("failed to allocate device-local shared tensor copies for the drafter "
                    "(the target's tensors are not schedulable on the drafter device)");
     }
 
@@ -3793,29 +3795,24 @@ void llama_model_share_tensors(llama_model * dst, const llama_model * src) {
         ggml_backend_tensor_set(d, host.data(), 0, host.size());
     };
     if (!dst->hparams.no_alloc) {
-        if (embd_cp != nullptr) {
-            gather(src_embd, embd_cp);
-        }
-        if (out_cp != nullptr && out_cp != embd_cp) {
-            gather(src_out, out_cp);
+        for (const auto & copy : copies) {
+            gather(copy.first, copy.second);
         }
     }
 
-    if (share_embd) {
-        dst->tok_embd = embd_cp != nullptr ? embd_cp : src->tok_embd;
-    }
-    if (share_out) {
-        dst->output = out_cp != nullptr ? out_cp : src->output;
+    for (const auto & a : attachments) {
+        if (a.share) {
+            auto copy = copies.find(a.src);
+            *a.dst = copy != copies.end() ? copy->second : a.src;
+        }
     }
 
     dst->adopt_buffer(std::move(ctx_ptr), ggml_backend_buffer_ptr(buf));
 
-    LLAMA_LOG_INFO("%s: target tensors not drafter-schedulable — %s %s%s%s on %s (%.1f MiB)\n",
+    LLAMA_LOG_INFO("%s: target tensors not drafter-schedulable — %s %zu shared tensors on %s (%.1f MiB)\n",
             __func__,
             dst->hparams.no_alloc ? "projected" : "gathered",
-            embd_cp != nullptr ? "tok_embd" : "",
-            embd_cp != nullptr && out_cp != nullptr ? "+" : "",
-            out_cp  != nullptr ? "output" : "",
+            copies.size(),
             ggml_backend_buft_name(buft),
             copy_bytes / 1024.0 / 1024.0);
 }

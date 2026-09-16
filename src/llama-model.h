@@ -671,7 +671,7 @@ struct llama_model {
     struct ggml_tensor * output_norm_enc = nullptr;
 
 
-    // NVFP4 per-tensor scale2, input_scale for LM head
+    // Quantization auxiliaries for the LM head (scales, EXL3 transforms, etc.).
     struct ggml_tensor * output_s    = nullptr;
     struct ggml_tensor * output_in_s = nullptr;
 
@@ -911,8 +911,3 @@ const std::vector<std::pair<std::string, ggml_tensor *>> & llama_internal_get_te
 // preserves tied-output models, where output points at token_embd and no
 // output.weight entry exists in the tensor map.
 ggml_tensor * llama_internal_get_shared_tensor(const llama_model * model, llm_tensor tensor);
-
-// Internal pure seam for the tied embedding/output copy plan used by
-// llama_model_share_tensors().
-bool llama_model_shared_output_needs_separate_copy(
-        bool copy_embedding, bool copy_output, bool tied_output);
