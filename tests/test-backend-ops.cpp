@@ -11423,6 +11423,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // Native Marlin Q4-A32 path (output rows and reduction width satisfy its
     // 256/128 alignment contract; batch 17 avoids MMVQ).
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_A32, GGML_TYPE_F32, 256, 17, 256, {1, 1}, {1, 1}));
+    // Ampere Marlin small-M tile boundaries: N <= 8192 and K divisible by
+    // 256 take the deeper K tile; the other cases take the wider N tile.
+    for (int64_t rows : { 8192, 8448 }) {
+        for (int64_t k : { 256, 384 }) {
+            for (int64_t batch : { 4, 8, 16 }) {
+                test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_A32, GGML_TYPE_F32, rows, batch, k, {1, 1}, {1, 1}));
+            }
+        }
+    }
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0_G128, GGML_TYPE_F32, 256, 17, 256, {1, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0_G128, GGML_TYPE_F32, 256, 65, 256, {1, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0_G128, GGML_TYPE_F32, 256, 100, 256, {1, 1}, {1, 1}));

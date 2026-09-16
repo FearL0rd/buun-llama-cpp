@@ -165,8 +165,19 @@ constexpr marlin_fn marlin_kernel() {
 }
 
 template<bool C_F32>
-marlin_fn select_marlin_kernel(int m_blocks, bool m_block_8) {
+marlin_fn select_marlin_kernel(int m_blocks, bool m_block_8, int64_t n, int64_t k, int cc) {
     if (m_blocks == 1) {
+        // Ampere small-batch tuning: narrower outputs reuse a deeper K tile;
+        // wide outputs benefit from more N work per block. Keep the existing
+        // dispatch on other architectures. Tile changes alter split-K rounding.
+        if (cc >= GGML_CUDA_CC_AMPERE && cc < GGML_CUDA_CC_ADA_LOVELACE) {
+            if (n <= 8192 && k % 256 == 0) {
+                return m_block_8 ? marlin_kernel<1, true, 4, 16, 256, C_F32>() :
+                                   marlin_kernel<1, false, 4, 16, 256, C_F32>();
+            }
+            return m_block_8 ? marlin_kernel<1, true, 16, 4, 256, C_F32>() :
+                               marlin_kernel<1, false, 16, 4, 256, C_F32>();
+        }
         return m_block_8 ? marlin_kernel<1, true, 8, 8, 256, C_F32>() : marlin_kernel<1, false, 8, 8, 256, C_F32>();
     }
     if (m_blocks == 2) return marlin_kernel<2, false, 16, 4, 256, C_F32>();
@@ -302,14 +313,15 @@ void ggml_cuda_marlin_q4_a32_launch(
     // With weight_alt the kernel computes [weight | weight_alt] as one 2n-wide GEMM.
     const int64_t out_n = weight_alt != nullptr ? 2 * n : n;
     const size_t out_elem = out_f32 ? sizeof(float) : sizeof(nv_bfloat16);
+    const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
     int64_t remaining = m;
     int64_t offset = 0;
     while (remaining > 0) {
         const int64_t split = ggml_cuda_marlin::next_m_split(remaining);
         const int m_blocks = ggml_cuda_marlin::m_blocks_for(split);
         const bool m_block_8 = split <= 8;
-        marlin_fn kernel = out_f32 ? select_marlin_kernel<true>(m_blocks, m_block_8) :
-                                     select_marlin_kernel<false>(m_blocks, m_block_8);
+        marlin_fn kernel = out_f32 ? select_marlin_kernel<true>(m_blocks, m_block_8, out_n, k, cc) :
+                                     select_marlin_kernel<false>(m_blocks, m_block_8, out_n, k, cc);
         CUDA_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, max_shared));
         kernel<<<sms, 256, max_shared, stream>>>(
             reinterpret_cast<const int4 *>(input + offset * k),
