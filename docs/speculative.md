@@ -61,6 +61,13 @@ nonzero temperature, `top_k` from 1 to 64, and `--spec-draft-p-min 0` (the defau
 It uses the same runtime for embedded GGUF MTP, native safetensors MTP, and MTP
 sidecars, and works with adaptive draft depth. No additional flag is needed.
 
+For a single recursive MTP head with a separate draft cache and the default
+maximum of three draft tokens, depth adapts between two and three. Low acceptance
+reduces depth; improved acceptance or a periodic probe can raise it again, including
+when an answer transitions from prose to code. Slots adapt independently and keep
+their learned depth across requests, with recovery re-armed at each new request.
+This does not increase the configured maximum or reserve additional KV capacity.
+
 Greedy requests, positive draft-confidence thresholds, Mirostat/adaptive-p,
 and shared-cache or chained-head MTP retain the existing drafting path. The
 probability-aware path preserves the target sampling distribution, not the exact

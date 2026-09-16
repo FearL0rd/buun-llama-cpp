@@ -1,4 +1,5 @@
 #include "speculative.h"
+#include "speculative-mtp-adaptive.h"
 
 #include "common.h"
 #include "ggml.h"
@@ -2742,14 +2743,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     std::vector<int>                i_last;
     std::vector<std::vector<float>> chain_h;
 
-    // A single recurrent MTP head is commonly reused recursively.  The third
-    // recursive prediction is model-dependent: it is valuable on Qwen3.6 but
-    // not on Qwen3.8.  Probe it once per slot, then retain depth three only when
-    // its marginal acceptance pays for the larger verify graph.
+    // Reversible per-request depth control. Never grow the reserved depth,
+    // and keep independently trained heads and shared-KV assistants out.
     bool adaptive_recursive_depth = false;
-    std::vector<int32_t> adaptive_cap;
-    std::vector<int32_t> adaptive_depth3_attempts;
-    std::vector<int32_t> adaptive_depth3_accepts;
+    std::vector<common_speculative_mtp_adaptive> adaptive;
     std::vector<int32_t> adaptive_last_draft_size;
 
     common_speculative_impl_draft_mtp(const common_params_speculative & params, uint32_t n_seq)
@@ -2807,9 +2804,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         const char * adaptive_env = getenv("GGML_MTP_DRAFT_ADAPTIVE");
         adaptive_recursive_depth = n_mtp_layers == 1 && !is_mem_shared && this->params.n_max == 3 &&
                                    !(adaptive_env && atoi(adaptive_env) == 0);
-        adaptive_cap.assign(n_seq, this->params.n_max);
-        adaptive_depth3_attempts.assign(n_seq, 0);
-        adaptive_depth3_accepts.assign(n_seq, 0);
+        adaptive.assign(n_seq, common_speculative_mtp_adaptive(this->params.n_min));
         adaptive_last_draft_size.assign(n_seq, 0);
 
         if (chain_heads) {
@@ -2855,6 +2850,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
     void begin(llama_seq_id seq_id, const llama_tokens & prompt) override {
         proposals[seq_id].clear();
+        adaptive[seq_id].begin();
+        adaptive_last_draft_size[seq_id] = 0;
         const int32_t N = (int32_t) prompt.size();
         if (N <= 0) {
             return;
@@ -3158,7 +3155,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 result.push_back(id);
 
                 int32_t n_max_eff = adaptive_recursive_depth
-                    ? std::min(params.n_max, adaptive_cap[seq_id])
+                    ? std::min(params.n_max, adaptive[seq_id].depth())
                     : params.n_max;
                 if (dp.n_max > 0) {
                     n_max_eff = std::min(n_max_eff, dp.n_max);
@@ -3219,29 +3216,32 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         }
     }
 
-    void accept(llama_seq_id seq_id, uint16_t n_accepted, bool /*is_other*/) override {
+    void accept(llama_seq_id seq_id, uint16_t n_accepted, bool is_other) override {
         if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
             return;
         }
 
-        if (adaptive_recursive_depth && adaptive_last_draft_size[seq_id] == 3) {
-            adaptive_depth3_attempts[seq_id]++;
-            adaptive_depth3_accepts[seq_id] += n_accepted >= 3;
+        if (adaptive_recursive_depth) {
+            const int previous = adaptive[seq_id].depth();
+            const int drafted = adaptive_last_draft_size[seq_id];
+            // CopySpec can append a suffix while MTP still owns acceptance.
+            // Count only acceptance of MTP's own prefix for depth selection.
+            adaptive[seq_id].accept(drafted, std::min<int>(n_accepted, drafted), is_other);
             adaptive_last_draft_size[seq_id] = 0;
-
-            if (adaptive_depth3_attempts[seq_id] >= 16) {
-                const float p3 = (float) adaptive_depth3_accepts[seq_id] /
-                                 (float) adaptive_depth3_attempts[seq_id];
-                if (p3 < 0.50f) {
-                    adaptive_cap[seq_id] = 2;
-                    SPC_DBG("MTP seq %d marginal depth-3 acceptance %.3f; draft cap -> 2\n",
-                            (int) seq_id, p3);
-                }
-                adaptive_depth3_attempts[seq_id] = 0;
-                adaptive_depth3_accepts[seq_id] = 0;
+            if (previous != adaptive[seq_id].depth()) {
+                SPC_DBG("MTP seq %d adaptive draft cap %d -> %d\n", seq_id, previous, adaptive[seq_id].depth());
             }
         }
 
+        refresh_carry(seq_id, n_accepted);
+    }
+
+    // Rollback may refresh hidden rows after accept() has already recorded the
+    // outcome. It must not report a second outcome to the depth controller.
+    void refresh_carry(llama_seq_id seq_id, uint16_t n_accepted) {
+        if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
+            return;
+        }
         const int32_t n_rows = verify_h_rows[seq_id];
         if (n_rows <= 0) {
             return;
@@ -3265,6 +3265,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             return false;
         }
         proposals[seq_id].clear();
+        adaptive[seq_id].begin();
         return common_speculative_mtp_carry_state_load(
             pending_h_lifecycle[seq_id], pending_h[seq_id], data);
     }
@@ -3281,6 +3282,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         verify_h_rows[seq_id] = 0;
         i_last[seq_id] = -1;
         adaptive_last_draft_size[seq_id] = 0;
+        adaptive[seq_id].begin();
         if (chain_heads) {
             chain_h[seq_id].clear();
         }
@@ -6824,7 +6826,7 @@ void common_speculative_rollback_dft(common_speculative * spec, llama_seq_id seq
             auto * mtp = static_cast<common_speculative_impl_draft_mtp *>(impl.get());
             auto * ctx_dft = mtp->params.ctx_dft;
             llama_memory_seq_rm(llama_get_memory(ctx_dft), seq_id, n_past, -1);
-            mtp->accept(seq_id, n_accepted, false);
+            mtp->refresh_carry(seq_id, n_accepted);
         }
     }
 }
