@@ -6,8 +6,9 @@
 // The caller owns both Hadamard transforms. F16 inputs/weights and F32 accumulation
 // match the cuBLAS path's precision, but not its floating-point reduction order.
 // SM86 measurements favor BM=64 for short prompts, BM=128 for longer prompts.
-template <int bits, int cb, int BM>
-__global__ void exl3_gemm_kernel(const uint8_t *weights, const half *xh, float *y, int k, int n, int m) {
+template <int bits, int cb, int BM, int min_blocks>
+__global__ void __launch_bounds__(256, min_blocks)
+exl3_gemm_kernel(const uint8_t *weights, const half *xh, float *y, int k, int n, int m) {
 #if __CUDA_ARCH__ >= 700
     using namespace nvcuda;
     constexpr int BN = 64, BK = BM == 64 ? 128 : 64, STRIDE = BK + 8;
@@ -15,7 +16,10 @@ __global__ void exl3_gemm_kernel(const uint8_t *weights, const half *xh, float *
     constexpr int MV = BM / 32;
     __shared__ __align__(32) half a[BN * STRIDE];
     __shared__ __align__(32) half b[BM * STRIDE];
-    __shared__ __align__(32) float c[8 * 256];
+    // The final K-loop barrier retires all readers of a before the epilogue.
+    // Reuse that tile for warp-private output staging, saving 8 KiB per CTA.
+    static_assert(sizeof(a) >= 8 * 256 * sizeof(float));
+    float *c = reinterpret_cast<float *>(a);
     const int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
     const int n0 = blockIdx.x * BN, m0 = blockIdx.y * BM;
     wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> fa;

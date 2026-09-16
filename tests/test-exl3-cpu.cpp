@@ -310,6 +310,9 @@ int main(int argc, char ** argv) {
             ok &= run(backend, 4, 2, false, tokens, 1);
         }
         ok &= run(backend, 4, 2, false, 129, 1, false, 5120, 640);
+        // Wider output exercises the three-CTA SM86 GEMM variant on a 3090;
+        // the narrow case above covers the two-CTA variant and partial M tiles.
+        ok &= run(backend, 4, 2, false, 129, 1, false, 128, 6144);
     }
     ok &= run(backend, 2, 2, true, 21, 1);
     ok &= run(backend, 2, 2, true, 22, 3);

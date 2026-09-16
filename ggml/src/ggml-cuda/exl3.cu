@@ -596,9 +596,20 @@ void ggml_cuda_mul_mat_exl3(ggml_backend_cuda_context & ctx, const ggml_tensor *
     if (ggml_cuda_info().devices[ctx.device].cc == 860 && bits == 4 && cb == 2 && m >= 17) {
         const uint8_t * weights = static_cast<const uint8_t *>(src0->data);
         if (m <= 128) {
-            exl3_gemm_kernel<4, 2, 64><<<dim3(n / 64, (m + 63) / 64), 256, 0, stream>>>(weights, xh.get(), y, k, n, m);
+            exl3_gemm_kernel<4, 2, 64, 2><<<dim3(n / 64, (m + 63) / 64), 256, 0, stream>>>(weights, xh.get(), y, k, n, m);
         } else {
-            exl3_gemm_kernel<4, 2, 128><<<dim3(n / 64, (m + 127) / 128), 256, 0, stream>>>(weights, xh.get(), y, k, n, m);
+            const dim3 grid(n / 64, (m + 127) / 128);
+            const int blocks = grid.x * grid.y;
+            const int sms = ggml_cuda_info().devices[ctx.device].nsm;
+            // A third resident CTA shortens some launch tails, but its tighter
+            // register budget loses when two CTAs/SM finish in as few waves.
+            const int waves2 = (blocks + 2 * sms - 1) / (2 * sms);
+            const int waves3 = (blocks + 3 * sms - 1) / (3 * sms);
+            if (waves3 < waves2) {
+                exl3_gemm_kernel<4, 2, 128, 3><<<grid, 256, 0, stream>>>(weights, xh.get(), y, k, n, m);
+            } else {
+                exl3_gemm_kernel<4, 2, 128, 2><<<grid, 256, 0, stream>>>(weights, xh.get(), y, k, n, m);
+            }
         }
         exl3_had_out_kernel<<<dim3(n / 128, m), 32, 0, stream>>>(y, svh, n);
         return;
