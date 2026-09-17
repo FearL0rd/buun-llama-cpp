@@ -7,7 +7,7 @@
 #include <cstdint>
 #include <vector>
 
-static void check(ggml_backend_t backend, int tokens, int copies, int channels, bool dependency) {
+static void check(ggml_backend_t backend, int tokens, int copies, int channels, bool dependency, bool inactive = false) {
     constexpr int prefix = 3, sequences = 2, capacity = 4, head = 1;
     const int width = prefix + tokens, row = prefix * channels;
     auto * ctx = ggml_init({4 * 1024 * 1024, nullptr, true});
@@ -42,6 +42,15 @@ static void check(ggml_backend_t backend, int tokens, int copies, int channels, 
     }
     auto * buffer = ggml_backend_alloc_ctx_tensors(ctx, backend);
     GGML_ASSERT(buffer);
+    if (inactive) {
+        // The backend skips non-compute nodes, which can be unallocated. A
+        // look-ahead matcher must respect that boundary before testing ranges.
+        auto * unused_src = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 16);
+        auto * unused_dst = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 16);
+        auto * unused_copy = ggml_cpy(ctx, unused_src, unused_dst);
+        unused_copy->flags &= ~GGML_TENSOR_FLAG_COMPUTE;
+        ggml_graph_add_node(graph, unused_copy);
+    }
     ggml_backend_tensor_set(input, data.data(), 0, ggml_nbytes(input));
     const std::vector<float> initial(expected.size(), -123.0f);
     for (int iteration = 0; iteration < 3; ++iteration) {
@@ -62,14 +71,20 @@ static void check(ggml_backend_t backend, int tokens, int copies, int channels, 
     ggml_free(ctx);
 }
 
-int main() {
+int main(int argc, char ** argv) {
     if (ggml_backend_cuda_get_device_count() == 0) return 77;
     auto * backend = ggml_backend_cuda_init(0);
     if (!backend) return 77;
+    if (argc == 2 && std::strcmp(argv[1], "--inactive") == 0) {
+        check(backend, 8, 8, 257, false, true);
+        ggml_backend_free(backend);
+        return 0;
+    }
     for (int copies : {1,2,8,16,17}) {
         check(backend, 1, copies, 257, false);
         check(backend, copies, copies, 257, true);
     }
     check(backend, 8, 8, 10240, true);
+    check(backend, 8, 8, 257, false, true);
     ggml_backend_free(backend);
 }

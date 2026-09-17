@@ -6255,7 +6255,11 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             ggml_tensor * candidate = cgraph->nodes[j];
             if (candidate->op == GGML_OP_VIEW) continue;
             if (candidate->op != GGML_OP_CPY || candidate->type != GGML_TYPE_F32 ||
+                    (candidate->flags & GGML_TENSOR_FLAG_COMPUTE) == 0 ||
                     candidate->src[0]->type != GGML_TYPE_F32 ||
+                    // External DFlash views may carry device data without a
+                    // buffer object. Leave those on the ordinary copy path.
+                    candidate->buffer == nullptr || candidate->src[0]->buffer == nullptr ||
                     ggml_nelements(candidate) != ggml_nelements(candidate->src[0]) ||
                     ggml_cuda_tensors_overlap(candidate, candidate->src[0])) break;
             bool independent = true;
