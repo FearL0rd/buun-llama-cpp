@@ -6494,6 +6494,35 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         }
     }
 
+    // Single-sequence verification can read the indexed initial state directly.
+    // The source remains an explicit graph dependency; no host-side row index
+    // is baked into a captured graph. Keep all other shapes on the gather path.
+    if (node->op == GGML_OP_GET_ROWS && i + 2 < cgraph->n_nodes &&
+        ggml_cuda_info().devices[cuda_ctx->device].cc == 860) {
+        constexpr ggml_op ops[] = {GGML_OP_GET_ROWS, GGML_OP_RESHAPE, GGML_OP_GATED_DELTA_NET};
+        const int outputs[] = {i + 2};
+        ggml_tensor * reshape = cgraph->nodes[i + 1];
+        ggml_tensor * gdn = cgraph->nodes[i + 2];
+        if (ggml_can_fuse_subgraph(cgraph, i, 3, ops, outputs, 1) &&
+            reshape->src[0] == node && gdn->src[5] == reshape &&
+            node->type == GGML_TYPE_F32 && node->src[0]->type == GGML_TYPE_F32 &&
+            node->src[1]->type == GGML_TYPE_I32 && ggml_nelements(node->src[1]) == 1 &&
+            ggml_is_contiguous(node->src[0]) && ggml_is_contiguous(node->src[1]) &&
+            ggml_is_matrix(node->src[0]) && gdn->src[2]->ne[3] == 1 &&
+            gdn->src[2]->ne[0] == 128 && gdn->src[3]->ne[0] == 1 &&
+            gdn->src[2]->ne[2] >= 2 && gdn->src[2]->ne[2] <= 16 &&
+            ggml_get_op_params_i32(gdn, 0) > 1 &&
+            node->src[0]->ne[0] == ggml_nelements(reshape) &&
+            ggml_cuda_check_fusion_memory_ranges(cgraph, i, 3, outputs, 1)) {
+            ggml_cuda_gated_delta_net_fused_cache cache{};
+            const int skip = ggml_cuda_try_gdn_cache_fusion(cgraph, i + 2, cuda_ctx, cache);
+            cache.input_state = static_cast<const float *>(node->src[0]->data);
+            cache.input_rows = static_cast<const int32_t *>(node->src[1]->data);
+            ggml_cuda_op_gated_delta_net_fused_cache(*cuda_ctx, gdn, cache);
+            return 2 + skip;
+        }
+    }
+
     // gated_delta_net -> cpy: scatter recurrent-state snapshots into the cache
     if (node->op == GGML_OP_GATED_DELTA_NET) {
         ggml_cuda_gated_delta_net_fused_cache fused_state_cpy{};

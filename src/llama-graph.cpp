@@ -4119,6 +4119,17 @@ ggml_tensor * llm_graph_context::build_rs_in(
                             (size_t) kv_state->get_head() * states->nb[1]);
     }
 
+    // With no reset or extra-state copies, nothing needs this gather before
+    // the recurrent consumer. Let graph traversal place it beside that op so
+    // a backend can combine the indexed read with the recurrence. Keep the
+    // ordinary schedule for multiple devices, host state and larger batches.
+    if (n_seqs == 1 && ubatch.n_tokens > 1 && ubatch.n_tokens <= 16 &&
+        kv_state->get_n_rs() == (uint32_t) n_seqs && kv_state->get_rs_z() == -1 &&
+        ggml_backend_sched_get_n_backends(sched) == 2 && cparams.offload_kqv &&
+        s->buffer != nullptr && !ggml_backend_buffer_is_host(s->buffer)) {
+        return ggml_get_rows(ctx0, ggml_reshape_2d(ctx0, s, state_size, s->ne[1]), inp->s_copy_main);
+    }
+
     return build_rs(inp, s, state_size, n_seqs);
 }
 
