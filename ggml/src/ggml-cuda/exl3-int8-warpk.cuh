@@ -93,6 +93,7 @@ __device__ __forceinline__ void gemv_warpk_impl(const uint8_t * weights,
         const uint8_t * prepared, float * output, int k, int n, int nrows_max, int ksplit, int m, warpk_pair pair) {
 #if !defined(GGML_USE_HIP) && __CUDA_ARCH__ == 860
     constexpr int COLS = 32, RING = 4, NACC = M * (RESID ? 2 : 1), PLANES = NACC / 8, TWORDS = BITS * 8;
+    constexpr bool HOIST_FOLD = BITS == 4 && M == 8 && WK == 16;
     static_assert(M == 8 || M == 16);
     static_assert(BITS == 4 || BITS == 6);
     if constexpr (PAIR) {
@@ -186,9 +187,25 @@ __device__ __forceinline__ void gemv_warpk_impl(const uint8_t * weights,
                         // Centered weights are [-512,508], activations [-127,127].
                         // 256 products stay exact: 512*127*256 < 2^24. Fold before
                         // that bound is exceeded; the remaining sum is integer.
-                        if ((kb & 15) == 15 || kb + 1 == nr) {
+                        if (!HOIST_FOLD && ((kb & 15) == 15 || kb + 1 == nr)) {
 #pragma unroll
                             for (int l = 0; l < 4; ++l) { carry[t][p][l] += int(a[l]); a[l] = 0; }
+                        }
+                    }
+                }
+                // Hoist folding across independent tiles for this many-warp
+                // geometry. Wide projections prefer the interleaved schedule.
+                // Each accumulator still folds at the identical K positions.
+                if (HOIST_FOLD && ((kb & 15) == 15 || kb + 1 == nr)) {
+#pragma unroll
+                    for (int t = 0; t < 2; ++t) {
+#pragma unroll
+                        for (int p = 0; p < PLANES; ++p) {
+#pragma unroll
+                            for (int l = 0; l < 4; ++l) {
+                                carry[t][p][l] += int(accum[t][p][l]);
+                                accum[t][p][l] = 0;
+                            }
                         }
                     }
                 }
