@@ -239,6 +239,7 @@ static void exl3_warpk_launch(ggml_backend_cuda_context & ctx, const uint8_t * w
             CUDA_CHECK(cudaFuncSetAttribute(exl3_int8::prepare_warpk<RESID, PAIR, M>, cudaFuncAttributeMaxDynamicSharedMemorySize, cap));
             if constexpr (BITS == 4) {
                 CUDA_CHECK(cudaFuncSetAttribute(exl3_int8::gemv_warpk<4, BITS, RESID, PAIR, M>, cudaFuncAttributeMaxDynamicSharedMemorySize, cap));
+                CUDA_CHECK(cudaFuncSetAttribute(exl3_int8::gemv_warpk<5, BITS, RESID, PAIR, M>, cudaFuncAttributeMaxDynamicSharedMemorySize, cap));
                 CUDA_CHECK(cudaFuncSetAttribute(exl3_int8::gemv_warpk<16, BITS, RESID, PAIR, M>, cudaFuncAttributeMaxDynamicSharedMemorySize, cap));
             } else {
                 CUDA_CHECK(cudaFuncSetAttribute(exl3_int8::gemv_warpk<5, BITS, RESID, PAIR, M>, cudaFuncAttributeMaxDynamicSharedMemorySize, cap));
@@ -255,7 +256,13 @@ static void exl3_warpk_launch(ggml_backend_cuda_context & ctx, const uint8_t * w
         // Wide output projections favor fewer K warps; narrower projections
         // have more original K groups and benefit from the larger block.
         if (n >= 3 * k) {
-            exl3_int8::gemv_warpk<4, BITS, RESID, PAIR, M><<<grid, 128, smem, stream>>>(weights, prepared.get(), output, k, n, rows, splits, m, pair);
+            // Five warps divide ten original K groups evenly for wider verify
+            // batches. Keep the independently measured eight-row schedule.
+            if (M == 16 && splits == 10 && (!PAIR || pair.splits == 10)) {
+                exl3_int8::gemv_warpk<5, BITS, RESID, PAIR, M><<<grid, 160, smem, stream>>>(weights, prepared.get(), output, k, n, rows, splits, m, pair);
+            } else {
+                exl3_int8::gemv_warpk<4, BITS, RESID, PAIR, M><<<grid, 128, smem, stream>>>(weights, prepared.get(), output, k, n, rows, splits, m, pair);
+            }
         } else {
             exl3_int8::gemv_warpk<16, BITS, RESID, PAIR, M><<<grid, 512, smem, stream>>>(weights, prepared.get(), output, k, n, rows, splits, m, pair);
         }
