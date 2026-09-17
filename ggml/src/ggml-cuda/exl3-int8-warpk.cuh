@@ -1,6 +1,6 @@
 #pragma once
 
-// SM86 M8 executor: original INT8 quantization, expressed as exact integer
+// SM86 M8/M16 executor: original INT8 quantization, expressed as exact integer
 // products on F16/F32 MMA. K groups and their floating reduction order remain
 // identical to the scalar path, including the vocabulary head's residual.
 namespace exl3_int8 {
@@ -15,10 +15,10 @@ struct warpk_pair {
 
 // One warp owns one token row. Its max and integer sum need no cross-warp
 // reduction. Prepared uint2 fragments give the consumer coalesced MMA-B loads.
-template <bool RESID, bool PAIR>
-__global__ __launch_bounds__(256) void prepare_warpk(const float * x, const half * suh,
+template <bool RESID, bool PAIR, int M = 8>
+__global__ __launch_bounds__(M * 32) void prepare_warpk(const float * x, const half * suh,
         uint8_t * prepared, int k, int nrows_max, int m, warpk_pair pair) {
-    constexpr int M = 8, PLANES = RESID ? 2 : 1, NACC = M * PLANES;
+    constexpr int NACC = M * (RESID ? 2 : 1), PLANES = NACC / 8;
     const int row = threadIdx.x / 32, lane = threadIdx.x % 32;
     if constexpr (PAIR) {
         if (blockIdx.z) { suh = pair.suh; prepared = pair.prepared; nrows_max = pair.rows; }
@@ -80,7 +80,7 @@ __global__ __launch_bounds__(256) void prepare_warpk(const float * x, const half
         }
     }
     __syncthreads();
-    for (int i = threadIdx.x; i < nrows_max * 32 * PLANES; i += 256) {
+    for (int i = threadIdx.x; i < nrows_max * 32 * PLANES; i += M * 32) {
         const int kb = i / (32 * PLANES), p = ((i / 32) % PLANES) * 8 + (i % 32) / 4, j = (i % 4) * 2;
         auto value = [&](int t) { return __int2half_rn(kb < nrows ? int(quant[offset(p, kb * 16 + j + t)]) : 0); };
         reinterpret_cast<half2 *>(prepared + 8 * NACC)[2 * i] = __halves2half2(value(0), value(1));
@@ -88,11 +88,12 @@ __global__ __launch_bounds__(256) void prepare_warpk(const float * x, const half
     }
 }
 
-template <int WK, int BITS, bool RESID, bool PAIR>
+template <int WK, int BITS, bool RESID, bool PAIR, int M = 8>
 __global__ __launch_bounds__(WK * 32) void gemv_warpk(const uint8_t * weights,
         const uint8_t * prepared, float * output, int k, int n, int nrows_max, int ksplit, int m, warpk_pair pair) {
 #if !defined(GGML_USE_HIP) && __CUDA_ARCH__ == 860
-    constexpr int M = 8, COLS = 32, RING = 4, PLANES = RESID ? 2 : 1, NACC = M * PLANES, TWORDS = BITS * 8;
+    constexpr int COLS = 32, RING = 4, NACC = M * (RESID ? 2 : 1), PLANES = NACC / 8, TWORDS = BITS * 8;
+    static_assert(M == 8 || M == 16);
     static_assert(BITS == 4 || BITS == 6);
     if constexpr (PAIR) {
         if (blockIdx.z) {
