@@ -313,6 +313,9 @@ int main(int argc, char ** argv) {
         // Wider output exercises the three-CTA SM86 GEMM variant on a 3090;
         // the narrow case above covers the two-CTA variant and partial M tiles.
         ok &= run(backend, 4, 2, false, 129, 1, false, 128, 6144);
+        // Wide short batches select BM128; exercise both ragged edges.
+        ok &= run(backend, 4, 2, false, 65, 1, false, 128, 8192);
+        ok &= run(backend, 4, 2, false, 127, 1, false, 128, 8192);
     }
     ok &= run(backend, 2, 2, true, 21, 1);
     ok &= run(backend, 2, 2, true, 22, 3);

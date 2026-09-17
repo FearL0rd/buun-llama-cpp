@@ -606,7 +606,12 @@ void ggml_cuda_mul_mat_exl3(ggml_backend_cuda_context & ctx, const ggml_tensor *
     // retain the qualified fallback below.
     if (ggml_cuda_info().devices[ctx.device].cc == 860 && bits == 4 && cb == 2 && m >= 17) {
         const uint8_t * weights = static_cast<const uint8_t *>(src0->data);
-        if (m <= 128) {
+        const int nsm = ggml_cuda_info().devices[ctx.device].nsm;
+        // Short batches benefit from smaller row tiles. Keep enough blocks for
+        // narrow outputs: BM128 halves their grid and can lose to BM32/64.
+        if (m <= 32 || (m <= 64 && n / 64 < nsm)) {
+            exl3_gemm_kernel<4, 2, 32, 3><<<dim3(n / 64, (m + 31) / 32), 256, 0, stream>>>(weights, xh.get(), y, k, n, m);
+        } else if (m <= 64 || (m <= 128 && n / 64 < (3 * nsm + 1) / 2)) {
             exl3_gemm_kernel<4, 2, 64, 2><<<dim3(n / 64, (m + 63) / 64), 256, 0, stream>>>(weights, xh.get(), y, k, n, m);
         } else {
             const dim3 grid(n / 64, (m + 127) / 128);

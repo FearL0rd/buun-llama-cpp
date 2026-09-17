@@ -11,8 +11,8 @@ __global__ void __launch_bounds__(256, min_blocks)
 exl3_gemm_kernel(const uint8_t *weights, const half *xh, float *y, int k, int n, int m) {
 #if __CUDA_ARCH__ >= 700
     using namespace nvcuda;
-    constexpr int BN = 64, BK = BM == 64 ? 128 : 64, STRIDE = BK + 8;
-    static_assert(BM == 64 || BM == 128);
+    constexpr int BN = 64, BK = BM <= 64 ? 128 : 64, STRIDE = BK + 8;
+    static_assert(BM == 32 || BM == 64 || BM == 128);
     constexpr int MV = BM / 32;
     __shared__ __align__(32) half a[BN * STRIDE];
     __shared__ __align__(32) half b[BM * STRIDE];
