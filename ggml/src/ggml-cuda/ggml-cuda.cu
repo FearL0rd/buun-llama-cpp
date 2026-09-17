@@ -6165,7 +6165,9 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 beta_mm->src[1] == input;
             const bool layout_ok = edges_ok && dt && a && input &&
                 (alpha_mm->src[0]->type == GGML_TYPE_BF16 ||
-                    (alpha_mm->src[0]->type == GGML_TYPE_F16 && input->ne[1] == 8 &&
+                    // Above eight rows the ordinary F16 route changes its
+                    // accumulation, so only fuse the matching half2 reduction.
+                    (alpha_mm->src[0]->type == GGML_TYPE_F16 && input->ne[1] <= 8 &&
                      alpha_mm->src[0]->ne[0] == 5120 &&
                      ggml_cuda_info().devices[cuda_ctx->device].cc == 860 &&
                      ggml_get_op_params_i32(alpha_mm, 0) == GGML_PREC_DEFAULT &&

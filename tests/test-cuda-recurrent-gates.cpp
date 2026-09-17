@@ -13,7 +13,7 @@ int main() {
     GGML_ASSERT(backend);
     uint32_t rng = 429;
     auto random = [&] { rng = rng * 1664525u + 1013904223u; return (int(rng >> 16) - 32768) / 32768.0f; };
-    for (int m : {4,8}) for (int n : {7,48,64}) for (bool alias : {false,true}) {
+    for (int m : {1,2,3,4,7,8,9,12,13,16,17}) for (int n : {7,48,64}) for (bool alias : {false,true}) {
       std::vector<float> reference;
       for (bool unfused : {true,false}) {
         rng = 429;
