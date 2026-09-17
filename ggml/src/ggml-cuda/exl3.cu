@@ -270,6 +270,10 @@ static void exl3_warpk_launch(ggml_backend_cuda_context & ctx, const uint8_t * w
         // One useful warp per original K group avoids idle warps in the head.
         if (splits == 5) {
             exl3_int8::gemv_warpk<5, BITS, RESID, PAIR, M><<<grid, 160, smem, stream>>>(weights, prepared.get(), output, k, n, rows, splits, m, pair);
+        } else if (M == 8 && m >= 7 && splits == 6 && n >= 200000) {
+            // Large-vocabulary verification benefits from two K groups per
+            // warp; smaller heads retain the independently measured schedule.
+            exl3_int8::gemv_warpk<3, BITS, RESID, PAIR, M><<<grid, 96, smem, stream>>>(weights, prepared.get(), output, k, n, rows, splits, m, pair);
         } else {
             exl3_int8::gemv_warpk<6, BITS, RESID, PAIR, M><<<grid, 192, smem, stream>>>(weights, prepared.get(), output, k, n, rows, splits, m, pair);
         }
