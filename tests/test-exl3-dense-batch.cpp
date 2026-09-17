@@ -18,7 +18,7 @@
 // SM86 also covers wider verify batches, including the single-launch K4 M13 path.
 // Rows deliberately have different scales/outliers: sharing an activation max
 // across rows must not accidentally satisfy this test.
-static bool check_batch(ggml_backend_t backend, int bits, int k, int n, bool head, int max_m) {
+static bool check_batch(ggml_backend_t backend, int bits, int k, int n, bool head, int max_m, bool exact_bound = false) {
     auto * ctx = ggml_init({1024*1024, nullptr, true});
     auto * compute = ggml_init({4*1024*1024, nullptr, true});
     auto * w = ggml_new_tensor_2d(ctx, ggml_exl3_type(bits, 2), k, n);
@@ -46,6 +46,7 @@ static bool check_batch(ggml_backend_t backend, int bits, int k, int n, bool hea
     auto next = [&]() { rng = rng*1664525u + 1013904223u; return rng; };
     std::vector<unsigned char> weights(ggml_nbytes(w));
     for (auto & v : weights) v = next() >> 24;
+    if (exact_bound) std::fill(weights.begin(), weights.end(), 0);
     ggml_backend_tensor_set(w, weights.data(), 0, weights.size());
     std::vector<float> input(k*max_m);
     const float scales[] = {1.0f, 0.0f, 0.001f, 100.0f, 0.1f, 10.0f, 1.0f, 0.01f};
@@ -53,10 +54,14 @@ static bool check_batch(ggml_backend_t backend, int bits, int k, int n, bool hea
         float v = 0;
         for (int j = 0; j < 6; ++j) v += float(next() >> 8)/16777216.0f - 0.5f;
         input[i] = v*scales[(i/k)%8]*(i%127 == 0 ? 8.0f : 1.0f);
+        // A Hadamard impulse gives a constant transformed row, quantized to
+        // +/-127. Zero trellis windows give centered weight -512: exercise the
+        // F16/F32 executor's worst-case exact-integer accumulation bound.
+        if (exact_bound) input[i] = i % 128 == 0 ? 16.f * scales[(i/k)%8] : 0.f;
     }
     ggml_backend_tensor_set(x, input.data(), 0, ggml_nbytes(x));
     std::vector<ggml_fp16_t> signs(k), output_scales(n);
-    for (int i = 0; i < k; ++i) signs[i] = ggml_fp32_to_fp16(i%3 ? 1.0f : -1.0f);
+    for (int i = 0; i < k; ++i) signs[i] = ggml_fp32_to_fp16(exact_bound || i%3 ? 1.0f : -1.0f);
     for (int i = 0; i < n; ++i) {
         output_scales[i] = ggml_fp32_to_fp16((i%7 ? 1.0f : -1.0f)*(0.01f + float(i%13)*0.002f));
     }
@@ -83,7 +88,7 @@ static bool check_batch(ggml_backend_t backend, int bits, int k, int n, bool hea
     ggml_free(compute);
     ggml_backend_buffer_free(buffer);
     ggml_free(ctx);
-    printf("K%d k=%d n=%d head=%d: %s\n", bits, k, n, head, ok ? "PASS" : "FAIL");
+    printf("K%d k=%d n=%d head=%d bound=%d: %s\n", bits, k, n, head, exact_bound, ok ? "PASS" : "FAIL");
     return ok;
 }
 
@@ -183,6 +188,7 @@ int main() {
         ok &= check_pair(backend, 17408, 17408, m, true);
         ok &= check_pair(backend, 12288, 6144, m, false);
     }
+    if (sm86) ok &= check_batch(backend, 4, 5120, 17408, false, 8, true);
     ggml_backend_free(backend);
     return ok ? 0 : 1;
 }

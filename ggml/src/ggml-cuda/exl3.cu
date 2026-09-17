@@ -31,6 +31,7 @@
 #include "exl3-had.cuh"
 #include "exl3-gemv.cuh"
 #include "exl3-gemv-int8.cuh"
+#include "exl3-int8-warpk.cuh"
 
 namespace {
 
@@ -105,7 +106,7 @@ __global__ void exl3_had_in_kernel(const float * __restrict__ x, const half * __
 }
 
 // y[m][n] (F32, in place) = had128(y) / sqrt(128) * svh; grid (n/128, m), block 32
-__global__ void exl3_had_out_kernel(float * __restrict__ y, const half * __restrict__ svh, int n) {
+__device__ __forceinline__ void exl3_had_out(float * __restrict__ y, const half * __restrict__ svh, int n) {
     const int lane = threadIdx.x;
     const int col  = blockIdx.x * 128 + lane * 4;
     const size_t base = size_t(blockIdx.y) * n + col;
@@ -118,6 +119,14 @@ __global__ void exl3_had_out_kernel(float * __restrict__ y, const half * __restr
     v.z = v.z * EXL3_HAD_SCALE * __low2float(s23);
     v.w = v.w * EXL3_HAD_SCALE * __high2float(s23);
     *reinterpret_cast<float4 *>(y + base) = v;
+}
+
+__global__ void exl3_had_out_kernel(float * y, const half * svh, int n) {
+    exl3_had_out(y, svh, n);
+}
+
+__global__ void exl3_had_out_pair(float * y0, const half * s0, float * y1, const half * s1, int n) {
+    exl3_had_out(blockIdx.z ? y1 : y0, blockIdx.z ? s1 : s0, n);
 }
 
 template <int bits, int cb>
@@ -197,6 +206,49 @@ void exl3_int8_geometry(int bits, int nacc, int m, int k, int colblocks, int pai
     smem   = size_t(nrows) * 16 * (size_t(nacc) * 4 + size_t(m) * 2) + exl3_int8::stage_bytes(bits);
 }
 
+// Small N cannot amortize preparation; large split counts exceed the ordered
+// reduction's shared-memory budget. K6 qualification covers five/six K groups.
+static bool exl3_warpk_shape(int bits, bool residual, int n, int ksplit) {
+    return (bits == 4 && !residual && n >= 4096 && ksplit <= 40) ||
+           (bits == 6 && residual && n >= 131072 && (ksplit == 5 || ksplit == 6));
+}
+
+template <int BITS, bool RESID, bool PAIR>
+static void exl3_warpk_launch(ggml_backend_cuda_context & ctx, const uint8_t * weights, const float * x,
+        const half * suh, const half * svh, float * output, int k, int n, int rows, int splits,
+        exl3_int8::warpk_pair pair = {}, const half * svh1 = nullptr) {
+    constexpr int M = 8, NACC = RESID ? 16 : 8;
+    const size_t bytes = size_t(splits) * (8 * NACC + NACC * rows * 32);
+    ggml_cuda_pool_alloc<uint8_t> prepared(ctx.pool(), bytes * (PAIR ? 2 : 1));
+    if constexpr (PAIR) pair.prepared = prepared.get() + bytes;
+    const auto stream = ctx.stream();
+    exl3_int8::prepare_warpk<RESID, PAIR><<<dim3(1, splits, PAIR ? 2 : 1), 256, size_t(rows) * 16 * (NACC + 2 * M), stream>>>(
+            x, suh, prepared.get(), k, rows, pair);
+    const dim3 grid(n / 32, 1, PAIR ? 2 : 1);
+    const size_t smem = size_t(splits) * M * 32 * sizeof(float);
+    if constexpr (BITS == 4) {
+        // Wide output projections favor fewer K warps; narrower projections
+        // have more original K groups and benefit from the larger block.
+        if (n >= 3 * k) {
+            exl3_int8::gemv_warpk<4, BITS, RESID, PAIR><<<grid, 128, smem, stream>>>(weights, prepared.get(), output, k, n, rows, splits, pair);
+        } else {
+            exl3_int8::gemv_warpk<16, BITS, RESID, PAIR><<<grid, 512, smem, stream>>>(weights, prepared.get(), output, k, n, rows, splits, pair);
+        }
+    } else {
+        // One useful warp per original K group avoids idle warps in the head.
+        if (splits == 5) {
+            exl3_int8::gemv_warpk<5, BITS, RESID, PAIR><<<grid, 160, smem, stream>>>(weights, prepared.get(), output, k, n, rows, splits, pair);
+        } else {
+            exl3_int8::gemv_warpk<6, BITS, RESID, PAIR><<<grid, 192, smem, stream>>>(weights, prepared.get(), output, k, n, rows, splits, pair);
+        }
+    }
+    if constexpr (PAIR) {
+        exl3_had_out_pair<<<dim3(n / 128, M, 2), 32, 0, stream>>>(output, svh, pair.output, svh1, n);
+    } else {
+        exl3_had_out_kernel<<<dim3(n / 128, M), 32, 0, stream>>>(output, svh, n);
+    }
+}
+
 // One launch = grid (n/256, ksplit, pairs); dense calls pass pairs = 1 with M tokens, the grouped
 // MoE path M = 1 with one (token, expert) pair per block-z.
 template <int bits, int cb, int M, bool RESID, bool GROUPED>
@@ -231,6 +283,12 @@ void exl3_gemv_int8_launch(ggml_backend_cuda_context & ctx, const uint8_t * B, c
         }
     }
     GGML_ASSERT(smem <= cap);
+    if constexpr (cb == 2 && M == 8 && !GROUPED && ((bits == 4 && !RESID) || (bits == 6 && RESID))) {
+        if (ggml_cuda_info().devices[ctx.device].cc == 860 && exl3_warpk_shape(bits, RESID, n, ksplit)) {
+            exl3_warpk_launch<bits, RESID, false>(ctx, B, x, suh, svh, y, k, n, nrows, ksplit);
+            return;
+        }
+    }
     ggml_cuda_pool_alloc<float> partials(ctx.pool(), size_t(ksplit) * M * pairs * n);
     int * counters = exl3_int8_counters(ctx);
     if constexpr (cb == 2 && bits == 6 && M >= 3 && M <= 8 && RESID && !GROUPED) {
@@ -375,11 +433,28 @@ bool ggml_cuda_exl3_bundle(ggml_backend_cuda_context & ctx, ggml_tensor * a, ggm
     if (a->ne[1] == 13 && a->ne[0] == b->ne[0]) {
         return false;
     }
+    if (a->ne[1] == 8) {
+        // Pair equal-width projections without concatenating their transforms.
+        // Unequal widths use the independently tuned warp-K launches.
+        const int k = a->src[0]->ne[0], n = a->ne[0];
+        if (n != b->ne[0]) return false;
+        int splits, rows; size_t smem;
+        exl3_int8_geometry(4, 8, 8, k, (n + 255) / 256, 1, exl3_int8_smem_cap(ctx.device), splits, rows, smem);
+        if (!exl3_warpk_shape(4, false, n, splits)) return false;
+        const exl3_int8::warpk_pair pair {
+            static_cast<const uint8_t *>(b->src[0]->data), static_cast<const half *>(b->src[3]->data),
+            nullptr, static_cast<float *>(b->data),
+        };
+        exl3_warpk_launch<4, false, true>(ctx, static_cast<const uint8_t *>(a->src[0]->data),
+                static_cast<const float *>(a->src[1]->data), static_cast<const half *>(a->src[3]->data),
+                static_cast<const half *>(a->src[2]->data), static_cast<float *>(a->data), k, n, rows, splits,
+                pair, static_cast<const half *>(b->src[2]->data));
+        return true;
+    }
     switch (a->ne[1]) {
         case 1:  return exl3_int8_bundle_launch<1>(ctx, a, b);
         case 4:  return exl3_int8_bundle_launch<4>(ctx, a, b);
         case 7:  return exl3_int8_bundle_launch<7>(ctx, a, b);
-        case 8:  return exl3_int8_bundle_launch<8>(ctx, a, b);
         case 13: return exl3_int8_bundle_launch<13>(ctx, a, b);
         default: return false;
     }
