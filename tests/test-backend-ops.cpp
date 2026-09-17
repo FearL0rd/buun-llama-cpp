@@ -12208,6 +12208,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                     GGML_TYPE_F32, {n, 7, 1, 1}, k, true, true));
         }
     }
+    // Batched large-vocabulary selection: crossover boundaries and stable ties.
+    for (int64_t n : {65535, 65536, 65537, 248320}) {
+        for (int64_t rows : {6, 7, 32, 33}) {
+            for (int k : {1, 16, 64}) {
+                test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {n, rows, 1, 1}, k));
+                test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {n, rows, 1, 1}, k, true, true));
+            }
+        }
+    }
     for (int i = 0; i < 20; ++i) {
         for (int k : {1, 2, 3, 7, 15, 100, 500, 1023, 9999}) {
             if (k <= 1<<i) {
