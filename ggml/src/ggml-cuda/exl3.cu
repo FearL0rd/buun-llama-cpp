@@ -224,18 +224,36 @@ void exl3_gemv_int8_launch(ggml_backend_cuda_context & ctx, const uint8_t * B, c
     // Larger specializations are admitted only when this geometry fits their cap.
     exl3_int8_geometry(bits, nacc, M, k, colblocks, pairs,
             exl3_int8_smem_cap(ctx.device), ksplit, nrows, smem);
-    if constexpr (cb == 2 && M == 8 && !GROUPED && ((bits >= 2 && bits <= 4) || (bits == 6 && RESID))) {
+    if constexpr (M >= 3 && M <= 8 && exl3_int8::sm86_matrix_shape(bits, cb, M, RESID, GROUPED)) {
         if (ggml_cuda_info().devices[ctx.device].cc == 860) {
-            // Byte activations + F16 transform scratch; this MMA path does not
-            // use the scalar decoder's shared weight-staging ring.
-            smem = size_t(nrows) * 16 * (nacc + M * 2);
+            // Byte activations, F16 transform scratch, and the head's weight ring.
+            smem = size_t(nrows) * 16 * (nacc + M * 2) + exl3_int8::head_stage_bytes(bits);
         }
     }
     GGML_ASSERT(smem <= cap);
     ggml_cuda_pool_alloc<float> partials(ctx.pool(), size_t(ksplit) * M * pairs * n);
     int * counters = exl3_int8_counters(ctx);
+    if constexpr (cb == 2 && bits == 6 && M >= 3 && M <= 8 && RESID && !GROUPED) {
+        if (ggml_cuda_info().devices[ctx.device].cc == 860) {
+            const auto prepare = exl3_int8::gemv_int8_kernel<bits, cb, M, RESID, false, false, exl3_int8::input_mode::prepare>;
+            const auto consume = exl3_int8::gemv_int8_kernel<bits, cb, M, RESID, false, false, exl3_int8::input_mode::consume>;
+            static bool prep_attr[GGML_CUDA_MAX_DEVICES] = {};
+            if (!prep_attr[ctx.device]) {
+                CUDA_CHECK(cudaFuncSetAttribute(prepare, cudaFuncAttributeMaxDynamicSharedMemorySize, int(cap)));
+                CUDA_CHECK(cudaFuncSetAttribute(consume, cudaFuncAttributeMaxDynamicSharedMemorySize, int(cap)));
+                prep_attr[ctx.device] = true;
+            }
+            ggml_cuda_pool_alloc<uint8_t> prepared(ctx.pool(), size_t(ksplit) * (2 * nacc * sizeof(uint32_t) + nacc * nrows * 16));
+            prepare<<<dim3(1, ksplit), exl3_int8::THREADS, smem, stream>>>(
+                B, x, suh, svh, y, partials.get(), counters, k, n, nrows, ga, {}, prepared.get());
+            const size_t consume_smem = size_t(nacc) * nrows * 16 + exl3_int8::head_stage_bytes(bits);
+            consume<<<dim3(colblocks, ksplit), exl3_int8::THREADS, consume_smem, stream>>>(
+                B, x, suh, svh, y, partials.get(), counters, k, n, nrows, ga, {}, prepared.get());
+            return;
+        }
+    }
     kernel<<<dim3(colblocks, ksplit, pairs), exl3_int8::THREADS, smem, stream>>>(
-        B, x, suh, svh, y, partials.get(), counters, k, n, nrows, ga, {});
+        B, x, suh, svh, y, partials.get(), counters, k, n, nrows, ga, {}, nullptr);
 }
 
 template <int bits, bool RESID>
@@ -314,7 +332,7 @@ static bool exl3_int8_bundle_launch(ggml_backend_cuda_context & ctx, ggml_tensor
     size_t sm0, sm1;
     exl3_int8_geometry(4, M, M, k, c0, 1, exl3_int8_smem_cap(ctx.device), s0, r0, sm0);
     exl3_int8_geometry(4, M, M, k, c1, 1, exl3_int8_smem_cap(ctx.device), s1, r1, sm1);
-    if constexpr (M == 8) {
+    if constexpr (M >= 4 && M <= 8) {
         sm0 = size_t(r0) * 16 * M * 3;
         sm1 = size_t(r1) * 16 * M * 3;
     }
@@ -336,7 +354,7 @@ static bool exl3_int8_bundle_launch(ggml_backend_cuda_context & ctx, ggml_tensor
     kernel<<<c0 * s0 + c1 * s1, exl3_int8::THREADS, std::max(sm0, sm1), ctx.stream()>>>(
         static_cast<const uint8_t *>(a->src[0]->data), static_cast<const float *>(a->src[1]->data),
         static_cast<const half *>(a->src[3]->data), static_cast<const half *>(a->src[2]->data),
-        static_cast<float *>(a->data), partials.get(), counters, k, n0, r0, {}, args);
+        static_cast<float *>(a->data), partials.get(), counters, k, n0, r0, {}, args, nullptr);
     return true;
 }
 

@@ -53,8 +53,30 @@ __device__ __forceinline__ void cp_async_wait() {
 
 // pair-row staging depth (rows in flight per warp) for the smem unit (K = 5..8)
 constexpr int STAGE_D = 4;
+// The SM86 multi-row head favors two warp-private stages; the scalar decoder
+// retains its independently tuned four-stage pipeline.
+constexpr int HEAD_STAGE_D = 2;
 __host__ __device__ constexpr bool stage_smem(int bits) { return bits >= 5; }
 __host__ __device__ constexpr int stage_bytes(int bits) { return stage_smem(bits) ? 8 * STAGE_D * 16 * bits * 4 : 0; }
+
+// Shared by the device specialization and host allocation: compact storage
+// must never be selected for a row count that still uses the scalar executor.
+__host__ __device__ constexpr bool sm86_matrix_shape(int bits, int cb, int m, bool residual, bool grouped) {
+    return cb == 2 && !grouped && (
+            (bits >= 2 && bits <= 4 &&
+             (m == 3 || m == 4 || m == 8 || (bits == 4 && (m == 5 || m == 6 || m == 7 || (m == 13 && !residual)))) &&
+             !(bits == 4 && m == 3 && !residual)) ||
+            (bits == 6 && residual && m >= 3 && m <= 8));
+}
+
+__host__ __device__ constexpr int head_stage_bytes(int bits) {
+    return bits == 6 ? 8 * HEAD_STAGE_D * 16 * bits * 4 : 0;
+}
+
+// Reuse the same transform/quantization implementation when a large head can
+// amortize one preparation launch across its output columns. No decoded weights
+// are retained, and each original K slice keeps its scales and sum order.
+enum class input_mode { inline_quantize, prepare, consume };
 
 __device__ __forceinline__ float dot2(half2 w, half2 x) {
     const float2 wf = __half22float2(w), xf = __half22float2(x);
@@ -276,10 +298,10 @@ struct bundle_args {
     int n, nrows, ksplit, first_blocks, second_blocks;
 };
 
-template <int bits, int cb, int M, bool RESID, bool GROUPED, bool BUNDLE = false>
+template <int bits, int cb, int M, bool RESID, bool GROUPED, bool BUNDLE = false, input_mode INPUT = input_mode::inline_quantize>
 __global__ void __launch_bounds__(THREADS) gemv_int8_kernel(const uint8_t * __restrict__ B,
         const float * __restrict__ x, const half * __restrict__ suh, const half * __restrict__ svh, float * __restrict__ y,
-        float * __restrict__ partials, int * __restrict__ counters, int k, int n, int nrows_max, grouped_args ga, bundle_args bundle = {}) {
+        float * __restrict__ partials, int * __restrict__ counters, int k, int n, int nrows_max, grouped_args ga, bundle_args bundle = {}, uint8_t * prepared = nullptr) {
     int column_block = blockIdx.x, k_block = blockIdx.y, k_blocks = gridDim.y;
     if constexpr (BUNDLE) {
         static_assert(!GROUPED);
@@ -311,11 +333,7 @@ __global__ void __launch_bounds__(THREADS) gemv_int8_kernel(const uint8_t * __re
 #elif !defined(GGML_USE_HIP) && __CUDA_ARCH__ == 860
     // SM86: matrix cores help dense verify batches; plain K4 M3 favors vector dots.
     // K6 residual batches cover the vocabulary head without dropping its correction.
-    constexpr bool WMMA = INT8 && !GROUPED && (
-            (bits >= 2 && bits <= 4 &&
-             (M == 3 || M == 4 || M == 8 || (bits == 4 && (M == 5 || M == 6 || M == 7 || (M == 13 && !RESID)))) &&
-             !(bits == 4 && M == 3 && !RESID)) ||
-            (bits == 6 && RESID && M >= 3 && M <= 8));
+    constexpr bool WMMA = sm86_matrix_shape(bits, cb, M, RESID, GROUPED);
 #else
     constexpr bool WMMA = false;
 #endif
@@ -336,17 +354,14 @@ __global__ void __launch_bounds__(THREADS) gemv_int8_kernel(const uint8_t * __re
         counters += size_t(pair) * gridDim.x;
     }
 #if !defined(GGML_USE_HIP) && __CUDA_ARCH__ == 860
-    // M8 verification: keep one byte per activation and form MMA's repeated
-    // bytes in registers. The smaller buffer improves residency without
-    // changing slice boundaries, scales, residuals or integer dot products.
-    constexpr bool COMPACT = WMMA && M == 8;
+    constexpr bool COMPACT = WMMA && M >= 3 && M <= 8;
 #else
     constexpr bool COMPACT = false;
 #endif
     extern __shared__ uint32_t sh_as[];
-    half * sh_xh = reinterpret_cast<half *>(reinterpret_cast<uint8_t *>(sh_as) +
-            size_t(NACC) * nrows_max * 16 * (COMPACT ? 1 : 4));
-    uint32_t * sh_stage = reinterpret_cast<uint32_t *>(sh_xh + size_t(M) * nrows_max * 16);   // [8 warps][STAGE_D][2*TWORDS]
+    half * sh_xh = reinterpret_cast<half *>(reinterpret_cast<uint8_t *>(sh_as) + size_t(NACC) * nrows_max * 16 * (COMPACT ? 1 : 4));
+    uint32_t * sh_stage = reinterpret_cast<uint32_t *>(sh_xh +
+            (INPUT == input_mode::consume ? 0 : size_t(M) * nrows_max * 16));
     __shared__ float sh_y[M][COLS];
     __shared__ float sh_redf[THREADS / 32][M];
     __shared__ int   sh_redi[THREADS / 32][NACC];
@@ -359,10 +374,15 @@ __global__ void __launch_bounds__(THREADS) gemv_int8_kernel(const uint8_t * __re
     const int kb0   = k_block * nrows_max;
     const int nrows = min(nrows_max, kslices - kb0);
     const int kn    = nrows * 16;
+    constexpr int HEADER_BYTES = 2 * NACC * sizeof(uint32_t);
+    if constexpr (INPUT != input_mode::inline_quantize) {
+        static_assert(M >= 3 && M <= 8 && bits == 6 && RESID && !GROUPED && !BUNDLE);
+        prepared += size_t(k_block) * (HEADER_BYTES + NACC * nrows_max * 16);
+    }
 
     // input transform of this block's own k range (128-aligned: nrows % 8 == 0): xh = had128(x * suh) / sqrt(128),
     // F16 in smem, with the per-slice max |xh| per row
-    {
+    if constexpr (INPUT != input_mode::consume) {
         float amax[M];
 #pragma unroll
         for (int r = 0; r < M; ++r) amax[r] = 0.0f;
@@ -417,7 +437,7 @@ __global__ void __launch_bounds__(THREADS) gemv_int8_kernel(const uint8_t * __re
         else return sh_as[splat_index(p, i)];
     };
     // quantize inline while staging the splats; exact int sums per plane
-    if constexpr (INT8) {
+    if constexpr (INT8 && INPUT != input_mode::consume) {
         int sum[NACC];
 #pragma unroll
         for (int p = 0; p < NACC; ++p) sum[p] = 0;
@@ -455,6 +475,27 @@ __global__ void __launch_bounds__(THREADS) gemv_int8_kernel(const uint8_t * __re
         __syncthreads();
     }
 
+    if constexpr (INPUT == input_mode::prepare) {
+        for (int i = threadIdx.x; i < NACC * nrows_max * 4; i += THREADS) {
+            reinterpret_cast<uint32_t *>(prepared + HEADER_BYTES)[i] = i % (nrows_max * 4) < kn / 4 ? sh_as[i] : 0;
+        }
+        if (threadIdx.x < NACC) {
+            reinterpret_cast<uint32_t *>(prepared)[threadIdx.x] = __float_as_uint(sh_q[threadIdx.x]);
+            reinterpret_cast<uint32_t *>(prepared)[NACC + threadIdx.x] = uint32_t(sh_s[threadIdx.x]);
+        }
+        return;
+    }
+    if constexpr (INPUT == input_mode::consume) {
+        for (int i = threadIdx.x; i < NACC * nrows_max * 4; i += THREADS) {
+            sh_as[i] = reinterpret_cast<const uint32_t *>(prepared + HEADER_BYTES)[i];
+        }
+        if (threadIdx.x < NACC) {
+            sh_q[threadIdx.x] = __uint_as_float(reinterpret_cast<uint32_t *>(prepared)[threadIdx.x]);
+            sh_s[threadIdx.x] = int(reinterpret_cast<uint32_t *>(prepared)[NACC + threadIdx.x]);
+        }
+        __syncthreads();
+    }
+
     const float k_inv = __half2float(__ushort_as_half(0x1eee));
     const float bias  = __half2float(__ushort_as_half(0xc931));
     const float cbias = 1024.0f * k_inv + bias;
@@ -475,6 +516,27 @@ __global__ void __launch_bounds__(THREADS) gemv_int8_kernel(const uint8_t * __re
         // Each lane loads one packed word per tile (two for K6). Prefetch four K tiles, then
         // shuffle word pairs and extract nearby windows together for the matrix core.
         constexpr int RING = 4;
+#if !defined(GGML_USE_HIP) && __CUDA_ARCH__ == 860
+        constexpr bool WSTAGE = bits == 6 && M >= 3 && M <= 8;
+#else
+        constexpr bool WSTAGE = false;
+#endif
+        constexpr int PAIRW = 2 * TWORDS;
+        uint32_t * warp_stage = sh_stage + warp * HEAD_STAGE_D * PAIRW;
+        auto stage_weights = [&](int kb) {
+            if constexpr (WSTAGE) {
+                const int tile = lane / (TWORDS / 4);
+                if (lane < PAIRW / 4 && kb < nrows && nt + tile < n_tiles) {
+                    const auto * src = B32 + (size_t(nt + tile) * kslices + kb0 + kb) * TWORDS + (lane % (TWORDS / 4)) * 4;
+                    cp_async16(warp_stage + (kb % HEAD_STAGE_D) * PAIRW + lane * 4, src);
+                }
+                cp_async_commit();
+            }
+        };
+        if constexpr (WSTAGE) {
+#pragma unroll
+            for (int i = 0; i < HEAD_STAGE_D - 1; ++i) stage_weights(i);
+        }
         uint32_t words[2][RING] = {};
         uint32_t words_hi[2][RING] = {};
         auto load_word = [&](int tile, int kb, int extra = 0) {
@@ -485,8 +547,10 @@ __global__ void __launch_bounds__(THREADS) gemv_int8_kernel(const uint8_t * __re
         for (int tile = 0; tile < 2; ++tile) {
 #pragma unroll
             for (int d = 0; d < RING; ++d) {
-                words[tile][d] = load_word(tile, d);
-                if constexpr (bits > 4) words_hi[tile][d] = load_word(tile, d, 32);
+                if constexpr (!WSTAGE) {
+                    words[tile][d] = load_word(tile, d);
+                    if constexpr (bits > 4) words_hi[tile][d] = load_word(tile, d, 32);
+                }
             }
         }
         for (int base = 0; base < nrows; base += RING) {
@@ -494,6 +558,11 @@ __global__ void __launch_bounds__(THREADS) gemv_int8_kernel(const uint8_t * __re
             for (int drow = 0; drow < RING; ++drow) {
                 const int kb = base + drow;
                 if (kb >= nrows) break;
+                if constexpr (WSTAGE) {
+                    cp_async_wait<HEAD_STAGE_D - 2>();
+                    __syncwarp();
+                    stage_weights(kb + HEAD_STAGE_D - 1);
+                }
 #if defined(GGML_USE_HIP) && defined(RDNA4)
                 i2 decoded[2][4];
 #pragma unroll
@@ -534,13 +603,28 @@ __global__ void __launch_bounds__(THREADS) gemv_int8_kernel(const uint8_t * __re
 #elif !defined(GGML_USE_HIP) && __CUDA_ARCH__ == 860
                 uint32_t current[2];
                 uint32_t current_hi[2] = {};
+                uint32_t operands[2][PLANES][2];
+#pragma unroll
+                for (int half = 0; half < 2; ++half) {
+#pragma unroll
+                    for (int plane = 0; plane < PLANES; ++plane) {
+                        const int p = plane * 8 + lane / 4;
+                        const int j = half * 8 + lane % 4;
+                        if constexpr (M <= 8) {
+                            operands[half][plane][0] = p < NACC ? load_splat(p, kb * 16 + j) : 0;
+                            operands[half][plane][1] = p < NACC ? load_splat(p, kb * 16 + j + 4) : 0;
+                        }
+                    }
+                }
 #pragma unroll
                 for (int tile = 0; tile < 2; ++tile) {
-                    current[tile] = words[tile][drow];
-                    words[tile][drow] = load_word(tile, kb + RING);
-                    if constexpr (bits > 4) {
-                        current_hi[tile] = words_hi[tile][drow];
-                        words_hi[tile][drow] = load_word(tile, kb + RING, 32);
+                    if constexpr (!WSTAGE) {
+                        current[tile] = words[tile][drow];
+                        words[tile][drow] = load_word(tile, kb + RING);
+                        if constexpr (bits > 4) {
+                            current_hi[tile] = words_hi[tile][drow];
+                            words_hi[tile][drow] = load_word(tile, kb + RING, 32);
+                        }
                     }
                 }
 #pragma unroll
@@ -558,11 +642,18 @@ __global__ void __launch_bounds__(THREADS) gemv_int8_kernel(const uint8_t * __re
                                 const int end = (t + 257 + 4 * pair + 2) * bits;
                                 const int first = (end - 2 * bits - 16) / 32, last = (end - 1) / 32;
                                 const int ilo = last % TWORDS, ihi = first % TWORDS;
-                                const uint32_t lo0 = __shfl_sync(0xffffffffu, current[tile], ilo & 31);
-                                const uint32_t hi0 = __shfl_sync(0xffffffffu, current[tile], ihi & 31);
-                                const uint32_t lo1 = __shfl_sync(0xffffffffu, current_hi[tile], ilo & 31);
-                                const uint32_t hi1 = __shfl_sync(0xffffffffu, current_hi[tile], ihi & 31);
-                                const uint32_t lo = ilo < 32 ? lo0 : lo1, hi = ihi < 32 ? hi0 : hi1;
+                                uint32_t lo, hi;
+                                if constexpr (WSTAGE) {
+                                    const uint32_t * row = warp_stage + (kb % HEAD_STAGE_D) * PAIRW + tile * TWORDS;
+                                    lo = nt + tile < n_tiles ? row[ilo] : 0;
+                                    hi = nt + tile < n_tiles ? row[ihi] : 0;
+                                } else {
+                                    const uint32_t lo0 = __shfl_sync(0xffffffffu, current[tile], ilo & 31);
+                                    const uint32_t hi0 = __shfl_sync(0xffffffffu, current[tile], ihi & 31);
+                                    const uint32_t lo1 = __shfl_sync(0xffffffffu, current_hi[tile], ilo & 31);
+                                    const uint32_t hi1 = __shfl_sync(0xffffffffu, current_hi[tile], ihi & 31);
+                                    lo = ilo < 32 ? lo0 : lo1; hi = ihi < 32 ? hi0 : hi1;
+                                }
 #pragma unroll
                                 for (int s = 0; s < 2; ++s) {
                                     const uint32_t w = exl3::fshift(lo, hi, (last + 1) * 32 - end + (2 - 2 * s) * bits) & 65535u;
@@ -588,8 +679,8 @@ __global__ void __launch_bounds__(THREADS) gemv_int8_kernel(const uint8_t * __re
                         for (int plane = 0; plane < PLANES; ++plane) {
                             const int p = plane * 8 + lane / 4;
                             const int j = j0 + lane % 4;
-                            const uint32_t b0 = p < NACC ? load_splat(p, kb * 16 + j) : 0;
-                            const uint32_t b1 = p < NACC ? load_splat(p, kb * 16 + j + 4) : 0;
+                            const uint32_t b0 = M <= 8 ? operands[j0 / 8][plane][0] : (p < NACC ? load_splat(p, kb * 16 + j) : 0);
+                            const uint32_t b1 = M <= 8 ? operands[j0 / 8][plane][1] : (p < NACC ? load_splat(p, kb * 16 + j + 4) : 0);
                             int * d = acc[tile][plane];
                             asm("mma.sync.aligned.m16n8k32.row.col.s32.u8.s8.s32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
                                 : "+r"(d[0]), "+r"(d[1]), "+r"(d[2]), "+r"(d[3])
@@ -599,6 +690,10 @@ __global__ void __launch_bounds__(THREADS) gemv_int8_kernel(const uint8_t * __re
                 }
 #endif
             }
+        }
+        if constexpr (WSTAGE) {
+            cp_async_wait<0>();
+            __syncwarp();
         }
 #if defined(GGML_USE_HIP) && defined(RDNA4)
 #pragma unroll
