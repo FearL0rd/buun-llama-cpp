@@ -3930,6 +3930,39 @@ struct test_rms_norm : public test_case {
     }
 };
 
+// Recurrent gated normalization with separate head, token and sequence axes.
+// A strided gate models a view into a joint QKV|Z projection; expose_norm keeps
+// the intermediate live and must prevent a fusion from discarding its output.
+struct test_rms_norm_silu : public test_case {
+    const int64_t width, tokens, sequences;
+    const bool strided, expose_norm;
+    ggml_tensor * norm = nullptr;
+    ggml_tensor * out = nullptr;
+
+    test_rms_norm_silu(int64_t width, int64_t tokens, int64_t sequences,
+                      bool strided, bool expose_norm = false) :
+        width(width), tokens(tokens), sequences(sequences), strided(strided), expose_norm(expose_norm) {}
+
+    bool run_whole_graph() override { return true; }
+    std::vector<ggml_tensor *> fusion_test_nodes() override {
+        return expose_norm ? std::vector<ggml_tensor *>{norm, out} : std::vector<ggml_tensor *>{out};
+    }
+    std::string op_desc(ggml_tensor *) override { return "RMS_NORM_SILU"; }
+    std::string vars() override { return VARS_TO_STR5(width, tokens, sequences, strided, expose_norm); }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        auto * x = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, width, 8, tokens, sequences);
+        auto * weight = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, width);
+        auto * storage = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, width, strided ? 16 : 8, tokens, sequences);
+        auto * gate = strided ? ggml_view_4d(ctx, storage, width, 8, tokens, sequences,
+            storage->nb[1], storage->nb[2], storage->nb[3], width*8*sizeof(float)) : storage;
+        norm = ggml_mul(ctx, ggml_rms_norm(ctx, x, 1e-6f), weight);
+        if (expose_norm) { ggml_set_output(norm); }
+        out = ggml_mul(ctx, norm, ggml_silu(ctx, gate));
+        return out;
+    }
+};
+
 // RMS_NORM + channel weight feeding two BF16 projections. CUDA may retain or
 // separately prepare the normalized BF16 activation; expose_norm also proves
 // that the canonical F32 result remains valid for a non-GEMM consumer.
@@ -11282,6 +11315,20 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
     test_cases.emplace_back(new test_rms_norm_mul_bf16_mm(false));
     test_cases.emplace_back(new test_rms_norm_mul_bf16_mm(true));
+
+    for (int64_t width : {128, 256}) {
+        for (int64_t tokens : {1, 3, 8, 13, 14}) {
+            for (int64_t sequences : {1, 4}) {
+                for (bool strided : {false, true}) {
+                    test_cases.emplace_back(new test_rms_norm_silu(width, tokens, sequences, strided));
+                }
+            }
+        }
+    }
+    test_cases.emplace_back(new test_rms_norm_silu(128, 8, 5, true));
+    test_cases.emplace_back(new test_rms_norm_silu(128, 8, 2, true, true));
+    test_cases.emplace_back(new test_rms_norm_silu(64, 8, 2, false));
+    test_cases.emplace_back(new test_rms_norm_silu(512, 8, 2, true));
 
     for (auto multi_add : {false, true}) {
         for (auto set_rows : {false, true}) {

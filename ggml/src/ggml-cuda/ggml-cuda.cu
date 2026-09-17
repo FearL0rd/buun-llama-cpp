@@ -7657,7 +7657,12 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                     x->type == GGML_TYPE_F32 && gamma->type == GGML_TYPE_F32 &&
                     gate->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 &&
                     (x->ne[0] == 256 || x->ne[0] == 128) &&
-                    x->ne[2] == 1 && x->ne[3] == 1 &&
+                    // Verification preserves token/sequence axes around the
+                    // contiguous normalization rows. Keep the measured small-
+                    // batch extension on SM86; other shapes use existing paths.
+                    ((x->ne[2] == 1 && x->ne[3] == 1) ||
+                     (ggml_cuda_info().devices[cuda_ctx->device].cc == 860 &&
+                      x->ne[2] <= 13 && x->ne[3] <= 4)) &&
                     ggml_are_same_shape(x, gate) && ggml_are_same_shape(x, dst) &&
                     ggml_is_contiguous(x) && ggml_is_contiguous(dst) &&
                     ggml_is_contiguous(gamma) && gamma->ne[0] == x->ne[0] &&
