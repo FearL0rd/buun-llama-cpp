@@ -71,6 +71,61 @@ static void check(ggml_backend_t backend, int tokens, int copies, int channels, 
     ggml_free(ctx);
 }
 
+// Exercise distinct four-dimensional layouts, padding, and singleton axes.
+// Keep sentinels in the gaps so an incorrect offset cannot silently pass.
+static void check_layouts(ggml_backend_t backend, bool singleton) {
+    auto * ctx = ggml_init({4 * 1024 * 1024, nullptr, true});
+    auto * graph = ggml_new_graph_custom(ctx, 128, false);
+    const int64_t src_ne[4] = {3, singleton ? 1 : 5, 7, 2};
+    const int64_t dst_ne[4] = {7, 3, 2, singleton ? 1 : 5};
+    const size_t src_nb[4] = {4, 20, 120, 1000};
+    const size_t dst_nb[4] = {4, 48, 200, 512};
+    constexpr int storage = 2048;
+    ggml_tensor * input[2], * output[2];
+    std::vector<uint32_t> data(storage), expected[2];
+    for (int i = 0; i < storage; ++i) data[i] = 0x3f000000u + unsigned(i);
+    data[0] = 0x7fc01234u; data[1] = 0x80000000u; data[2] = 0xff800000u;
+    auto offset = [](int64_t index, const int64_t * ne, const size_t * nb) {
+        size_t result = 0;
+        for (int d = 0; d < 4; ++d) {
+            result += (index % ne[d]) * nb[d];
+            index /= ne[d];
+        }
+        return result / sizeof(float);
+    };
+    for (int c = 0; c < 2; ++c) {
+        input[c] = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, storage);
+        output[c] = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, storage);
+        auto * src = ggml_view_4d(ctx, input[c], src_ne[0], src_ne[1], src_ne[2], src_ne[3],
+                                 src_nb[1], src_nb[2], src_nb[3], 0);
+        auto * dst = ggml_view_4d(ctx, output[c], dst_ne[0], dst_ne[1], dst_ne[2], dst_ne[3],
+                                 dst_nb[1], dst_nb[2], dst_nb[3], 0);
+        ggml_build_forward_expand(graph, ggml_cpy(ctx, src, dst));
+        expected[c].assign(storage, 0xdeadbeefu);
+        for (int64_t i = 0; i < ggml_nelements(src); ++i) {
+            expected[c][offset(i, dst_ne, dst_nb)] = data[offset(i, src_ne, src_nb)];
+        }
+    }
+    auto * buffer = ggml_backend_alloc_ctx_tensors(ctx, backend);
+    GGML_ASSERT(buffer);
+    const std::vector<uint32_t> initial(storage, 0xdeadbeefu);
+    for (int pass = 0; pass < 3; ++pass) {
+        for (int c = 0; c < 2; ++c) {
+            ggml_backend_tensor_set(input[c], data.data(), 0, ggml_nbytes(input[c]));
+            ggml_backend_tensor_set(output[c], initial.data(), 0, ggml_nbytes(output[c]));
+        }
+        GGML_ASSERT(ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS);
+        for (int c = 0; c < 2; ++c) {
+            std::vector<uint32_t> actual(storage);
+            ggml_backend_tensor_get(output[c], actual.data(), 0, ggml_nbytes(output[c]));
+            GGML_ASSERT(actual == expected[c]);
+        }
+    }
+    std::printf("PASS four-dimensional copy layouts singleton=%d\n", singleton);
+    ggml_backend_buffer_free(buffer);
+    ggml_free(ctx);
+}
+
 int main(int argc, char ** argv) {
     if (ggml_backend_cuda_get_device_count() == 0) return 77;
     auto * backend = ggml_backend_cuda_init(0);
@@ -86,5 +141,7 @@ int main(int argc, char ** argv) {
     }
     check(backend, 8, 8, 10240, true);
     check(backend, 8, 8, 257, false, true);
+    check_layouts(backend, false);
+    check_layouts(backend, true);
     ggml_backend_free(backend);
 }
