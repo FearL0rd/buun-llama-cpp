@@ -62,7 +62,7 @@ public:
 
     bool can_reuse(const llm_graph_params & params) override {
         return params.cross == cross &&
-            params.ubatch.n_tokens == (uint32_t) (n_blocks * block_size);
+            params.ubatch.n_tokens == (uint32_t) (n_blocks * block_size + params.cparams.dflash_oneg_n_inject);
     }
 
     ggml_tensor * uniforms = nullptr;
