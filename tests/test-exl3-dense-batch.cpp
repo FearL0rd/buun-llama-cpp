@@ -189,6 +189,9 @@ int main() {
         ok &= check_pair(backend, 12288, 6144, m, false);
     }
     if (sm86) ok &= check_batch(backend, 4, 5120, 17408, false, 8, true);
+    if (sm86) for (int k : {128, 384, 640}) {
+        ok &= check_batch(backend, 6, k, 131072, true, 13);
+    }
     if (sm86) for (int m : {4, 5, 6, 7, 8, 13}) {
         ok &= check_pair(backend, 6144, 12288, m, true);  // larger second projection
         ok &= check_pair(backend, 4096, 4352, m, true);   // minimum paired width, unequal K slices

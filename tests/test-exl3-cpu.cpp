@@ -13,6 +13,10 @@
 #include <thread>
 #include <vector>
 
+#ifdef EXL3_TEST_CUDA
+#include <cuda_runtime_api.h>
+#endif
+
 static ggml_backend_t cache_gpu = nullptr;
 static bool gpu_executor = false;
 static decltype(ggml_moe_cache.dispatch) real_dispatch;
@@ -71,7 +75,7 @@ static void had(float * x, int n) {
 }
 
 static bool run(ggml_backend_t backend, int bits, int cb, bool grouped, int tokens, int lanes, bool windowed = false,
-                int k = 256, int n = 384, int overlap = -1, bool automatic = false) {
+                int k = 256, int n = 384, int overlap = -1, bool automatic = false, bool head = false) {
     constexpr float norm = 0.088388347648f;
     // The cache's existing pool policy requires at least 64 expert entries.
     const int experts = grouped ? (cache_gpu && !windowed ? 64 : 3) : 1;
@@ -96,7 +100,7 @@ static bool run(ggml_backend_t backend, int bits, int cb, bool grouped, int toke
         y->src[2] = svh;
         y->src[3] = suh;
     }
-    ggml_set_name(w, "blk.0.ffn_up_exps.weight");
+    ggml_set_name(w, head ? "output.weight" : "blk.0.ffn_up_exps.weight");
     auto * graph = ggml_new_graph(ctx);
     ggml_build_forward_expand(graph, y);
     if (!ggml_backend_supports_op(backend, y)) {
@@ -196,7 +200,7 @@ static bool run(ggml_backend_t backend, int bits, int cb, bool grouped, int toke
     }
     // Standalone GPU mul1 uses quantized activations, unlike the exact CPU/cache
     // path. Its separate batch/policy gates require exact repeated execution.
-    const bool quantized_activations = gpu_executor && (grouped || tokens <= 16);
+    const bool quantized_activations = gpu_executor && !head && (grouped || tokens <= 16);
     ok &= worst < (quantized_activations ? 1e-2 : 2e-5);
     // The cache provider accepts at most ten tokens; larger cases above still
     // exercise CPU transform sharing/fallback and exact thread-count agreement.
@@ -269,7 +273,16 @@ static bool run(ggml_backend_t backend, int bits, int cb, bool grouped, int toke
 }
 
 int main(int argc, char ** argv) {
-    gpu_executor = argc == 2 && std::strcmp(argv[1], "--gpu") == 0;
+    const bool head = argc == 2 && std::strcmp(argv[1], "--gpu-head") == 0;
+    gpu_executor = head || (argc == 2 && std::strcmp(argv[1], "--gpu") == 0);
+    if (head) {
+#ifdef EXL3_TEST_CUDA
+        cudaDeviceProp props{};
+        if (cudaGetDeviceProperties(&props, 0) != cudaSuccess || props.major != 8 || props.minor != 6) return 77;
+#else
+        return 77;
+#endif
+    }
     if (argc == 2 && std::strcmp(argv[1], "--cache") == 0) {
         ggml_backend_load_all();
         cache_gpu = ggml_backend_init_by_name("CUDA0", nullptr);
@@ -291,6 +304,16 @@ int main(int argc, char ** argv) {
     }
     GGML_ASSERT(backend);
     bool ok = true;
+    if (head) {
+        // Independently decode stream bits and use double dot products. Unlike
+        // row-vs-batch parity, this catches consistent decode/MMA permutations.
+        // K128 leaves half the K partitions idle; K640 has a partial partition.
+        for (int k : {128, 384, 640}) for (int m : {1, 8, 9, 13}) {
+            ok &= run(backend, 6, 2, false, m, 1, false, k, 131072, -1, false, true);
+        }
+        ggml_backend_free(backend);
+        return ok ? 0 : 1;
+    }
     for (int cb = 0; cb < 3; ++cb) for (int bits = 1; bits <= 8; ++bits) {
         ok &= run(backend, bits, cb, false, 1, 1);
         ok &= run(backend, bits, cb, false, 8, 1);

@@ -34,6 +34,7 @@
 #include "exl3-int8-warpk.cuh"
 #if !defined(GGML_USE_HIP)
 #include "exl3-gemm.cuh"
+#include "exl3-head.cuh"
 #endif
 
 namespace {
@@ -152,7 +153,8 @@ void exl3_reconstruct_launch(const uint8_t * data, half * dst, int k, int n0, in
 
 // ---- int8 activation path (up to MAX_M rows per launch) ---------------------------------
 // GGML_EXL3_INT8: 0 = off (fp16 tensor-core gemv), 1 = int8 + error-feedback residual everywhere,
-// 2 = plain int8 (residual only for the head), unset = per-tensor rule: plain for K <= 6, residual for K >= 7.
+// 2 = plain int8 (residual only for the head), unset = per-tensor rule: plain for K <= 6, residual for K >= 7,
+// with the SM86 six-bit vocabulary head using F16 activations and F32 accumulation at M=1..13.
 // The residual limits additional activation error for high-bit weights. Plain activations at lower
 // bit widths are a precision/performance policy, not exact agreement with the F16-activation executor.
 
@@ -546,6 +548,27 @@ void ggml_cuda_mul_mat_exl3(ggml_backend_cuda_context & ctx, const ggml_tensor *
     const half * svh = static_cast<const half *>(dst->src[2]->data);
     cudaStream_t stream = ctx.stream();
     float * y = static_cast<float *>(dst->data);
+
+#if !defined(GGML_USE_HIP)
+    // Keep one head arithmetic policy across single-row decode and verification.
+    // Explicit INT8 modes retain their original executors; this is the default
+    // SM86 policy, not a drafting-only switch or an expanded-weight cache.
+    if (exl3_int8_mode() == -1 && ggml_cuda_info().devices[ctx.device].cc == 860 && bits == 6 && cb == 2 &&
+            m >= 1 && m <= 13 && k % 128 == 0 && n >= 131072 && n % 128 == 0 &&
+            strcmp(src0->name, "output.weight") == 0) {
+        ggml_cuda_pool_alloc<half> transformed(ctx.pool(), size_t(m) * k);
+        exl3_had_in_kernel<<<dim3(k / 128, m), 32, 0, stream>>>(
+            static_cast<const float *>(src1->data), suh, transformed.get(), k);
+        const auto * weights = static_cast<const uint8_t *>(src0->data);
+        if (m <= 8) {
+            exl3_head::project<1><<<n / 32, 512, 0, stream>>>(transformed.get(), weights, y, m, k, n);
+        } else {
+            exl3_head::project<2><<<n / 32, 512, 0, stream>>>(transformed.get(), weights, y, m, k, n);
+        }
+        exl3_had_out_kernel<<<dim3(n / 128, m), 32, 0, stream>>>(y, svh, n);
+        return;
+    }
+#endif
 
     // the int8 path relies on the mul1 codebook being affine in the byte sum
     if (cb == 2 && exl3_int8_applicable(bits, m, k, n, ggml_cuda_info().devices[ctx.device].cc)) {
