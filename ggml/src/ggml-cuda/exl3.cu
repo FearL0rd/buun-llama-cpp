@@ -224,6 +224,13 @@ void exl3_gemv_int8_launch(ggml_backend_cuda_context & ctx, const uint8_t * B, c
     // Larger specializations are admitted only when this geometry fits their cap.
     exl3_int8_geometry(bits, nacc, M, k, colblocks, pairs,
             exl3_int8_smem_cap(ctx.device), ksplit, nrows, smem);
+    if constexpr (cb == 2 && M == 8 && !GROUPED && ((bits >= 2 && bits <= 4) || (bits == 6 && RESID))) {
+        if (ggml_cuda_info().devices[ctx.device].cc == 860) {
+            // Byte activations + F16 transform scratch; this MMA path does not
+            // use the scalar decoder's shared weight-staging ring.
+            smem = size_t(nrows) * 16 * (nacc + M * 2);
+        }
+    }
     GGML_ASSERT(smem <= cap);
     ggml_cuda_pool_alloc<float> partials(ctx.pool(), size_t(ksplit) * M * pairs * n);
     int * counters = exl3_int8_counters(ctx);
@@ -307,6 +314,10 @@ static bool exl3_int8_bundle_launch(ggml_backend_cuda_context & ctx, ggml_tensor
     size_t sm0, sm1;
     exl3_int8_geometry(4, M, M, k, c0, 1, exl3_int8_smem_cap(ctx.device), s0, r0, sm0);
     exl3_int8_geometry(4, M, M, k, c1, 1, exl3_int8_smem_cap(ctx.device), s1, r1, sm1);
+    if constexpr (M == 8) {
+        sm0 = size_t(r0) * 16 * M * 3;
+        sm1 = size_t(r1) * 16 * M * 3;
+    }
     if (std::max(sm0, sm1) > cap) {
         return false;
     }

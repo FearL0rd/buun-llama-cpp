@@ -335,8 +335,17 @@ __global__ void __launch_bounds__(THREADS) gemv_int8_kernel(const uint8_t * __re
         partials += size_t(pair) * k_blocks * M * n;
         counters += size_t(pair) * gridDim.x;
     }
-    extern __shared__ uint32_t sh_as[];   // [NACC][nrows_max * 16] splats, then [M][nrows_max * 16] F16 xh
-    half * sh_xh = reinterpret_cast<half *>(sh_as + size_t(NACC) * nrows_max * 16);
+#if !defined(GGML_USE_HIP) && __CUDA_ARCH__ == 860
+    // M8 verification: keep one byte per activation and form MMA's repeated
+    // bytes in registers. The smaller buffer improves residency without
+    // changing slice boundaries, scales, residuals or integer dot products.
+    constexpr bool COMPACT = WMMA && M == 8;
+#else
+    constexpr bool COMPACT = false;
+#endif
+    extern __shared__ uint32_t sh_as[];
+    half * sh_xh = reinterpret_cast<half *>(reinterpret_cast<uint8_t *>(sh_as) +
+            size_t(NACC) * nrows_max * 16 * (COMPACT ? 1 : 4));
     uint32_t * sh_stage = reinterpret_cast<uint32_t *>(sh_xh + size_t(M) * nrows_max * 16);   // [8 warps][STAGE_D][2*TWORDS]
     __shared__ float sh_y[M][COLS];
     __shared__ float sh_redf[THREADS / 32][M];
@@ -399,6 +408,14 @@ __global__ void __launch_bounds__(THREADS) gemv_int8_kernel(const uint8_t * __re
 #endif
         return p * nrows_max * 16 + i;
     };
+    auto store_splat = [&](int p, int i, int v) {
+        if constexpr (COMPACT) reinterpret_cast<uint8_t *>(sh_as)[splat_index(p, i)] = uint8_t(int8_t(v));
+        else sh_as[splat_index(p, i)] = uint32_t(uint8_t(int8_t(v))) * 0x01010101u;
+    };
+    auto load_splat = [&](int p, int i) {
+        if constexpr (COMPACT) return uint32_t(reinterpret_cast<uint8_t *>(sh_as)[splat_index(p, i)]) * 0x01010101u;
+        else return sh_as[splat_index(p, i)];
+    };
     // quantize inline while staging the splats; exact int sums per plane
     if constexpr (INT8) {
         int sum[NACC];
@@ -412,13 +429,13 @@ __global__ void __launch_bounds__(THREADS) gemv_int8_kernel(const uint8_t * __re
                 const float q  = sh_q[p0];
                 int v = __float2int_rn(a / q);
                 v = max(-127, min(127, v));
-                sh_as[splat_index(p0, i)] = uint32_t(uint8_t(int8_t(v))) * 0x01010101u;
+                store_splat(p0, i, v);
                 sum[p0] += v;
                 if constexpr (RESID) {
                     const float rr = a - q * float(v);
                     int v2 = __float2int_rn(rr / sh_q[p0 + 1]);
                     v2 = max(-127, min(127, v2));
-                    sh_as[splat_index(p0 + 1, i)] = uint32_t(uint8_t(int8_t(v2))) * 0x01010101u;
+                    store_splat(p0 + 1, i, v2);
                     sum[p0 + 1] += v2;
                 }
             }
@@ -571,8 +588,8 @@ __global__ void __launch_bounds__(THREADS) gemv_int8_kernel(const uint8_t * __re
                         for (int plane = 0; plane < PLANES; ++plane) {
                             const int p = plane * 8 + lane / 4;
                             const int j = j0 + lane % 4;
-                            const uint32_t b0 = p < NACC ? sh_as[splat_index(p, kb * 16 + j)] : 0;
-                            const uint32_t b1 = p < NACC ? sh_as[splat_index(p, kb * 16 + j + 4)] : 0;
+                            const uint32_t b0 = p < NACC ? load_splat(p, kb * 16 + j) : 0;
+                            const uint32_t b1 = p < NACC ? load_splat(p, kb * 16 + j + 4) : 0;
                             int * d = acc[tile][plane];
                             asm("mma.sync.aligned.m16n8k32.row.col.s32.u8.s8.s32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
                                 : "+r"(d[0]), "+r"(d[1]), "+r"(d[2]), "+r"(d[3])
