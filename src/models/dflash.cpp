@@ -712,7 +712,7 @@ static ggml_tensor * build_dflash2_grouped_conv(
     GGML_ASSERT(projected->ne[0] == 2 * taps * n_groups);
 
     const char * fused_env = std::getenv("GGML_DFLASH2_FUSED_CONV");
-    if (fused_env && std::atoi(fused_env) != 0) {
+    if (!fused_env || std::atoi(fused_env) != 0) {
         if (!ggml_is_contiguous(hidden)) {
             hidden = ggml_cont(g.ctx0, hidden);
         }
