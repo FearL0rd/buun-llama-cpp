@@ -54,17 +54,27 @@ __global__ __launch_bounds__(M * 32) void prepare_warpk(const float * x, const h
     int sum = 0, sum2 = 0;
     __syncwarp();
     auto offset = [&](int p, int i) { return p * nrows_max * 16 + (i ^ ((p & 7) * 4)); };
-    for (int i = lane; i < kn; i += 32) {
-        const float a = __half2float(xh[size_t(row) * nrows_max * 16 + i]);
-        const int v = max(-127, min(127, __float2int_rn(a / q)));
-        quant[offset(p0, i)] = int8_t(v);
-        sum += v;
-        if constexpr (RESID) {
-            const float rr = a - q * float(v);
-            const int v2 = max(-127, min(127, __float2int_rn(rr / q2)));
-            quant[offset(p0 + 1, i)] = int8_t(v2);
-            sum2 += v2;
+    // The XOR swizzle preserves each four-byte group. Quantize the same
+    // scalars with the same divisions, then issue aligned word stores.
+    for (int i = lane * 4; i < kn; i += 128) {
+        union { uint2 words; uint16_t halves[4]; } values;
+        values.words = *reinterpret_cast<const uint2 *>(xh + size_t(row) * nrows_max * 16 + i);
+        uint32_t packed = 0, packed2 = 0;
+#pragma unroll
+        for (int t = 0; t < 4; ++t) {
+            const float a = __half2float(__ushort_as_half(values.halves[t]));
+            const int v = max(-127, min(127, __float2int_rn(a / q)));
+            packed |= uint32_t(uint8_t(v)) << (8*t);
+            sum += v;
+            if constexpr (RESID) {
+                const float rr = a - q * float(v);
+                const int v2 = max(-127, min(127, __float2int_rn(rr / q2)));
+                packed2 |= uint32_t(uint8_t(v2)) << (8*t);
+                sum2 += v2;
+            }
         }
+        *reinterpret_cast<uint32_t *>(quant + offset(p0, i)) = packed;
+        if constexpr (RESID) *reinterpret_cast<uint32_t *>(quant + offset(p0+1, i)) = packed2;
     }
 #pragma unroll
     for (int d = 16; d; d >>= 1) {
