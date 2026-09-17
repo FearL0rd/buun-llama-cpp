@@ -217,7 +217,7 @@ static bool exl3_warpk_shape(int bits, bool residual, int n, int ksplit) {
 
 template <int BITS, bool RESID, bool PAIR>
 static void exl3_warpk_launch(ggml_backend_cuda_context & ctx, const uint8_t * weights, const float * x,
-        const half * suh, const half * svh, float * output, int k, int n, int rows, int splits,
+        const half * suh, const half * svh, float * output, int k, int n, int rows, int splits, int m,
         exl3_int8::warpk_pair pair = {}, const half * svh1 = nullptr) {
     constexpr int M = 8, NACC = RESID ? 16 : 8;
     const size_t bytes = size_t(splits) * (8 * NACC + NACC * rows * 32);
@@ -229,29 +229,29 @@ static void exl3_warpk_launch(ggml_backend_cuda_context & ctx, const uint8_t * w
     const int max_rows = PAIR ? std::max(rows, pair.rows) : rows;
     const int max_n = PAIR ? std::max(n, pair.n) : n;
     exl3_int8::prepare_warpk<RESID, PAIR><<<dim3(1, max_splits, PAIR ? 2 : 1), 256, size_t(max_rows) * 16 * (NACC + 2 * M), stream>>>(
-            x, suh, prepared.get(), k, rows, pair);
+            x, suh, prepared.get(), k, rows, m, pair);
     const dim3 grid(max_n / 32, 1, PAIR ? 2 : 1);
     const size_t smem = size_t(max_splits) * M * 32 * sizeof(float);
     if constexpr (BITS == 4) {
         // Wide output projections favor fewer K warps; narrower projections
         // have more original K groups and benefit from the larger block.
         if (n >= 3 * k) {
-            exl3_int8::gemv_warpk<4, BITS, RESID, PAIR><<<grid, 128, smem, stream>>>(weights, prepared.get(), output, k, n, rows, splits, pair);
+            exl3_int8::gemv_warpk<4, BITS, RESID, PAIR><<<grid, 128, smem, stream>>>(weights, prepared.get(), output, k, n, rows, splits, m, pair);
         } else {
-            exl3_int8::gemv_warpk<16, BITS, RESID, PAIR><<<grid, 512, smem, stream>>>(weights, prepared.get(), output, k, n, rows, splits, pair);
+            exl3_int8::gemv_warpk<16, BITS, RESID, PAIR><<<grid, 512, smem, stream>>>(weights, prepared.get(), output, k, n, rows, splits, m, pair);
         }
     } else {
         // One useful warp per original K group avoids idle warps in the head.
         if (splits == 5) {
-            exl3_int8::gemv_warpk<5, BITS, RESID, PAIR><<<grid, 160, smem, stream>>>(weights, prepared.get(), output, k, n, rows, splits, pair);
+            exl3_int8::gemv_warpk<5, BITS, RESID, PAIR><<<grid, 160, smem, stream>>>(weights, prepared.get(), output, k, n, rows, splits, m, pair);
         } else {
-            exl3_int8::gemv_warpk<6, BITS, RESID, PAIR><<<grid, 192, smem, stream>>>(weights, prepared.get(), output, k, n, rows, splits, pair);
+            exl3_int8::gemv_warpk<6, BITS, RESID, PAIR><<<grid, 192, smem, stream>>>(weights, prepared.get(), output, k, n, rows, splits, m, pair);
         }
     }
     if constexpr (PAIR) {
-        exl3_had_out_pair<<<dim3(max_n / 128, M, 2), 32, 0, stream>>>(output, svh, pair.output, svh1, n, pair.n);
+        exl3_had_out_pair<<<dim3(max_n / 128, m, 2), 32, 0, stream>>>(output, svh, pair.output, svh1, n, pair.n);
     } else {
-        exl3_had_out_kernel<<<dim3(n / 128, M), 32, 0, stream>>>(output, svh, n);
+        exl3_had_out_kernel<<<dim3(n / 128, m), 32, 0, stream>>>(output, svh, n);
     }
 }
 
@@ -289,9 +289,9 @@ void exl3_gemv_int8_launch(ggml_backend_cuda_context & ctx, const uint8_t * B, c
         }
     }
     GGML_ASSERT(smem <= cap);
-    if constexpr (cb == 2 && M == 8 && !GROUPED && ((bits == 4 && !RESID) || (bits == 6 && RESID))) {
+    if constexpr (cb == 2 && !GROUPED && ((bits == 4 && !RESID && M >= 4 && M <= 8) || (bits == 6 && RESID && M >= 5 && M <= 8))) {
         if (ggml_cuda_info().devices[ctx.device].cc == 860 && exl3_warpk_shape(bits, RESID, n, ksplit)) {
-            exl3_warpk_launch<bits, RESID, false>(ctx, B, x, suh, svh, y, k, n, nrows, ksplit);
+            exl3_warpk_launch<bits, RESID, false>(ctx, B, x, suh, svh, y, k, n, nrows, ksplit, M);
             return;
         }
     }
@@ -435,30 +435,32 @@ bool ggml_cuda_exl3_bundle(ggml_backend_cuda_context & ctx, ggml_tensor * a, ggm
             strcmp(a->src[0]->name, "output.weight") == 0 || strcmp(b->src[0]->name, "output.weight") == 0) {
         return false;
     }
-    // Wide equal-width M13 pairs lost to separate launches in the shape sweep.
-    if (a->ne[1] == 13 && a->ne[0] == b->ne[0]) {
-        return false;
-    }
-    if (a->ne[1] == 8) {
+    const int m = a->ne[1], k = a->src[0]->ne[0], n = a->ne[0], n1 = b->ne[0];
+    if (((m >= 4 && m <= 8) || m == 13) && n >= 4096 && n1 >= 4096 &&
+            (n >= 3 * k) == (n1 >= 3 * k)) {
         // Keep each projection's original quantization slices and input signs.
-        const int k = a->src[0]->ne[0], n = a->ne[0];
-        const int n1 = b->ne[0];
-        if ((n >= 3 * k) != (n1 >= 3 * k)) return false;
         int splits, rows, splits1, rows1; size_t smem;
         exl3_int8_geometry(4, 8, 8, k, (n + 255) / 256, 1, exl3_int8_smem_cap(ctx.device), splits, rows, smem);
         exl3_int8_geometry(4, 8, 8, k, (n1 + 255) / 256, 1, exl3_int8_smem_cap(ctx.device), splits1, rows1, smem);
-        if (!exl3_warpk_shape(4, false, n, splits) || !exl3_warpk_shape(4, false, n1, splits1)) return false;
-        const exl3_int8::warpk_pair pair {
-            static_cast<const uint8_t *>(b->src[0]->data), static_cast<const half *>(b->src[3]->data),
-            nullptr, static_cast<float *>(b->data),
-            n1, rows1, splits1,
-        };
-        exl3_warpk_launch<4, false, true>(ctx, static_cast<const uint8_t *>(a->src[0]->data),
-                static_cast<const float *>(a->src[1]->data), static_cast<const half *>(a->src[3]->data),
-                static_cast<const half *>(a->src[2]->data), static_cast<float *>(a->data), k, n, rows, splits,
-                pair, static_cast<const half *>(b->src[2]->data));
-        return true;
+        if (exl3_warpk_shape(4, false, n, splits) && exl3_warpk_shape(4, false, n1, splits1)) {
+            exl3_int8::warpk_pair pair {
+                static_cast<const uint8_t *>(b->src[0]->data), static_cast<const half *>(b->src[3]->data),
+                nullptr, static_cast<float *>(b->data), n1, rows1, splits1,
+            };
+            // The thirteen-row path reuses the same executor as an 8+5 split.
+            for (int row = 0; row < m; row += 8) {
+                pair.output = static_cast<float *>(b->data) + size_t(row) * n1;
+                exl3_warpk_launch<4, false, true>(ctx, static_cast<const uint8_t *>(a->src[0]->data),
+                        static_cast<const float *>(a->src[1]->data) + size_t(row) * k,
+                        static_cast<const half *>(a->src[3]->data), static_cast<const half *>(a->src[2]->data),
+                        static_cast<float *>(a->data) + size_t(row) * n, k, n, rows, splits,
+                        std::min(8, m - row), pair, static_cast<const half *>(b->src[2]->data));
+            }
+            return true;
+        }
     }
+    // Preserve the measured scalar fallback outside the matrix executor's shapes.
+    if (m == 13 && n == n1) return false;
     switch (a->ne[1]) {
         case 1:  return exl3_int8_bundle_launch<1>(ctx, a, b);
         case 4:  return exl3_int8_bundle_launch<4>(ctx, a, b);
@@ -520,7 +522,7 @@ void ggml_cuda_mul_mat_exl3(ggml_backend_cuda_context & ctx, const ggml_tensor *
             int ksplit, nrows; size_t smem;
             exl3_int8_geometry(bits, 13, 13, k, (n + exl3_int8::COLS - 1) / exl3_int8::COLS,
                     1, exl3_int8_smem_cap(ctx.device), ksplit, nrows, smem);
-            if (smem <= cap) {
+            if (smem <= cap && !exl3_warpk_shape(bits, resid, n, ksplit)) {
                 exl3_gemv_int8_launch<4, 2, 13, false, false>(
                         ctx, B, x, suh, svh, y, k, n, 1, {}, stream);
                 return;

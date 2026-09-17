@@ -17,7 +17,7 @@ struct warpk_pair {
 // reduction. Prepared uint2 fragments give the consumer coalesced MMA-B loads.
 template <bool RESID, bool PAIR>
 __global__ __launch_bounds__(256) void prepare_warpk(const float * x, const half * suh,
-        uint8_t * prepared, int k, int nrows_max, warpk_pair pair) {
+        uint8_t * prepared, int k, int nrows_max, int m, warpk_pair pair) {
     constexpr int M = 8, PLANES = RESID ? 2 : 1, NACC = M * PLANES;
     const int row = threadIdx.x / 32, lane = threadIdx.x % 32;
     if constexpr (PAIR) {
@@ -33,7 +33,7 @@ __global__ __launch_bounds__(256) void prepare_warpk(const float * x, const half
     float maximum = 0;
     for (int i = lane * 4; i < kn; i += 128) {
         const int col = kb0 * 16 + i;
-        const float4 xv = *reinterpret_cast<const float4 *>(x + size_t(row) * k + col);
+        const float4 xv = row < m ? *reinterpret_cast<const float4 *>(x + size_t(row) * k + col) : make_float4(0, 0, 0, 0);
         const half2 s01 = *reinterpret_cast<const half2 *>(suh + col);
         const half2 s23 = *reinterpret_cast<const half2 *>(suh + col + 2);
         float v0 = xv.x * __low2float(s01), v1 = xv.y * __high2float(s01);
@@ -90,7 +90,7 @@ __global__ __launch_bounds__(256) void prepare_warpk(const float * x, const half
 
 template <int WK, int BITS, bool RESID, bool PAIR>
 __global__ __launch_bounds__(WK * 32) void gemv_warpk(const uint8_t * weights,
-        const uint8_t * prepared, float * output, int k, int n, int nrows_max, int ksplit, warpk_pair pair) {
+        const uint8_t * prepared, float * output, int k, int n, int nrows_max, int ksplit, int m, warpk_pair pair) {
 #if !defined(GGML_USE_HIP) && __CUDA_ARCH__ == 860
     constexpr int M = 8, COLS = 32, RING = 4, PLANES = RESID ? 2 : 1, NACC = M * PLANES, TWORDS = BITS * 8;
     static_assert(BITS == 4 || BITS == 6);
@@ -204,7 +204,7 @@ __global__ __launch_bounds__(WK * 32) void gemv_warpk(const uint8_t * weights,
         }
     }
     __syncthreads();
-    for (int i = threadIdx.x; i < M * COLS; i += blockDim.x) {
+    for (int i = threadIdx.x; i < m * COLS; i += blockDim.x) {
         float v = 0;
         for (int g = 0; g < ksplit; ++g) v = __fadd_rn(v, partial[g * M * COLS + i]);
         output[size_t(i / COLS) * n + blockIdx.x * COLS + i % COLS] = v;

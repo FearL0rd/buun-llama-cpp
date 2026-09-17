@@ -15,7 +15,7 @@
 #include <vector>
 
 // Compare every row of each projection with that row executed alone.
-// SM86 also covers wider verify batches, including the single-launch K4 M13 path.
+// SM86 also covers padded matrix tiles and wider verification batches.
 // Rows deliberately have different scales/outliers: sharing an activation max
 // across rows must not accidentally satisfy this test.
 static bool check_batch(ggml_backend_t backend, int bits, int k, int n, bool head, int max_m, bool exact_bound = false) {
@@ -181,7 +181,7 @@ int main() {
         ok &= check_batch(backend, bits, 2048, 6144, false, max_m);
         ok &= check_batch(backend, bits, 4096, 151936, true, max_m); // cap-limited split, head residual
     }
-    for (int m : {1, 4, 7, 8, 13}) {
+    for (int m : {1, 4, 5, 6, 7, 8, 13}) {
         if (m > 8 && !sm86) continue;
         ok &= check_pair(backend, 12288, 6144, m, true);
         ok &= check_pair(backend, 640, 128, m, true);
@@ -189,11 +189,11 @@ int main() {
         ok &= check_pair(backend, 12288, 6144, m, false);
     }
     if (sm86) ok &= check_batch(backend, 4, 5120, 17408, false, 8, true);
-    if (sm86) {
-        ok &= check_pair(backend, 6144, 12288, 8, true);  // larger second projection
-        ok &= check_pair(backend, 4096, 4352, 8, true);   // minimum paired width, unequal K slices
-        ok &= check_pair(backend, 17408, 16384, 8, true); // unequal wide projections
-        ok &= check_pair(backend, 17408, 12288, 8, true); // different executor shapes fall back
+    if (sm86) for (int m : {4, 5, 6, 7, 8, 13}) {
+        ok &= check_pair(backend, 6144, 12288, m, true);  // larger second projection
+        ok &= check_pair(backend, 4096, 4352, m, true);   // minimum paired width, unequal K slices
+        ok &= check_pair(backend, 17408, 16384, m, true); // unequal wide projections
+        ok &= check_pair(backend, 17408, 12288, m, true); // different executor shapes fall back
     }
     ggml_backend_free(backend);
     return ok ? 0 : 1;
