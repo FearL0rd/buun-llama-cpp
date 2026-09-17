@@ -90,7 +90,8 @@ static bool llm_build_dflash2_selector(
         return false;
     }
     const int64_t n_tokens = logits->ne[1];
-    const int64_t block_size = g.hparams.dflash_block_size;
+    const int64_t block_size = g.cparams.dflash_block_size > 0
+        ? g.cparams.dflash_block_size : g.hparams.dflash_block_size;
     const int64_t n_blocks = n_tokens / block_size;
     const int64_t n_steps  = block_size - 1;
     const int64_t rank     = g.hparams.dflash2_selector_rank;
@@ -720,7 +721,8 @@ static ggml_tensor * build_dflash2_grouped_conv(
             projected = ggml_cont(g.ctx0, projected);
         }
         return ggml_dflash2_conv(g.ctx0, hidden, projected, base,
-                side, group_size, g.hparams.dflash_block_size);
+                side, group_size, g.cparams.dflash_block_size > 0
+                    ? g.cparams.dflash_block_size : g.hparams.dflash_block_size);
     }
 
     ggml_tensor * blocks = ggml_reshape_3d(g.ctx0, hidden, group_size, n_groups, n_tokens);
@@ -744,7 +746,8 @@ static ggml_tensor * build_dflash2_grouped_conv(
     // Shift once, then mask every block anchor. This keeps graph size constant
     // when reservation covers a large ubatch (the prototype emitted one concat
     // chain per reserved block and could exhaust the graph-node budget).
-    const int64_t block_size = hp.dflash_block_size;
+    const int64_t block_size = g.cparams.dflash_block_size > 0
+        ? g.cparams.dflash_block_size : hp.dflash_block_size;
     GGML_ASSERT(block_size > 1);
     ggml_tensor * first = ggml_view_3d(g.ctx0, blocks, group_size, n_groups, 1,
             blocks->nb[1], blocks->nb[2], 0);

@@ -2007,6 +2007,14 @@ void llama_context::set_dflash_topk(int k) {
     gf_res_prev->reset();
 }
 
+void llama_context::set_dflash_block_size(int n) {
+    GGML_ASSERT(n == 0 || (n >= 3 && n <= model.hparams.dflash_block_size));
+    if (cparams.dflash_block_size != n) {
+        cparams.dflash_block_size = n;
+        gf_res_prev->reset();
+    }
+}
+
 void llama_context::set_dflash_n_slots(int n) {
     const int clamped = std::max(1, std::min(n, (int) LLAMA_DFLASH_MAX_SLOTS));
     if (cparams.dflash_n_slots == clamped) {
@@ -7671,6 +7679,10 @@ void llama_set_dflash_oneg_inject(llama_context * ctx, void * carry, int32_t n_i
 
 void llama_set_dflash_n_slots(llama_context * ctx, int n) {
     ctx->set_dflash_n_slots(n);
+}
+
+void llama_set_dflash_block_size(llama_context * ctx, int n) {
+    ctx->set_dflash_block_size(n);
 }
 
 void llama_set_tape_recording(llama_context * ctx, bool enable) {
