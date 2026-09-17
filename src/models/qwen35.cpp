@@ -273,6 +273,12 @@ std::pair<ggml_tensor *, ggml_tensor *> llama_model_qwen35::graph::build_qkvz(
 
     ggml_tensor * qkv_mixed = build_lora_mm(
         model.layers[il].wqkv, input, model.layers[il].wqkv_s, model.layers[il].wqkv_in_s);
+    if (n_seq_tokens == 8 && ggml_type_is_exl3(model.layers[il].wqkv->type) &&
+            ggml_type_is_exl3(model.layers[il].wqkv_gate->type)) {
+        // Keep the independent projections adjacent for the backend's paired
+        // executor, rather than materializing Z before QKV's downstream graph.
+        ggml_build_forward_expand(gf, qkv_mixed);
+    }
     qkv_mixed = ggml_reshape_3d(ctx0, qkv_mixed, qkv_mixed->ne[0], n_seq_tokens, n_seqs);
     cb(qkv_mixed, "linear_attn_qkv_mixed", il);
 

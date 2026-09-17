@@ -125,7 +125,9 @@ __global__ void exl3_had_out_kernel(float * y, const half * svh, int n) {
     exl3_had_out(y, svh, n);
 }
 
-__global__ void exl3_had_out_pair(float * y0, const half * s0, float * y1, const half * s1, int n) {
+__global__ void exl3_had_out_pair(float * y0, const half * s0, float * y1, const half * s1, int n, int n1) {
+    if (blockIdx.z) n = n1;
+    if (blockIdx.x >= n / 128) return;
     exl3_had_out(blockIdx.z ? y1 : y0, blockIdx.z ? s1 : s0, n);
 }
 
@@ -219,13 +221,17 @@ static void exl3_warpk_launch(ggml_backend_cuda_context & ctx, const uint8_t * w
         exl3_int8::warpk_pair pair = {}, const half * svh1 = nullptr) {
     constexpr int M = 8, NACC = RESID ? 16 : 8;
     const size_t bytes = size_t(splits) * (8 * NACC + NACC * rows * 32);
-    ggml_cuda_pool_alloc<uint8_t> prepared(ctx.pool(), bytes * (PAIR ? 2 : 1));
+    const size_t pair_bytes = PAIR ? size_t(pair.splits) * (8 * NACC + NACC * pair.rows * 32) : 0;
+    ggml_cuda_pool_alloc<uint8_t> prepared(ctx.pool(), bytes + pair_bytes);
     if constexpr (PAIR) pair.prepared = prepared.get() + bytes;
     const auto stream = ctx.stream();
-    exl3_int8::prepare_warpk<RESID, PAIR><<<dim3(1, splits, PAIR ? 2 : 1), 256, size_t(rows) * 16 * (NACC + 2 * M), stream>>>(
+    const int max_splits = PAIR ? std::max(splits, pair.splits) : splits;
+    const int max_rows = PAIR ? std::max(rows, pair.rows) : rows;
+    const int max_n = PAIR ? std::max(n, pair.n) : n;
+    exl3_int8::prepare_warpk<RESID, PAIR><<<dim3(1, max_splits, PAIR ? 2 : 1), 256, size_t(max_rows) * 16 * (NACC + 2 * M), stream>>>(
             x, suh, prepared.get(), k, rows, pair);
-    const dim3 grid(n / 32, 1, PAIR ? 2 : 1);
-    const size_t smem = size_t(splits) * M * 32 * sizeof(float);
+    const dim3 grid(max_n / 32, 1, PAIR ? 2 : 1);
+    const size_t smem = size_t(max_splits) * M * 32 * sizeof(float);
     if constexpr (BITS == 4) {
         // Wide output projections favor fewer K warps; narrower projections
         // have more original K groups and benefit from the larger block.
@@ -243,7 +249,7 @@ static void exl3_warpk_launch(ggml_backend_cuda_context & ctx, const uint8_t * w
         }
     }
     if constexpr (PAIR) {
-        exl3_had_out_pair<<<dim3(n / 128, M, 2), 32, 0, stream>>>(output, svh, pair.output, svh1, n);
+        exl3_had_out_pair<<<dim3(max_n / 128, M, 2), 32, 0, stream>>>(output, svh, pair.output, svh1, n, pair.n);
     } else {
         exl3_had_out_kernel<<<dim3(n / 128, M), 32, 0, stream>>>(output, svh, n);
     }
@@ -434,16 +440,18 @@ bool ggml_cuda_exl3_bundle(ggml_backend_cuda_context & ctx, ggml_tensor * a, ggm
         return false;
     }
     if (a->ne[1] == 8) {
-        // Pair equal-width projections without concatenating their transforms.
-        // Unequal widths use the independently tuned warp-K launches.
+        // Keep each projection's original quantization slices and input signs.
         const int k = a->src[0]->ne[0], n = a->ne[0];
-        if (n != b->ne[0]) return false;
-        int splits, rows; size_t smem;
+        const int n1 = b->ne[0];
+        if ((n >= 3 * k) != (n1 >= 3 * k)) return false;
+        int splits, rows, splits1, rows1; size_t smem;
         exl3_int8_geometry(4, 8, 8, k, (n + 255) / 256, 1, exl3_int8_smem_cap(ctx.device), splits, rows, smem);
-        if (!exl3_warpk_shape(4, false, n, splits)) return false;
+        exl3_int8_geometry(4, 8, 8, k, (n1 + 255) / 256, 1, exl3_int8_smem_cap(ctx.device), splits1, rows1, smem);
+        if (!exl3_warpk_shape(4, false, n, splits) || !exl3_warpk_shape(4, false, n1, splits1)) return false;
         const exl3_int8::warpk_pair pair {
             static_cast<const uint8_t *>(b->src[0]->data), static_cast<const half *>(b->src[3]->data),
             nullptr, static_cast<float *>(b->data),
+            n1, rows1, splits1,
         };
         exl3_warpk_launch<4, false, true>(ctx, static_cast<const uint8_t *>(a->src[0]->data),
                 static_cast<const float *>(a->src[1]->data), static_cast<const half *>(a->src[3]->data),

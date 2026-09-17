@@ -10,6 +10,7 @@ struct warpk_pair {
     const half * suh;
     uint8_t * prepared;
     float * output;
+    int n, rows, splits;
 };
 
 // One warp owns one token row. Its max and integer sum need no cross-warp
@@ -19,11 +20,12 @@ __global__ __launch_bounds__(256) void prepare_warpk(const float * x, const half
         uint8_t * prepared, int k, int nrows_max, warpk_pair pair) {
     constexpr int M = 8, PLANES = RESID ? 2 : 1, NACC = M * PLANES;
     const int row = threadIdx.x / 32, lane = threadIdx.x % 32;
-    const int kb0 = blockIdx.y * nrows_max;
-    const int nrows = min(nrows_max, k / 16 - kb0), kn = nrows * 16;
     if constexpr (PAIR) {
-        if (blockIdx.z) { suh = pair.suh; prepared = pair.prepared; }
+        if (blockIdx.z) { suh = pair.suh; prepared = pair.prepared; nrows_max = pair.rows; }
     }
+    const int kb0 = blockIdx.y * nrows_max;
+    if (kb0 >= k / 16) return;
+    const int nrows = min(nrows_max, k / 16 - kb0), kn = nrows * 16;
     prepared += size_t(blockIdx.y) * (8 * NACC + NACC * nrows_max * 32);
     extern __shared__ uint32_t scratch[];
     auto * quant = reinterpret_cast<int8_t *>(scratch);
@@ -93,8 +95,12 @@ __global__ __launch_bounds__(WK * 32) void gemv_warpk(const uint8_t * weights,
     constexpr int M = 8, COLS = 32, RING = 4, PLANES = RESID ? 2 : 1, NACC = M * PLANES, TWORDS = BITS * 8;
     static_assert(BITS == 4 || BITS == 6);
     if constexpr (PAIR) {
-        if (blockIdx.z) { weights = pair.weights; prepared = pair.prepared; output = pair.output; }
+        if (blockIdx.z) {
+            weights = pair.weights; prepared = pair.prepared; output = pair.output;
+            n = pair.n; nrows_max = pair.rows; ksplit = pair.splits;
+        }
     }
+    if (blockIdx.x >= n / 32) return;
     const int warp = threadIdx.x / 32, lane = threadIdx.x % 32, nt = blockIdx.x * 2, kslices = k / 16;
     extern __shared__ float partial[];
     __shared__ __align__(16) uint32_t stage[BITS == 6 ? WK : 1][BITS == 6 ? 4 * TWORDS : 1];

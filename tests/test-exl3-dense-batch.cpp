@@ -189,6 +189,12 @@ int main() {
         ok &= check_pair(backend, 12288, 6144, m, false);
     }
     if (sm86) ok &= check_batch(backend, 4, 5120, 17408, false, 8, true);
+    if (sm86) {
+        ok &= check_pair(backend, 6144, 12288, 8, true);  // larger second projection
+        ok &= check_pair(backend, 4096, 4352, 8, true);   // minimum paired width, unequal K slices
+        ok &= check_pair(backend, 17408, 16384, 8, true); // unequal wide projections
+        ok &= check_pair(backend, 17408, 12288, 8, true); // different executor shapes fall back
+    }
     ggml_backend_free(backend);
     return ok ? 0 : 1;
 }
