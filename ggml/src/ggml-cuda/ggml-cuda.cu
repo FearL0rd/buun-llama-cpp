@@ -6125,10 +6125,11 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         }
     }
 
-    // Qwen3.5/3.6 recurrent decode computes two small BF16 projections from
+    // Qwen3.5-family recurrent decode computes two small projections from
     // the same activation, then immediately applies their gate epilogues.
     // Pairing the projections and eliding four launch-sized epilogues is
-    // worthwhile at batch one. Keep the structural and layout checks strict
+    // worthwhile for BF16 batch one and measured SM86 F16 verify batches.
+    // Keep the structural and layout checks strict
     // so all other graphs retain the ordinary implementation.
     static const bool qwen35_gates = std::getenv("GGML_CUDA_DISABLE_QWEN35_GATES") == nullptr;
     if (qwen35_gates && i + 8 < cgraph->n_nodes) {
@@ -6163,8 +6164,13 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 ggml_get_unary_op(beta) == GGML_UNARY_OP_SIGMOID &&
                 beta_mm->src[1] == input;
             const bool layout_ok = edges_ok && dt && a && input &&
-                alpha_mm->src[0]->type == GGML_TYPE_BF16 &&
-                beta_mm->src[0]->type == GGML_TYPE_BF16 && input->type == GGML_TYPE_F32 &&
+                (alpha_mm->src[0]->type == GGML_TYPE_BF16 ||
+                    (alpha_mm->src[0]->type == GGML_TYPE_F16 && input->ne[1] == 8 &&
+                     alpha_mm->src[0]->ne[0] == 5120 &&
+                     ggml_cuda_info().devices[cuda_ctx->device].cc == 860 &&
+                     ggml_get_op_params_i32(alpha_mm, 0) == GGML_PREC_DEFAULT &&
+                     ggml_get_op_params_i32(beta_mm, 0) == GGML_PREC_DEFAULT)) &&
+                beta_mm->src[0]->type == alpha_mm->src[0]->type && input->type == GGML_TYPE_F32 &&
                 dt->type == GGML_TYPE_F32 && a->type == GGML_TYPE_F32 &&
                 alpha_mm->type == GGML_TYPE_F32 && beta_mm->type == GGML_TYPE_F32 &&
                 gate->type == GGML_TYPE_F32 && beta->type == GGML_TYPE_F32 &&
@@ -6181,7 +6187,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 ggml_nelements(dt) == alpha_mm->src[0]->ne[1] &&
                 ggml_nelements(a) == alpha_mm->src[0]->ne[1];
             if (layout_ok) {
-                if (input->ne[1] == 1) {
+                if (input->ne[1] == 1 || alpha_mm->src[0]->type == GGML_TYPE_F16) {
                     const bool gate_direct = ggml_cuda_check_fusion_memory_ranges(cgraph, i, 9, out_nodes, 1);
                     const bool beta_direct = ggml_cuda_check_fusion_memory_ranges(cgraph, i, 9, out_nodes + 1, 1);
                     if ((!gate_direct || !beta_direct) && ggml_cuda_tensors_overlap(gate, beta)) {
@@ -6200,8 +6206,13 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                     if (!beta_direct) {
                         beta_tmp.data = beta_scratch.alloc(ggml_nelements(beta));
                     }
-                    ggml_cuda_op_qwen35_recurrent_gates(
-                        *cuda_ctx, alpha_mm->src[0], beta_mm->src[0], input, dt, a, &gate_tmp, &beta_tmp);
+                    if (alpha_mm->src[0]->type == GGML_TYPE_F16) {
+                        ggml_cuda_op_qwen35_recurrent_gates_f16(
+                            *cuda_ctx, alpha_mm->src[0], beta_mm->src[0], input, dt, a, &gate_tmp, &beta_tmp);
+                    } else {
+                        ggml_cuda_op_qwen35_recurrent_gates(
+                            *cuda_ctx, alpha_mm->src[0], beta_mm->src[0], input, dt, a, &gate_tmp, &beta_tmp);
+                    }
                     if (!gate_direct) {
                         CUDA_CHECK(cudaMemcpyAsync(gate->data, gate_tmp.data, ggml_nbytes(gate),
                             cudaMemcpyDeviceToDevice, cuda_ctx->stream()));
