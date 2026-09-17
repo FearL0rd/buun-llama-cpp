@@ -131,8 +131,17 @@ __global__ __launch_bounds__(WK * 32) void gemv_warpk(const uint8_t * weights,
             if constexpr (BITS == 6) {
                 if (kb < nr && lane < 2 * TWORDS / 4) {
                     const int t = lane / (TWORDS / 4), w = (lane % (TWORDS / 4)) * 4;
-                    cp_async16(stage[warp] + (kb % 2) * 2 * TWORDS + lane * 4,
-                               b + (size_t(nt + t) * kslices + kb0 + kb) * TWORDS + w);
+                    void * dst = stage[warp] + (kb % 2) * 2 * TWORDS + lane * 4;
+                    const void * src = b + (size_t(nt + t) * kslices + kb0 + kb) * TWORDS + w;
+                    if constexpr (M == 8 && WK == 3) {
+                        // Large-vocabulary head: fetch neighboring packed weights
+                        // into L2 while copying this lane's unchanged 16 bytes.
+                        const uint32_t smem = static_cast<uint32_t>(__cvta_generic_to_shared(dst));
+                        asm volatile("cp.async.cg.shared.global.L2::128B [%0], [%1], 16;"
+                                     :: "r"(smem), "l"(src));
+                    } else {
+                        cp_async16(dst, src);
+                    }
                 }
                 cp_async_commit();
             }
