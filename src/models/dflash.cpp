@@ -778,52 +778,6 @@ static ggml_tensor * llm_build_dflash2_conv_prepare(
         ggml_tensor * hidden,
         ggml_tensor * base,
         ggml_tensor * projection,
-        ggml_tensor ** coefficients);
-
-static ggml_tensor * llm_build_dflash2_conv_finish(
-        llm_graph_context & g,
-        ggml_tensor * hidden,
-        ggml_tensor * coefficients,
-        ggml_tensor * base);
-
-static ggml_tensor * build_dflash2_conv_prepare_tail(
-        llm_graph_context & g,
-        ggml_tensor * hidden,
-        int64_t n_prefix,
-        ggml_tensor * base,
-        ggml_tensor * projection,
-    ggml_tensor ** coefficients) {
-    if (n_prefix == 0) {
-        return llm_build_dflash2_conv_prepare(g, hidden, base, projection, coefficients);
-    }
-    ggml_tensor * tail = ggml_view_2d(g.ctx0, hidden, hidden->ne[0], hidden->ne[1] - n_prefix,
-            hidden->nb[1], (size_t) n_prefix * hidden->nb[1]);
-    ggml_tensor * convolved = llm_build_dflash2_conv_prepare(g, tail, base, projection, coefficients);
-    ggml_tensor * prefix = ggml_view_2d(g.ctx0, hidden, hidden->ne[0], n_prefix, hidden->nb[1], 0);
-    return ggml_concat(g.ctx0, prefix, convolved, 1);
-}
-
-static ggml_tensor * build_dflash2_conv_finish_tail(
-        llm_graph_context & g,
-        ggml_tensor * hidden,
-        int64_t n_prefix,
-        ggml_tensor * coefficients,
-    ggml_tensor * base) {
-    if (n_prefix == 0) {
-        return llm_build_dflash2_conv_finish(g, hidden, coefficients, base);
-    }
-    ggml_tensor * tail = ggml_view_2d(g.ctx0, hidden, hidden->ne[0], hidden->ne[1] - n_prefix,
-            hidden->nb[1], (size_t) n_prefix * hidden->nb[1]);
-    ggml_tensor * convolved = build_dflash2_grouped_conv(g, tail, coefficients, base, 1);
-    ggml_tensor * prefix = ggml_view_2d(g.ctx0, hidden, hidden->ne[0], n_prefix, hidden->nb[1], 0);
-    return ggml_concat(g.ctx0, prefix, convolved, 1);
-}
-
-static ggml_tensor * llm_build_dflash2_conv_prepare(
-        llm_graph_context & g,
-        ggml_tensor * hidden,
-        ggml_tensor * base,
-        ggml_tensor * projection,
         ggml_tensor ** coefficients) {
     *coefficients = g.build_lora_mm(projection, hidden);
     return build_dflash2_grouped_conv(g, hidden, *coefficients, base, 0);
@@ -1081,7 +1035,12 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
 
     ggml_tensor * inp_tokens = inp->tokens;
 
-    ggml_tensor * inpL = ggml_get_rows(ctx0, tok_embd, inp->tokens);
+    // The injection prefix only writes K/V from inp_g. It has no live hidden
+    // stream: keep residuals/projections on the noise rows throughout the graph.
+    ggml_tensor * noise_tokens = n_inj > 0
+        ? ggml_view_1d(ctx0, inp->tokens, n_tokens - n_inj, size_t(n_inj) * inp->tokens->nb[0])
+        : inp->tokens;
+    ggml_tensor * inpL = ggml_get_rows(ctx0, tok_embd, noise_tokens);
     cb(inpL, "inp_noise_embd", -1);
 
     res->add_input(std::move(inp));
@@ -1095,25 +1054,28 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
         ggml_tensor * attn_coeff = nullptr;
         ggml_tensor * attn_inp = noise_norm;
         if (layer.dflash2_attn_conv_base) {
-            attn_inp = build_dflash2_conv_prepare_tail(*this, noise_norm, n_inj,
+            attn_inp = llm_build_dflash2_conv_prepare(*this, noise_norm,
                     layer.dflash2_attn_conv_base, layer.dflash2_attn_conv_proj, &attn_coeff);
             cb(attn_inp, "attn_conv_in", il);
         }
 
         ggml_tensor * Qcur = build_lora_mm(layer.wq, attn_inp, layer.wq_s);
+        if (n_inj > 0) {
+            // Retain the existing query/mask/cache topology. Placeholder queries
+            // are discarded below; only the tail's projection is computed.
+            Qcur = ggml_pad_ext(ctx0, Qcur, 0, 0, n_inj, 0, 0, 0, 0, 0);
+        }
         ggml_tensor * Kcur;
         ggml_tensor * Vcur;
         if (inp_g) {
             // K/V rows [0, n_inj) come from the encoder output (injection), the rest
             // from the noise tokens — per-row math matches both standalone graphs
-            ggml_tensor * tail = ggml_view_2d(ctx0, attn_inp, n_embd, n_tokens - n_inj,
-                    attn_inp->nb[1], (size_t) n_inj * attn_inp->nb[1]);
             Kcur = ggml_concat(ctx0,
                     build_lora_mm(layer.wk, inp_g, layer.wk_s),
-                    build_lora_mm(layer.wk, tail,  layer.wk_s), 1);
+                    build_lora_mm(layer.wk, attn_inp, layer.wk_s), 1);
             Vcur = ggml_concat(ctx0,
                     build_lora_mm(layer.wv, inp_g, layer.wv_s),
-                    build_lora_mm(layer.wv, tail,  layer.wv_s), 1);
+                    build_lora_mm(layer.wv, attn_inp, layer.wv_s), 1);
         } else {
             Kcur = build_lora_mm(layer.wk, attn_inp, layer.wk_s);
             Vcur = build_lora_mm(layer.wv, attn_inp, layer.wv_s);
@@ -1134,11 +1096,16 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
 
         // cache-aware, non-causal attention
         ggml_tensor * cur = use_iswa
-            ? build_attn(inp_attn_iswa, layer.wo, NULL, layer.wo_s, Qcur, Kcur, Vcur, nullptr, layer.attn_sinks, nullptr, kq_scale, il)
-            : build_attn(inp_attn,      layer.wo, NULL, layer.wo_s, Qcur, Kcur, Vcur, nullptr, layer.attn_sinks, nullptr, kq_scale, il);
+            ? build_attn(inp_attn_iswa, n_inj ? nullptr : layer.wo, NULL, layer.wo_s, Qcur, Kcur, Vcur, nullptr, layer.attn_sinks, nullptr, kq_scale, il)
+            : build_attn(inp_attn,      n_inj ? nullptr : layer.wo, NULL, layer.wo_s, Qcur, Kcur, Vcur, nullptr, layer.attn_sinks, nullptr, kq_scale, il);
+        if (n_inj > 0) {
+            cur = ggml_view_2d(ctx0, cur, cur->ne[0], n_tokens - n_inj,
+                    cur->nb[1], size_t(n_inj) * cur->nb[1]);
+            cur = build_lora_mm(layer.wo, cur, layer.wo_s);
+        }
 
         if (attn_coeff) {
-            cur = build_dflash2_conv_finish_tail(*this, cur, n_inj,
+            cur = llm_build_dflash2_conv_finish(*this, cur,
                     attn_coeff, layer.dflash2_attn_conv_base);
             cb(cur, "attn_conv_out", il);
         }
@@ -1151,7 +1118,7 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
 
         ggml_tensor * ffn_coeff = nullptr;
         if (layer.dflash2_ffn_conv_base) {
-            cur = build_dflash2_conv_prepare_tail(*this, cur, n_inj,
+            cur = llm_build_dflash2_conv_prepare(*this, cur,
                     layer.dflash2_ffn_conv_base, layer.dflash2_ffn_conv_proj, &ffn_coeff);
             cb(cur, "ffn_conv_in", il);
         }
@@ -1165,7 +1132,7 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
         cb(cur, "ffn_out", il);
 
         if (ffn_coeff) {
-            cur = build_dflash2_conv_finish_tail(*this, cur, n_inj,
+            cur = llm_build_dflash2_conv_finish(*this, cur,
                     ffn_coeff, layer.dflash2_ffn_conv_base);
             cb(cur, "ffn_conv_out", il);
         }
@@ -1177,11 +1144,6 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
     }
 
     ggml_tensor * cur = inpL;
-    if (n_inj > 0) {
-        // only the noise rows produce outputs — drop the injection rows here so the
-        // logits/nextn tails line up with the batch's output rows
-        cur = ggml_view_2d(ctx0, cur, n_embd, n_tokens - n_inj, cur->nb[1], (size_t) n_inj * cur->nb[1]);
-    }
 
     cur = build_norm(cur, model.output_norm, NULL, LLM_NORM_RMS, -1);
     cb(cur, "result_norm", -1);
