@@ -89,7 +89,7 @@ __global__ __launch_bounds__(M * 32) void prepare_warpk(const float * x, const h
 }
 
 template <int WK, int BITS, bool RESID, bool PAIR, int M = 8>
-__global__ __launch_bounds__(WK * 32) void gemv_warpk(const uint8_t * weights,
+__device__ __forceinline__ void gemv_warpk_impl(const uint8_t * weights,
         const uint8_t * prepared, float * output, int k, int n, int nrows_max, int ksplit, int m, warpk_pair pair) {
 #if !defined(GGML_USE_HIP) && __CUDA_ARCH__ == 860
     constexpr int COLS = 32, RING = 4, NACC = M * (RESID ? 2 : 1), PLANES = NACC / 8, TWORDS = BITS * 8;
@@ -222,6 +222,20 @@ __global__ __launch_bounds__(WK * 32) void gemv_warpk(const uint8_t * weights,
 #else
     NO_DEVICE_CODE;
 #endif
+}
+
+// Keep the original one-argument launch bound: an explicit minimum of one
+// changes register allocation for unrelated specializations on SM86.
+template <int WK, int BITS, bool RESID, bool PAIR, int M = 8>
+__global__ __launch_bounds__(WK * 32) void gemv_warpk(const uint8_t * weights,
+        const uint8_t * prepared, float * output, int k, int n, int nrows_max, int ksplit, int m, warpk_pair pair) {
+    gemv_warpk_impl<WK, BITS, RESID, PAIR, M>(weights, prepared, output, k, n, nrows_max, ksplit, m, pair);
+}
+
+template <bool PAIR>
+__global__ __launch_bounds__(512, 2) void gemv_warpk_m16(const uint8_t * weights,
+        const uint8_t * prepared, float * output, int k, int n, int nrows_max, int ksplit, int m, warpk_pair pair) {
+    gemv_warpk_impl<16, 4, false, PAIR, 16>(weights, prepared, output, k, n, nrows_max, ksplit, m, pair);
 }
 
 } // namespace exl3_int8
