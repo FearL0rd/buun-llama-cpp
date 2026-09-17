@@ -88,7 +88,7 @@ __global__ __launch_bounds__(M * 32) void prepare_warpk(const float * x, const h
     }
 }
 
-template <int WK, int BITS, bool RESID, bool PAIR, int M = 8>
+template <int WK, int BITS, bool RESID, bool PAIR, int M = 8, bool COMPACT = false>
 __device__ __forceinline__ void gemv_warpk_impl(const uint8_t * weights,
         const uint8_t * prepared, float * output, int k, int n, int nrows_max, int ksplit, int m, warpk_pair pair) {
 #if !defined(GGML_USE_HIP) && __CUDA_ARCH__ == 860
@@ -208,7 +208,9 @@ __device__ __forceinline__ void gemv_warpk_impl(const uint8_t * weights,
                         v += scales[p + 1] * (inv * float(residual) + bias * float(sums[p + 1]));
                     }
                     const int row = RESID ? p / 2 : p;
-                    partial[(group * M + row) * COLS + c] = v;
+                    if (!COMPACT || row < m) {
+                        partial[(group * (COMPACT ? m : M) + row) * COLS + c] = v;
+                    }
                 }
             }
         }
@@ -216,7 +218,7 @@ __device__ __forceinline__ void gemv_warpk_impl(const uint8_t * weights,
     __syncthreads();
     for (int i = threadIdx.x; i < m * COLS; i += blockDim.x) {
         float v = 0;
-        for (int g = 0; g < ksplit; ++g) v = __fadd_rn(v, partial[g * M * COLS + i]);
+        for (int g = 0; g < ksplit; ++g) v = __fadd_rn(v, partial[g * (COMPACT ? m : M) * COLS + i]);
         output[size_t(i / COLS) * n + blockIdx.x * COLS + i % COLS] = v;
     }
 #else
@@ -236,6 +238,12 @@ template <bool PAIR>
 __global__ __launch_bounds__(512, 2) void gemv_warpk_m16(const uint8_t * weights,
         const uint8_t * prepared, float * output, int k, int n, int nrows_max, int ksplit, int m, warpk_pair pair) {
     gemv_warpk_impl<16, 4, false, PAIR, 16>(weights, prepared, output, k, n, nrows_max, ksplit, m, pair);
+}
+
+template <bool PAIR>
+__global__ __launch_bounds__(512, 2) void gemv_warpk_m16_compact(const uint8_t * weights,
+        const uint8_t * prepared, float * output, int k, int n, int nrows_max, int ksplit, int m, warpk_pair pair) {
+    gemv_warpk_impl<16, 4, false, PAIR, 16, true>(weights, prepared, output, k, n, nrows_max, ksplit, m, pair);
 }
 
 } // namespace exl3_int8

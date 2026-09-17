@@ -94,8 +94,7 @@ static bool check_batch(ggml_backend_t backend, int bits, int k, int n, bool hea
 
 // The joint graph may bundle projections, while each one-node graph cannot.
 // Independent signs and unequal output widths catch accidental row concatenation.
-static bool check_pair(ggml_backend_t backend, int n0, int n1, int m, bool shared_input) {
-    constexpr int k = 5120;
+static bool check_pair(ggml_backend_t backend, int n0, int n1, int m, bool shared_input, int k = 5120) {
     auto * ctx = ggml_init({1024*1024, nullptr, true});
     auto * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, m);
     auto * x2 = shared_input ? x : ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, m);
@@ -154,7 +153,7 @@ static bool check_pair(ggml_backend_t backend, int n0, int n1, int m, bool share
     }
     ggml_backend_buffer_free(buffer);
     ggml_free(ctx);
-    printf("pair N%d/%d M%d shared=%d: %s\n", n0, n1, m, shared_input, ok ? "PASS" : "FAIL");
+    printf("pair K%d N%d/%d M%d shared=%d: %s\n", k, n0, n1, m, shared_input, ok ? "PASS" : "FAIL");
     return ok;
 }
 
@@ -189,6 +188,15 @@ int main() {
         ok &= check_pair(backend, 12288, 6144, m, false);
     }
     if (sm86) ok &= check_batch(backend, 4, 5120, 17408, false, 8, true);
+    // Thirteen live rows within a sixteen-row tile: the down projection's
+    // shared partials must omit padding without changing any reduction order.
+    if (sm86) {
+        ok &= check_batch(backend, 4, 17408, 5120, false, 16);
+        for (int m : {8, 13, 16}) {
+            ok &= check_pair(backend, 5120, 6144, m, true, 17408);
+            ok &= check_pair(backend, 5120, 4352, m, false, 17408);
+        }
+    }
     if (sm86) for (int k : {128, 384, 640}) {
         ok &= check_batch(backend, 6, k, 131072, true, 13);
     }

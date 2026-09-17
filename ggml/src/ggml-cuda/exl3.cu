@@ -269,8 +269,12 @@ static void exl3_warpk_launch(ggml_backend_cuda_context & ctx, const uint8_t * w
             if constexpr (M == 16 && !RESID) {
                 // Two blocks fit by shared memory, but the unconstrained M16
                 // kernel's 81-100 registers otherwise limit residency to one.
-                // Keep the larger shared-memory projections unconstrained.
-                if (smem <= 48 * 1024) {
+                // Drop unused partial rows when that also brings a larger
+                // shared-memory projection below the two-block limit.
+                const size_t live_smem = size_t(max_splits) * m * 32 * sizeof(float);
+                if (smem > 48 * 1024 && live_smem <= 48 * 1024) {
+                    exl3_int8::gemv_warpk_m16_compact<PAIR><<<grid, 512, live_smem, stream>>>(weights, prepared.get(), output, k, n, rows, splits, m, pair);
+                } else if (smem <= 48 * 1024) {
                     exl3_int8::gemv_warpk_m16<PAIR><<<grid, 512, smem, stream>>>(weights, prepared.get(), output, k, n, rows, splits, m, pair);
                 } else {
                     exl3_int8::gemv_warpk<16, BITS, RESID, PAIR, M><<<grid, 512, smem, stream>>>(weights, prepared.get(), output, k, n, rows, splits, m, pair);
