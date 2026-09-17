@@ -644,6 +644,10 @@ if ((TARGET ggml-cuda OR TARGET ggml-hip) AND NOT GGML_BACKEND_DL)
 endif()
 if (TARGET ggml-cuda AND NOT GGML_BACKEND_DL)
     enable_language(CUDA)
+    llama_build(test-cuda-copy-batch.cpp)
+    target_link_libraries(test-cuda-copy-batch PRIVATE ggml-cuda)
+    llama_test(test-cuda-copy-batch LABEL "backend")
+    set_tests_properties(test-cuda-copy-batch PROPERTIES SKIP_RETURN_CODE 77)
     # Small scale-aware cases exercise generic fallbacks without the expensive
     # CPU reference of production-sized dynamic FP8 GEMMs.
     llama_test(test-backend-ops NAME test-cuda-native-quant-fallbacks

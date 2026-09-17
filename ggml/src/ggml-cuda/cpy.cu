@@ -7,6 +7,51 @@
 
 typedef void (*cpy_kernel_t)(const char * cx, char * cdst);
 
+struct cpy_batch_item {
+    const char * src;
+    char * dst;
+    int64_t count;
+    int64_t src_ne[4], dst_ne[4];
+    size_t src_nb[4], dst_nb[4];
+};
+
+struct cpy_batch_args { cpy_batch_item items[16]; };
+
+static __global__ void cpy_batch_f32(cpy_batch_args args) {
+    const auto & item = args.items[blockIdx.y];
+    int64_t i = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i >= item.count) return;
+    int64_t si = i, di = i;
+    size_t so = 0, ds = 0;
+#pragma unroll
+    for (int d = 0; d < 4; ++d) {
+        so += (si % item.src_ne[d]) * item.src_nb[d];
+        ds += (di % item.dst_ne[d]) * item.dst_nb[d];
+        si /= item.src_ne[d];
+        di /= item.dst_ne[d];
+    }
+    *reinterpret_cast<float *>(item.dst + ds) = *reinterpret_cast<const float *>(item.src + so);
+}
+
+void ggml_cuda_cpy_batch(ggml_backend_cuda_context & ctx, const ggml_tensor * const * sources,
+        ggml_tensor * const * destinations, int count) {
+    GGML_ASSERT(count >= 2 && count <= 16);
+    cpy_batch_args args = {};
+    int64_t max_count = 0;
+    for (int i = 0; i < count; ++i) {
+        auto & a = args.items[i];
+        a.src = static_cast<const char *>(sources[i]->data);
+        a.dst = static_cast<char *>(destinations[i]->data);
+        a.count = ggml_nelements(sources[i]);
+        max_count = std::max(max_count, a.count);
+        for (int d = 0; d < 4; ++d) {
+            a.src_ne[d] = sources[i]->ne[d]; a.src_nb[d] = sources[i]->nb[d];
+            a.dst_ne[d] = destinations[i]->ne[d]; a.dst_nb[d] = destinations[i]->nb[d];
+        }
+    }
+    if (max_count) cpy_batch_f32<<<dim3((max_count + 255) / 256, count), 256, 0, ctx.stream()>>>(args);
+}
+
 const int CUDA_CPY_TILE_DIM_2D = 32; // 2D tile dimension for transposed blocks
 const int CUDA_CPY_BLOCK_NM = 8;     // block size of 3rd dimension if available
 const int CUDA_CPY_BLOCK_ROWS = 8;   // block dimension for marching through rows

@@ -6234,6 +6234,36 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         }
     }
 
+    // Coalesce independent state-window copies. VIEW nodes carry metadata only;
+    // every read/write range must remain disjoint from the other copies.
+    if (node->op == GGML_OP_CPY && ggml_cuda_info().devices[cuda_ctx->device].cc == 860) {
+        const ggml_tensor * sources[16];
+        ggml_tensor * destinations[16];
+        int count = 0, last = i;
+        for (int j = i; j < cgraph->n_nodes && count < 16; ++j) {
+            ggml_tensor * candidate = cgraph->nodes[j];
+            if (candidate->op == GGML_OP_VIEW) continue;
+            if (candidate->op != GGML_OP_CPY || candidate->type != GGML_TYPE_F32 ||
+                    candidate->src[0]->type != GGML_TYPE_F32 ||
+                    ggml_nelements(candidate) != ggml_nelements(candidate->src[0]) ||
+                    ggml_cuda_tensors_overlap(candidate, candidate->src[0])) break;
+            bool independent = true;
+            for (int c = 0; independent && c < count; ++c) {
+                independent = !ggml_cuda_tensors_overlap(candidate, destinations[c]) &&
+                    !ggml_cuda_tensors_overlap(candidate, sources[c]) &&
+                    !ggml_cuda_tensors_overlap(candidate->src[0], destinations[c]);
+            }
+            if (!independent) break;
+            sources[count] = candidate->src[0];
+            destinations[count++] = candidate;
+            last = j;
+        }
+        if (count > 1) {
+            ggml_cuda_cpy_batch(*cuda_ctx, sources, destinations, count);
+            return last - i;
+        }
+    }
+
     // Recurrent conv state at decode width: CONCAT(saved prefix, transposed
     // projection) is followed by a VIEW of its last columns copied back into
     // the state buffer. One kernel writes both the concatenation and the state
