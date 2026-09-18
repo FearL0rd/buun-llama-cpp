@@ -1612,7 +1612,6 @@ public:
               int32_t id_slot, const std::string & adapter_config_key,
               server_prompt_cache_restore_shape & restore_shape,
               common_cache_plan_record * rec = nullptr,
-              int32_t required_source_id = -1,
               common_cache_family_binding * restored_family = nullptr);
 
     template <bool Observed>
@@ -1620,7 +1619,6 @@ public:
                    llama_context * ctx_tgt, llama_context * ctx_dft,
                    int32_t id_slot, const std::string & adapter_config_key,
                    common_cache_plan_record * rec,
-                   int32_t required_source_id,
                    common_cache_family_binding * restored_family,
                    server_prompt_cache_restore_shape & restore_shape);
 
@@ -1742,7 +1740,7 @@ private:
     const_iterator find_state_exact(
         const server_tokens & tokens,
         const std::string & adapter_config_key) const noexcept;
-    bool destroy_priced_host_entry(
+    bool destroy_retention_host_entry(
             server_cache_destruction_reason reason,
             iterator incoming,
             iterator & legacy_floor,

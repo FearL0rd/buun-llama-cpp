@@ -101,7 +101,6 @@ struct server_vbr_empty_handoff_gate {
     uint64_t durable_incumbent_prefix = 0;
     bool exact_incumbent_durable = false;
     bool hard_lease = false;
-    bool recovery_pin = false;
     bool deferred_task = false;
     bool incumbent_supported = false;
     bool family_matches = false;

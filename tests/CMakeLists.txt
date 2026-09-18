@@ -309,9 +309,6 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     target_compile_definitions(test-cache-control PRIVATE
         CACHE_CONTROL_GOLDEN_PATH="${PROJECT_SOURCE_DIR}/tests/fixtures/cache-control-v1.json")
 
-    llama_build_and_test(test-cache-plan-estimate.cpp)
-    target_include_directories(test-cache-plan-estimate PRIVATE ${PROJECT_SOURCE_DIR}/src)
-
     llama_build_and_test(
         test-cache-plan-authority.cpp
         ${PROJECT_SOURCE_DIR}/tools/server/server-cache-plan-authority.cpp)
@@ -327,7 +324,7 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
         ${PROJECT_SOURCE_DIR}/src
         ${PROJECT_SOURCE_DIR}/tools/server)
     target_compile_definitions(test-cache-plan-preflight PRIVATE
-        CACHE_PLAN_PREFLIGHT_GOLDEN_PATH="${PROJECT_SOURCE_DIR}/tests/fixtures/cache-plan-preflight-v1.json")
+        CACHE_PLAN_PREFLIGHT_GOLDEN_PATH="${PROJECT_SOURCE_DIR}/tests/fixtures/cache-plan-preflight-v2.json")
 
     llama_build_and_test(
         test-retention-sidecar.cpp
