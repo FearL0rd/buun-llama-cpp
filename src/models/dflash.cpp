@@ -496,7 +496,6 @@ void llama_model_dflash::load_arch_tensors(llama_model_loader &) {
     }
 
     fc              = create_tensor(tn(LLM_TENSOR_FC,              "weight"), { n_embd_inp, n_embd }, 0);
-    fc_s            = create_tensor(tn(LLM_TENSOR_FC,              "scale"),  { 1 }, TENSOR_NOT_REQUIRED);
     output_norm_enc = create_tensor(tn(LLM_TENSOR_ENC_OUTPUT_NORM, "weight"), { n_embd }, 0); // encoder hidden_norm (after fc)
     output_norm     = create_tensor(tn(LLM_TENSOR_OUTPUT_NORM,    "weight"), { n_embd }, 0); // decoder final norm
 
@@ -626,7 +625,7 @@ template <>
 llama_model_dflash::graph<true>::graph(const llama_model & model, const llm_graph_params & params) : llm_graph_context(params) {
     ggml_tensor * cur = build_inp_embd_enc();
 
-    cur = build_lora_mm(model.fc, cur, model.fc_s);
+    cur = build_lora_mm(model.fc, cur, model.fc_s, model.fc_in_s);
     cb(cur, "fc_out", -1);
 
     cur = build_norm(cur, model.output_norm_enc, NULL, LLM_NORM_RMS, -1);
@@ -654,7 +653,7 @@ static ggml_tensor * build_dflash_staged_enc(llm_graph_context & g, const llama_
     g.res->add_input(std::move(inp));
     g.cb(cur, "inp_g_embeddings", -1);
 
-    cur = g.build_lora_mm(model.fc, cur, model.fc_s);
+    cur = g.build_lora_mm(model.fc, cur, model.fc_s, model.fc_in_s);
     g.cb(cur, "fc_out", -1);
 
     cur = g.build_norm(cur, model.output_norm_enc, NULL, LLM_NORM_RMS, -1);
@@ -680,7 +679,7 @@ static ggml_tensor * build_dflash_inject_input(llm_graph_context & g, const llam
     g.cb(cur, "inp_g_embeddings", -1);
 
     if (fused) {
-        cur = g.build_lora_mm(model.fc, cur, model.fc_s);
+        cur = g.build_lora_mm(model.fc, cur, model.fc_s, model.fc_in_s);
         g.cb(cur, "fc_out", -1);
 
         cur = g.build_norm(cur, model.output_norm_enc, NULL, LLM_NORM_RMS, -1);
@@ -957,8 +956,8 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
         for (int il = 0; il < n_layer; ++il) {
             const auto & layer = model.layers[il];
 
-            ggml_tensor * Kcur = build_lora_mm(layer.wk, inp_g, layer.wk_s);
-            ggml_tensor * Vcur = build_lora_mm(layer.wv, inp_g, layer.wv_s);
+            ggml_tensor * Kcur = build_lora_mm(layer.wk, inp_g, layer.wk_s, layer.wk_in_s);
+            ggml_tensor * Vcur = build_lora_mm(layer.wv, inp_g, layer.wv_s, layer.wv_in_s);
 
             Kcur = ggml_reshape_3d(ctx0, Kcur, n_embd_head, n_head_kv, n_tokens);
             Vcur = ggml_reshape_3d(ctx0, Vcur, n_embd_head, n_head_kv, n_tokens);
@@ -1061,7 +1060,7 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
             cb(attn_inp, "attn_conv_in", il);
         }
 
-        ggml_tensor * Qcur = build_lora_mm(layer.wq, attn_inp, layer.wq_s);
+        ggml_tensor * Qcur = build_lora_mm(layer.wq, attn_inp, layer.wq_s, layer.wq_in_s);
         if (n_inj > 0) {
             // Retain the existing query/mask/cache topology. Placeholder queries
             // are discarded below; only the tail's projection is computed.
@@ -1073,14 +1072,14 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
             // K/V rows [0, n_inj) come from the encoder output (injection), the rest
             // from the noise tokens — per-row math matches both standalone graphs
             Kcur = ggml_concat(ctx0,
-                    build_lora_mm(layer.wk, inp_g, layer.wk_s),
-                    build_lora_mm(layer.wk, attn_inp, layer.wk_s), 1);
+                    build_lora_mm(layer.wk, inp_g, layer.wk_s, layer.wk_in_s),
+                    build_lora_mm(layer.wk, attn_inp, layer.wk_s, layer.wk_in_s), 1);
             Vcur = ggml_concat(ctx0,
-                    build_lora_mm(layer.wv, inp_g, layer.wv_s),
-                    build_lora_mm(layer.wv, attn_inp, layer.wv_s), 1);
+                    build_lora_mm(layer.wv, inp_g, layer.wv_s, layer.wv_in_s),
+                    build_lora_mm(layer.wv, attn_inp, layer.wv_s, layer.wv_in_s), 1);
         } else {
-            Kcur = build_lora_mm(layer.wk, attn_inp, layer.wk_s);
-            Vcur = build_lora_mm(layer.wv, attn_inp, layer.wv_s);
+            Kcur = build_lora_mm(layer.wk, attn_inp, layer.wk_s, layer.wk_in_s);
+            Vcur = build_lora_mm(layer.wv, attn_inp, layer.wv_s, layer.wv_in_s);
         }
 
         Qcur = ggml_reshape_3d(ctx0, Qcur, n_embd_head, n_head,    n_tokens);
@@ -1097,13 +1096,16 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
         cb(Vcur, "Vcur", il);
 
         // cache-aware, non-causal attention
+        const bool project_separately = n_inj > 0 || layer.wo_in_s != nullptr;
         ggml_tensor * cur = use_iswa
-            ? build_attn(inp_attn_iswa, n_inj ? nullptr : layer.wo, NULL, layer.wo_s, Qcur, Kcur, Vcur, nullptr, layer.attn_sinks, nullptr, kq_scale, il)
-            : build_attn(inp_attn,      n_inj ? nullptr : layer.wo, NULL, layer.wo_s, Qcur, Kcur, Vcur, nullptr, layer.attn_sinks, nullptr, kq_scale, il);
+            ? build_attn(inp_attn_iswa, project_separately ? nullptr : layer.wo, NULL, layer.wo_s, Qcur, Kcur, Vcur, nullptr, layer.attn_sinks, nullptr, kq_scale, il)
+            : build_attn(inp_attn,      project_separately ? nullptr : layer.wo, NULL, layer.wo_s, Qcur, Kcur, Vcur, nullptr, layer.attn_sinks, nullptr, kq_scale, il);
         if (n_inj > 0) {
             cur = ggml_view_2d(ctx0, cur, cur->ne[0], n_tokens - n_inj,
                     cur->nb[1], size_t(n_inj) * cur->nb[1]);
-            cur = build_lora_mm(layer.wo, cur, layer.wo_s);
+        }
+        if (project_separately) {
+            cur = build_lora_mm(layer.wo, cur, layer.wo_s, layer.wo_in_s);
         }
 
         if (attn_coeff) {
@@ -1130,7 +1132,8 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
                 layer.ffn_gate, NULL, layer.ffn_gate_s,
                 layer.ffn_down, NULL, layer.ffn_down_s,
                 NULL,
-                LLM_FFN_SILU, LLM_FFN_PAR, il);
+                LLM_FFN_SILU, LLM_FFN_PAR, il,
+                layer.ffn_up_in_s, layer.ffn_gate_in_s, layer.ffn_down_in_s);
         cb(cur, "ffn_out", il);
 
         if (ffn_coeff) {

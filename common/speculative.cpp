@@ -5255,13 +5255,8 @@ common_speculative_type common_speculative_type_from_name(const std::string & na
     return it->second;
 }
 
-std::vector<common_speculative_type> common_speculative_types_from_gguf(const std::string & path) {
-    struct gguf_init_params gguf_params = {
-        /* .no_alloc = */ true,
-        /* .ctx      = */ nullptr,
-    };
-
-    gguf_context_ptr gguf_ctx(gguf_init_from_file(path.c_str(), gguf_params));
+std::vector<common_speculative_type> common_speculative_types_from_model(const std::string & path) {
+    gguf_context_ptr gguf_ctx(llama_model_load_metadata(path.c_str()));
     if (!gguf_ctx) {
         return {};
     }
@@ -5273,6 +5268,8 @@ std::vector<common_speculative_type> common_speculative_types_from_gguf(const st
 
     const std::string arch = gguf_get_val_str(gguf_ctx.get(), arch_id);
     if (arch != "dflash") {
+        // This tensor-directory probe remains GGUF-only. Native MTP still
+        // requires explicit selection; metadata-only native models return none.
         const uint32_t block_count = gguf_get_val_u32(gguf_ctx.get(), gguf_find_key(gguf_ctx.get(), (arch + ".block_count").c_str()));
 
         if (gguf_find_tensor(gguf_ctx.get(), ("blk." + std::to_string(block_count - 1) + ".nextn.eh_proj.weight").c_str()) >= 0) {

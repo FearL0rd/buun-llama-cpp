@@ -1084,7 +1084,7 @@ static std::vector<ggml_backend_dev_t> server_target_fit_devices(const common_pa
 // after context creation otherwise forces a first-request resize and CUDA graph
 // recapture. --spec-dflash-default may still enter as the legacy DFlash type.
 //
-// Read only the GGUF metadata/tensor directory. The real draft model is still
+// Read only model metadata (GGUF or native safetensors). The real draft model is still
 // loaded once, with its final placement, after the target context is available.
 static bool server_preflight_dflash2(common_params & params) {
     auto & spec = params.speculative;
@@ -1094,10 +1094,7 @@ static bool server_preflight_dflash2(common_params & params) {
 
     const std::string & path = spec.draft.mparams.path;
     std::unique_ptr<gguf_context, decltype(&gguf_free)> metadata(
-        gguf_init_from_file(path.c_str(), {
-            /*.no_alloc =*/ true,
-            /*.ctx      =*/ nullptr,
-        }),
+        llama_model_load_metadata(path.c_str()),
         gguf_free);
     if (!metadata) {
         SRV_WRN("%s", "could not inspect draft metadata before target sizing; using legacy DFlash sizing\n");

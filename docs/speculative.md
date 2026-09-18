@@ -150,7 +150,7 @@ llama-server -m Qwen3-4B.gguf -md Qwen3-4B-DFlash.gguf \
 #### DFlash2
 
 DFlash2 sidecars use the shared `draft-dflash` runtime. Their learned grouped
-convolutions and candidate selector are detected from GGUF metadata. Every
+convolutions and candidate selector are detected from model metadata. Every
 backbone position and the selector's complete adjacent-candidate score lattice
 run in parallel; only the final path walk is sequential. At nonzero temperature,
 the selector also supplies its proposal probabilities to exact p/q speculative
@@ -163,6 +163,21 @@ python convert_hf_to_gguf.py z-lab/Qwen3.8-27B-DFlash2 \
 llama-server -m Qwen3.8-27B.gguf -md Qwen3.8-27B-DFlash2-Q8_0.gguf \
     -fa on --jinja
 ```
+
+Qwen `DFlash2DraftModel` safetensors directories can also be passed directly to
+`-md`, including `r0b0tlab/Qwen3.8-27B-DFlash2-EXL3-4.00bpw`. No GGUF conversion or
+tokenizer copy is needed: the sidecar consumes target token IDs and shares the
+target's embedding/output tensors when they are absent from the sidecar. The
+target may itself be GGUF or a supported safetensors directory. For example,
+after downloading both repositories:
+
+```bash
+llama-server -m /models/Qwen3.8-27B-EXL3-4.00bpw \
+    -md /models/Qwen3.8-27B-DFlash2-EXL3-4.00bpw -ngl 99 -ngld 99 -fa on
+```
+
+This native sidecar support currently covers the Qwen NeoX-RoPE backbone; it
+does not imply support for Gemma DFlash or arbitrary draft architectures.
 
 The server detects DFlash2 from the sidecar, so `-md` does not require an
 explicit `--spec-type`. Unless `--spec-draft-n-max` is supplied, it also selects

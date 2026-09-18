@@ -2135,6 +2135,13 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                 layer.nextn.shared_head_head_in_s = create_input_scale(tn(LLM_TENSOR_NEXTN_SHARED_HEAD_HEAD, "input_scale", i), layer.nextn.shared_head_head);
             }
         }
+        // DFlash's feature projection uses the same native quantization side
+        // tensors as decoder projections (EXL3 signs/scales, FP8 scales, etc.).
+        if (fc && arch == LLM_ARCH_DFLASH) {
+            if (!fc_s) fc_s = load_weight_scale(tn(LLM_TENSOR_FC, "scale"), fc);
+            if (!fc_in_s) fc_in_s = create_input_scale(tn(LLM_TENSOR_FC, "input_scale"), fc);
+            validate_weight_scale(fc, fc_s);
+        }
         // output scales
         if (output && (output->type == GGML_TYPE_NVFP4 || output->type == GGML_TYPE_F8_E4M3 ||
                        output->type == GGML_TYPE_I8 ||

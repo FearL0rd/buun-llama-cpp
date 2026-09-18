@@ -1324,6 +1324,17 @@ struct ggml_tensor * llama_model_loader::get_tensor_meta_exact(const char * name
     return pos == weights_map.end() ? nullptr : pos->second.tensor;
 }
 
+bool llama_model_loader::has_tensor_exact(const char * name) const {
+    if (get_tensor_meta_exact(name)) return true;
+    if (!files.empty()) return false;
+    if (tensor_source) {
+        ggml_type type = GGML_TYPE_COUNT;
+        std::array<int64_t, GGML_MAX_DIMS> ne{};
+        return tensor_source->describe(name, type, ne);
+    }
+    return gguf_find_tensor(metadata, name) >= 0;
+}
+
 struct ggml_tensor * llama_model_loader::require_tensor_meta(const std::string & name) const {
     struct ggml_tensor * tensor = get_tensor_meta(name.c_str());
     if (!tensor) {
