@@ -1041,7 +1041,7 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
     ggml_tensor * noise_tokens = n_inj > 0
         ? ggml_view_1d(ctx0, inp->tokens, n_tokens - n_inj, size_t(n_inj) * inp->tokens->nb[0])
         : inp->tokens;
-    ggml_tensor * inpL = ggml_get_rows(ctx0, tok_embd, noise_tokens);
+    ggml_tensor * inpL = build_get_rows_embd(tok_embd, noise_tokens);
     cb(inpL, "inp_noise_embd", -1);
 
     res->add_input(std::move(inp));
@@ -1292,7 +1292,7 @@ llama_model_dflash::graph_dsv4::graph_dsv4(const llama_model & model, const llm_
 
     ggml_tensor * inp_tokens = inp->tokens;
 
-    ggml_tensor * inpL = ggml_get_rows(ctx0, tok_embd, inp->tokens);
+    ggml_tensor * inpL = build_get_rows_embd(tok_embd, inp->tokens);
     cb(inpL, "inp_noise_embd", -1);
 
     res->add_input(std::move(inp));

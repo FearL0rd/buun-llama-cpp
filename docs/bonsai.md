@@ -35,6 +35,20 @@ PQ2_0 trades a larger file for simpler decoding. Benchmark both on the target
 hardware rather than assuming the smaller packing is faster. This is a dense
 model; it does not need MoE expert-cache flags.
 
+### DFlash2
+
+The Qwen3.8-27B DFlash2 Q2_K drafter has been tested with both Bonsai packings.
+Add `-md /path/to/Qwen3.8-27B-DFlash2-Q2_K.gguf --spec-dflash-default`
+to the command above. Shared embedding/output tensors retain their Hadamard
+transforms, and draft token lookups restore the original embedding basis.
+This uses the fork's optimized DFlash2 path.
+
+Speedup depends on the prompt and packing; speculation can still be slower than
+target-only decoding. See the validation report for measured examples. The
+existing DFlash auto-fit probe can warn that `ctx_other` is missing and fall back
+to the supplied placement; successful inference after that warning does not
+mean auto-fit proved the placement viable.
+
 ## Implementation and provenance
 
 The port is based on [PrismML's llama.cpp fork](https://github.com/PrismML-Eng/llama.cpp),

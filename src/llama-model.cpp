@@ -3992,11 +3992,46 @@ void llama_model_share_tensors(llama_model * dst, const llama_model * src) {
         ggml_tensor * src;
         bool share;
     };
-    const attachment attachments[] = {
+    std::vector<attachment> attachments = {
         { &dst->tok_embd,    src->tok_embd,    share_embd },
         { &dst->output,      src->output,      share_out  },
         { &dst->output_s,    src->output_s,    share_out  },
         { &dst->output_in_s, src->output_in_s, share_out  },
+    };
+
+    // Folded weights must carry their transforms into the draft graph. Treat
+    // rotations/signs like the other auxiliaries: even a host-resident weight
+    // can have a transform on a device that the drafter cannot schedule.
+    struct shared_transform {
+        ggml_tensor ** weight;
+        llama_hadamard_rotations * map;
+        llama_hadamard_transform transform;
+    };
+    std::vector<shared_transform> transforms;
+    for (const auto & a : attachments) {
+        if (!a.share || !a.src) {
+            continue;
+        }
+        for (const auto & maps : {
+                std::make_pair(&src->hadamard_rotations, &dst->hadamard_rotations),
+                std::make_pair(&src->hadamard_inverses,  &dst->hadamard_inverses) }) {
+            const auto it = maps.first->find(a.src);
+            if (it != maps.first->end()) {
+                transforms.push_back({ a.dst, maps.second, it->second });
+            }
+        }
+    }
+    // Finish growing transforms before taking pointers into its elements.
+    for (auto & t : transforms) {
+        attachments.push_back({ &t.transform.rot,   t.transform.rot,   true });
+        attachments.push_back({ &t.transform.signs, t.transform.signs, true });
+    }
+    const auto attach_transforms = [&]() {
+        for (const auto & t : transforms) {
+            // A copied weight has a new identity; the draft graph looks up that
+            // pointer, not the source model's tensor pointer.
+            t.map->insert_or_assign(*t.weight, t.transform);
+        }
     };
 
     // a target tensor can be shared by pointer only if the drafter can schedule it: host
@@ -4035,6 +4070,7 @@ void llama_model_share_tensors(llama_model * dst, const llama_model * src) {
                 *a.dst = a.src;
             }
         }
+        attach_transforms();
         return;
     }
 
@@ -4045,7 +4081,7 @@ void llama_model_share_tensors(llama_model * dst, const llama_model * src) {
         ? ggml_backend_cpu_buffer_type()
         : ggml_backend_dev_buffer_type(dst->devices[0].dev);
 
-    ggml_init_params ip = { /*.mem_size =*/ 4*ggml_tensor_overhead(), /*.mem_buffer =*/ nullptr, /*.no_alloc =*/ true };
+    ggml_init_params ip = { /*.mem_size =*/ attachments.size()*ggml_tensor_overhead(), /*.mem_buffer =*/ nullptr, /*.no_alloc =*/ true };
     ggml_context_ptr ctx_ptr { ggml_init(ip) };
     ggml_context * ctx = ctx_ptr.get();
 
@@ -4094,6 +4130,7 @@ void llama_model_share_tensors(llama_model * dst, const llama_model * src) {
             *a.dst = copy != copies.end() ? copy->second : a.src;
         }
     }
+    attach_transforms();
 
     dst->adopt_buffer(std::move(ctx_ptr), ggml_backend_buffer_ptr(buf));
 

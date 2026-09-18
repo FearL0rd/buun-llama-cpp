@@ -2854,6 +2854,22 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     return moe_out;
 }
 
+// Restore Hadamard-latent embedding rows to the primal basis after lookup.
+// Shared drafters also use this path, including their noise-token views.
+ggml_tensor * llm_graph_context::build_get_rows_embd(ggml_tensor * tok_embd, ggml_tensor * tokens) const {
+    ggml_tensor * cur = ggml_get_rows(ctx0, tok_embd, tokens);
+    if (hadamard_inverses) {
+        const auto it = hadamard_inverses->find(tok_embd);
+        if (it != hadamard_inverses->end()) {
+            cur = llama_mul_mat_hadamard(ctx0, cur, it->second.rot);
+            if (it->second.signs) {
+                cur = ggml_mul(ctx0, cur, it->second.signs);
+            }
+        }
+    }
+    return cur;
+}
+
 // input embeddings with optional lora
 ggml_tensor * llm_graph_context::build_inp_embd(ggml_tensor * tok_embd) const {
     const int64_t n_embd_inp = hparams.n_embd_inp();
@@ -2880,19 +2896,7 @@ ggml_tensor * llm_graph_context::build_inp_embd(ggml_tensor * tok_embd) const {
     {
         auto & cur = inps[0];
 
-        cur = ggml_get_rows(ctx0, tok_embd, inp->tokens);
-
-        // a Hadamard-latent embedding table stores rotated rows; restore the
-        // primal basis right after the lookup: h = s * (H z)
-        if (hadamard_inverses) {
-            const auto it = hadamard_inverses->find(tok_embd);
-            if (it != hadamard_inverses->end()) {
-                cur = llama_mul_mat_hadamard(ctx0, cur, it->second.rot);
-                if (it->second.signs) {
-                    cur = ggml_mul(ctx0, cur, it->second.signs);
-                }
-            }
-        }
+        cur = build_get_rows_embd(tok_embd, inp->tokens);
 
         // apply lora for embedding tokens if needed
         for (const auto & lora : *loras) {

@@ -289,9 +289,10 @@ Metal fallback changes have source review only; no Metal host was available.
 
 ### Qualification limits
 
-This qualifies text inference on CPU/CUDA, with hardware validation on one
+The original port qualifies text inference on CPU/CUDA, with hardware validation on one
 SM86 GPU. HIP, Metal, Vulkan, multi-GPU operation, adapters, speculative decoding,
-and vision were not qualified. The portable HIP fallback is not a claim of HIP
+and vision were not qualified in that campaign. DFlash2 follow-up results are
+below. The portable HIP fallback is not a claim of HIP
 performance parity.
 
 The `reuse-*` and `wide-*` experiments are not optimization authorities: source
@@ -301,3 +302,55 @@ The affected sources and header dependents were explicitly rebuilt, and the
 consistent snapshot is `candidate-bin`. Its tests and timings above supersede
 those earlier candidates. New transfers use content comparison without
 preserving source timestamps. The initial port and Prism references are intact.
+
+## DFlash2 shared-transform follow-up
+
+Patch base: `63d057134e794349c1a2641c0cc9eba9e8b9575d`. Tested on Dorei with
+`Qwen3.8-27B-DFlash2-Q2_K.gguf` from `/root/models/qwen38-drafters`.
+The missing pieces were transform descriptors for shared embeddings/output
+heads and inverse transforms after DFlash token lookup, not target hidden-state
+capture. Sharing now places auxiliary tensors using the existing alias/copy
+rules and keys descriptors by the destination tensor identity.
+
+Four server prompts (19, 25, 25, and 1,381 tokens), temperature zero, seed 1234,
+up to 256 generated tokens, no prompt reuse; F16 KV, context 8,192, batch/ubatch
+512, eight CPU threads, full GPU offload, `--spec-dflash-default`, draft maximum
+15. The optimized fork DFlash2 selector was confirmed in the logs.
+
+| Packing | Accepted/generated before | Accepted/generated fixed | Coding TG before/fixed | Explanation TG before/fixed |
+| --- | ---: | ---: | ---: | ---: |
+| PTQ1_0 | 0/1,261 | 376/1,066 | 24.23 / 67.78 | 23.99 / 49.54 |
+| PQ2_0 | 0/1,261 | 379/1,065 | 43.91 / 115.32 | 43.65 / 87.32 |
+
+Rates are tokens/second. These are short serial smoke comparisons, not a broad
+performance benchmark or speedups against target-only decoding. In particular,
+target-only PTQ ran the explanation at about 62 tok/s, faster than DFlash2.
+All fixed responses were coherent; sampled PQ decoding at temperature 1 also
+produced coherent responses with nonzero acceptance.
+
+Regression controls using the preserved `simplify-bin` baseline:
+
+- Target-only PTQ: all four output texts/token arrays identical; coding TG
+  62.50 -> 62.09, explanation TG 62.16 -> 61.89, long-prompt PP
+  965.97 -> 960.97 tok/s.
+- Ordinary Qwen3.8-27B IQ3_XXS + the same DFlash2 drafter: all four output
+  texts/token arrays and acceptance counts identical; coding TG
+  121.07 -> 120.66, explanation TG 78.45 -> 78.27, long-prompt PP
+  1010.78 -> 1010.01 tok/s. These single samples do not prove zero overhead.
+- `test-draft-shared-tensors` passes CPU/GPU alias/copy and allocation-free
+  sharing contracts, tied/independent heads, transform deduplication and metadata,
+  and numerical inverse-embedding/forward-head checks including a token view.
+- `test-llama-archs -a llama -s 1234` passes the Bonsai loader contracts and
+  CPU/CUDA/Meta graph checks (Meta roundtrip is skipped).
+
+Explicit full auto-fit reports `dflash requires ctx_other to be set`, fails its
+draft context measurement, and restores pre-fit parameters on **both** baseline
+and candidate. Inference then succeeds with the supplied placement. This is a
+separate pre-existing limitation, not a passed auto-fit test; the lower-level
+allocation-free sharing tests do pass.
+
+Artifacts under the Dorei root above: `bonsai-dflash-repro.py`,
+`dflash-{ptq,pq}-{repro,fixed}`, `dflash-plain-ptq-{simplify-bin,build/bin}`,
+`dflash-qwen-regression-{simplify-bin,build/bin}`, `dflash-pq-fit-{sampled,debug,baseline}`,
+`dflash-fix-shared-tests.log`, and `dflash-fix-arch-tests.log`. Each server run
+records its exact command, log, and responses. Candidate binary: `build/bin`.
