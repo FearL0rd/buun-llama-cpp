@@ -98,7 +98,7 @@ fills. Models without a baked price order use a generic cross-model order.
 ## Native .safetensors support + EXL3
 
 Load supported `.safetensors` model directories directly, including EXL3 quants—no GGUF conversion
-required. See the [safetensors format support matrix](docs/development/native-safetensors-architecture-plan.md#6-broad-quantization-coverage)
+required. See the [safetensors guide](docs/safetensors.md#supported-quantization-formats)
 for supported quantization types and limitations. Support depends on the model architecture and backend.
 
 ## TCQ (trellis-coded KV cache)
