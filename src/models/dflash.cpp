@@ -77,7 +77,7 @@ private:
 
 // DFlash2 predicts every block position in parallel. The selector does the same
 // for its expensive work: it materializes the complete [successor, predecessor]
-// score lattice for every draft position before walking the seven selected edges.
+// score lattice for every draft position before walking the selected edges.
 // Only that tiny index walk is sequential, matching the reference implementation.
 // Row zero of each returned block is a dummy (the consumer skips the anchor row).
 static bool llm_build_dflash2_selector(
@@ -106,7 +106,7 @@ static bool llm_build_dflash2_selector(
     GGML_ASSERT(top_k >= 1 && top_k <= 64);
 
     // Row zero is the committed anchor. The trained selector consumes decoder
-    // rows 1..block_size-1 and predicts the seven draft tokens in parallel.
+    // rows 1..block_size-1 and predicts those draft tokens in parallel.
     ggml_tensor * hidden_steps = ggml_view_3d(g.ctx0, hidden,
             hidden->ne[0], n_steps, n_blocks,
             hidden->nb[1], (size_t) block_size * hidden->nb[1], hidden->nb[1]);
@@ -706,6 +706,8 @@ static ggml_tensor * build_dflash2_grouped_conv(
     const int64_t n_groups   = n_embd / group_size;
     const int64_t taps       = hp.dflash2_conv_kernel_size;
     const int64_t n_tokens   = hidden->ne[1];
+    const int64_t block_size = g.cparams.dflash_block_size > 0
+        ? g.cparams.dflash_block_size : hp.dflash_block_size;
 
     GGML_ASSERT(side == 0 || side == 1);
     GGML_ASSERT(taps == 2);
@@ -721,8 +723,7 @@ static ggml_tensor * build_dflash2_grouped_conv(
             projected = ggml_cont(g.ctx0, projected);
         }
         return ggml_dflash2_conv(g.ctx0, hidden, projected, base,
-                side, group_size, g.cparams.dflash_block_size > 0
-                    ? g.cparams.dflash_block_size : g.hparams.dflash_block_size);
+                side, group_size, block_size);
     }
 
     ggml_tensor * blocks = ggml_reshape_3d(g.ctx0, hidden, group_size, n_groups, n_tokens);
@@ -746,8 +747,6 @@ static ggml_tensor * build_dflash2_grouped_conv(
     // Shift once, then mask every block anchor. This keeps graph size constant
     // when reservation covers a large ubatch (the prototype emitted one concat
     // chain per reserved block and could exhaust the graph-node budget).
-    const int64_t block_size = g.cparams.dflash_block_size > 0
-        ? g.cparams.dflash_block_size : hp.dflash_block_size;
     GGML_ASSERT(block_size > 1);
     ggml_tensor * first = ggml_view_3d(g.ctx0, blocks, group_size, n_groups, 1,
             blocks->nb[1], blocks->nb[2], 0);

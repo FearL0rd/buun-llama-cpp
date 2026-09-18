@@ -1749,7 +1749,8 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
     int32_t dflash2_adaptive_depth(llama_seq_id seq_id, int32_t n_max, llama_pos position) {
         auto & st = adpt[seq_id];
-        // Prototype: reuse single-slot shape costs only within a context band.
+        // Reuse single-slot shape costs only within a context-depth band;
+        // acceptance and depth decisions remain request-local.
         int64_t bucket = 2048;
         while (bucket < position) { bucket *= 2; }
         if (dflash2_timing_bucket[seq_id] != bucket) {

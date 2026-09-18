@@ -157,6 +157,10 @@ static bool check_pair(ggml_backend_t backend, int n0, int n1, int m, bool share
     return ok;
 }
 
+#ifdef EXL3_TEST_CUDA
+bool test_cuda_exl3_sm86_image();
+#endif
+
 int main() {
     auto * reg = ggml_backend_cuda_reg();
     if (ggml_backend_reg_dev_count(reg) == 0) return 77;
@@ -170,7 +174,7 @@ int main() {
 #ifdef EXL3_TEST_CUDA
     cudaDeviceProp props{};
     GGML_ASSERT(cudaGetDeviceProperties(&props, 0) == cudaSuccess);
-    sm86 = props.major == 8 && props.minor == 6;
+    sm86 = props.major == 8 && props.minor == 6 && test_cuda_exl3_sm86_image();
 #endif
     bool ok = true;
     for (int bits = 1; bits <= 8; ++bits) {

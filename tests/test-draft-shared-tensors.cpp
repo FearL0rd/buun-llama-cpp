@@ -58,7 +58,8 @@ static void check(ggml_backend_buffer_type_t buft, bool own_device, bool no_allo
         }
     }
     GGML_ASSERT((draft.output == draft.tok_embd) == tied);
-    // Repeated setup must not replace a materialized head or its auxiliaries.
+    // A materialized head or fully borrowed same-device bundle is stable on
+    // repeat setup. Auxiliary-only copies are not covered by this assertion.
     if (draft.output != target.output || own_device) {
         llama_model_share_tensors(&draft, &target);
         GGML_ASSERT(draft.output == dests[1] && draft.output_s == dests[2] && draft.output_in_s == dests[3]);

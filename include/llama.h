@@ -1339,8 +1339,9 @@ extern "C" {
 
     // DFlash: set top-K for drafter (1 = argmax, >1 = top-K candidates per position)
     LLAMA_API void llama_set_dflash_topk(struct llama_context * ctx, int k);
-    // Runtime DFlash2 proposal width; zero restores the model default. Does not
-    // change the model or reserved maximum capacity. Call between decodes.
+    // Runtime DFlash2 proposal width: [3, configured model block size], or zero
+    // to restore the model default. Does not change the model or reserved
+    // maximum capacity. Call between decodes.
     LLAMA_API void llama_set_dflash_block_size(struct llama_context * ctx, int n);
 
     // Upstream block-diffusion drafter (arch "dflash"): build the in-graph top-K/argmax

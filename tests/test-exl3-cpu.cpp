@@ -272,13 +272,18 @@ static bool run(ggml_backend_t backend, int bits, int cb, bool grouped, int toke
     return ok;
 }
 
+#ifdef EXL3_TEST_CUDA
+bool test_cuda_exl3_sm86_image();
+#endif
+
 int main(int argc, char ** argv) {
     const bool head = argc == 2 && std::strcmp(argv[1], "--gpu-head") == 0;
     gpu_executor = head || (argc == 2 && std::strcmp(argv[1], "--gpu") == 0);
     if (head) {
 #ifdef EXL3_TEST_CUDA
         cudaDeviceProp props{};
-        if (cudaGetDeviceProperties(&props, 0) != cudaSuccess || props.major != 8 || props.minor != 6) return 77;
+        if (cudaGetDeviceProperties(&props, 0) != cudaSuccess || props.major != 8 || props.minor != 6 ||
+            !test_cuda_exl3_sm86_image()) return 77;
 #else
         return 77;
 #endif

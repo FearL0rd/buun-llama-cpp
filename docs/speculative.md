@@ -185,6 +185,12 @@ server slot, and batches armed slots into one drafter decode. The legacy
 supported; the sidecar itself falls back to layer placement and can be pinned
 with `--spec-draft-device`. Adaptive depth is enabled by default; set
 `GGML_DFLASH_DRAFT_ADAPTIVE=0` to hold every cycle at the configured maximum.
+The adaptive controller measures intermediate verification depths, including
+seven and two proposals when the configured limits permit them. With one slot,
+it also shrinks the drafter's proposal block to match; multi-slot drafting keeps
+the shared block geometry while adapting each slot's verification depth. Timing
+calibration can be reused within a context-depth band, but acceptance history
+and depth decisions reset with each request.
 By default, DFlash2 matches the server's resolved main sampling temperature
 (the target GGUF default, or an explicit `--temp`). Use `--spec-draft-temp T`
 to override it; an explicit value of `0` keeps greedy draft proposals. Legacy
