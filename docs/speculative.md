@@ -180,10 +180,11 @@ This native sidecar support currently covers the Qwen NeoX-RoPE backbone; it
 does not imply support for Gemma DFlash or arbitrary draft architectures.
 
 The server detects DFlash2 from the sidecar, so `-md` does not require an
-explicit `--spec-type`. Unless `--spec-draft-n-max` is supplied, it also selects
-the sidecar's fastest measured full draft depth. The released Qwen3.8 sidecar
+explicit `--spec-type`. Unless `--spec-draft-n-max` is supplied, it permits
+adaptive depth up to the configured block size minus one. The released Qwen3.8 sidecar
 advertises an eight-position block; the runtime defaults that geometry to the
-faster measured `anchor + 12` block. `--spec-dflash-default` remains a compatible
+`anchor + 12` block tuned on GGUF drafters. The fastest width depends on the
+drafter quantization, workload, and hardware. `--spec-dflash-default` remains a compatible
 spelling. Set
 `GGML_DFLASH2_BLOCK_SIZE_OVERRIDE=8` to restore the checkpoint metadata, or use
 another value from 3 through 64 for experimentation:
