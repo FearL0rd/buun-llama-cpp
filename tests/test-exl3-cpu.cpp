@@ -334,7 +334,7 @@ int main(int argc, char ** argv) {
         // Dense tiled prefill: admission boundary, partial token tiles, and
         // the short/long tile crossover. Compare to the independent scalar
         // oracle and require identical repeated execution, as above.
-        for (int tokens : {16, 17, 18, 31, 32, 33, 63, 64, 65, 127, 128, 129, 255, 256, 257}) {
+        for (int tokens : {9, 13, 16, 17, 18, 31, 32, 33, 63, 64, 65, 127, 128, 129, 255, 256, 257}) {
             ok &= run(backend, 4, 2, false, tokens, 1);
         }
         ok &= run(backend, 4, 2, false, 129, 1, false, 5120, 640);

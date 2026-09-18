@@ -170,11 +170,12 @@ int main() {
         ggml_backend_free(backend);
         return 77;
     }
-    bool sm86 = false;
+    bool sm86 = false, sm75 = false;
 #ifdef EXL3_TEST_CUDA
     cudaDeviceProp props{};
     GGML_ASSERT(cudaGetDeviceProperties(&props, 0) == cudaSuccess);
     sm86 = props.major == 8 && props.minor == 6 && test_cuda_exl3_sm86_image();
+    sm75 = props.major == 7 && props.minor == 5;
 #endif
     bool ok = true;
     for (int bits = 1; bits <= 8; ++bits) {
@@ -191,7 +192,7 @@ int main() {
         ok &= check_pair(backend, 17408, 17408, m, true);
         ok &= check_pair(backend, 12288, 6144, m, false);
     }
-    if (sm86) ok &= check_batch(backend, 4, 5120, 17408, false, 8, true);
+    if (sm86 || sm75) ok &= check_batch(backend, 4, 5120, 17408, false, 8, true);
     // Thirteen live rows within a sixteen-row tile: the down projection's
     // shared partials must omit padding without changing any reduction order.
     if (sm86) {

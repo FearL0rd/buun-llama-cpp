@@ -339,6 +339,10 @@ __global__ void __launch_bounds__(THREADS) gemv_int8_kernel(const uint8_t * __re
     // Measured dense mul1 crossover: retain vector dots for one/two rows.
     // Other row counts/precisions and grouped MoE retain their existing executor.
     constexpr bool WMMA = INT8 && !GROUPED && bits >= 2 && bits <= 4 && (M == 3 || M == 4 || M == 8);
+#elif !defined(GGML_USE_HIP) && __CUDA_ARCH__ == 750
+    // Turing uses four smaller integer MMAs. Keep vector dots for the
+    // unmeasured formats/rows and for small plain-int8 verification batches.
+    constexpr bool WMMA = INT8 && !GROUPED && bits == 4 && (M == 8 || (RESID && M == 4));
 #elif !defined(GGML_USE_HIP) && __CUDA_ARCH__ == 860
     // SM86: matrix cores help dense verify batches; plain K4 M3 favors vector dots.
     // K6 residual batches cover the vocabulary head without dropping its correction.
@@ -518,7 +522,7 @@ __global__ void __launch_bounds__(THREADS) gemv_int8_kernel(const uint8_t * __re
         using i2 = int __attribute__((ext_vector_type(2)));
         using i8 = int __attribute__((ext_vector_type(8)));
         i8 acc[2] = {};
-#elif !defined(GGML_USE_HIP) && __CUDA_ARCH__ == 860
+#elif !defined(GGML_USE_HIP) && (__CUDA_ARCH__ == 860 || __CUDA_ARCH__ == 750)
         constexpr int PLANES = (NACC + 7) / 8;
         int acc[2][PLANES][4] = {};
 #endif
@@ -609,7 +613,7 @@ __global__ void __launch_bounds__(THREADS) gemv_int8_kernel(const uint8_t * __re
                         acc[tile] = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12(false, a, true, b, acc[tile], false);
                     }
                 }
-#elif !defined(GGML_USE_HIP) && __CUDA_ARCH__ == 860
+#elif !defined(GGML_USE_HIP) && (__CUDA_ARCH__ == 860 || __CUDA_ARCH__ == 750)
                 uint32_t current[2];
                 uint32_t current_hi[2] = {};
                 uint32_t operands[2][PLANES][2];
@@ -691,9 +695,22 @@ __global__ void __launch_bounds__(THREADS) gemv_int8_kernel(const uint8_t * __re
                             const uint32_t b0 = M <= 8 ? operands[j0 / 8][plane][0] : (p < NACC ? load_splat(p, kb * 16 + j) : 0);
                             const uint32_t b1 = M <= 8 ? operands[j0 / 8][plane][1] : (p < NACC ? load_splat(p, kb * 16 + j + 4) : 0);
                             int * d = acc[tile][plane];
+#if __CUDA_ARCH__ == 750
+                            // Same integer dot and accumulator layout as m16n8k32;
+                            // Turing's native instruction covers eight rows / K16.
+                            asm("mma.sync.aligned.m8n8k16.row.col.s32.u8.s8.s32 {%0,%1}, {%2}, {%3}, {%0,%1};"
+                                : "+r"(d[0]), "+r"(d[1]) : "r"(a[0]), "r"(b0));
+                            asm("mma.sync.aligned.m8n8k16.row.col.s32.u8.s8.s32 {%0,%1}, {%2}, {%3}, {%0,%1};"
+                                : "+r"(d[2]), "+r"(d[3]) : "r"(a[1]), "r"(b0));
+                            asm("mma.sync.aligned.m8n8k16.row.col.s32.u8.s8.s32 {%0,%1}, {%2}, {%3}, {%0,%1};"
+                                : "+r"(d[0]), "+r"(d[1]) : "r"(a[2]), "r"(b1));
+                            asm("mma.sync.aligned.m8n8k16.row.col.s32.u8.s8.s32 {%0,%1}, {%2}, {%3}, {%0,%1};"
+                                : "+r"(d[2]), "+r"(d[3]) : "r"(a[3]), "r"(b1));
+#else
                             asm("mma.sync.aligned.m16n8k32.row.col.s32.u8.s8.s32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
                                 : "+r"(d[0]), "+r"(d[1]), "+r"(d[2]), "+r"(d[3])
                                 : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+#endif
                         }
                     }
                 }
@@ -723,7 +740,7 @@ __global__ void __launch_bounds__(THREADS) gemv_int8_kernel(const uint8_t * __re
                 }
             }
         }
-#elif !defined(GGML_USE_HIP) && __CUDA_ARCH__ == 860
+#elif !defined(GGML_USE_HIP) && (__CUDA_ARCH__ == 860 || __CUDA_ARCH__ == 750)
 #pragma unroll
         for (int tile = 0; tile < 2; ++tile) {
 #pragma unroll
