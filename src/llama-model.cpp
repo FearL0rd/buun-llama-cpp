@@ -29,6 +29,8 @@
 #include "ggml-cpp.h"
 
 #include <algorithm>
+#include <cctype>
+#include <cstdio>
 #include <cassert>
 #include <cfloat>
 #include <cinttypes>
@@ -1437,6 +1439,152 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
         gguf_kv.emplace(name, value);
     }
 
+    uint32_t hadamard_version = 0;
+    if (ml.get_key("prism.hadamard.version", hadamard_version, false)) {
+        if (hadamard_version != 1) {
+            throw std::runtime_error(format("unsupported prism.hadamard.version: %u", hadamard_version));
+        }
+
+        uint32_t block_size = 0;
+        std::string transform;
+        std::string axis;
+        std::string sign_mode;
+        std::vector<std::string> weight_names;
+
+        ml.get_key("prism.hadamard.block_size", block_size);
+        ml.get_key("prism.hadamard.transform", transform);
+        ml.get_key("prism.hadamard.axis", axis);
+        ml.get_key("prism.hadamard.sign_mode", sign_mode);
+        ml.get_arr("prism.hadamard.weight_names", weight_names);
+
+        if (block_size == 0 || (block_size & (block_size - 1)) != 0) {
+            throw std::runtime_error(format("invalid prism.hadamard.block_size: %u", block_size));
+        }
+        if (transform != "normalized-sylvester-walsh-hadamard") {
+            throw std::runtime_error(format("unsupported prism.hadamard.transform: %s", transform.c_str()));
+        }
+        if (axis != "input-last-dimension") {
+            throw std::runtime_error(format("unsupported prism.hadamard.axis: %s", axis.c_str()));
+        }
+        if (sign_mode != "identity" && sign_mode != "explicit") {
+            throw std::runtime_error(format("unsupported prism.hadamard.sign_mode: %s", sign_mode.c_str()));
+        }
+        if (weight_names.empty()) {
+            throw std::runtime_error("prism.hadamard.weight_names is empty");
+        }
+
+        if (sign_mode == "explicit") {
+            std::vector<int32_t> sign_widths;
+            std::vector<int32_t> sign_values;
+            ml.get_arr("prism.hadamard.sign_widths", sign_widths);
+            ml.get_arr("prism.hadamard.sign_values", sign_values);
+            // explicit mode with no widths would leave the sign table empty, which reads
+            // as identity later and silently changes the model function
+            if (sign_widths.empty()) {
+                throw std::runtime_error("prism.hadamard.sign_mode is explicit but sign_widths is empty");
+            }
+            size_t off = 0;
+            for (const int32_t width : sign_widths) {
+                if (width <= 0 || (uint32_t) width % block_size != 0 || off + width > sign_values.size()) {
+                    throw std::runtime_error(format("invalid prism.hadamard sign width: %d", width));
+                }
+                auto inserted = hadamard_sign_data.emplace(width, std::vector<int32_t>{});
+                if (!inserted.second) {
+                    throw std::runtime_error(format("duplicate prism.hadamard sign width: %d", width));
+                }
+                auto & vec = inserted.first->second;
+                vec.assign(sign_values.begin() + off, sign_values.begin() + off + width);
+                for (const int32_t v : vec) {
+                    if (v != 1 && v != -1) {
+                        throw std::runtime_error("prism.hadamard sign values must be +/-1");
+                    }
+                }
+                off += width;
+            }
+            if (off != sign_values.size()) {
+                throw std::runtime_error("prism.hadamard.sign_values length mismatch");
+            }
+        }
+
+        ml.get_key("prism.hadamard.gdn_v_grouped", hadamard_gdn_v_grouped, false);
+
+        // the activation-side transform is applied only by build_lora_mm/build_lora_mm_id;
+        // refuse to load folded weights for architectures or tensor kinds that are not
+        // verified to route every matmul through those helpers, rather than run wrong math
+        switch (arch) {
+            case LLM_ARCH_LLAMA:
+            case LLM_ARCH_QWEN3:
+            case LLM_ARCH_QWEN3MOE:
+            case LLM_ARCH_QWEN35:
+            case LLM_ARCH_QWEN35MOE:
+            case LLM_ARCH_QWEN3NEXT:
+                break;
+            default:
+                throw std::runtime_error(format(
+                    "prism.hadamard: arch '%s' is not verified to apply the activation transform to all folded weights",
+                    llm_arch_name(arch)));
+        }
+
+        const auto is_foldable_weight = [](const std::string & name) {
+            static const char * kinds[] = {
+                "attn_q", "attn_k", "attn_v", "attn_qkv", "attn_gate", "attn_output",
+                "ffn_gate", "ffn_up", "ffn_down",
+                "ffn_gate_exps", "ffn_up_exps", "ffn_down_exps", "ffn_gate_up_exps",
+                "ffn_gate_shexp", "ffn_up_shexp", "ffn_down_shexp",
+                "ssm_out",
+            };
+            if (name == "output.weight") {
+                return true; // the output head is built through build_lora_mm in every arch
+            }
+            if (name.compare(0, 4, "blk.") != 0) {
+                return false;
+            }
+            size_t pos = 4;
+            while (pos < name.size() && isdigit((unsigned char) name[pos])) {
+                pos++;
+            }
+            if (pos == 4 || pos >= name.size() || name[pos] != '.') {
+                return false;
+            }
+            pos++;
+            for (const char * kind : kinds) {
+                const std::string suffix = std::string(kind) + ".weight";
+                if (name.compare(pos, std::string::npos, suffix) == 0) {
+                    return true;
+                }
+            }
+            return false;
+        };
+
+        for (const auto & weight_name : weight_names) {
+            if (!is_foldable_weight(weight_name)) {
+                throw std::runtime_error(format(
+                    "prism.hadamard: weight '%s' is not on a verified Hadamard-aware matmul path", weight_name.c_str()));
+            }
+            if (!hadamard_weight_blocks.emplace(weight_name, block_size).second) {
+                throw std::runtime_error(format("duplicate prism.hadamard weight: %s", weight_name.c_str()));
+            }
+        }
+
+        // tensors consumed by row lookup store latent rows and need the
+        // inverse transform applied to the lookup result instead
+        std::vector<std::string> inverse_names;
+        if (gguf_find_key(ctx, "prism.hadamard.inverse_weight_names") >= 0) {
+            ml.get_arr("prism.hadamard.inverse_weight_names", inverse_names);
+        }
+        for (const auto & name : inverse_names) {
+            // the graph applies the inverse only to the token-embedding lookup; any
+            // other latent table would load and silently stay rotated
+            if (name != "token_embd.weight") {
+                throw std::runtime_error(format(
+                    "prism.hadamard: weight '%s' is not a verified inverse-after-lookup table", name.c_str()));
+            }
+            if (hadamard_weight_blocks.count(name) || !hadamard_inverse_blocks.emplace(name, block_size).second) {
+                throw std::runtime_error(format("duplicate prism.hadamard inverse weight: %s", name.c_str()));
+            }
+        }
+    }
+
     // get general kv
     ml.get_key(LLM_KV_GENERAL_NAME, name, false);
 
@@ -2291,31 +2439,164 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         }
     }
 
-    if (ml.no_alloc) {
-        return true;
-    }
+    if (!ml.no_alloc) {
+        // GGUF non-host uploads need temporary staging. Load those contexts before
+        // host weights; native sources keep their own load/binding order.
+        if (!ml.use_mmap && !ml.files.empty() && !ml.tensor_source) {
+            std::stable_partition(ctx_buf_maps.begin(), ctx_buf_maps.end(), [](const auto & ctx_buf_map) {
+                const auto & buf_map = ctx_buf_map.second;
+                return !buf_map.empty() && !ggml_backend_buffer_is_host(buf_map.begin()->second);
+            });
+        }
 
-    // GGUF non-host uploads need temporary staging. Load those contexts before
-    // host weights; native sources keep their own load/binding order.
-    if (!ml.use_mmap && !ml.files.empty() && !ml.tensor_source) {
-        std::stable_partition(ctx_buf_maps.begin(), ctx_buf_maps.end(), [](const auto & ctx_buf_map) {
-            const auto & buf_map = ctx_buf_map.second;
-            return !buf_map.empty() && !ggml_backend_buffer_is_host(buf_map.begin()->second);
-        });
-    }
+        for (auto & [ctx, buf_map] : ctx_buf_maps) {
+            if (!ml.load_all_data(ctx, buf_map, use_mlock ? &pimpl->mlock_mmaps : NULL, params.progress_callback, params.progress_callback_user_data)) {
+                return false;
+            }
+        }
+        ml.validate_source_complete();
 
-    // load tensor data
-    for (auto & [ctx, buf_map] : ctx_buf_maps) {
-        if (!ml.load_all_data(ctx, buf_map, use_mlock ? &pimpl->mlock_mmaps : NULL, params.progress_callback, params.progress_callback_user_data)) {
-            return false;
+        if (use_mmap_buffer) {
+            for (auto & mapping : ml.mappings) {
+                pimpl->mappings.emplace_back(std::move(mapping));
+            }
         }
     }
-    ml.validate_source_complete();
 
-    if (use_mmap_buffer) {
-        for (auto & mapping : ml.mappings) {
-            pimpl->mappings.emplace_back(std::move(mapping));
+    // Mapped weights acquire their tensor buffers during load_all_data above.
+    // Dry loads already have dummy buffers and must also build the transforms.
+    if (!hadamard_weight_blocks.empty() || !hadamard_inverse_blocks.empty()) {
+        struct hadamard_rotation {
+            uint32_t block_size;
+            ggml_backend_buffer_type_t buft;
+            ggml_tensor * tensor;
+        };
+
+        std::vector<hadamard_rotation> rotations;
+        std::map<std::pair<uint32_t, ggml_backend_buffer_type_t>, ggml_tensor *> sign_tensors;
+
+        const std::pair<const std::unordered_map<std::string, uint32_t> *, llama_hadamard_rotations *> groups[] = {
+            { &hadamard_weight_blocks,  &hadamard_rotations },
+            { &hadamard_inverse_blocks, &hadamard_inverses  },
+        };
+        // Put the lookup-side transform with its consumer, the first layer,
+        // rather than with a CPU-mapped embedding table or an arbitrary weight.
+        const auto inverse_buft = ggml_backend_dev_buffer_type(dev_layer(0));
+
+        // Fit probes need the same descriptors and graph as real loads, but
+        // must not allocate or upload their data. Retain the contexts in both
+        // cases so memory_breakdown() includes these permanent weights.
+        const auto new_transform = [&](ggml_backend_buffer_type_t buft, uint32_t width, uint32_t rows,
+                                       const std::string & name) {
+            ggml_context_ptr ctx { ggml_init({ ggml_tensor_overhead(), nullptr, true }) };
+            if (!ctx) {
+                throw std::runtime_error("failed to create Hadamard context");
+            }
+            auto * tensor = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, width, rows);
+            ggml_set_name(tensor, name.c_str());
+            ggml_backend_buffer_ptr buffer { ml.no_alloc
+                ? ggml_backend_buft_alloc_buffer(buft, 0)
+                : ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), buft) };
+            if (!buffer) {
+                throw std::runtime_error(format("unable to allocate %s Hadamard buffer", ggml_backend_buft_name(buft)));
+            }
+            if (ml.no_alloc) {
+                tensor->buffer = buffer.get();
+            }
+            ggml_backend_buffer_set_usage(buffer.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+            std::vector<ggml_backend_buffer_ptr> buffers;
+            buffers.emplace_back(std::move(buffer));
+            pimpl->ctxs_bufs.emplace_back(std::move(ctx), std::move(buffers));
+            return tensor;
+        };
+
+        for (const auto & [blocks, target] : groups)
+        for (const auto & entry : *blocks) {
+            const std::string & weight_name = entry.first;
+            const uint32_t block_size = entry.second;
+            const ggml_tensor * weight = get_tensor(weight_name.c_str());
+            if (weight == nullptr) {
+                throw std::runtime_error(format("prism.hadamard weight not found: %s", weight_name.c_str()));
+            }
+            if (weight->ne[0] % block_size != 0) {
+                throw std::runtime_error(format(
+                    "prism.hadamard block size %u does not divide input dimension %lld for %s",
+                    block_size, (long long) weight->ne[0], weight_name.c_str()));
+            }
+            if (weight->buffer == nullptr) {
+                throw std::runtime_error(format("prism.hadamard weight has no buffer: %s", weight_name.c_str()));
+            }
+
+            ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(weight->buffer);
+            if (target == &hadamard_inverses) {
+                buft = inverse_buft;
+            }
+            auto it = std::find_if(rotations.begin(), rotations.end(),
+                    [block_size, buft](const hadamard_rotation & rotation) {
+                        return rotation.block_size == block_size && rotation.buft == buft;
+                    });
+
+            if (it == rotations.end()) {
+                ggml_tensor * rotation = new_transform(buft, block_size, block_size,
+                        format("prism.hadamard.%u", block_size));
+                if (!ml.no_alloc) {
+                    std::vector<float> data((size_t) block_size * block_size);
+                    const float scale = 1.0f / sqrtf((float) block_size);
+                    for (uint32_t row = 0; row < block_size; ++row) {
+                        for (uint32_t col = 0; col < block_size; ++col) {
+                            uint32_t parity = row & col;
+                            parity ^= parity >> 16;
+                            parity ^= parity >> 8;
+                            parity ^= parity >> 4;
+                            parity ^= parity >> 2;
+                            parity ^= parity >> 1;
+                            data[(size_t) row * block_size + col] = (parity & 1) ? -scale : scale;
+                        }
+                    }
+                    ggml_backend_tensor_set(rotation, data.data(), 0, data.size() * sizeof(float));
+                }
+                rotations.push_back({ block_size, buft, rotation });
+                it = std::prev(rotations.end());
+            }
+
+            ggml_tensor * sign_tensor = nullptr;
+            if (!hadamard_sign_data.empty()) {
+                const uint32_t width = (uint32_t) weight->ne[0];
+                const auto sd = hadamard_sign_data.find(width);
+                if (sd == hadamard_sign_data.end()) {
+                    throw std::runtime_error(format(
+                        "prism.hadamard has no sign vector for width %u (%s)", width, weight_name.c_str()));
+                }
+                const auto key = std::make_pair(width, buft);
+                auto st = sign_tensors.find(key);
+                if (st == sign_tensors.end()) {
+                    ggml_tensor * signs = new_transform(buft, width, 1, format("prism.hadamard.signs.%u", width));
+                    if (!ml.no_alloc) {
+                        const std::vector<float> data(sd->second.begin(), sd->second.end());
+                        ggml_backend_tensor_set(signs, data.data(), 0, data.size() * sizeof(float));
+                    }
+                    st = sign_tensors.emplace(key, signs).first;
+                }
+                sign_tensor = st->second;
+            }
+
+            llama_hadamard_transform transform { it->tensor, sign_tensor };
+            if (hadamard_gdn_v_grouped && weight_name.find(".ssm_out.") != std::string::npos) {
+                const int64_t n_v = hparams.ssm_dt_rank;
+                const int64_t n_k = hparams.ssm_n_group;
+                if (n_k <= 0 || n_v <= 0 || n_v % n_k != 0 || weight->ne[0] % n_v != 0) {
+                    throw std::runtime_error(format("prism.hadamard: bad GDN head geometry for %s", weight_name.c_str()));
+                }
+                transform.perm_hd  = weight->ne[0] / n_v;
+                transform.perm_nk  = n_k;
+                transform.perm_rep = n_v / n_k;
+            }
+            target->emplace(weight, transform);
         }
+
+        LLAMA_LOG_INFO("%s: loaded %zu Hadamard-folded weight(s) (%zu inverse-lookup) using %zu rotation(s) and %zu sign vector(s)\n",
+                __func__, hadamard_rotations.size() + hadamard_inverses.size(), hadamard_inverses.size(),
+                rotations.size(), sign_tensors.size());
     }
 
     return true;

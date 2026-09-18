@@ -405,6 +405,12 @@ machine will rely on reclaim/reload or swap and can slow down sharply. More slot
 other resident models require additional headroom. Context length, KV type, host memory bandwidth,
 CPU threads, and expert-cache hit rate all affect the final speed.
 
+## Bonsai 2 ternary models
+
+CPU/CUDA inference supports Prism's Bonsai 2 `PQ2_0` and `PTQ1_0` GGUFs,
+including their Hadamard-folded weights. See [Bonsai 2](docs/bonsai.md) for
+format details, launch flags, and backend limitations.
+
 ## Build
 
 ### NVIDIA (CUDA)
