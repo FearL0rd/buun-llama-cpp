@@ -6642,6 +6642,84 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         }
     }
 
+    // Single-consumer Bonsai transforms can write MMVQ's Q8 activation layout
+    // directly. The subgraph check deliberately leaves shared Q/K/V rotations
+    // on the ordinary path instead of recomputing them for every projection.
+    if (ggml_can_fuse_subgraph(cgraph, i,
+            { GGML_OP_MUL, GGML_OP_RESHAPE, GGML_OP_MUL_MAT, GGML_OP_RESHAPE, GGML_OP_MUL_MAT }, { i + 4 })) {
+        const ggml_tensor * mul = node;
+        const ggml_tensor * reshape = cgraph->nodes[i + 1];
+        const ggml_tensor * rot = cgraph->nodes[i + 2];
+        const ggml_tensor * restored = cgraph->nodes[i + 3];
+        ggml_tensor * mm = cgraph->nodes[i + 4];
+        const ggml_tensor * x = mul->src[0];
+        const ggml_tensor * signs = mul->src[1];
+        const ggml_tensor * w = mm->src[0];
+        const int output = i + 4;
+        const int cc = ggml_cuda_info().devices[cuda_ctx->device].cc;
+        if (ggml_get_op_params_i32(rot, 1) == GGML_HINT_SRC0_IS_HADAMARD &&
+            rot->ne[0] == 1024 && rot->src[1] == reshape && reshape->src[0] == mul &&
+            restored->src[0] == rot && mm->src[1] == restored &&
+            (w->type == GGML_TYPE_PTQ1_0 || w->type == GGML_TYPE_Q2_0_G128) &&
+            x->type == GGML_TYPE_F32 && signs->type == GGML_TYPE_F32 && mm->type == GGML_TYPE_F32 &&
+            x->ne[0] % 1024 == 0 && ggml_are_same_shape(x, restored) &&
+            signs->ne[0] == x->ne[0] && ggml_nelements(signs) == x->ne[0] &&
+            ggml_is_contiguous(x) && ggml_is_contiguous(signs) && ggml_is_contiguous(w) &&
+            ggml_is_contiguous(restored) && ggml_is_contiguous(mm) &&
+            ggml_backend_buft_is_cuda(w->buffer->buft) &&
+            ggml_cuda_should_use_mmvq(w->type, cc, x->ne[1]) &&
+            ggml_get_op_params_i32(mm, 1) != GGML_HINT_FORCE_MMQ &&
+            !w->view_src &&
+            ggml_cuda_check_fusion_memory_ranges(cgraph, i, 5, &output, 1)) {
+            ggml_cuda_mul_mat_vec_q_fwht(*cuda_ctx, x, signs, mm);
+            return 4;
+        }
+    }
+
+    // Inverse embedding rotation: gather, FWHT, then signs, without an
+    // intermediate dequantized embedding or transform buffer.
+    if (ggml_can_fuse_subgraph(cgraph, i,
+            { GGML_OP_GET_ROWS, GGML_OP_RESHAPE, GGML_OP_MUL_MAT, GGML_OP_RESHAPE, GGML_OP_MUL }, { i + 4 })) {
+        const ggml_tensor * reshape = cgraph->nodes[i + 1];
+        const ggml_tensor * rot = cgraph->nodes[i + 2];
+        const ggml_tensor * restored = cgraph->nodes[i + 3];
+        ggml_tensor * out = cgraph->nodes[i + 4];
+        const int output = i + 4;
+        if (ggml_get_op_params_i32(rot, 1) == GGML_HINT_SRC0_IS_HADAMARD &&
+            rot->ne[0] == 1024 && rot->src[1] == reshape && reshape->src[0] == node &&
+            restored->src[0] == rot && out->src[0] == restored &&
+            ggml_backend_buft_is_cuda(node->src[0]->buffer->buft) &&
+            ggml_cuda_check_fusion_memory_ranges(cgraph, i, 5, &output, 1) &&
+            ggml_cuda_get_rows_fwht(*cuda_ctx, node, out->src[1], out)) {
+            return 4;
+        }
+    }
+
+    // Hadamard sign flip + reshape + FWHT-hint matmul: multiply the sign
+    // vector during the transform's load instead of a separate full pass
+    if (ggml_can_fuse_subgraph(cgraph, i, { GGML_OP_MUL, GGML_OP_RESHAPE, GGML_OP_MUL_MAT }, { i + 2 })) {
+        const ggml_tensor * mul     = cgraph->nodes[i];
+        const ggml_tensor * reshape = cgraph->nodes[i + 1];
+        ggml_tensor *       mm      = cgraph->nodes[i + 2];
+
+        const ggml_tensor * x     = mul->src[0];
+        const ggml_tensor * signs = mul->src[1];
+
+        const bool pattern_ok = ggml_get_op_params_i32(mm, 1) == GGML_HINT_SRC0_IS_HADAMARD &&
+            mm->src[1] == reshape && reshape->src[0] == mul &&
+            signs->ne[1] == 1 && signs->ne[2] == 1 && signs->ne[3] == 1 &&
+            signs->type == GGML_TYPE_F32 &&
+            (x->type == GGML_TYPE_F32 || x->type == GGML_TYPE_F16) &&
+            // ggml_mul keeps src0's type, so an F16 x gives an F16 mul
+            mul->type == x->type &&
+            ggml_is_contiguous(x) && ggml_is_contiguous(signs) &&
+            signs->ne[0] == x->ne[0] && signs->ne[0] % mm->src[0]->ne[0] == 0;
+
+        if (pattern_ok && ggml_cuda_op_fwht_signed(*cuda_ctx, x, signs, mm)) {
+            return 2;
+        }
+    }
+
     //RoPE + view + set-rows
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_ROPE, GGML_OP_VIEW, GGML_OP_SET_ROWS }, {})) {
         ggml_tensor * rope     = cgraph->nodes[i];
@@ -8962,7 +9040,10 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                 if (a->nb[0] != ggml_element_size(a) || b->nb[0] != ggml_element_size(b)) {
                     return false; // TODO this could in principle be implemented though currently there is no use case.
                 }
-                if (b->type == GGML_TYPE_F16 && a->type != GGML_TYPE_F16) {
+                const bool is_hadamard = op->op == GGML_OP_MUL_MAT &&
+                    ggml_get_op_params_i32(op, 1) == GGML_HINT_SRC0_IS_HADAMARD;
+                if (b->type == GGML_TYPE_F16 && a->type != GGML_TYPE_F16 &&
+                    !(is_hadamard && a->type == GGML_TYPE_F32)) {
                     return false;
                 }
 #ifdef GGML_USE_MUSA
@@ -8984,6 +9065,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                     case GGML_TYPE_Q1_0:
                     case GGML_TYPE_Q2_0:
                     case GGML_TYPE_Q2_0_G128:
+                    case GGML_TYPE_PTQ1_0:
                     case GGML_TYPE_Q4_0:
                     case GGML_TYPE_Q4_1:
                     case GGML_TYPE_Q4_A32:
@@ -9028,6 +9110,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                     case GGML_TYPE_Q1_0:
                     case GGML_TYPE_Q2_0:
                     case GGML_TYPE_Q2_0_G128:
+                    case GGML_TYPE_PTQ1_0:
                     case GGML_TYPE_Q4_0:
                     case GGML_TYPE_Q4_1:
                     case GGML_TYPE_Q5_0:

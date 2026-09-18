@@ -1837,6 +1837,8 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     loras            (params.loras),
     mctx             (params.mctx),
     cross            (params.cross),
+    hadamard_rotations(params.hadamard_rotations),
+    hadamard_inverses (params.hadamard_inverses),
     tree_mask        (params.tree_mask),
     tree_parent_ids           (params.tree_parent_ids),
     tree_ssm_intermediates    (params.tree_ssm_intermediates),
@@ -1882,12 +1884,44 @@ ggml_tensor * llm_graph_context::build_cvec(
     return cvec->apply_to(ctx0, cur, il);
 }
 
+ggml_tensor * llm_graph_context::build_hadamard_input(ggml_tensor * w, ggml_tensor * cur) const {
+    if (!hadamard_rotations || hadamard_rotations->empty()) {
+        return cur;
+    }
+    const auto it = hadamard_rotations->find(w);
+    if (it == hadamard_rotations->end()) {
+        return cur;
+    }
+    const auto & t = it->second;
+    const hadamard_input_key key { cur, t.rot, t.signs, t.perm_hd, t.perm_nk, t.perm_rep };
+    const auto cached = hadamard_inputs.find(key);
+    if (cached != hadamard_inputs.end()) {
+        return cached->second;
+    }
+    if (t.perm_rep > 1) {
+        // Tiled [hd, nk, rep] -> grouped [hd, rep, nk] feature order.
+        cur = ggml_is_contiguous(cur) ? cur : ggml_cont(ctx0, cur);
+        const int64_t ne1 = cur->ne[1], ne2 = cur->ne[2], ne3 = cur->ne[3];
+        cur = ggml_reshape_4d(ctx0, cur, t.perm_hd, t.perm_nk, t.perm_rep, ne1*ne2*ne3);
+        cur = ggml_cont(ctx0, ggml_permute(ctx0, cur, 0, 2, 1, 3));
+        cur = ggml_reshape_4d(ctx0, cur, t.perm_hd*t.perm_nk*t.perm_rep, ne1, ne2, ne3);
+    }
+    if (t.signs) {
+        cur = ggml_mul(ctx0, cur, t.signs);
+    }
+    cur = llama_mul_mat_hadamard(ctx0, cur, t.rot);
+    hadamard_inputs.emplace(key, cur);
+    return cur;
+}
+
 ggml_tensor * llm_graph_context::build_lora_mm(
           ggml_tensor * w,
           ggml_tensor * cur,
           ggml_tensor * w_s,
           ggml_tensor * in_s) const {
-    ggml_tensor * res = ggml_mul_mat(ctx0, w, cur);
+    ggml_tensor * cur_mm = build_hadamard_input(w, cur);
+
+    ggml_tensor * res = ggml_mul_mat(ctx0, w, cur_mm);
 
     if (in_s) {
         const bool fp8_scale = w->type == GGML_TYPE_F8_E4M3 &&
@@ -1965,7 +1999,9 @@ ggml_tensor * llm_graph_context::build_lora_mm_id(
           ggml_tensor * ids,
           ggml_tensor * w_s,
           ggml_tensor * w_in_s) const {
-    ggml_tensor * res = ggml_mul_mat_id(ctx0, w, cur, ids);
+    ggml_tensor * cur_mm = build_hadamard_input(w, cur);
+
+    ggml_tensor * res = ggml_mul_mat_id(ctx0, w, cur_mm, ids);
 
     if (ggml_type_is_exl3(w->type)) {
         // EXL3 experts: per-expert output scales (svh, F16 [n, n_expert]) and input signs
@@ -2845,6 +2881,18 @@ ggml_tensor * llm_graph_context::build_inp_embd(ggml_tensor * tok_embd) const {
         auto & cur = inps[0];
 
         cur = ggml_get_rows(ctx0, tok_embd, inp->tokens);
+
+        // a Hadamard-latent embedding table stores rotated rows; restore the
+        // primal basis right after the lookup: h = s * (H z)
+        if (hadamard_inverses) {
+            const auto it = hadamard_inverses->find(tok_embd);
+            if (it != hadamard_inverses->end()) {
+                cur = llama_mul_mat_hadamard(ctx0, cur, it->second.rot);
+                if (it->second.signs) {
+                    cur = ggml_mul(ctx0, cur, it->second.signs);
+                }
+            }
+        }
 
         // apply lora for embedding tokens if needed
         for (const auto & lora : *loras) {

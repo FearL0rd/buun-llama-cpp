@@ -2,6 +2,7 @@
 #include "mmvq-tuning.h"
 #include "moe-cache-mmv-tuning.h"
 #include "quantize.cuh"
+#include "fwht.cuh"
 #include "unary.cuh"
 #include "vecdotq.cuh"
 #if !defined(GGML_USE_HIP)
@@ -975,6 +976,7 @@ static constexpr __device__ vec_dot_q_cuda_t get_vec_dot_q_cuda(ggml_type type) 
         case GGML_TYPE_Q1_0:    return vec_dot_q1_0_q8_1;
         case GGML_TYPE_Q2_0:    return vec_dot_q2_0_q8_1;
         case GGML_TYPE_Q2_0_G128: return vec_dot_q2_0_g128_q8_1;
+        case GGML_TYPE_PTQ1_0: return vec_dot_ptq1_0_q8_1;
         case GGML_TYPE_Q4_0:    return vec_dot_q4_0_q8_1;
         case GGML_TYPE_Q4_1:    return vec_dot_q4_1_q8_1;
         case GGML_TYPE_Q4_A32:  return vec_dot_q4_a32_q8_1;
@@ -1008,6 +1010,7 @@ static constexpr __host__ __device__ int get_vdr_mmvq(ggml_type type) {
         case GGML_TYPE_Q1_0:    return VDR_Q1_0_Q8_1_MMVQ;
         case GGML_TYPE_Q2_0:    return VDR_Q2_0_Q8_1_MMVQ;
         case GGML_TYPE_Q2_0_G128: return VDR_Q2_0_Q8_1_MMVQ;
+        case GGML_TYPE_PTQ1_0: return VDR_PTQ1_0_Q8_1_MMVQ;
         case GGML_TYPE_Q4_0:    return VDR_Q4_0_Q8_1_MMVQ;
         case GGML_TYPE_Q4_1:    return VDR_Q4_1_Q8_1_MMVQ;
         case GGML_TYPE_Q4_A32:  return VDR_Q4_A32_Q8_1_MMVQ;
@@ -1297,6 +1300,11 @@ bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne11) {
                 return ne11 <= 4;
         }
     }
+#if !defined(GGML_USE_HIP)
+    if (type == GGML_TYPE_PTQ1_0 && GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= GGML_CUDA_CC_TURING) {
+        return ne11 <= 7;
+    }
+#endif
     // k-quants cost more to decode and mvq redoes that per column, so MMQ wins sooner.
     // Only list quant-types MMQ supports, others would fall back to cuBLAS.
     if (GGML_CUDA_CC_IS_NVIDIA(cc) && cc == GGML_CUDA_CC_ADA_LOVELACE) {
@@ -2498,6 +2506,12 @@ static void mul_mat_vec_q_switch_type(
                  nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
                  nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, stream, allow_small_k);
             break;
+        case GGML_TYPE_PTQ1_0:
+            mul_mat_vec_q_switch_ncols_dst<GGML_TYPE_PTQ1_0>
+                (vx, vy, ids, fusion, dst, ncols_x, nrows_x, ncols_dst, stride_row_x, stride_col_y, stride_col_dst,
+                 nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
+                 nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, stream, allow_small_k);
+            break;
         case GGML_TYPE_Q2_0:
             mul_mat_vec_q_switch_ncols_dst<GGML_TYPE_Q2_0>
                 (vx, vy, ids, fusion, dst, ncols_x, nrows_x, ncols_dst, stride_row_x, stride_col_y, stride_col_dst,
@@ -2658,7 +2672,8 @@ static void ggml_cuda_mul_mat_vec_q_impl(
         ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst,
         const ggml_cuda_mm_fusion_args_host * fusion, float post_scale, bool post_silu,
         const ggml_tensor * fp8_marker, const ggml_tensor * conv_prefix = nullptr,
-        const ggml_tensor * conv_weight = nullptr, ggml_tensor * conv_state = nullptr) {
+        const ggml_tensor * conv_weight = nullptr, ggml_tensor * conv_state = nullptr,
+        const ggml_tensor * fwht_input = nullptr, const ggml_tensor * fwht_signs = nullptr) {
     GGML_ASSERT(        src1->type == GGML_TYPE_F32);
     GGML_ASSERT(        dst->type  == GGML_TYPE_F32);
     GGML_ASSERT(!ids || ids->type  == GGML_TYPE_I32); // Optional, used for batched GGML_MUL_MAT_ID.
@@ -2792,7 +2807,10 @@ static void ggml_cuda_mul_mat_vec_q_impl(
 #else
     GGML_ASSERT(fp8_marker == nullptr);
 #endif
-    {
+    if (fwht_input) {
+        GGML_ASSERT(!ids && !fp8_marker && ne10 == ne10_padded);
+        ggml_cuda_fwht_q8_1(ctx, fwht_input, fwht_signs, src1_q8_1.get());
+    } else {
         const int64_t s11 = src1->nb[1] / ts_src1;
         const int64_t s12 = src1->nb[2] / ts_src1;
         const int64_t s13 = src1->nb[3] / ts_src1;
@@ -2858,6 +2876,12 @@ void ggml_cuda_mul_mat_vec_q(
         const ggml_tensor * ids, ggml_tensor * dst, const ggml_cuda_mm_fusion_args_host * fusion,
         float post_scale, bool post_silu, const ggml_tensor * fp8_marker) {
     ggml_cuda_mul_mat_vec_q_impl(ctx, src0, src1, ids, dst, fusion, post_scale, post_silu, fp8_marker);
+}
+
+void ggml_cuda_mul_mat_vec_q_fwht(ggml_backend_cuda_context & ctx,
+        const ggml_tensor * input, const ggml_tensor * signs, ggml_tensor * dst) {
+    ggml_cuda_mul_mat_vec_q_impl(ctx, dst->src[0], dst->src[1], nullptr, dst, nullptr,
+        1.0f, false, nullptr, nullptr, nullptr, nullptr, input, signs);
 }
 
 void ggml_cuda_mul_mat_vec_q_conv(ggml_backend_cuda_context & ctx,
