@@ -5643,15 +5643,14 @@ struct test_mul_mat_block_fp8 : public test_case {
 };
 
 struct test_mul_mat_static_i8 : public test_case {
-    static constexpr int64_t k = 32;
-    static constexpr int64_t n = 4;
-    static constexpr int64_t m = 3;
+    const int64_t k, n, m;
 
-    explicit test_mul_mat_static_i8(bool asymmetric = false, bool thresholded = false) :
-        asymmetric(asymmetric), thresholded(thresholded) {}
+    explicit test_mul_mat_static_i8(bool asymmetric = false, bool thresholded = false,
+            int64_t k = 32, int64_t n = 4, int64_t m = 3) :
+        k(k), n(n), m(m), asymmetric(asymmetric), thresholded(thresholded) {}
 
     std::string vars() override {
-        return std::string("k=32,n=4,m=3,") +
+        return "k=" + std::to_string(k) + ",n=" + std::to_string(n) + ",m=" + std::to_string(m) + "," +
             (asymmetric ? "scale=0.25,zero=-17" : thresholded ? "outlier_threshold=6" : "scale=0.25");
     }
     std::string op_desc(ggml_tensor *) override { return "MUL_MAT_STATIC_I8"; }
@@ -5696,8 +5695,9 @@ struct test_mul_mat_static_i8 : public test_case {
                 }
                 ggml_backend_tensor_set(tensor, input.data(), 0, input.size() * sizeof(float));
             } else if (strcmp(tensor->name, "static_i8_weight_scale") == 0) {
-                const std::array<float, n> scales = { 0.5f, 0.25f, 0.125f, 0.0625f };
-                ggml_backend_tensor_set(tensor, scales.data(), 0, sizeof(scales));
+                std::vector<float> scales(n);
+                for (int64_t row = 0; row < n; ++row) scales[row] = std::ldexp(0.5f, -int(row % 4));
+                ggml_backend_tensor_set(tensor, scales.data(), 0, n * sizeof(float));
             } else if (strcmp(tensor->name, "static_i8_input_scale") == 0) {
                 const float scale = 0.25f;
                 if (asymmetric) {
@@ -11467,6 +11467,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat_static_i8());
     test_cases.emplace_back(new test_mul_mat_static_i8(true));
     test_cases.emplace_back(new test_mul_mat_static_i8(false, true));
+    // SM75's bandwidth-bound GEMV, including its asymmetric/outlier corrections.
+    test_cases.emplace_back(new test_mul_mat_static_i8(false, false, 5120, 5120, 1));
+    test_cases.emplace_back(new test_mul_mat_static_i8(true, false, 5120, 5120, 1));
+    test_cases.emplace_back(new test_mul_mat_static_i8(false, true, 5120, 5120, 1));
     test_cases.emplace_back(new test_mul_mat_dynamic_i4());
     test_cases.emplace_back(new test_mul_mat_dynamic_i4(true));
     test_cases.emplace_back(new test_mul_mat_q4_a32_residual_chain());
