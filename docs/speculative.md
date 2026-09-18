@@ -208,7 +208,7 @@ the shared block geometry while adapting each slot's verification depth. Timing
 calibration can be reused within a context-depth band, but acceptance history
 and depth decisions reset with each request.
 By default, DFlash2 matches the server's resolved main sampling temperature
-(the target GGUF default, or an explicit `--temp`). Use `--spec-draft-temp T`
+(the target model default, or an explicit `--temp`). Use `--spec-draft-temp T`
 to override it; an explicit value of `0` keeps greedy draft proposals. Legacy
 DFlash sidecars retain their greedy default.
 
