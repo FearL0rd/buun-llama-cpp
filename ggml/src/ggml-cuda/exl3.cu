@@ -649,8 +649,8 @@ void ggml_cuda_mul_mat_exl3(ggml_backend_cuda_context & ctx, const ggml_tensor *
     // projection. SM75 wins at short batches, and up to 128 rows on wide
     // outputs; its narrower shapes favor cuBLAS sooner than SM86's do.
     const int cc_gemm = ggml_cuda_info().devices[ctx.device].cc;
-    const bool turing_gemm = cc_gemm == GGML_CUDA_CC_TURING && m >= 9 &&
-        (m <= 32 || (m <= 128 && n >= 2 * k));
+    const bool turing_gemm = ggml_cuda_exl3_turing_gemm_supported(
+        cc_gemm, ggml_cuda_highest_compiled_arch(cc_gemm), m, n, k);
     if (bits == 4 && cb == 2 &&
             ((exl3_sm86_available(cc_gemm) && m >= 17) || turing_gemm)) {
         const uint8_t * weights = static_cast<const uint8_t *>(src0->data);

@@ -19,6 +19,7 @@
 
 static ggml_backend_t cache_gpu = nullptr;
 static bool gpu_executor = false;
+static bool turing_executor = false;
 static decltype(ggml_moe_cache.dispatch) real_dispatch;
 static decltype(ggml_moe_cache.collect) real_collect;
 static int cache_hits = 0;
@@ -200,7 +201,8 @@ static bool run(ggml_backend_t backend, int bits, int cb, bool grouped, int toke
     }
     // Standalone GPU mul1 uses quantized activations, unlike the exact CPU/cache
     // path. Its separate batch/policy gates require exact repeated execution.
-    const bool quantized_activations = gpu_executor && !head && (grouped || tokens <= 16);
+    const bool quantized_activations = gpu_executor && !head &&
+        (grouped || tokens <= (turing_executor ? 8 : 16));
     ok &= worst < (quantized_activations ? 1e-2 : 2e-5);
     // The cache provider accepts at most ten tokens; larger cases above still
     // exercise CPU transform sharing/fallback and exact thread-count agreement.
@@ -279,6 +281,13 @@ bool test_cuda_exl3_sm86_image();
 int main(int argc, char ** argv) {
     const bool head = argc == 2 && std::strcmp(argv[1], "--gpu-head") == 0;
     gpu_executor = head || (argc == 2 && std::strcmp(argv[1], "--gpu") == 0);
+#ifdef EXL3_TEST_CUDA
+    if (gpu_executor) {
+        cudaDeviceProp props{};
+        turing_executor = cudaGetDeviceProperties(&props, 0) == cudaSuccess &&
+            props.major == 7 && props.minor == 5;
+    }
+#endif
     if (head) {
 #ifdef EXL3_TEST_CUDA
         cudaDeviceProp props{};
