@@ -6499,7 +6499,13 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     // Single-sequence verification can read the indexed initial state directly.
     // The source remains an explicit graph dependency; no host-side row index
     // is baked into a captured graph. Keep all other shapes on the gather path.
-    if (node->op == GGML_OP_GET_ROWS && i + 2 < cgraph->n_nodes &&
+    // Multi-GPU: the state-row ids arrive through per-split input copies whose
+    // ordering is not captured with the fused kernel on other devices, leaving
+    // the baked pointer reading stale memory. The unfused gather is correct
+    // everywhere and costs a few KB per layer, so fuse only on single-device rigs.
+    static const bool gdn_cache_fusion_allowed = ggml_cuda_info().device_count == 1;
+    if (gdn_cache_fusion_allowed &&
+        node->op == GGML_OP_GET_ROWS && i + 2 < cgraph->n_nodes &&
         ggml_cuda_info().devices[cuda_ctx->device].cc == 860) {
         constexpr ggml_op ops[] = {GGML_OP_GET_ROWS, GGML_OP_RESHAPE, GGML_OP_GATED_DELTA_NET};
         const int outputs[] = {i + 2};
@@ -6526,7 +6532,8 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     }
 
     // gated_delta_net -> cpy: scatter recurrent-state snapshots into the cache
-    if (node->op == GGML_OP_GATED_DELTA_NET) {
+    // (single-device rigs only — see the multi-GPU note above).
+    if (gdn_cache_fusion_allowed && node->op == GGML_OP_GATED_DELTA_NET) {
         ggml_cuda_gated_delta_net_fused_cache fused_state_cpy{};
         const int nodes_to_skip = ggml_cuda_try_gdn_cache_fusion(cgraph, i, cuda_ctx, fused_state_cpy);
         if (nodes_to_skip > 0) {
