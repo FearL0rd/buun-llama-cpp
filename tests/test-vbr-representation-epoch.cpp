@@ -6,6 +6,7 @@
 #include "llama-vbr-artifact-capture.h"
 #include "llama-vbr-explicit-capture.h"
 #include "llama-vbr-codec.h"
+#include "llama-vbr-precision.h"
 #include "llama.h"
 
 #include <algorithm>
@@ -73,6 +74,33 @@ struct llama_kv_cache_vbr_epoch_test {
 
     static size_t budget(const llama_kv_cache * kv) {
         return kv->vbr_budget_bytes_;
+    }
+
+    static bool restore_policy_limits(llama_kv_cache * kv) {
+        if (!kv || !kv->vbr_vmm_active() || kv->vbr_degrade_cursor_ != 0) {
+            return false;
+        }
+        const auto saved_limit = kv->vbr_degrade_limit_;
+        const auto saved_band = kv->first_band_end_;
+        const auto saved_typed = kv->vbr_floor_typed_;
+        kv->vbr_degrade_limit_ = kv->vbr_degrade_order_.size();
+        kv->first_band_end_ = 1;
+        kv->vbr_floor_typed_ = false;
+        vbr_import_destination_child implicit, explicit_floor, no_peer;
+        const bool implicit_ok = kv->vbr_demand_limit() == 1 &&
+            kv->vbr_import_destination_input(256, implicit) && implicit.policy.steps.size() > 1;
+        kv->vbr_floor_typed_ = true;
+        const bool explicit_ok = kv->vbr_demand_limit() == kv->vbr_degrade_limit_ &&
+            kv->vbr_import_destination_input(256, explicit_floor) &&
+            explicit_floor.policy.steps.size() == implicit.policy.steps.size();
+        kv->first_band_end_ = 0;
+        const bool no_peer_ok = kv->vbr_demand_limit() == 0 &&
+            kv->vbr_import_destination_input(256, no_peer) &&
+            no_peer.policy.steps.size() == implicit.policy.steps.size();
+        kv->vbr_degrade_limit_ = saved_limit;
+        kv->first_band_end_ = saved_band;
+        kv->vbr_floor_typed_ = saved_typed;
+        return implicit_ok && explicit_ok && no_peer_ok && kv->vbr_degrade_cursor_ == 0;
     }
 
     static size_t entry_cost(const llama_kv_cache * kv) {
@@ -2005,6 +2033,84 @@ static bool run_identity_cpu_tests() {
 }
 
 static bool run_generation_cpu_tests() {
+    for (size_t a = 0; a < VBR_TURBO_PRECISION_LADDER.size(); ++a) {
+        for (size_t b = 0; b < VBR_TURBO_PRECISION_LADDER.size(); ++b) {
+            const auto source = VBR_TURBO_PRECISION_LADDER[a];
+            const auto target = VBR_TURBO_PRECISION_LADDER[b];
+            vbr_downward_recipe recipe;
+            const auto status = vbr_downward_resolve_recipe(
+                source, target, VBR_TURBO_PRECISION_LADDER.back(), true, recipe);
+            const auto expected = a == b ? vbr_downward_recipe_status::equal_tier
+                : a < b ? vbr_downward_recipe_status::resolved
+                        : vbr_downward_recipe_status::upward_forbidden;
+            if (status != expected || vbr_precision_rank(source) != int(a) ||
+                vbr_precision_merge(source, target) != VBR_TURBO_PRECISION_LADDER[std::max(a, b)]) {
+                fprintf(stderr, "canonical recipe/provenance ladder differs\n");
+                return false;
+            }
+        }
+    }
+    {
+        vbr_precision_admission near;
+        near.add(GGML_TYPE_TURBO3_TCQ, GGML_TYPE_TURBO4_0, 128);
+        near.add(GGML_TYPE_TURBO8_0, GGML_TYPE_TURBO4_0, 384);
+        auto far = near;
+        far.add(GGML_TYPE_TURBO1_TCQ, GGML_TYPE_F16, 1);
+        vbr_precision_admission broad;
+        broad.add(GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO8_0, 512);
+        vbr_precision_admission unknown;
+        unknown.add(-1, GGML_TYPE_F16, 512);
+        vbr_precision_admission exact;
+        exact.add(GGML_TYPE_TURBO3_0, GGML_TYPE_TURBO3_0, 512);
+        vbr_precision_admission boundary;
+        boundary.add(GGML_TYPE_TURBO8_0, GGML_TYPE_F16, 1);
+        boundary.add(GGML_TYPE_F16, GGML_TYPE_F16, 3);
+        auto over_boundary = boundary;
+        over_boundary.add(GGML_TYPE_TURBO8_0, GGML_TYPE_F16, 1);
+        vbr_precision_admission overflow;
+        overflow.add(GGML_TYPE_F16, GGML_TYPE_F16, UINT64_MAX);
+        overflow.add(GGML_TYPE_F16, GGML_TYPE_F16, 1);
+        vbr_precision_admission invalid;
+        invalid.add(GGML_TYPE_COUNT, GGML_TYPE_COUNT, 1);
+        vbr_precision_admission classic;
+        classic.add(GGML_TYPE_Q4_0, GGML_TYPE_Q8_0, 1);
+        classic.add(GGML_TYPE_F16, GGML_TYPE_Q8_0, 3);
+        vbr_precision_admission families;
+        families.add(GGML_TYPE_Q4_0, GGML_TYPE_TURBO4_0, 1);
+        if (!near.allowed() || far.allowed() || broad.allowed() || unknown.allowed() || !exact.allowed() ||
+            !boundary.allowed() || over_boundary.allowed() || overflow.allowed() || invalid.allowed() ||
+            !classic.allowed() || families.allowed()) {
+            fprintf(stderr, "layout nearness admission limits failed\n");
+            return false;
+        }
+    }
+    {
+        vbr_generation_tracker precision(1, 16, 1);
+        const auto publish = [&](int32_t to, vbr_repr_transition transition) {
+            return precision.publish_unit(0, precision.unit_generation(0).current_type,
+                to, vbr_downward_tier_domain(ggml_type(to)), 0, transition,
+                transition == vbr_repr_transition::full_reset
+                    ? vbr_mutation_registrant::full_reset : vbr_mutation_registrant::degrade_next, {});
+        };
+        if (!precision.initialize_unit(0, GGML_TYPE_F16, vbr_repr_domain::full) ||
+            !publish(GGML_TYPE_TURBO3_TCQ, vbr_repr_transition::degrade_other) ||
+            !publish(GGML_TYPE_F16, vbr_repr_transition::promote) ||
+            precision.unit_generation(0).effective_type != GGML_TYPE_TURBO3_TCQ ||
+            !publish(GGML_TYPE_TURBO4_0, vbr_repr_transition::degrade_other) ||
+            precision.unit_generation(0).effective_type != GGML_TYPE_TURBO3_TCQ ||
+            !publish(GGML_TYPE_F16, vbr_repr_transition::full_reset) ||
+            precision.unit_generation(0).effective_type != GGML_TYPE_F16 ||
+            !precision.global_transition(vbr_mutation_registrant::state_read_install,
+                vbr_operation_class::state_api) ||
+            precision.unit_generation(0).effective_type != -1 ||
+            !publish(GGML_TYPE_TURBO4_0, vbr_repr_transition::degrade_other) ||
+            precision.unit_generation(0).effective_type != -1 ||
+            vbr_precision_merge(GGML_TYPE_TURBO3_0, GGML_TYPE_TURBO3_TCQ) != -1 ||
+            vbr_precision_merge(GGML_TYPE_Q4_0, GGML_TYPE_F16) != GGML_TYPE_Q4_0) {
+            fprintf(stderr, "precision provenance was lost or invented\n");
+            return false;
+        }
+    }
     llama_kv_cells ownership_index;
     ownership_index.resize(4);
     ownership_index.pos_set(0, 5);
@@ -2916,13 +3022,14 @@ int main(int argc, char ** argv) {
     const bool partition_typed = argc == 3 && std::string(argv[1]) == "--iswa-budget";
     const bool partition_env   = argc == 3 && std::string(argv[1]) == "--iswa-budget-env";
     const bool reset_domains   = argc == 3 && std::string(argv[1]) == "--reset-entry-domains";
+    const bool restore_policy = argc == 3 && std::string(argv[1]) == "--restore-policy";
     const bool partition_only  = partition_typed || partition_env;
-    if (argc != 2 && !partition_only && !reset_domains) {
+    if (argc != 2 && !partition_only && !reset_domains && !restore_policy) {
         fprintf(stderr, "usage: %s MODEL | --iswa-budget MODEL | --iswa-budget-env MODEL | "
-                "--reset-entry-domains MODEL | --identity-cpu | --generation-cpu | --operation-cpu\n", argv[0]);
+                "--reset-entry-domains MODEL | --restore-policy MODEL | --identity-cpu | --generation-cpu | --operation-cpu\n", argv[0]);
         return 1;
     }
-    const char * model_path = partition_only || reset_domains ? argv[2] : argv[1];
+    const char * model_path = partition_only || reset_domains || restore_policy ? argv[2] : argv[1];
 
     if (!partition_only) {
         // operation registry registry foundation: RAII closes exactly once, IDs are process-global/nonzero, and a
@@ -3033,13 +3140,19 @@ int main(int argc, char ** argv) {
     llama_memory_t mem = llama_get_memory(ctx.get());
     llama_kv_cache * base = nullptr;
     llama_kv_cache * swa  = nullptr;
-    if (reset_domains) {
+    if (reset_domains || restore_policy) {
         if (auto * hybrid = dynamic_cast<llama_memory_hybrid *>(mem)) {
             base = hybrid->get_mem_attn();
         } else if (!get_iswa_children(mem, base, swa)) {
             base = dynamic_cast<llama_kv_cache *>(mem);
         }
         mem->clear(true);
+        if (restore_policy) {
+            const bool valid = base && llama_kv_cache_vbr_epoch_test::restore_policy_limits(base) &&
+                (!swa || llama_kv_cache_vbr_epoch_test::restore_policy_limits(swa));
+            fprintf(stderr, "VBR local restore versus peer-demand policy %s\n", valid ? "PASS" : "FAIL");
+            return valid ? 0 : 1;
+        }
         const bool valid = base && llama_kv_cache_vbr_epoch_test::active(base) &&
             llama_kv_cache_vbr_epoch_test::reset_entry_domains(base) &&
             (!swa || llama_kv_cache_vbr_epoch_test::reset_entry_domains(swa));

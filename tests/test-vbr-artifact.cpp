@@ -576,6 +576,8 @@ static vbr_artifact_decode_limits limits(uint64_t bytes) {
 static void test_golden_and_native_lineage() {
     fixture_storage storage;
     auto package = make_package(storage);
+    // Preserve the v3 wire golden while newer metadata evolves explicitly.
+    package.version = package.manifest.version = 3;
     std::vector<uint8_t> encoded;
     CHECK(vbr_artifact_encode_vector(
               package, encoded, 1024*1024) ==
@@ -608,7 +610,7 @@ static void test_golden_and_native_lineage() {
     CHECK(vbr_artifact_decode_vector(
               encoded, limits(1024*1024), decoded) ==
           vbr_artifact_status::ok);
-    CHECK(decoded.version == VBR_UNIT_ARTIFACT_FORMAT_VERSION);
+    CHECK(decoded.version == 3);
     CHECK(decoded.unit_blobs.size() == 1);
     CHECK(decoded.unit_blobs[0].descriptor.meansub_model_id == 1);
     CHECK(decoded.unit_blobs[0].descriptor.meansub_layer == 0);
@@ -629,6 +631,31 @@ static void test_golden_and_native_lineage() {
     CHECK(decoded.manifest.stream_placements.size() == 1);
     CHECK(decoded.manifest.stream_placements[0].cells[0].ext_x == 10);
     CHECK(decoded.manifest.stream_placements[0].cells[1].ext_y == 21);
+}
+
+static void test_precision_provenance_roundtrip() {
+    fixture_storage storage;
+    auto package = make_package(storage);
+    package.manifest.generation.version = 2;
+    auto & descriptor = package.unit_blobs[0].descriptor;
+    auto & generation = package.manifest.generation.controllers[0].units[0];
+    descriptor.representation.effective_type = GGML_TYPE_TURBO3_TCQ;
+    generation.effective_type = GGML_TYPE_TURBO3_TCQ;
+    std::vector<uint8_t> bytes;
+    CHECK(vbr_artifact_encode_vector(package, bytes, 1024*1024) == vbr_artifact_status::ok);
+    vbr_artifact_package decoded;
+    CHECK(vbr_artifact_decode_vector(bytes, limits(1024*1024), decoded) == vbr_artifact_status::ok);
+    CHECK(decoded.version == 4);
+    if (!decoded.unit_blobs.empty()) {
+        CHECK(decoded.unit_blobs[0].descriptor.representation.effective_type == GGML_TYPE_TURBO3_TCQ);
+        CHECK(decoded.manifest.generation.controllers[0].units[0].effective_type == GGML_TYPE_TURBO3_TCQ);
+    }
+    // A disagreement is not permission to assume the higher-precision tag.
+    generation.effective_type = GGML_TYPE_F16;
+    CHECK(vbr_artifact_encode_vector(package, bytes, 1024*1024) != vbr_artifact_status::ok);
+    generation.effective_type = GGML_TYPE_TURBO3_TCQ;
+    package.version = package.manifest.version = 3;
+    CHECK(vbr_artifact_encode_vector(package, bytes, 1024*1024) != vbr_artifact_status::ok);
 }
 
 // Pinned legacy Turbo sides still belong to a dynamic VBR artifact. They do
@@ -4066,7 +4093,6 @@ static void test_manifest_validator_matrix() {
     downward_unit.current_type = GGML_TYPE_TURBO3_TCQ;
     downward_unit.downward_supported = true;
     downward_unit.downward_movable = true;
-    downward_unit.controller_floor_type = GGML_TYPE_TURBO1_TCQ;
     downward_unit.downward_type = downward_unit.current_type;
     downward_unit.downward_domain = vbr_repr_domain::tapped;
     downward_unit.downward_recipe_id = 1;
@@ -4320,14 +4346,15 @@ static void test_manifest_validator_matrix() {
         CHECK(plan.transfer_bytes == upward_unit.upward_transfer_bytes);
         CHECK(plan.codec_workspace_bytes ==
               upward_unit.upward_codec_workspace_bytes);
-        CHECK(plan.target_last_source_type == GGML_TYPE_F16);
-        CHECK(plan.target_promote_hops == 0);
+        CHECK(plan.target_last_source_type == GGML_TYPE_TURBO8_0);
+        CHECK(plan.target_promote_hops ==
+              same_domain_source.view.units()[0].descriptor.promote_hops + 1);
         CHECK(plan.stash_action ==
               vbr_validated_stash_action::omit_live_rebased);
         const auto & generation =
             upward.proof->tracker_install().children[0].units[0];
-        CHECK(generation.last_source_type == GGML_TYPE_F16);
-        CHECK(generation.promote_hops == 0);
+        CHECK(generation.last_source_type == GGML_TYPE_TURBO8_0);
+        CHECK(generation.promote_hops == plan.target_promote_hops);
     }
 
     auto no_upward_quote = upward_policy;
@@ -9607,6 +9634,7 @@ int main(int argc, char ** argv) {
     }
 #endif
     test_golden_and_native_lineage();
+    test_precision_provenance_roundtrip();
     test_pinned_legacy_turbo_types();
     test_v1_decode_and_v2_restore_metadata();
     test_identity_and_reference_separation();

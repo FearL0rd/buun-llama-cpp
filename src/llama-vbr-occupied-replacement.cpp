@@ -202,6 +202,9 @@ bool occupied_target_unit_matches(
         target.last_source_type != descriptor.last_source_type ||
         captured.last_source_type != descriptor.last_source_type ||
         live.generation.last_source_type != descriptor.last_source_type ||
+        captured.effective_type != descriptor.representation.effective_type ||
+        live.generation.effective_type != descriptor.representation.effective_type ||
+        target.effective_type != descriptor.representation.effective_type ||
         target.promote_hops != descriptor.promote_hops ||
         captured.promote_hops != descriptor.promote_hops ||
         live.generation.promote_hops != descriptor.promote_hops ||
@@ -333,6 +336,7 @@ std::array<uint8_t, 32> occupied_currency_digest(
         writer.u64(unit.generation.publish_seq);
         writer.u64(uint64_t(unit.generation.current_type));
         writer.u64(uint64_t(unit.generation.last_source_type));
+        writer.u64(uint64_t(unit.generation.effective_type));
         writer.u64(uint64_t(unit.generation.domain));
         writer.u64(unit.generation.promote_hops);
         writer.u64(uint64_t(unit.generation.last_transition));

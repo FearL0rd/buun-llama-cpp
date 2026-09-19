@@ -3577,6 +3577,7 @@ private:
     uint64_t vbr_automatic_restore_occupied_attempts = 0;
     uint64_t vbr_automatic_restore_occupied_succeeded = 0;
     uint64_t vbr_automatic_restore_occupied_fallbacks = 0;
+    int64_t vbr_restore_refusal_log_us = 0;
     static constexpr uint64_t VBR_AUTOMATIC_EXACT_CAPTURE_MAX_BYTES =
         16ull*1024ull*1024ull*1024ull;
     static constexpr int64_t VBR_READINESS_SCAN_INTERVAL_MS = 1000;
@@ -9796,6 +9797,24 @@ private:
             *restored_prefix = SIZE_MAX;
         }
         try {
+            const auto report_refusal = [&](const server_vbr_artifact_import_output & result,
+                                            int64_t started) {
+                const int64_t now = ggml_time_us();
+                if (vbr_restore_refusal_log_us != 0 && now - vbr_restore_refusal_log_us < 5000000) {
+                    return;
+                }
+                vbr_restore_refusal_log_us = now;
+                SLT_INF(slot,
+                    "VBR host restore declined: status=%s validation=%s schedule=%s destination=%s "
+                    "precision_refused=%d worst_steps=%u deficit=%" PRIu64 "/%" PRIu64
+                    " restore_ms=%.2f (continuing without this artifact; detailed reason at -lv 5)\n",
+                    server_vbr_artifact_import_status_name(result.status),
+                    vbr_manifest_validation_status_name(result.validation_status),
+                    vbr_import_schedule_status_name(result.schedule_status),
+                    vbr_import_destination_status_name(result.destination_status),
+                    int(result.precision_refused), result.precision.worst_steps,
+                    result.precision.deficit, result.precision.weight, (now-started)/1000.0);
+            };
             if (!params_base.vbr_prompt_cache || !prompt_cache ||
                 !vbr_artifact_store ||
                 task.type != SERVER_TASK_TYPE_COMPLETION || task.is_child() ||
@@ -10028,6 +10047,7 @@ private:
                 server_vbr_artifact_import_target request;
                 request.memory = memory;
                 request.destination = slot.id;
+                request.incoming_cells = task.n_tokens();
                 request.execution_identity = frontier_execution_identity;
                 request.adapter_config_identity = adapter_identity;
                 request.previously_observed = true;
@@ -10102,7 +10122,7 @@ private:
                         "automatic occupied VBR restore refused: status=%s "
                         "guard=%s schedule=%s destination=%s validation=%s "
                         "stage=%s adopt=%s phase=%s "
-                        "recovery=%s reset=%s\n",
+                        "recovery=%s reset=%s precision_refused=%d precision_known=%d worst_steps=%u deficit=%" PRIu64 "/%" PRIu64 "\n",
                         server_vbr_artifact_import_status_name(imported.status),
                         vbr_occupied_replacement_guard_status_name(
                             imported.occupied_guard_status),
@@ -10116,7 +10136,10 @@ private:
                         vbr_adopt_status_name(imported.adopt_status),
                         vbr_adopt_phase_name(imported.phase),
                         vbr_adopt_recovery_outcome_name(imported.recovery),
-                        quarantined ? "true" : "false");
+                        quarantined ? "true" : "false", int(imported.precision_refused),
+                        int(imported.precision.known), imported.precision.worst_steps,
+                        imported.precision.deficit, imported.precision.weight);
+                    report_refusal(imported, started);
                     // A semantically identical host frontier can still carry
                     // an old slot/layout after an earlier restore. The guard
                     // has refused before any write; refresh from the live
@@ -10252,6 +10275,7 @@ private:
                 server_vbr_artifact_import_target request;
                 request.memory = memory;
                 request.destination = slot.id;
+                request.incoming_cells = task.n_tokens();
                 request.execution_identity = frontier_execution_identity;
                 request.adapter_config_identity = adapter_identity;
                 request.previously_observed = false;
@@ -10316,7 +10340,7 @@ private:
                     slot,
                     "automatic VBR host restore refused: status=%s "
                     "validation=%s schedule=%s destination=%s max_deficit=%" PRIu64 " decision=%s adopt=%s "
-                    "phase=%s units=%u companions=%u rollback=%llu\n",
+                    "phase=%s units=%u companions=%u rollback=%llu precision_refused=%d precision_known=%d worst_steps=%u deficit=%" PRIu64 "/%" PRIu64 "\n",
                     server_vbr_artifact_import_status_name(imported.status),
                     vbr_manifest_validation_status_name(
                         imported.validation_status),
@@ -10327,7 +10351,11 @@ private:
                     vbr_adopt_status_name(imported.adopt_status),
                     vbr_adopt_phase_name(imported.phase), imported.units,
                     imported.companions,
-                    static_cast<unsigned long long>(imported.rollback_count));
+                    static_cast<unsigned long long>(imported.rollback_count),
+                    int(imported.precision_refused), int(imported.precision.known),
+                    imported.precision.worst_steps, imported.precision.deficit,
+                    imported.precision.weight);
+                report_refusal(imported, started);
                 return false;
             }
             GGML_ASSERT(state.published);

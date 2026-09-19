@@ -1,5 +1,6 @@
 #include "llama-vbr-explicit-capture.h"
 #include "llama-sha256.h"
+#include "llama-vbr-upward.h"
 #include "turbo-rotation-data.h"
 
 #include <atomic>
@@ -97,6 +98,41 @@ int main() {
         check(changed.meansub_digest != original.meansub_digest && changed.rotation_digest == original.rotation_digest,
               "mean setting was cached with rotation");
         mean_off.set(nullptr);
+
+        // Real production identities, not fixture markers: the row codecs
+        // differ, but reconstruction must recognize the same baked mean.
+        for (int model : {1, 2}) {
+            for (bool side : {false, true}) {
+                vbr_explicit_representation_identity source, target;
+                check(vbr_explicit_capture_representation_identity(
+                    &policy, GGML_TYPE_TURBO4_0, side, model, source), "source identity failed");
+                check(vbr_explicit_capture_representation_identity(
+                    &policy, GGML_TYPE_F16, side, model, target), "target identity failed");
+                check(source.meansub_baked && target.meansub_baked, "missing baked table fixture");
+                check(source.meansub_digest == target.meansub_digest, "mean identity depends on tier");
+                check(source.codec_id != target.codec_id && source.codec_version == 2 &&
+                      target.codec_version == 2 && source.codebook_digest != target.codebook_digest,
+                      "codec identities lost endpoint separation");
+                vbr_upward_recipe recipe;
+                check(vbr_upward_resolve_recipe(GGML_TYPE_TURBO4_0, GGML_TYPE_F16, recipe) ==
+                      vbr_upward_recipe_status::resolved, "cross-domain recipe failed");
+                const vbr_upward_representation_identity a {
+                    source.codebook_digest, source.rotation_digest, source.meansub_digest,
+                    model, 0, source.meansub_baked, source.codec_id, source.codec_version, source.codebook_digest};
+                auto b = a;
+                b.codebook_digest = target.codebook_digest;
+                b.rotation_digest = target.rotation_digest;
+                b.meansub_digest = target.meansub_digest;
+                b.codec_id = target.codec_id;
+                b.representation_reference_digest = target.codebook_digest;
+                const auto zero = std::array<uint8_t, 32>{};
+                check(vbr_upward_build_identity(recipe, a, b, source.codebook_digest, target.codebook_digest) != zero,
+                      "real cross-domain identity refused");
+                b.meansub_digest[0] ^= 1;
+                check(vbr_upward_build_identity(recipe, a, b, source.codebook_digest, target.codebook_digest) == zero,
+                      "different mean table accepted");
+            }
+        }
 
 #ifdef __linux__
         // Anonymous temporary backing lets the same override path change bytes
