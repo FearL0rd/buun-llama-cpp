@@ -5805,6 +5805,11 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         return 0;
     }
 
+    // Multi-GPU rigs: per-device splits make the fused state read/write paths
+    // unsafe (split-input ids ordering / compute-buffer clobbers); the unfused
+    // paths are correct everywhere and cost a few KB per layer.
+    static const bool gdn_cache_fusion_allowed = ggml_cuda_info().device_count == 1;
+
     ggml_tensor * node = cgraph->nodes[i];
     const ggml_op scale_add_ops[] = { GGML_OP_MUL, GGML_OP_ADD };
     const int scale_add_output = i + 1;
@@ -6506,7 +6511,6 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     // ordering is not captured with the fused kernel on other devices, leaving
     // the baked pointer reading stale memory. The unfused gather is correct
     // everywhere and costs a few KB per layer, so fuse only on single-device rigs.
-    static const bool gdn_cache_fusion_allowed = ggml_cuda_info().device_count == 1;
     if (gdn_cache_fusion_allowed &&
         node->op == GGML_OP_GET_ROWS && i + 2 < cgraph->n_nodes &&
         ggml_cuda_info().devices[cuda_ctx->device].cc == 860) {
