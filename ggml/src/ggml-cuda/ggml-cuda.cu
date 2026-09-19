@@ -6287,7 +6287,10 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     // projection) is followed by a VIEW of its last columns copied back into
     // the state buffer. One kernel writes both the concatenation and the state
     // slot from the two sources; SSM_CONV then reads the concatenation.
-    if (node->op == GGML_OP_CONCAT && ggml_get_op_params_i32(node, 0) == 0 &&
+    // Multi-GPU: under per-device splits this fused write can clobber the
+    // graph-input allocations sharing the compute buffer (recurrent-state ids
+    // read as float bits), so keep the unfused path there.
+    if (gdn_cache_fusion_allowed && node->op == GGML_OP_CONCAT && ggml_get_op_params_i32(node, 0) == 0 &&
             node->type == GGML_TYPE_F32 && i + 2 < cgraph->n_nodes) {
         const ggml_tensor * prefix = node->src[0];
         const ggml_tensor * body   = node->src[1];
