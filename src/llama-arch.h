@@ -89,7 +89,6 @@ enum llm_arch {
     LLM_ARCH_GLM4,
     LLM_ARCH_GLM4_MOE,
     LLM_ARCH_GLM_DSA,
-    LLM_ARCH_GLM5NEXT,
     LLM_ARCH_BITNET,
     LLM_ARCH_T5,
     LLM_ARCH_T5ENCODER,
@@ -165,6 +164,7 @@ enum llm_arch {
     LLM_ARCH_MAPLE = 151,
     LLM_ARCH_HY_V4 = 152,
     LLM_ARCH_SPARK2_5 = 153,
+    LLM_ARCH_GLM5NEXT = 154,
     LLM_ARCH_UNKNOWN = 142,
 };
 
