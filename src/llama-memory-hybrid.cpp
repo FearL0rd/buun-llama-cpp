@@ -193,6 +193,14 @@ bool llama_memory_hybrid::seq_rm_attn(
         llama_seq_id seq_id,
         llama_pos    p0,
         llama_pos    p1) {
+    // The indexer is auxiliary attention state. Every attention-only edit must retain the same
+    // cell membership in both children (mirrors llama_memory_hybrid_idx), else apply()'s
+    // n_kv cross-check fires once the server's context checkpoints roll cells back.
+    if (mem_idx) {
+        const bool removed_idx = mem_idx->seq_rm(seq_id, p0, p1);
+        GGML_ASSERT(removed_idx);
+        GGML_UNUSED(removed_idx);
+    }
     return mem_attn->seq_rm(seq_id, p0, p1);
 }
 
@@ -200,11 +208,21 @@ bool llama_memory_hybrid::seq_rm_transient(llama_seq_id seq_id, llama_pos p0, ll
     if (!mem_recr->seq_rm(seq_id, p0, p1)) {
         return false;
     }
+    if (mem_idx) {
+        const bool removed_idx = mem_idx->seq_rm_transient(seq_id, p0, p1);
+        GGML_ASSERT(removed_idx);
+        GGML_UNUSED(removed_idx);
+    }
     return mem_attn->seq_rm_transient(seq_id, p0, p1);
 }
 
 bool llama_memory_hybrid::seq_rm_attn_transient(
         llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
+    if (mem_idx) {
+        const bool removed_idx = mem_idx->seq_rm_attn_transient(seq_id, p0, p1);
+        GGML_ASSERT(removed_idx);
+        GGML_UNUSED(removed_idx);
+    }
     return mem_attn->seq_rm_attn_transient(seq_id, p0, p1);
 }
 
