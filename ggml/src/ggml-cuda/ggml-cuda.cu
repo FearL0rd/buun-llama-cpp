@@ -7999,6 +7999,14 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 int nodes_to_skip = ggml_cuda_try_fuse(cuda_ctx, cgraph, i);
 
                 if (nodes_to_skip != 0) {
+                    static const bool log_fusion = getenv("GGML_CUDA_LOG_FUSION") != nullptr;
+                    if (log_fusion && cuda_ctx->device == 1) {
+                        const int last_fused = i + nodes_to_skip;
+                        fprintf(stderr, "FUSE dev=1 n=%d first=[%d]%s('%s') last=[%d]%s('%s')\n",
+                                nodes_to_skip + 1, i, ggml_op_name(node->op), node->name,
+                                last_fused, ggml_op_name(cgraph->nodes[last_fused]->op),
+                                cgraph->nodes[last_fused]->name);
+                    }
 #ifdef GGML_CUDA_DEBUG
                     const int last_fused = i + nodes_to_skip;
                     GGML_LOG_INFO("nodes_fused: %d, first: %s (%s), last: %s (%s)\n",
