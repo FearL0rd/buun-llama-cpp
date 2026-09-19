@@ -165,8 +165,19 @@ public:
         }
     }
 
-    void write_tensor(ggml_tensor *, size_t, size_t) override {
-        matches_ = false;
+    void write_tensor(ggml_tensor * tensor, size_t offset, size_t size) override {
+        if (!matches_ || !tensor || offset > ggml_nbytes(tensor) ||
+            size > ggml_nbytes(tensor)-offset) {
+            matches_ = false;
+            return;
+        }
+        tensor_scratch_.resize(std::min(size, scratch_.size()));
+        for (size_t done = 0; done < size && matches_;) {
+            const size_t take = std::min(tensor_scratch_.size(), size-done);
+            ggml_backend_tensor_get(tensor, tensor_scratch_.data(), offset+done, take);
+            write(tensor_scratch_.data(), take);
+            done += take;
+        }
     }
 
     size_t n_bytes() override { return size_t(offset_); }
@@ -178,6 +189,7 @@ public:
 private:
     const artifact_segment_chain & expected_;
     std::vector<uint8_t> scratch_;
+    std::vector<uint8_t> tensor_scratch_;
     uint64_t offset_ = 0;
     bool matches_ = true;
 };
@@ -193,7 +205,8 @@ class server_vbr_draft_image final : public vbr_prepared_companion_image {
 public:
     server_vbr_draft_target target;
     uint64_t expected_bytes = 0;
-    std::vector<uint8_t> recovery;
+    const artifact_segment_chain * recovery = nullptr;
+    uint64_t recovery_bytes = 0;
     llama_pos recovery_live_terminal = -1;
 
     static bool empty(const void * opaque) noexcept {
@@ -293,34 +306,25 @@ public:
                 llama_memory_seq_pos_min(memory, destination);
             const size_t live_bytes = llama_state_seq_get_size_ext(
                 target->ctx, destination, LLAMA_STATE_SEQ_FLAGS_NONE);
-            static constexpr size_t MAX_DRAFT_RECOVERY_BYTES = 64u << 20;
             if (image->recovery_live_terminal != target->recovery_terminal ||
-                recovery_live_min != target->recovery_terminal ||
-                live_bytes == 0 || live_bytes > MAX_DRAFT_RECOVERY_BYTES ||
+                recovery_live_min < 0 ||
+                recovery_live_min > target->recovery_terminal ||
+                live_bytes == 0 ||
                 live_bytes != recovery->bytes ||
                 recovery->source->size() != recovery->bytes) {
                 return false;
             }
-            image->recovery.resize(live_bytes);
-            if (llama_state_seq_get_data_ext(
-                    target->ctx, image->recovery.data(), live_bytes,
-                    destination, LLAMA_STATE_SEQ_FLAGS_NONE) != live_bytes) {
+            // Dense MTP drafts retain a whole attention prefix, not just the
+            // terminal recurrent row. Compare it in bounded chunks and retain
+            // the already-accounted recovery owner instead of duplicating it.
+            server_vbr_chain_match_writer writer(*recovery->source);
+            if (target->ctx->state_seq_write_data_stream(
+                    writer, destination, LLAMA_STATE_SEQ_FLAGS_NONE) != live_bytes ||
+                !writer.matches()) {
                 return false;
             }
-            std::vector<uint8_t> recovery_chunk(
-                std::min<size_t>(size_t(1) << 20, live_bytes));
-            for (size_t offset = 0; offset < live_bytes;) {
-                const size_t take = std::min(
-                    recovery_chunk.size(), live_bytes-offset);
-                if (!recovery->source->read(
-                        offset, recovery_chunk.data(), take) ||
-                    std::memcmp(
-                        recovery_chunk.data(),
-                        image->recovery.data()+offset, take) != 0) {
-                    return false;
-                }
-                offset += take;
-            }
+            image->recovery = recovery->source;
+            image->recovery_bytes = recovery->bytes;
             auto * raw = image.get();
             output = std::move(image);
             if (!llama_memory_seq_rm(
@@ -363,19 +367,12 @@ public:
                 image.target.destination, -1, -1)) {
             return false;
         }
-        if (image.recovery.empty()) {
+        if (!image.recovery) {
             return empty(&image.target);
         }
         try {
-            const size_t restored = llama_state_seq_set_data_ext(
-                image.target.ctx, image.recovery.data(),
-                image.recovery.size(), image.target.destination,
-                LLAMA_STATE_SEQ_FLAGS_NONE);
-            auto * memory = llama_get_memory(image.target.ctx);
-            return restored == image.recovery.size() && memory &&
-                llama_memory_seq_pos_max(
-                    memory, image.target.destination) ==
-                        image.recovery_live_terminal;
+            return load(image.target, *image.recovery, image.recovery_bytes,
+                        image.recovery_live_terminal);
         } catch (...) {
             return false;
         }
@@ -2787,6 +2784,8 @@ bool server_vbr_artifact_store::capture_projected_host_batch(
         measured.capture_status = captured.status;
         measured.capture_phase = captured.phase;
         measured.inner_stream_status = captured.inner_stream_status;
+        measured.generation_failure = captured.generation_failure;
+        measured.size_failure = captured.size_failure;
         measured.source_namespace = captured.source_namespace;
         measured.first_available_manifest_id =
             captured.first_available_manifest_id;
@@ -3522,13 +3521,6 @@ server_vbr_artifact_import_output server_vbr_artifact_store::import_package_impl
                 request.frontier_logits,
             });
         }
-        if (snapshot_status ==
-                vbr_import_target_snapshot_status::unavailable) {
-            output.validation_status =
-                vbr_manifest_validation_status::unavailable;
-            return fail(server_vbr_artifact_import_status::unavailable,
-                        impl_->counters.imports_unavailable);
-        }
         output.schedule_status = schedule_quote.status();
         const auto & destination = schedule_quote.destination();
         output.destination_status = destination.status;
@@ -3539,6 +3531,13 @@ server_vbr_artifact_import_output server_vbr_artifact_store::import_package_impl
         output.destination_physical_growth_bytes =
             destination.physical_growth_needed;
         output.destination_max_deficit = destination.max_deficit;
+        if (snapshot_status ==
+                vbr_import_target_snapshot_status::unavailable) {
+            output.validation_status =
+                vbr_manifest_validation_status::unavailable;
+            return fail(server_vbr_artifact_import_status::unavailable,
+                        impl_->counters.imports_unavailable);
+        }
         context.schedule_quote = &schedule_quote;
         if (schedule_quote.status() != vbr_import_schedule_status::_count) {
             impl_->counters.import_schedules[

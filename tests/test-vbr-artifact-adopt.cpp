@@ -9,6 +9,8 @@
 #include "llama-vbr-generation.h"
 #include "llama-vbr-operation.h"
 #include "llama-memory-tree.h"
+#include "llama-memory-recurrent.h"
+#include "llama-model.h"
 #include "llama-vbr-artifact-catalog.h"
 #include "llama-vbr-explicit-capture.h"
 #include "llama-vbr-identity-digest.h"
@@ -2145,7 +2147,8 @@ struct fixture {
                      bool occupied_import = false,
                      bool recycle_import = false,
                      bool transformed_recycle_import = false,
-                     bool occupied_spec_companion_import = false)
+                     bool occupied_spec_companion_import = false,
+                     bool permuted_placement = false)
         : source(package(
               bytes, companion,
               upward_import ? upward_source : GGML_TYPE_TURBO8_0,
@@ -2188,6 +2191,16 @@ struct fixture {
                 controller.floor_type = GGML_TYPE_TURBO1_TCQ;
             }
         }
+        const auto permute = [permuted_placement](vbr_artifact_package & package) {
+            if (permuted_placement) {
+                for (auto & placement : package.manifest.stream_placements) {
+                    for (auto & cell : placement.cells) {
+                        cell.logical_position = (cell.logical_position + 2)%placement.cells.size();
+                    }
+                }
+            }
+        };
+        permute(source);
         const auto prepared = vbr_artifact_prepare(source);
         if (prepared != vbr_artifact_status::ok) {
             std::fprintf(stderr, "VBR adoption prepare status=%s source=%s hops=%u stash=%u\n",
@@ -2334,6 +2347,7 @@ struct fixture {
                 occupied_spec_companion
                     ? vbr_artifact_companion_kind::required_spec_payload
                     : vbr_artifact_companion_kind::recurrent);
+            permute(recovery_source);
             for (size_t i = 0;
                  i < recovery_source.manifest.controller_policy.size() &&
                  i < source.manifest.controller_policy.size(); ++i) {
@@ -2416,6 +2430,9 @@ struct fixture {
             for (uint32_t i = 0; i < cells.size(); ++i) {
                 cells[i] = { 0, i, llama_pos(i), llama_pos(10+i),
                     llama_pos(20+i), 0, 1, true };
+                if (permuted_placement) {
+                    cells[i].logical_position = (i + 2)%cells.size();
+                }
             }
             const auto & live_view = transformed_recycle
                 ? recovery_view : view;
@@ -2973,6 +2990,38 @@ static void test_real_driver_smoke() {
     CHECK(f.ledger.snapshot().live_ops == f.catalog_live_ops);
 }
 
+static void test_busy_controller_refused_before_operation_open() {
+    fixture f;
+    const auto instance = f.target.children[0].instance;
+    vbr_operation_binding binding;
+    binding.kind = vbr_operation_kind::decode;
+    binding.child_phase = vbr_operation_phase::mutate;
+    CHECK(vbr_binding_add_instance_target(
+        binding, vbr_operation_kind::decode,
+        vbr_operation_class::ordinary_decode, instance,
+        VBR_STREAM_ANY, 1, 0, 100));
+    vbr_scoped_operation decode(binding);
+    CHECK(bool(decode));
+
+    const auto result = adopt(f);
+    CHECK(result.status == vbr_adopt_status::operation_unavailable);
+    CHECK(result.phase == vbr_adopt_phase::operation_open);
+    CHECK(!f.target.operation_opened);
+    CHECK(!f.target.operation_quarantined);
+    CHECK(!f.target.recovery_reserved);
+    CHECK(f.target.transfer_calls == 0);
+    CHECK(f.target.publish_calls == 0);
+    CHECK(f.target.construction_empty());
+    CHECK(f.ledger.snapshot().live_ops == f.catalog_live_ops);
+    CHECK(!vbr_operation_registry_quiescent_for(&instance, 1));
+    CHECK(decode.close(vbr_operation_outcome::committed));
+
+    // The busy refusal did not poison the retained artifact or destination.
+    CHECK(adopt(f).status == vbr_adopt_status::adopted);
+    f.target.erase_imported();
+    CHECK(f.ledger.snapshot().live_ops == f.catalog_live_ops);
+}
+
 static vbr_adopt_result adopt_occupied(
         fixture & f, vbr_adopt_phase fail_phase = vbr_adopt_phase::_count,
         bool fail_after = false) {
@@ -3083,6 +3132,26 @@ static void test_occupied_replacement_free_cell_adoption() {
     for (const auto & offset : f.target.relocated_offsets) {
         CHECK(offset.first == 0);
         CHECK(offset.second == 5);
+    }
+}
+
+static void test_occupied_permuted_placement() {
+    for (const bool recycle : { false, true }) {
+        fixture f(false, false, false, GGML_TYPE_TURBO8_0, GGML_TYPE_F16,
+                  0, vbr_artifact_clean_stash_state::absent_at_source,
+                  false, false, true, recycle, false, false, true);
+        CHECK(f.occupied_guard.ready());
+        const auto & mappings = f.occupied_guard.cell_mapping();
+        CHECK(mappings.size() == 5);
+        for (size_t i = 0; i < mappings.size(); ++i) {
+            CHECK(mappings[i].logical_position == llama_pos(i));
+            CHECK(mappings[i].source_physical_cell == (i + 3)%5);
+            CHECK(mappings[i].source_packed_row == (i + 3)%5);
+            CHECK(mappings[i].destination_physical_cell ==
+                  (recycle ? (i + 3)%5 : i + 5));
+        }
+        const auto validated = vbr_validate_unit_manifest_snapshot(f.snapshot, f.view, f.policy);
+        CHECK(validated.status == vbr_manifest_validation_status::validated);
     }
 }
 
@@ -5901,6 +5970,133 @@ static void test_final_recheck_excludes_only_own_reservation() {
     operation.close(vbr_operation_outcome::aborted);
 }
 
+static void test_recurrent_replacement_preserves_other_sequence() {
+    llama_model_ptr model(llama_model_create(LLM_ARCH_MAMBA, llama_model_default_params()));
+    CHECK(model);
+    if (!model) {
+        return;
+    }
+    model->hparams.n_layer_all = 1;
+    model->hparams.ssm_d_conv = 2;
+    model->hparams.ssm_d_inner = 4;
+    model->hparams.ssm_d_state = 2;
+    llama_memory_recurrent memory(*model, GGML_TYPE_F32, GGML_TYPE_F32, false, 2, 2, 1, {});
+    memory.used = 2;
+    for (int i = 0; i < 2; ++i) {
+        memory.cells[i].pos = 10 + i;
+        memory.cells[i].src = i;
+        memory.cells[i].tail = i;
+        memory.cells[i].seq_id.insert(i);
+    }
+    const auto fill = [&](uint32_t row, float value) {
+        for (auto * tensor : { memory.r_l[0], memory.s_l[0] }) {
+            std::vector<float> values(size_t(tensor->ne[0]), value);
+            ggml_backend_tensor_set(tensor, values.data(), row*values.size()*sizeof(float),
+                                    values.size()*sizeof(float));
+        }
+    };
+    fill(0, 1.0f);
+    fill(1, 3.0f);
+    const auto capture = [&](llama_seq_id sequence) {
+        struct writer : llama_io_write_i {
+            std::vector<uint8_t> bytes;
+            void write(const void * data, size_t size) override {
+                const auto * p = static_cast<const uint8_t *>(data);
+                bytes.insert(bytes.end(), p, p + size);
+            }
+            void write_tensor(ggml_tensor * tensor, size_t offset, size_t size) override {
+                const size_t start = bytes.size();
+                bytes.resize(start + size);
+                ggml_backend_tensor_get(tensor, bytes.data() + start, offset, size);
+            }
+            size_t n_bytes() override { return bytes.size(); }
+        } out;
+        const uint32_t magic = 0xaf143cd8;
+        out.write(&magic, sizeof(magic));
+        out.write(&sequence, sizeof(sequence));
+        memory.state_write(out, sequence, 0);
+        return out.bytes;
+    };
+    auto recovery = capture(0);
+    const auto foreign = capture(1);
+    fill(0, 2.0f);
+    memory.cells[0].pos = 20;
+    const auto incoming = capture(0);
+    fill(0, 1.0f);
+    memory.cells[0].pos = 10;
+    const auto parse = [&](const std::vector<uint8_t> & bytes) {
+        artifact_segment_chain chain(bytes.size());
+        CHECK(chain.append(bytes.data(), bytes.size()));
+        vbr_artifact_companion_payload descriptor;
+        descriptor.kind = vbr_artifact_companion_kind::recurrent;
+        descriptor.format_version = 1;
+        descriptor.build_identity_digest = vbr_explicit_recurrent_companion_build_identity();
+        descriptor.payload_bytes = bytes.size();
+        vbr_target_companion_snapshot target;
+        target.kind = descriptor.kind;
+        target.format_version = descriptor.format_version;
+        target.build_identity_digest = descriptor.build_identity_digest;
+        target.available = true;
+        target.target_cookie = &memory;
+        std::unique_ptr<vbr_parsed_companion_image> parsed;
+        CHECK(vbr_parse_recurrent_companion(nullptr, descriptor, chain, target, parsed));
+        return parsed;
+    };
+    const auto provider = vbr_recurrent_companion_adoption_provider(memory);
+    std::unique_ptr<vbr_prepared_companion_image> image;
+    const auto prepare = [&]() {
+        return provider.prepare_replacement(provider.context, parse(incoming), parse(recovery), 0, image);
+    };
+    // Sharing either the logical cell or its deferred physical source must
+    // still refuse before writing anything, even though independent rows work.
+    memory.cells[0].seq_id.insert(1);
+    CHECK(!prepare() && !image);
+    memory.cells[0].seq_id.erase(1);
+    memory.cells[1].src = 0;
+    CHECK(!prepare() && !image);
+    memory.cells[1].src = 1;
+    CHECK(capture(0) == recovery && capture(1) == foreign);
+    CHECK(prepare());
+    if (!image) {
+        return;
+    }
+    CHECK(provider.recheck(provider.context, *image));
+    CHECK(capture(1) == foreign);
+    CHECK(provider.rollback(provider.context, *image));
+    CHECK(capture(0) == recovery && capture(1) == foreign);
+    image.reset();
+    CHECK(prepare());
+    if (image) {
+        CHECK(provider.recheck(provider.context, *image));
+        provider.publish_swap(provider.context, *image);
+        CHECK(capture(0) == incoming && capture(1) == foreign);
+        CHECK(memory.used == 2 && memory.cells[1].tail == 1);
+    }
+    image.reset();
+    // An accepted speculative rollback can leave the live state in a backup
+    // plane. Failure must keep that plane and its metadata; success installs
+    // the incoming row into the base plane and resets only this sequence.
+    fill(2, 5.0f);
+    memory.cells[0].pos = 30;
+    memory.rs_idx[0] = 1;
+    memory.rollback_valid_depth[0] = 1;
+    recovery = capture(0);
+    CHECK(prepare());
+    if (image) {
+        CHECK(provider.recheck(provider.context, *image));
+        CHECK(provider.rollback(provider.context, *image));
+        CHECK(capture(0) == recovery && capture(1) == foreign);
+        CHECK(memory.rs_idx[0] == 1 && memory.rollback_valid_depth[0] == 1);
+    }
+    image.reset();
+    CHECK(prepare());
+    if (image) {
+        provider.publish_swap(provider.context, *image);
+        CHECK(memory.rs_idx[0] == 0 && memory.rollback_valid_depth[0] == 0);
+        CHECK(capture(0) == incoming && capture(1) == foreign);
+    }
+}
+
 static void test_checkpoint_recurrent_frontier_header() {
     std::array<uint8_t,
         2*sizeof(uint32_t)+sizeof(llama_seq_id)+sizeof(llama_pos)> bytes = {};
@@ -5981,7 +6177,9 @@ static bool parse_vbr_type(const std::string & name, ggml_type & output) {
 }
 
 int main(int argc, char ** argv) {
+    test_recurrent_replacement_preserves_other_sequence();
     adoption_fixture::test_occupied_replacement_free_cell_adoption();
+    adoption_fixture::test_occupied_permuted_placement();
     adoption_fixture::test_occupied_replacement_fault_preserves_incumbent();
     adoption_fixture::test_occupied_spec_companion_replacement_and_rollback();
     adoption_fixture::test_occupied_recycle_success_and_zero_growth();
@@ -5995,6 +6193,7 @@ int main(int argc, char ** argv) {
     test_closed_vocabularies();
     test_complete_tree_barrier_fail_closed();
     adoption_fixture::test_real_driver_smoke();
+    adoption_fixture::test_busy_controller_refused_before_operation_open();
     adoption_fixture::test_erase_releases_receipt_for_second_adopt();
     adoption_fixture::test_phase_fault_matrix();
     adoption_fixture::test_shard_child_and_partial_map_matrix();

@@ -631,6 +631,40 @@ static void test_golden_and_native_lineage() {
     CHECK(decoded.manifest.stream_placements[0].cells[1].ext_y == 21);
 }
 
+// Pinned legacy Turbo sides still belong to a dynamic VBR artifact. They do
+// not become ladder rungs, but their original codec must survive serialization.
+static void test_pinned_legacy_turbo_types() {
+    for (const auto type : { GGML_TYPE_TURBO2_0, GGML_TYPE_TURBO3_0 }) {
+        fixture_storage storage;
+        auto package = make_package(storage);
+        auto & descriptor = package.unit_blobs[0].descriptor;
+        descriptor.current_type = descriptor.last_source_type = type;
+        auto & generation = package.manifest.generation.controllers[0].units[0];
+        generation.current_type = generation.last_source_type = type;
+        std::vector<uint8_t> bytes;
+        CHECK(vbr_artifact_encode_vector(package, bytes, 1024*1024) == vbr_artifact_status::ok);
+        vbr_artifact_package decoded;
+        CHECK(vbr_artifact_decode_vector(bytes, limits(1024*1024), decoded) == vbr_artifact_status::ok);
+        if (!decoded.unit_blobs.empty()) {
+            CHECK(decoded.unit_blobs[0].descriptor.current_type == type);
+            CHECK(decoded.unit_blobs[0].descriptor.last_source_type == type);
+        }
+        const vbr_import_schedule_unit pinned {
+            0, 0, type, type, vbr_repr_domain::tapped, vbr_repr_domain::tapped,
+        };
+        CHECK(vbr_classify_import_schedule_units({ pinned }) ==
+              vbr_import_schedule_status::exact);
+        CHECK(vbr_classify_import_schedule_units({ pinned, {
+            0, 1, GGML_TYPE_F16, GGML_TYPE_TURBO8_0,
+            vbr_repr_domain::full, vbr_repr_domain::full,
+        } }) == vbr_import_schedule_status::downward);
+        auto unsupported = pinned;
+        unsupported.target_type = GGML_TYPE_TURBO3_TCQ;
+        CHECK(vbr_classify_import_schedule_units({ unsupported }) ==
+              vbr_import_schedule_status::unavailable);
+    }
+}
+
 static void test_v1_decode_and_v2_restore_metadata() {
     fixture_storage storage;
     auto legacy = make_package(storage);
@@ -8368,6 +8402,60 @@ static void test_prompt_cache_vbr_pressure_retires_physical_union() {
           refresh_high_reference.reference_artifact);
     CHECK(fixture.catalog->snapshot().references == 2);
 
+    // Recovery refresh is different from a quality downgrade: an equal-tier
+    // recapture replaces stale placement/companion evidence and drops the old
+    // execution's anchor. Pins and the hard host budget still apply.
+    const auto recovery_refresh_reference = publish_fixture(*fixture.catalog,
+        fixture.package, fixture.completions(), fixture.budget);
+    auto recovery_refresh = owned_payload(recovery_refresh_reference.reference_artifact);
+    cache.states.front().recovery_pins = 1;
+    CHECK(cache.refresh_vbr_compact(
+              prompt, recovery_refresh.vbr_compact_owner(),
+              fixture.package.manifest.identity.execution_identity,
+              fixture.package.manifest.identity.adapter_config_identity,
+              source_slot, true) == server_prompt_cache_vbr_refresh_status::busy);
+    cache.states.front().recovery_pins = 0;
+    cache.limit_size = 1;
+    CHECK(cache.refresh_vbr_compact(
+              prompt, recovery_refresh.vbr_compact_owner(),
+              fixture.package.manifest.identity.execution_identity,
+              fixture.package.manifest.identity.adapter_config_identity,
+              source_slot, true) == server_prompt_cache_vbr_refresh_status::budget_refused);
+    cache.limit_size = 0;
+    server_cache_lease_identity recovery_identity;
+    occupied_replacement_fallback recovery_fallback;
+    authority.leases.bind_fallback_provider(&recovery_fallback);
+    CHECK(server_cache_lease_build_identity(
+        fixture.package.manifest.identity.execution_identity,
+        fixture.package.manifest.identity.adapter_config_identity,
+        prompt.tokens, prompt.n_tokens(), recovery_identity));
+    const auto recovery_lease = authority.leases.grant_hard(
+        { refresh_host_artifact, common_retention_artifact_kind::host_entry, -1 },
+        server_cache_lease_scope::from(authority.leases.new_context_scope()),
+        recovery_identity, UINT64_MAX / 2);
+    CHECK(recovery_lease);
+    CHECK(cache.refresh_vbr_compact(
+              prompt, recovery_refresh.vbr_compact_owner(),
+              fixture.package.manifest.identity.execution_identity,
+              fixture.package.manifest.identity.adapter_config_identity,
+              source_slot, true) == server_prompt_cache_vbr_refresh_status::busy);
+    CHECK(authority.leases.release(recovery_lease));
+    authority.leases.bind_fallback_provider(nullptr);
+    CHECK(cache.refresh_vbr_compact(
+              prompt, recovery_refresh.vbr_compact_owner(),
+              fixture.package.manifest.identity.execution_identity,
+              fixture.package.manifest.identity.adapter_config_identity,
+              source_slot, true) == server_prompt_cache_vbr_refresh_status::updated_compact_only);
+    recovery_refresh = {};
+    CHECK(cache.states.size() == 1 && &cache.states.front() == refresh_address);
+    CHECK(cache.states.front().cache_plan_source_id == refresh_source_id);
+    CHECK(cache.states.front().cache_family == refresh_family);
+    CHECK(retention.artifact_id(refresh_host_key) == refresh_host_artifact);
+    CHECK(!cache.states.front().payload.vbr_has_quality_anchor());
+    CHECK(cache.states.front().payload.vbr_compact_owner()->reference_artifact() ==
+          recovery_refresh_reference.reference_artifact);
+    CHECK(fixture.catalog->snapshot().references == 1);
+
     // Without an anchor allowance the same degraded refresh still updates
     // compact-current, but retires the former high-quality owner instead of
     // creating hidden anchor debt or a second logical node.
@@ -9519,6 +9607,7 @@ int main(int argc, char ** argv) {
     }
 #endif
     test_golden_and_native_lineage();
+    test_pinned_legacy_turbo_types();
     test_v1_decode_and_v2_restore_metadata();
     test_identity_and_reference_separation();
     test_fail_closed_decode();

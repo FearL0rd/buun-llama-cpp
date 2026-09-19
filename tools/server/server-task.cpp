@@ -2850,7 +2850,8 @@ server_prompt_cache::refresh_vbr_compact(
         server_prompt_cache_vbr_owner incoming,
         const std::string & execution_identity,
         const std::string & adapter_config_key,
-        int32_t source_slot) noexcept {
+        int32_t source_slot,
+        bool replace_live_recovery) noexcept {
     using status = server_prompt_cache_vbr_refresh_status;
     if (!incoming || !acct || !retention_obs || source_slot < 0 ||
         execution_identity.empty() || adapter_config_key.empty() ||
@@ -2888,6 +2889,20 @@ server_prompt_cache::refresh_vbr_compact(
         if (target->recovery_pins != 0) {
             return status::busy;
         }
+        if (replace_live_recovery) {
+            server_cache_lease_identity identity;
+            if (!lease_obs || !server_cache_lease_build_identity(
+                    execution_identity, adapter_config_key, target->prompt.tokens,
+                    target->prompt.n_tokens(), identity)) {
+                return status::busy;
+            }
+            const auto lease = lease_obs->inspect_range(
+                retention_obs->artifact_id(server_retention_instance_key::for_host_entry(&*target)),
+                identity, target->prompt.sequence_epoch, 0, target->prompt.n_tokens());
+            if (lease.state != server_cache_lease_eval_state::known || server_cache_lease_is_hard(lease)) {
+                return status::busy;
+            }
+        }
 
         const auto * old_variants = target->payload.vbr_variants();
         if (!old_variants || !old_variants->compact_current()) {
@@ -2901,7 +2916,16 @@ server_prompt_cache::refresh_vbr_compact(
         const auto * old_compact = old_variants->compact_current().get();
         server_prompt_cache_payload replacement;
         bool unchanged = false;
-        if (!target->payload.prepare_vbr_refresh(
+        // Reuse is content-addressed, but rollback also authenticates the
+        // live physical placement and companion bytes. A fresh capture of
+        // that same frontier may therefore replace an equal-tier artifact.
+        // Do not retain an anchor from a different numerical execution.
+        if (replace_live_recovery) {
+            replacement = server_prompt_cache_payload::from_vbr(std::move(incoming));
+            if (!replacement.valid()) {
+                return status::invalid;
+            }
+        } else if (!target->payload.prepare_vbr_refresh(
                 std::move(incoming), replacement,
                 quality_anchor_budget_enabled, unchanged)) {
             return unchanged ? status::unchanged : status::internal_error;
@@ -2973,7 +2997,12 @@ server_prompt_cache::refresh_vbr_compact(
         vbr_artifact_prepared_retire prepared;
         bool physical_retire = false;
         const uint64_t serial = acct->serial();
-        if (retired_owner &&
+        if (replace_live_recovery && !target->payload.vbr_logical_erase_only()) {
+            if (!target->payload.prepare_vbr_retire(serial, prepared)) {
+                return status::accounting_unavailable;
+            }
+            physical_retire = true;
+        } else if (retired_owner &&
             !target->payload.vbr_logical_erase_only()) {
             std::vector<const vbr_artifact_package_view *> retiring_packages {
                 &retired_owner->package(),

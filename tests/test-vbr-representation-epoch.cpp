@@ -5,6 +5,7 @@
 #include "llama-memory-hybrid.h"
 #include "llama-vbr-artifact-capture.h"
 #include "llama-vbr-explicit-capture.h"
+#include "llama-vbr-codec.h"
 #include "llama.h"
 
 #include <algorithm>
@@ -191,7 +192,9 @@ struct llama_kv_cache_vbr_epoch_test {
                         tracker->unit_generation(static_cast<uint32_t>(ikv * 2 + side));
                 const int32_t live_type =
                         tensor != nullptr ? static_cast<int32_t>(tensor->type) : -1;
-                if (unit.current_type != live_type) {
+                const auto domain = tensor && !llama_vbr_codec_full_domain(kv->vbr_params_.codec, tensor->type)
+                    ? vbr_repr_domain::tapped : vbr_repr_domain::full;
+                if (unit.current_type != live_type || unit.domain != domain) {
                     return false;
                 }
             }
@@ -713,6 +716,33 @@ struct llama_kv_cache_vbr_epoch_test {
 
     static void full_reset(llama_kv_cache * kv) {
         kv->vbr_full_reset();
+    }
+
+    static bool reset_entry_domains(llama_kv_cache * kv) {
+        // Empty-cache resets must describe the actual configured entry, not
+        // assume F16. Exercise a pinned legacy key and a tapped Turbo4 entry
+        // without interpreting any existing payload at a different type.
+        std::vector<std::pair<ggml_type *, ggml_type>> entries;
+        for (auto & pool : kv->vbr_pools_) {
+            for (auto & extent : pool.k) {
+                if (extent.t) {
+                    entries.emplace_back(&extent.type0, extent.type0);
+                }
+            }
+        }
+        bool valid = !entries.empty();
+        for (const auto type : { GGML_TYPE_TURBO3_0, GGML_TYPE_TURBO4_0 }) {
+            for (const auto & entry : entries) {
+                *entry.first = type;
+            }
+            kv->vbr_full_reset();
+            valid &= generation_units_match(kv);
+        }
+        for (const auto & entry : entries) {
+            *entry.first = entry.second;
+        }
+        kv->vbr_full_reset();
+        return valid && generation_units_match(kv);
     }
 
     static bool dry_occupied_apply_preserves_epochs(llama_kv_cache * kv, llama_seq_id seq_id) {
@@ -2885,13 +2915,14 @@ int main(int argc, char ** argv) {
     }
     const bool partition_typed = argc == 3 && std::string(argv[1]) == "--iswa-budget";
     const bool partition_env   = argc == 3 && std::string(argv[1]) == "--iswa-budget-env";
+    const bool reset_domains   = argc == 3 && std::string(argv[1]) == "--reset-entry-domains";
     const bool partition_only  = partition_typed || partition_env;
-    if (argc != 2 && !partition_only) {
+    if (argc != 2 && !partition_only && !reset_domains) {
         fprintf(stderr, "usage: %s MODEL | --iswa-budget MODEL | --iswa-budget-env MODEL | "
-                "--identity-cpu | --generation-cpu | --operation-cpu\n", argv[0]);
+                "--reset-entry-domains MODEL | --identity-cpu | --generation-cpu | --operation-cpu\n", argv[0]);
         return 1;
     }
-    const char * model_path = partition_only ? argv[2] : argv[1];
+    const char * model_path = partition_only || reset_domains ? argv[2] : argv[1];
 
     if (!partition_only) {
         // operation registry registry foundation: RAII closes exactly once, IDs are process-global/nonzero, and a
@@ -3002,6 +3033,19 @@ int main(int argc, char ** argv) {
     llama_memory_t mem = llama_get_memory(ctx.get());
     llama_kv_cache * base = nullptr;
     llama_kv_cache * swa  = nullptr;
+    if (reset_domains) {
+        if (auto * hybrid = dynamic_cast<llama_memory_hybrid *>(mem)) {
+            base = hybrid->get_mem_attn();
+        } else if (!get_iswa_children(mem, base, swa)) {
+            base = dynamic_cast<llama_kv_cache *>(mem);
+        }
+        mem->clear(true);
+        const bool valid = base && llama_kv_cache_vbr_epoch_test::active(base) &&
+            llama_kv_cache_vbr_epoch_test::reset_entry_domains(base) &&
+            (!swa || llama_kv_cache_vbr_epoch_test::reset_entry_domains(swa));
+        fprintf(stderr, "VBR configured entry reset domains %s\n", valid ? "PASS" : "FAIL");
+        return valid ? 0 : 1;
+    }
     if (auto * hybrid = dynamic_cast<llama_memory_hybrid *>(mem)) {
         auto * attention = hybrid->get_mem_attn();
         if (!llama_kv_cache_vbr_epoch_test::active(attention)) {
@@ -3490,6 +3534,11 @@ int main(int argc, char ** argv) {
     }
     llama_kv_cache_vbr_epoch_test::full_reset(base);
     llama_kv_cache_vbr_epoch_test::full_reset(swa);
+    if (!llama_kv_cache_vbr_epoch_test::reset_entry_domains(base) ||
+        !llama_kv_cache_vbr_epoch_test::reset_entry_domains(swa)) {
+        fprintf(stderr, "full reset did not preserve configured entry domains\n");
+        return 1;
+    }
     const auto reset = llama_memory_vbr_state(mem, 0, 0);
     if (reset.cursor != 0) {
         fprintf(stderr, "full reset did not rewind the VBR cursor\n");

@@ -1539,6 +1539,9 @@ struct server_slot {
     common_cache_plan_destruction_reason checkpoint_floor_refusal =
         common_cache_plan_destruction_reason::mandatory_anchor;
     std::array<uint8_t, 32> vbr_idle_capture_attempt_identity = {};
+    // A fragmented projection may exceed its bounded source-read budget.
+    // Retry that sealed frontier with the existing full-layout streamer.
+    std::array<uint8_t, 32> vbr_idle_exact_retry_identity = {};
     int64_t vbr_idle_capture_retry_after_ms = 0;
     bool vbr_idle_capture_terminal = false;
     bool vbr_idle_capture_isolated_retry = false;
@@ -1857,6 +1860,7 @@ struct server_slot {
         vbr_idle_capture_retry_after_ms = 0;
         vbr_idle_capture_terminal = false;
         vbr_idle_capture_isolated_retry = false;
+        vbr_idle_exact_retry_identity = {};
         vbr_idle_admission_refusals.clear();
         vbr_idle_support_status =
             server_vbr_prompt_cache_support_status::supported;
@@ -6024,13 +6028,13 @@ private:
     // deficit_raw only: page-exact and free-VRAM independent, so WHETHER a cache is erased
     // never depends on driver jitter or co-tenants (the cache's own live clamp still handles
     // those with tier degrades).
-    void vbr_reclaim_before_degrade(int except_id, uint32_t n_tokens_extra, const char * reason) {
+    bool vbr_reclaim_before_degrade(int except_id, uint32_t n_tokens_extra, const char * reason) {
         if (!server_vbr_dynamic_active(params_base) || params_base.vbr_reclaim_floor_bpv <= 0.0f) {
-            return;
+            return false;
         }
         auto st = vbr_pool_state(n_tokens_extra);
         if (st.deficit_raw <= 0 || st.bpv_if_degraded >= (double) params_base.vbr_reclaim_floor_bpv) {
-            return;
+            return false;
         }
         if (params_base.vbr_prompt_cache) {
             std::fill(
@@ -6078,6 +6082,7 @@ private:
                     st.bpv_if_degraded,
                     (double) params_base.vbr_reclaim_floor_bpv);
         }
+        return cleared > 0;
     }
 
     // reset-on-low-LCP (dynamic VBR): tiers are per-tensor and promotion cannot cross the tap
@@ -9695,11 +9700,98 @@ private:
         GGML_ABORT("invalid slot prompt admission");
     }
 
+    // A retained checkpoint stem is sufficient for reuse, but not for rolling
+    // back an occupied replacement of the longer live frontier. Seal that
+    // frontier only when an incoming host hit actually needs it. The existing
+    // occupied import still authenticates the complete recovery image and
+    // preserves foreign sequences; no whole-tree clear or relaxed guard.
+    bool ensure_vbr_replacement_recovery(server_slot & slot, bool refresh = false) {
+        const auto adapter = lora_config_identity(slot.lora);
+        if (!refresh && prompt_cache->contains_vbr_frontier(
+                slot.prompt, frontier_execution_identity, adapter)) {
+            return true;
+        }
+        if (slot.state != SLOT_STATE_IDLE || slot.is_processing() ||
+            slot.hard_lease_blocks_live_prefix() ||
+            queue_tasks.has_deferred_for_slot(slot.id)) {
+            return false;
+        }
+        auto * memory = llama_get_memory(ctx_tgt);
+        vbr_explicit_capture_request request;
+        server_vbr_artifact_capture_status status;
+        server_prompt_cache_vbr_publication_metadata publication;
+        server_prompt_cache_vbr_capacity_claim capacity;
+        if (!memory || !build_capture_request(slot, request, status) ||
+            (!refresh && !prompt_cache->prepare_vbr_publication_metadata(
+                slot.prompt, frontier_execution_identity, adapter,
+                slot.id, publication))) {
+            return false;
+        }
+        struct admission_context {
+            server_prompt_cache * cache;
+            server_prompt_cache_vbr_publication_metadata * publication;
+            server_prompt_cache_vbr_capacity_claim * capacity;
+            server_context_impl * owner;
+            server_slot * slot;
+            const std::string * adapter;
+            bool refresh;
+        } admission { prompt_cache.get(), &publication, &capacity, this, &slot, &adapter, refresh };
+        request.max_packed_bytes = vbr_automatic_exact_capture_max_bytes();
+        request.pretransfer_context = &admission;
+        request.pretransfer_admit = [](
+                void * opaque,
+                const vbr_explicit_capture_pretransfer_quote & quote) noexcept {
+            auto & context = *static_cast<admission_context *>(opaque);
+            if (context.refresh) {
+                return context.cache->preview_vbr_compact_refresh_capacity(
+                    context.slot->prompt, context.owner->frontier_execution_identity,
+                    *context.adapter, quote.conservative_host_resident_bytes);
+            }
+            return context.cache->prepare_vbr_publication_capacity(
+                &context.publication, 1, quote.conservative_host_resident_bytes,
+                *context.capacity);
+        };
+        const int64_t started = ggml_time_us();
+        server_vbr_explicit_host_capture capture;
+        auto result = vbr_artifact_store->prepare_host_payload(
+            *memory, std::move(request), capture);
+        if (result.status == server_vbr_artifact_capture_status::ok) {
+            result = vbr_artifact_store->transfer_host_payload(capture);
+        }
+        server_prompt_cache_vbr_owner payload;
+        if (result.status == server_vbr_artifact_capture_status::ok) {
+            result = vbr_artifact_store->publish_host_payload(capture, payload);
+        }
+        bool ready = false;
+        if (refresh && result.status == server_vbr_artifact_capture_status::ok && payload) {
+            ready = prompt_cache->refresh_vbr_compact(
+                slot.prompt, std::move(payload), frontier_execution_identity, adapter,
+                slot.id, true) == server_prompt_cache_vbr_refresh_status::updated_compact_only;
+        } else if (!refresh) {
+            ready = result.status == server_vbr_artifact_capture_status::ok &&
+                payload &&
+                (capacity.requires_publication_revalidation() ||
+                 prompt_cache->consume_vbr_publication_capacity(capacity)) &&
+                prompt_cache->publish_vbr(
+                    publication, server_prompt_cache_payload::from_vbr(std::move(payload)),
+                    slot.cache_family, !slot.task || !slot.task->is_child(), nullptr,
+                    capacity.requires_publication_revalidation() ? &capacity : nullptr);
+        }
+        SLT_DBG(slot,
+            "VBR recovery capture ready=%d status=%s phase=%s bytes=%" PRIu64 " duration_ms=%.3f\n",
+            int(ready), server_vbr_artifact_capture_status_name(result.status),
+            vbr_explicit_capture_phase_name(result.phase),
+            result.payload_bytes + result.companion_bytes,
+            (ggml_time_us() - started)/1000.0);
+        return ready;
+    }
+
     bool try_automatic_vbr_restore(
             server_slot & slot,
             const server_task & task,
             const common_cache_family_binding & incoming_family,
-            size_t * restored_prefix = nullptr) noexcept {
+            size_t * restored_prefix = nullptr,
+            bool recovery_refreshed = false) noexcept {
         if (restored_prefix) {
             *restored_prefix = SIZE_MAX;
         }
@@ -9737,6 +9829,14 @@ private:
                             "automatic occupied VBR restore refused: no exact host candidate\n");
                 }
                 return false;
+            }
+            // A previous batch for another slot may have returned without an
+            // output read. Settle its pending decode at the scheduler fence
+            // before sampling recovery currency or opening an import operation.
+            // Only host-cache candidates pay this fence, not ordinary launches.
+            llama_synchronize(ctx_tgt);
+            if (ctx_dft) {
+                llama_synchronize(ctx_dft.get());
             }
             const auto restore_event_for = [](
                     const server_prompt_cache_vbr_owner & payload) noexcept {
@@ -9893,6 +9993,10 @@ private:
                 }
             }
             if (occupied_candidate && !cleared_for_empty_handoff) {
+                if (!ensure_vbr_replacement_recovery(slot)) {
+                    vbr_automatic_restore_occupied_fallbacks++;
+                    return false;
+                }
                 server_prompt_cache_vbr_replacement_ticket ticket;
                 server_prompt_cache_vbr_replacement_diagnostics
                     replacement_diagnostics;
@@ -10013,6 +10117,22 @@ private:
                         vbr_adopt_phase_name(imported.phase),
                         vbr_adopt_recovery_outcome_name(imported.recovery),
                         quarantined ? "true" : "false");
+                    // A semantically identical host frontier can still carry
+                    // an old slot/layout after an earlier restore. The guard
+                    // has refused before any write; refresh from the live
+                    // source and retry once, retaining every validation.
+                    using guard_status = vbr_occupied_replacement_guard_status;
+                    if (!recovery_refreshed && !quarantined &&
+                        (imported.occupied_guard_status == guard_status::frontier_mismatch ||
+                         imported.occupied_guard_status == guard_status::ownership_mismatch ||
+                         imported.occupied_guard_status == guard_status::generation_mismatch ||
+                         imported.occupied_guard_status == guard_status::representation_mismatch)) {
+                        ticket = {};
+                        if (ensure_vbr_replacement_recovery(slot, true)) {
+                            return try_automatic_vbr_restore(
+                                slot, task, incoming_family, restored_prefix, true);
+                        }
+                    }
                     return false;
                 }
                 GGML_ASSERT(state.published);
@@ -10195,12 +10315,14 @@ private:
                 SLT_DBG(
                     slot,
                     "automatic VBR host restore refused: status=%s "
-                    "validation=%s schedule=%s decision=%s adopt=%s "
+                    "validation=%s schedule=%s destination=%s max_deficit=%" PRIu64 " decision=%s adopt=%s "
                     "phase=%s units=%u companions=%u rollback=%llu\n",
                     server_vbr_artifact_import_status_name(imported.status),
                     vbr_manifest_validation_status_name(
                         imported.validation_status),
                     vbr_import_schedule_status_name(imported.schedule_status),
+                    vbr_import_destination_status_name(imported.destination_status),
+                    imported.destination_max_deficit,
                     vbr_import_decision_name(imported.decision),
                     vbr_adopt_status_name(imported.adopt_status),
                     vbr_adopt_phase_name(imported.phase), imported.units,
@@ -10426,23 +10548,34 @@ private:
         auto launched_task =
             std::make_unique<const server_task>(std::move(task));
         size_t restored_prefix = SIZE_MAX;
-        const bool automatically_restored = try_automatic_vbr_restore(
+        bool automatically_restored = try_automatic_vbr_restore(
             slot, *launched_task, incoming_family, &restored_prefix);
-        slot.vbr_imported_complete_frontier = automatically_restored
-            ? uint64_t(restored_prefix) : 0;
 
-        const size_t retained_prefix = restored_prefix != SIZE_MAX
+        size_t retained_prefix = restored_prefix != SIZE_MAX
             ? restored_prefix
             : slot.prompt.tokens.get_common_prefix(launched_task->tokens);
 
         if (reclaim_before_launch &&
             server_vbr_dynamic_active(params_base) &&
             launched_task->n_tokens() > 0) {
-            vbr_reclaim_before_degrade(
+            const bool reclaimed = vbr_reclaim_before_degrade(
                 slot.id,
                 uint32_t(launched_task->n_tokens() - retained_prefix),
                 "launch");
+            // The first import can be refused because an otherwise empty
+            // destination shares its memory tree with another idle slot.
+            // Ordinary pressure reclaim may now have safely emptied that
+            // tree. Retry once against the new state before choosing prefill.
+            if (reclaimed && !automatically_restored) {
+                automatically_restored = try_automatic_vbr_restore(
+                    slot, *launched_task, incoming_family, &restored_prefix);
+                retained_prefix = restored_prefix != SIZE_MAX
+                    ? restored_prefix
+                    : slot.prompt.tokens.get_common_prefix(launched_task->tokens);
+            }
         }
+        slot.vbr_imported_complete_frontier = automatically_restored
+            ? uint64_t(restored_prefix) : 0;
 
         // The binding follows retained immutable content. Only a full-prefix
         // append/resume keeps the existing lineage; a branch/replacement
@@ -11602,6 +11735,13 @@ private:
             (transfer_retry || capacity_retry);
     }
 
+    static bool vbr_idle_retry_exact(
+            vbr_explicit_capture_phase phase,
+            vbr_capture_stream_status stream_status) noexcept {
+        return phase == vbr_explicit_capture_phase::unit_transfer &&
+            stream_status == vbr_capture_stream_status::projection_invalid;
+    }
+
     static bool vbr_idle_release_isolated_retry(
             size_t candidate_count,
             size_t successful_captures,
@@ -12352,9 +12492,14 @@ private:
             token_digest, pending->candidate.tier_epoch,
             pending->candidate.tier_epoch_swa);
         if (pending->candidate.refresh) {
+            // A full multi-slot frontier doubles as rollback authority. Keep
+            // the freshly captured placement/companions even at equal quality;
+            // the old content-identical copy may belong to another slot.
+            const bool replace_recovery = params_base.kv_unified && slots.size() > 1 &&
+                published_tokens == uint64_t(source.prompt.n_tokens());
             const auto refresh = prompt_cache->refresh_vbr_compact(
                 source.prompt, std::move(payload),
-                frontier_execution_identity, adapter_key, source.id);
+                frontier_execution_identity, adapter_key, source.id, replace_recovery);
             if (refresh != server_prompt_cache_vbr_refresh_status::
                     updated_with_anchor &&
                 refresh != server_prompt_cache_vbr_refresh_status::
@@ -13087,9 +13232,13 @@ private:
             const bool durable_stem = idle.id >= 0 &&
                 size_t(idle.id) < vbr_durable_stems_by_seq.size() &&
                 vbr_durable_stems_by_seq[size_t(idle.id)] != 0;
+            // A shared multi-slot tree cannot use the single-slot clear
+            // handoff. Once its reusable stem is safe, also retain the exact
+            // live frontier needed to roll back occupied replacement.
             if (!checkpoint_stem && !durable &&
                 !idle.prompt.tokens.has_media() &&
-                matching_attempt_stem_source) {
+                matching_attempt_stem_source &&
+                !(durable_stem && params_base.kv_unified && slots.size() > 1)) {
                 if (idle.vbr_idle_stem_coverage_tokens != 0 &&
                     durable_stem) {
                     continue;
@@ -13320,11 +13469,15 @@ private:
             (!candidates.empty() && candidates.front().slot &&
              (candidates.front().slot->can_speculate() ||
               candidates.front().checkpoint != nullptr));
+        const bool exact_layout_retry = candidates.size() == 1 &&
+            candidates.front().slot &&
+            candidates.front().slot->vbr_idle_exact_retry_identity ==
+                candidates.front().attempt_identity;
         const bool projected_stateful_capture =
             !readiness_only && stateful_companion_capture &&
-            projected_attention_layout_supported &&
+            projected_attention_layout_supported && !exact_layout_retry &&
             candidates.size() == 1 && manifests.size() == 1;
-        const bool exact_companion_capture = readiness_only ||
+        const bool exact_companion_capture = readiness_only || exact_layout_retry ||
             (stateful_companion_capture && !projected_stateful_capture);
         // Bound every capture by configured durable host capacity (and the
         // library's 16 GiB per-wave ceiling), not by a small transport-window
@@ -13863,7 +14016,7 @@ private:
         if (params_base.cache_debug) {
             SRV_INF(
                 "VBR_CAPTURE_TRACE event=projected_complete ok=%d "
-                "manifests=%zu status=%s phase=%s frontier=%u "
+                "manifests=%zu status=%s phase=%s inner_status=%s generation_failure=%s size_failure=%s frontier=%u "
                 "requested_tokens=%" PRIu64 " selected_tokens=%" PRIu64
                 " union_cells=%" PRIu64 " planned=%" PRIu64
                 " companion=%" PRIu64 " survey_cells=%" PRIu64
@@ -13875,6 +14028,10 @@ private:
                     diagnostics.capture_status),
                 vbr_explicit_capture_phase_name(
                     diagnostics.capture_phase),
+                diagnostics.inner_stream_status == vbr_capture_stream_status::_count
+                    ? "none" : vbr_capture_stream_status_name(diagnostics.inner_stream_status),
+                vbr_explicit_generation_failure_name(diagnostics.generation_failure),
+                vbr_explicit_size_failure_name(diagnostics.size_failure),
                 unsigned(diagnostics.frontier_status),
                 diagnostics.requested_frontier_tokens,
                 diagnostics.selected_frontier_tokens,
@@ -13954,6 +14111,10 @@ private:
                     witnessable_admission_refusal &&
                     vbr_record_idle_admission_refusal(
                         *candidate.slot, candidate.attempt_identity);
+                if (vbr_idle_retry_exact(
+                        diagnostics.capture_phase, diagnostics.inner_stream_status)) {
+                    candidate.slot->vbr_idle_exact_retry_identity = candidate.attempt_identity;
+                }
                 const bool begin_stem_retry = !candidate.refresh &&
                     !candidate.stem_requested && candidates.size() == 1 &&
                     (aggregate_over_cap || incoming_over_host_cap) &&
@@ -14084,9 +14245,11 @@ private:
                     publication_token_identity,
                     found->tier_epoch, found->tier_epoch_swa);
             if (found->refresh) {
+                const bool replace_recovery = params_base.kv_unified && slots.size() > 1 &&
+                    row.payload->package().manifest().identity.token_count == source.prompt.n_tokens();
                 const auto refresh = prompt_cache->refresh_vbr_compact(
                     source.prompt, std::move(row.payload),
-                    frontier_execution_identity, adapter_key, source.id);
+                    frontier_execution_identity, adapter_key, source.id, replace_recovery);
                 if (refresh ==
                         server_prompt_cache_vbr_refresh_status::
                             updated_with_anchor ||
@@ -20567,6 +20730,19 @@ server_vbr_reclaim_policy_for_test() {
                     vbr_idle_capacity_retry_manifest(
                         ranked, 3, admitted, 2) == 20;
             }();
+        result.fragmented_projection_retries_exact =
+            server_context_impl::vbr_idle_retry_exact(
+                vbr_explicit_capture_phase::unit_transfer,
+                vbr_capture_stream_status::projection_invalid) &&
+            !server_context_impl::vbr_idle_retry_exact(
+                vbr_explicit_capture_phase::unit_transfer,
+                vbr_capture_stream_status::cancelled) &&
+            !server_context_impl::vbr_idle_retry_exact(
+                vbr_explicit_capture_phase::unit_transfer,
+                vbr_capture_stream_status::transfer_failed) &&
+            !server_context_impl::vbr_idle_retry_exact(
+                vbr_explicit_capture_phase::companion_capture,
+                vbr_capture_stream_status::projection_invalid);
         result.isolated_capture_drains_without_backoff =
             server_context_impl::vbr_idle_release_isolated_retry(
                 1, 1, true, false, true, false) &&

@@ -1417,12 +1417,17 @@ public:
     // lower-quality recapture preserves the prior best owner as an optional
     // anchor when its independent budget fits. No unrelated cache victim is
     // selected by this bounded refresh transaction.
+    // replace_live_recovery is for a fresh capture of the current live
+    // frontier, not a catalog-selected quality variant. It retires stale
+    // placement/companion evidence (and any anchor) under the same budget
+    // and recovery-pin checks.
     server_prompt_cache_vbr_refresh_status refresh_vbr_compact(
         const server_prompt & source_prompt,
         server_prompt_cache_vbr_owner incoming,
         const std::string & execution_identity,
         const std::string & adapter_config_key,
-        int32_t source_slot) noexcept;
+        int32_t source_slot,
+        bool replace_live_recovery = false) noexcept;
     // Conservative pre-D2H replacement check for refresh.  The final refresh
     // transaction remeasures exact shared accounting; this preview only
     // authorizes transfer when the quoted compact cannot exceed the hard cap.

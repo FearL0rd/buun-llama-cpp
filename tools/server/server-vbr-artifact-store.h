@@ -242,6 +242,8 @@ struct server_vbr_projected_host_capture_diagnostics {
         vbr_explicit_capture_phase::validation;
     vbr_capture_stream_status inner_stream_status =
         vbr_capture_stream_status::_count;
+    vbr_explicit_generation_failure generation_failure = vbr_explicit_generation_failure::none;
+    vbr_explicit_size_failure size_failure = vbr_explicit_size_failure::none;
     uint64_t source_namespace = 0;
     uint64_t first_available_manifest_id = 0;
     uint64_t union_cells = 0;

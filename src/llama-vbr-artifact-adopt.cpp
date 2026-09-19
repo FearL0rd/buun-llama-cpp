@@ -1565,16 +1565,6 @@ class import_operation_scope {
     open_status open(const vbr_validated_manifest & manifest,
                      llama_seq_id destination,
                      const std::vector<llama_memory_tree_child> & tree) {
-        if (test_seam_) {
-            const auto status = test_seam_->operation_open(
-                manifest, destination, tree, instances_, test_operation_);
-            test_open_ = status == vbr_adopt_status::adopted;
-            if (status == vbr_adopt_status::recovery_unavailable) {
-                return open_status::recovery_unavailable;
-            }
-            return test_open_ ? open_status::ok :
-                open_status::operation_unavailable;
-        }
         vbr_operation_binding binding;
         binding.kind = vbr_operation_kind::state_import;
         binding.child_phase = vbr_operation_phase::mutate;
@@ -1594,8 +1584,22 @@ class import_operation_scope {
             }
             seen.push_back(child.target_instance);
         }
-        if (seen.empty()) {
+        // Refuse an in-flight decode before acquiring recovery ownership.
+        // Otherwise an untouched import can report quarantine merely because
+        // the foreign operation is still present when cleanup checks quiescence.
+        if (seen.empty() ||
+            !vbr_operation_registry_quiescent_for(seen.data(), seen.size())) {
             return open_status::operation_unavailable;
+        }
+        if (test_seam_) {
+            const auto status = test_seam_->operation_open(
+                manifest, destination, tree, instances_, test_operation_);
+            test_open_ = status == vbr_adopt_status::adopted;
+            if (status == vbr_adopt_status::recovery_unavailable) {
+                return open_status::recovery_unavailable;
+            }
+            return test_open_ ? open_status::ok :
+                open_status::operation_unavailable;
         }
         operation_ = std::make_unique<vbr_scoped_operation>(binding);
         if (!*operation_) {

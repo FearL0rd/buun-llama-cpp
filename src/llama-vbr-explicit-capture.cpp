@@ -93,6 +93,10 @@ const char * representation_override(
         int32_t type,
         bool value_side) {
     switch (type) {
+        case GGML_TYPE_TURBO2_0:
+            return std::getenv("TURBO_CB_T2");
+        case GGML_TYPE_TURBO3_0:
+            return std::getenv("TURBO_CB_T3");
         case GGML_TYPE_TURBO8_0:
             return std::getenv("TURBO_CB_T8");
         case GGML_TYPE_TURBO4_0:
@@ -2218,8 +2222,13 @@ vbr_explicit_prepare_occupied_replacement_guard(
                 memory, destination, recovery, bindings, true,
                 accounting_serial, representation_context,
                 representation_identity, target,
-                nullptr, nullptr, &recovery_quote, nullptr, nullptr, &tree) ||
-            target.destination_sequence_absent) {
+                nullptr, nullptr, &recovery_quote, nullptr, nullptr, &tree)) {
+            // The tree is supported, but a stale recovery representation may
+            // no longer describe it after retiering. This is not permission
+            // to transform rollback bytes; the caller must capture it anew.
+            return vbr_occupied_replacement_guard_status::representation_mismatch;
+        }
+        if (target.destination_sequence_absent) {
             return vbr_occupied_replacement_guard_status::unsupported_tree;
         }
         if (external_companions) {

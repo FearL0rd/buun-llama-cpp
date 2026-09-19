@@ -791,6 +791,12 @@ vbr_import_schedule_status vbr_classify_import_schedule_units(
             unit.target_domain != vbr_downward_tier_domain(target)) {
             return vbr_import_schedule_status::unavailable;
         }
+        // A pinned legacy side can be restored byte-for-byte alongside a
+        // dynamic sibling. It is not an edge in the TCQ transcode ladder.
+        if (source == target &&
+            (source == GGML_TYPE_TURBO2_0 || source == GGML_TYPE_TURBO3_0)) {
+            continue;
+        }
         vbr_downward_recipe recipe;
         const auto relation = vbr_downward_resolve_recipe(
             source, target, GGML_TYPE_TURBO1_TCQ, true, recipe);
@@ -1834,9 +1840,13 @@ vbr_manifest_validation_result vbr_validate_unit_manifest_snapshot(
                 return terminal_result(
                     vbr_manifest_validation_status::geometry_mismatch);
             }
-            for (size_t i = 0; i < mappings.size(); ++i) {
-                const auto & mapping = mappings[i];
-                const auto & source = placement.cells[i];
+            for (const auto & source : placement.cells) {
+                if (source.logical_position < 0 ||
+                    size_t(source.logical_position) >= mappings.size()) {
+                    return terminal_result(
+                        vbr_manifest_validation_status::ownership_mismatch);
+                }
+                const auto & mapping = mappings[size_t(source.logical_position)];
                 if (mapping.source_stream != placement.stream_index ||
                     mapping.logical_position != source.logical_position ||
                     mapping.source_physical_cell != source.physical_cell ||

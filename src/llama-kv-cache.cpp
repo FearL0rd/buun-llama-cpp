@@ -8506,7 +8506,8 @@ void llama_kv_cache::vbr_full_reset() {
                         unit,
                         before.current_type,
                         target,
-                        vbr_repr_domain::full,
+                        tensor != nullptr && !llama_vbr_codec_full_domain(vbr_params_.codec, tensor->type)
+                            ? vbr_repr_domain::tapped : vbr_repr_domain::full,
                         0,
                         vbr_repr_transition::full_reset,
                         vbr_mutation_registrant::full_reset,

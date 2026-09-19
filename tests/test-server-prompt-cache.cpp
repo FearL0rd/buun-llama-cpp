@@ -2025,6 +2025,7 @@ void test_lifecycle_defaults_and_reuse_thresholds() {
     CHECK(vbr_reclaim.token_identity_distinguishes_attempt);
     CHECK(vbr_reclaim.successful_attempt_is_state_sealed);
     CHECK(vbr_reclaim.multi_fresh_pressure_isolated);
+    CHECK(vbr_reclaim.fragmented_projection_retries_exact);
     CHECK(vbr_reclaim.isolated_capture_drains_without_backoff);
     CHECK(vbr_reclaim.unchanged_admission_refusal_is_suppressed);
     CHECK(vbr_reclaim.checkpoint_admission_refusals_are_independent);

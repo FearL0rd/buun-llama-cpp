@@ -46,7 +46,7 @@ static std::array<uint8_t, 32> rotation(int type, bool value_side) {
 int main() {
     try {
         // No environment writes while worker threads run.
-        test_env t8("TURBO_CB_T8"), t4("TURBO_CB_T4"), tcq("TURBO_TCQ_CB"),
+        test_env t8("TURBO_CB_T8"), t4("TURBO_CB_T4"), t3("TURBO_CB_T3"), t2("TURBO_CB_T2"), tcq("TURBO_TCQ_CB"),
             tcq_k("TURBO_TCQ_CB_K"), tcq_v("TURBO_TCQ_CB_V"), t1("TURBO1_TCQ_CB"),
             t1_k("TURBO1_TCQ_CB_K"), t1_v("TURBO1_TCQ_CB_V"),
             mean_off("TURBO_MEANSUB_OFF"), mean_k("TURBO_KMEAN_SUB"), mean_v("TURBO_VMEAN_SUB");
@@ -116,6 +116,16 @@ int main() {
         const auto second = identity(GGML_TYPE_TURBO4_0, false);
         check(first.codebook_digest != second.codebook_digest && first.meansub_digest != second.meansub_digest &&
               first.rotation_digest == second.rotation_digest, "same-path override edit was missed");
+        for (const auto type : {GGML_TYPE_TURBO2_0, GGML_TYPE_TURBO3_0}) {
+            const auto & env = type == GGML_TYPE_TURBO2_0 ? t2 : t3;
+            env.set(path.c_str());
+            write("CCCC");
+            const auto before = identity(type, false);
+            write("DDDD");
+            check(identity(type, false).codebook_digest != before.codebook_digest,
+                  "pinned legacy Turbo codebook override edit was missed");
+            env.set(nullptr);
+        }
         file.reset();
         check(!vbr_explicit_capture_representation_identity(&policy, GGML_TYPE_TURBO4_0, false, 0, changed),
               "missing override accepted after warm lookup");

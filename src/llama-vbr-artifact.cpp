@@ -596,6 +596,8 @@ bool descriptor_metadata_valid(
         bool allow_sparse_rows = false) {
     const bool current_type_supported =
         descriptor.current_type == GGML_TYPE_F16 ||
+        descriptor.current_type == GGML_TYPE_TURBO2_0 ||
+        descriptor.current_type == GGML_TYPE_TURBO3_0 ||
         descriptor.current_type == GGML_TYPE_TURBO8_0 ||
         descriptor.current_type == GGML_TYPE_TURBO4_0 ||
         descriptor.current_type == GGML_TYPE_TURBO3_TCQ ||
@@ -603,6 +605,8 @@ bool descriptor_metadata_valid(
         descriptor.current_type == GGML_TYPE_TURBO1_TCQ;
     const bool source_type_supported =
         descriptor.last_source_type == GGML_TYPE_F16 ||
+        descriptor.last_source_type == GGML_TYPE_TURBO2_0 ||
+        descriptor.last_source_type == GGML_TYPE_TURBO3_0 ||
         descriptor.last_source_type == GGML_TYPE_TURBO8_0 ||
         descriptor.last_source_type == GGML_TYPE_TURBO4_0 ||
         descriptor.last_source_type == GGML_TYPE_TURBO3_TCQ ||
