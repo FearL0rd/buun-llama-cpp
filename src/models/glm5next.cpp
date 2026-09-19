@@ -290,7 +290,11 @@ ggml_tensor * llama_model_glm5next::graph::build_kda_layer(
     cb(beta, "kda_beta", il);
 
     ggml_tensor * ssm_states_all = mctx_cur->get_s_l(il);
-    ggml_tensor * state = build_rs(inp_rs, ssm_states_all, hparams.n_embd_s(), n_seqs);
+    // build_rs_in (not build_rs): the fork's decode fast-path keeps the state read consistent
+    // with the shared delta-net state machinery. The plain build_rs leaves s_copy unconsumed by
+    // the fast path while this gather still reads it, which under multi-GPU splits lets layer
+    // splits on other devices gather rows through an uninitialized index view (IMA / corruption).
+    ggml_tensor * state = build_rs_in(inp_rs, ssm_states_all, hparams.n_embd_s(), n_seqs);
     state = ggml_reshape_4d(ctx0, state, head_dim, head_dim, n_head, n_seqs);
 
     ggml_tensor * out = build_recurrent_attn(inp_rs, ssm_states_all, Qcur, Kcur, Vcur, g, beta, state, il);
