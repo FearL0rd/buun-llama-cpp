@@ -1125,8 +1125,10 @@ thread_local ggml_cuda_upload_ring ggml_cuda_uploads[GGML_CUDA_MAX_DEVICES];
 }
 
 static bool ggml_cuda_upload_async(void * dst, const void * data, size_t size) {
+    // Diagnostic kill-switch: sync-copy fallback matching upstream behavior.
+    static const bool upload_ring_disabled = getenv("GGML_CUDA_DISABLE_UPLOAD_RING") != nullptr;
     auto & ring = ggml_cuda_uploads[ggml_cuda_get_device()];
-    if (ring.disabled || size > ring.max_upload) {
+    if (ring.disabled || upload_ring_disabled || size > ring.max_upload) {
         return false;
     }
     if (ring.host == nullptr) {
