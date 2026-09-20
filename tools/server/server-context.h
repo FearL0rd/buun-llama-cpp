@@ -198,6 +198,7 @@ struct server_vbr_reclaim_policy_result {
     bool token_identity_distinguishes_attempt = false;
     bool successful_attempt_is_state_sealed = false;
     bool multi_fresh_pressure_isolated = false;
+    bool fragmented_projection_retries_exact = false;
     bool isolated_capture_drains_without_backoff = false;
     bool unchanged_admission_refusal_is_suppressed = false;
     bool checkpoint_admission_refusals_are_independent = false;
