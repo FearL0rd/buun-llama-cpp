@@ -277,6 +277,14 @@ void llama_memory_hybrid::state_read(llama_io_read_i & io, llama_seq_id seq_id, 
     mem_recr->state_read(io, seq_id, flags);
 }
 
+void llama_memory_hybrid::state_write_range(llama_io_write_i & io, llama_seq_id seq_id, llama_pos p0, llama_pos p1) const {
+    mem_attn->state_write_range(io, seq_id, p0, p1);
+}
+
+void llama_memory_hybrid::state_append_range(llama_io_read_i & io, llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_pos p_limit) {
+    mem_attn->state_append_range(io, seq_id, p0, p1, p_limit);
+}
+
 llama_kv_cache * llama_memory_hybrid::get_mem_attn() const {
     return mem_attn.get();
 }

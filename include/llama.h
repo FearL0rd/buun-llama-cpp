@@ -1185,6 +1185,41 @@ extern "C" {
                     llama_seq_id   dest_seq_id,
            llama_state_seq_flags   flags);
 
+    // Position-range form of a sequence's base state: the part that PARTIAL_ONLY leaves out,
+    // restricted to positions [p0, p1). A range blob does not depend on the stream layout, so it
+    // moves between split and unified KV caches. All three return 0 on failure.
+    // Bump the version on any change to the blob layout: readers refuse other versions.
+#define LLAMA_STATE_SEQ_RANGE_VERSION 1
+
+    // The sequence must hold every position of the range, with none masked out.
+    // A memory with no base part (pure recurrent) yields a blob that is only its header.
+    LLAMA_API size_t llama_state_seq_get_size_range(
+            struct llama_context * ctx,
+                    llama_seq_id   seq_id,
+                       llama_pos   p0,
+                       llama_pos   p1);
+
+    LLAMA_API size_t llama_state_seq_get_data_range(
+            struct llama_context * ctx,
+                         uint8_t * dst,
+                          size_t   size,
+                    llama_seq_id   seq_id,
+                       llama_pos   p0,
+                       llama_pos   p1);
+
+    // Appends a blob written for [p0, p1) without clearing the sequence: p0 must be the position
+    // after the sequence's last one (0 when it is empty). Cells at pos >= p_limit are dropped, so
+    // a destination smaller than the saved range takes a prefix of it. On failure the cells of
+    // this call are removed and the earlier ones stay.
+    LLAMA_API size_t llama_state_seq_append_data(
+            struct llama_context * ctx,
+                   const uint8_t * src,
+                          size_t   size,
+                    llama_seq_id   dest_seq_id,
+                       llama_pos   p0,
+                       llama_pos   p1,
+                       llama_pos   p_limit);
+
     //
     // Decoding
     //

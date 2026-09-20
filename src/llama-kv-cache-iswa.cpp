@@ -774,6 +774,14 @@ void llama_kv_cache_iswa::state_read(llama_io_read_i & io, llama_seq_id seq_id, 
     kv_swa->state_read(io, seq_id, flags);
 }
 
+void llama_kv_cache_iswa::state_write_range(llama_io_write_i & io, llama_seq_id seq_id, llama_pos p0, llama_pos p1) const {
+    kv_base->state_write_range(io, seq_id, p0, p1);
+}
+
+void llama_kv_cache_iswa::state_append_range(llama_io_read_i & io, llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_pos p_limit) {
+    kv_base->state_append_range(io, seq_id, p0, p1, p_limit);
+}
+
 llama_kv_cache * llama_kv_cache_iswa::get_base() const {
     return kv_base.get();
 }

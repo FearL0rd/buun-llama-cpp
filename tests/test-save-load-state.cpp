@@ -1087,8 +1087,197 @@ static bool test_state_roundtrip(struct llama_model * model, const struct common
     return true;
 }
 
+// Test 11: position-range blobs
+// - build seq 1 with its cells interleaved between seq 0 cells, so the range writer has to order by position
+// - a fresh context that appends the range in three blobs and then takes the partial state must end up
+//   with the same sequence state, byte for byte, as the source
+// - one blob for the whole range must install under the other stream layout (unified <-> split)
+// - p_limit keeps a prefix of a blob; a blob that does not continue the sequence, names another range
+//   or is cut short is refused and leaves the sequence as it was
+static bool test_state_range(struct llama_model * model, const struct common_params & params, const llama_tokens & tokens) {
+    LOG("\n=== Test 11: position-range blobs ===\n");
 
-// Run the full save/load test suite (tests 1-10) for a single model.
+    if (llama_model_is_recurrent(model)) {
+        LOG("a recurrent state has no position-addressable part, skipped\n");
+        return true;
+    }
+
+    const llama_pos n  = (llama_pos) std::min<size_t>(tokens.size(), 48);
+    const llama_pos c0 = n / 3;
+    const llama_pos c1 = 2 * n / 3;
+    if (c0 < 2) {
+        LOG_ERR("%s: the prompt is too short\n", __func__);
+        return false;
+    }
+
+    // plain KV caches ignore PARTIAL_ONLY and write everything, so only these have a partial part
+    const bool has_partial = llama_model_is_recurrent(model) || llama_model_is_hybrid(model) || llama_model_n_swa(model) > 0;
+
+    const auto make_ctx = [&](bool unified) {
+        auto params_ctx = common_context_params_to_llama(params);
+        params_ctx.n_ctx      = 512;
+        params_ctx.n_seq_max  = 2;
+        params_ctx.kv_unified = unified;
+        return llama_context_ptr{llama_init_from_model(model, params_ctx)};
+    };
+
+    const auto get_range = [&](llama_context * ctx, llama_pos p0, llama_pos p1, std::vector<uint8_t> & blob) {
+        blob.resize(llama_state_seq_get_size_range(ctx, 1, p0, p1));
+        return !blob.empty() && llama_state_seq_get_data_range(ctx, blob.data(), blob.size(), 1, p0, p1) == blob.size();
+    };
+
+    const auto get_state = [&](llama_context * ctx, llama_state_seq_flags flags, std::vector<uint8_t> & blob) {
+        blob.resize(llama_state_seq_get_size_ext(ctx, 1, flags));
+        return !blob.empty() && llama_state_seq_get_data_ext(ctx, blob.data(), blob.size(), 1, flags) == blob.size();
+    };
+
+    const auto append = [&](llama_context * ctx, const std::vector<uint8_t> & blob, llama_pos p0, llama_pos p1, llama_pos p_limit) {
+        return llama_state_seq_append_data(ctx, blob.data(), blob.size(), 1, p0, p1, p_limit) > 0;
+    };
+
+    std::vector<uint8_t> src_full;
+    std::vector<uint8_t> src_partial;
+    std::vector<uint8_t> src_all;  // [0, n)
+    std::vector<uint8_t> src_head; // [0, c0)
+    std::vector<uint8_t> src_mid;  // [c0, c1)
+    std::vector<uint8_t> src_tail; // [c1, n)
+    std::vector<uint8_t> src_cut;  // [0, c1 - 1)
+
+    // one context at a time: a dynamic-VBR cache does not share the device with a second one
+    {
+        auto ctx = make_ctx(true);
+        if (!ctx) {
+            LOG_ERR("%s: failed to create the source context\n", __func__);
+            return false;
+        }
+
+        for (llama_pos i = 0; i < n; ++i) {
+            for (llama_seq_id seq = 0; seq < 2; ++seq) {
+                llama_batch_ptr batch(1, 0, 1);
+                common_batch_add(batch.get(), tokens[i], i, { seq }, true);
+                if (llama_decode(ctx.get(), batch.get()) != 0) {
+                    LOG_ERR("%s: failed to decode position %d of seq %d\n", __func__, i, seq);
+                    return false;
+                }
+            }
+        }
+
+        if (!get_state(ctx.get(), LLAMA_STATE_SEQ_FLAGS_NONE, src_full) ||
+            (has_partial && !get_state(ctx.get(), LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY, src_partial)) ||
+            !get_range(ctx.get(), 0,  n,      src_all)  ||
+            !get_range(ctx.get(), 0,  c0,     src_head) ||
+            !get_range(ctx.get(), c0, c1,     src_mid)  ||
+            !get_range(ctx.get(), c1, n,      src_tail) ||
+            !get_range(ctx.get(), 0,  c1 - 1, src_cut)) {
+            LOG_ERR("%s: failed to save the source blobs\n", __func__);
+            return false;
+        }
+
+        // a range the sequence does not hold cannot be written
+        if (llama_state_seq_get_size_range(ctx.get(), 1, 0, n + 1) != 0) {
+            LOG_ERR("%s: a range past the end of the sequence was written\n", __func__);
+            return false;
+        }
+    }
+
+    // three blobs and the partial state rebuild the source state
+    {
+        auto ctx = make_ctx(true);
+        if (!ctx) {
+            LOG_ERR("%s: failed to create the tiling context\n", __func__);
+            return false;
+        }
+
+        if (!append(ctx.get(), src_head, 0,  c0, n) ||
+            !append(ctx.get(), src_mid,  c0, c1, n) ||
+            !append(ctx.get(), src_tail, c1, n,  n)) {
+            LOG_ERR("%s: failed to append the three blobs\n", __func__);
+            return false;
+        }
+
+        if (has_partial && llama_state_seq_set_data_ext(ctx.get(), src_partial.data(), src_partial.size(), 1, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) != src_partial.size()) {
+            LOG_ERR("%s: failed to install the partial state\n", __func__);
+            return false;
+        }
+
+        std::vector<uint8_t> dst_full;
+        if (!get_state(ctx.get(), LLAMA_STATE_SEQ_FLAGS_NONE, dst_full) || dst_full != src_full) {
+            LOG_ERR("%s: the tiled sequence state differs from the source (%zu vs %zu bytes)\n", __func__, dst_full.size(), src_full.size());
+            return false;
+        }
+    }
+
+    // the other stream layout takes the same blob
+    {
+        auto ctx = make_ctx(false);
+        if (!ctx) {
+            // a dynamic-VBR cache exists only unified
+            LOG_WRN("%s: no split-stream context for this configuration, the cross-layout leg is skipped\n", __func__);
+        } else {
+            std::vector<uint8_t> dst_all;
+            if (!append(ctx.get(), src_all, 0, n, n) || !get_range(ctx.get(), 0, n, dst_all) || dst_all != src_all) {
+                LOG_ERR("%s: a blob written under unified KV did not install under split KV\n", __func__);
+                return false;
+            }
+        }
+    }
+
+    // p_limit and the refusals
+    {
+        auto ctx = make_ctx(true);
+        if (!ctx) {
+            LOG_ERR("%s: failed to create the p_limit context\n", __func__);
+            return false;
+        }
+
+        // the base part holds exactly [0, p). not seq_pos_max: on a hybrid or SWA memory that is the minimum
+        // over both parts, and the partial part stays empty here
+        const auto holds = [&](llama_pos p) {
+            return (p == 0 || llama_state_seq_get_size_range(ctx.get(), 1, 0, p) > 0) &&
+                llama_state_seq_get_size_range(ctx.get(), 1, 0, p + 1) == 0;
+        };
+
+        // does not continue the (empty) sequence
+        if (append(ctx.get(), src_mid, c0, c1, n) || !holds(0)) {
+            LOG_ERR("%s: a blob that does not start at 0 went into an empty sequence\n", __func__);
+            return false;
+        }
+
+        if (!append(ctx.get(), src_head, 0, c0, n)) {
+            LOG_ERR("%s: failed to append the head blob\n", __func__);
+            return false;
+        }
+
+        // names another range than the one it was written for
+        if (append(ctx.get(), src_mid, c0, c1 + 1, n) || !holds(c0)) {
+            LOG_ERR("%s: a blob was accepted for another range\n", __func__);
+            return false;
+        }
+
+        // cut short: the cells of the failed call go, the earlier ones stay
+        if (llama_state_seq_append_data(ctx.get(), src_mid.data(), src_mid.size() - 8, 1, c0, c1, n) != 0 || !holds(c0)) {
+            LOG_ERR("%s: a truncated blob was accepted or left cells behind\n", __func__);
+            return false;
+        }
+
+        // p_limit drops the last cell of the blob
+        std::vector<uint8_t> dst_cut;
+        if (!append(ctx.get(), src_mid, c0, c1, c1 - 1) || !holds(c1 - 1) ||
+            !get_range(ctx.get(), 0, c1 - 1, dst_cut) || dst_cut != src_cut) {
+            LOG_ERR("%s: p_limit did not keep exactly the prefix of the blob\n", __func__);
+            return false;
+        }
+    }
+
+    LOG("\nPASS\n");
+    return true;
+}
+
+
+// --range-only: run test 11 alone, it needs no generation baseline
+static bool g_range_only = false;
+
+// Run the full save/load test suite (tests 1-11) for a single model.
 // Returns true if all tests pass, false otherwise.
 static bool run_save_load_tests_for_model(const std::string & model_path, const struct common_params & base_params) {
     struct common_params params = base_params;
@@ -1128,6 +1317,10 @@ static bool run_save_load_tests_for_model(const std::string & model_path, const 
     }
 
     LOG_INF("%s: the input prompt is %d tokens\n", __func__, (int)tokens.size());
+
+    if (g_range_only) {
+        return test_state_range(model, params, tokens);
+    }
 
     // Test 1: baseline (saves state to disk)
     auto result_baseline = test_baseline(model, params, tokens);
@@ -1180,6 +1373,11 @@ static bool run_save_load_tests_for_model(const std::string & model_path, const 
         return false;
     }
 
+    // Test 11: position-range blobs
+    if (!test_state_range(model, params, tokens)) {
+        return false;
+    }
+
     LOG("\nAll tests passed.\n");
 
     return true;
@@ -1209,6 +1407,8 @@ int main(int argc, char ** argv) {
             }
             models_dir = argv[i + 1];
             i++;
+        } else if (strcmp(argv[i], "--range-only") == 0) {
+            g_range_only = true;
         } else {
             filtered_argv.push_back(argv[i]);
         }

@@ -2105,6 +2105,13 @@ void llama_memory_recurrent::state_read(llama_io_read_i & io, llama_seq_id seq_i
     }
 }
 
+// a recurrent state is not addressable by position: it has no base part, all of it is the partial part
+void llama_memory_recurrent::state_write_range(llama_io_write_i & /*io*/, llama_seq_id /*seq_id*/, llama_pos /*p0*/, llama_pos /*p1*/) const {
+}
+
+void llama_memory_recurrent::state_append_range(llama_io_read_i & /*io*/, llama_seq_id /*seq_id*/, llama_pos /*p0*/, llama_pos /*p1*/, llama_pos /*p_limit*/) {
+}
+
 void llama_memory_recurrent::state_write_meta(llama_io_write_i & io, const std::vector<std::pair<uint32_t, uint32_t>> & cell_ranges, llama_seq_id seq_id) const {
     for (const auto & range : cell_ranges) {
         for (uint32_t i = range.first; i < range.second; ++i) {
