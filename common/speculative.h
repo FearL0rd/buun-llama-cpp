@@ -67,13 +67,12 @@ struct common_speculative_mtp_context_params {
     bool kv_unified;
 };
 
-// Native and sidecar MTP contexts must expose the target's realized context
-// width per sequence. An implicit draft context can do that without multiplying
-// its KV allocation by the number of server slots by using unified KV. An
-// explicit -cd remains an exact user override, including the requested KV
-// topology.
+// Native and sidecar MTP share one unified pool across user sequences. Its
+// implicit capacity must cover the target's realized TOTAL context, including
+// all split target streams, without multiplying by backup sequence IDs.
+// An explicit -cd remains an exact user override, including KV topology.
 common_speculative_mtp_context_params common_speculative_mtp_context_params_resolve(
-        uint32_t target_n_ctx_seq,
+        uint32_t target_n_ctx,
         int32_t explicit_draft_n_ctx,
         uint32_t requested_n_seq_max,
         bool requested_kv_unified);

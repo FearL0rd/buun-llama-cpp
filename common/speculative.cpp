@@ -5501,7 +5501,7 @@ common_params common_base_params_to_speculative(const common_params & params) {
 }
 
 common_speculative_mtp_context_params common_speculative_mtp_context_params_resolve(
-        uint32_t target_n_ctx_seq,
+        uint32_t target_n_ctx,
         int32_t explicit_draft_n_ctx,
         uint32_t requested_n_seq_max,
         bool requested_kv_unified) {
@@ -5509,7 +5509,7 @@ common_speculative_mtp_context_params common_speculative_mtp_context_params_reso
         return { (uint32_t) explicit_draft_n_ctx, requested_n_seq_max, requested_kv_unified };
     }
 
-    return { target_n_ctx_seq, requested_n_seq_max, true };
+    return { target_n_ctx, requested_n_seq_max, true };
 }
 
 bool common_speculative_mtp_context_available(const common_params_speculative & params) {
@@ -5562,7 +5562,7 @@ common_speculative_init_result::common_speculative_init_result(
 
     auto cparams_mtp = cparams;
     const auto mtp_context = common_speculative_mtp_context_params_resolve(
-        llama_n_ctx_seq(ctx_tgt), params.speculative.draft.n_ctx,
+        llama_n_ctx(ctx_tgt), params.speculative.draft.n_ctx,
         cparams_mtp.n_seq_max,
         cparams_mtp.kv_unified);
     cparams_mtp.n_ctx      = mtp_context.n_ctx;

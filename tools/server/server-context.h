@@ -210,6 +210,7 @@ server_vbr_reclaim_policy_result
 server_vbr_reclaim_policy_for_test();
 
 struct server_vbr_slot_selection_result {
+    bool pinned_empty_lookup = false;
     bool learned_selected_cold = false;
     bool learned_kept_hot = false;
     bool selection_was_pure = false;
