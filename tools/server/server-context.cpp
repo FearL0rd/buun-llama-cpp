@@ -3678,6 +3678,8 @@ private:
     std::string resume_family_hex;
     bool resume_has_partial = false;
     std::vector<uint8_t> resume_staging; // one object
+    // entries of this key that found no slot at install: the next save keeps them
+    std::set<std::string> resume_unslotted;
     uint64_t frontier_next_sequence_epoch = 1;
     uint64_t frontier_ratchet_threshold = 1024;
 
@@ -5087,9 +5089,57 @@ private:
         }
         // one entry per slot of this resume key. What another configuration of this model family
         // saved is not counted against the slots of this one, the overall bound is what ends it
-        resume_store->prune(resume_key_hex, slots.size(), std::max<size_t>(8, 4*slots.size()));
+        resume_store->prune(
+            resume_key_hex, slots.size(), std::max<size_t>(8, 4*slots.size()), resume_unslotted);
         SRV_INF("RESUME event=capture_done why=%s slots=%zu t_ms=%.1f\n",
                 why, order.size(), (ggml_time_us() - t_start)/1000.0);
+    }
+
+    // The entry of the conversation in a slot. The slot's own, while its first chunk still leads
+    // the tokens. Else the conversation came back from the host cache or was sent again, and its
+    // entry is the one no slot holds whose chunks, but for the last, lead the tokens.
+    std::string resume_entry_of(
+            const server_slot & slot, const llama_tokens & ids, const std::string & adapter_hex) const {
+        const auto n_leading = [&](const server_resume_manifest & old) {
+            size_t n = 0;
+            if (old.resume_key == resume_key_hex &&
+                old.adapter_identity == adapter_hex &&
+                old.chunk_tokens == RESUME_CHUNK_TOKENS) {
+                server_resume_prefix_hasher hasher(ids);
+                while (n < old.chunks.size() &&
+                       old.chunks[n].p0 == int32_t(n)*RESUME_CHUNK_TOKENS &&
+                       size_t(old.chunks[n].p1) <= ids.size() &&
+                       hasher.at(size_t(old.chunks[n].p1)) == old.chunks[n].prefix_digest) {
+                    n++;
+                }
+            }
+            return n;
+        };
+
+        if (!slot.resume_entry_id.empty()) {
+            server_resume_manifest own;
+            std::string error;
+            if (resume_store->read_manifest(slot.resume_entry_id, own, error) == server_resume_reason::ok &&
+                n_leading(own) > 0) {
+                return slot.resume_entry_id;
+            }
+        }
+        std::string best;
+        size_t n_best = 0;
+        for (const auto & entry : resume_store->list()) {
+            const bool held = std::any_of(slots.begin(), slots.end(), [&](const server_slot & other) {
+                return other.resume_entry_id == entry.id;
+            });
+            if (entry.reason != server_resume_reason::ok || held) {
+                continue;
+            }
+            const size_t n = n_leading(entry.manifest);
+            if (n > n_best && n + 1 >= entry.manifest.chunks.size()) {
+                best   = entry.id;
+                n_best = n;
+            }
+        }
+        return best;
     }
 
     json resume_capture_slot(server_slot & slot) {
@@ -5141,16 +5191,19 @@ private:
         const std::string adapter     = lora_config_identity(slot.lora);
         const std::string adapter_hex = resume_adapter_hex(slot);
 
+        // a conversation that was moved out of this slot lives on in the host cache, if there is one
+        const std::string displaced = slot.resume_entry_id;
+        slot.resume_entry_id = resume_entry_of(slot, ids, adapter_hex);
+        if (displaced != slot.resume_entry_id && !displaced.empty() && fixed_host_cache_enabled()) {
+            resume_unslotted.insert(displaced);
+        }
+
         // what the entry of this conversation already holds
         server_resume_manifest old;
         bool have_old = false;
         if (!slot.resume_entry_id.empty()) {
             std::string error;
-            have_old =
-                resume_store->read_manifest(slot.resume_entry_id, old, error) == server_resume_reason::ok &&
-                old.resume_key == resume_key_hex &&
-                old.adapter_identity == adapter_hex &&
-                old.chunk_tokens == RESUME_CHUNK_TOKENS;
+            have_old = resume_store->read_manifest(slot.resume_entry_id, old, error) == server_resume_reason::ok;
         }
 
         server_resume_manifest next;
@@ -5180,17 +5233,8 @@ private:
             }
         }
 
-        // an entry follows its conversation: same id while the first chunk is still a prefix of it
-        bool same_entry = n_kept > 0;
-        if (have_old && !same_entry && !old.chunks.empty() && old.chunks[0].p1 <= n_tokens) {
-            server_resume_prefix_hasher hasher(ids);
-            same_entry = hasher.at(size_t(old.chunks[0].p1)) == old.chunks[0].prefix_digest;
-        }
-        if (!same_entry) {
-            have_old = false;
-            old = {};
-        }
-        const std::string id = same_entry ? slot.resume_entry_id : server_resume_store::new_entry_id();
+        // an entry follows its conversation, see resume_entry_of()
+        const std::string id = have_old ? slot.resume_entry_id : server_resume_store::new_entry_id();
 
         // tail states (§6), ascending by position
         struct tail_source {
@@ -5434,6 +5478,7 @@ private:
         }
         resume_store->sweep(id, next);
         slot.resume_entry_id = id;
+        resume_unslotted.erase(id);
 
         return json {
             {"outcome", "saved"},
@@ -5459,11 +5504,46 @@ private:
         for (size_t i = 0; i < slots.size(); ++i) {
             taken[i] = slots[i].prompt.n_tokens() > 0;
         }
+        // More conversations of this key than slots: the ones that get none go to the host
+        // prompt cache while a slot is still empty, the oldest first so that it is the first to
+        // be evicted. They keep their entries either way.
+        resume_unslotted.clear();
+        size_t n_host = 0;
+        std::set<std::string> reported;
+        {
+            std::vector<const server_resume_entry *> unslotted;
+            size_t n_free = size_t(std::count(taken.begin(), taken.end(), false));
+            for (const auto & entry : entries) {
+                if (entry.reason != server_resume_reason::ok || entry.manifest.resume_key != resume_key_hex) {
+                    continue;
+                }
+                if (n_free > 0) {
+                    n_free--;
+                } else {
+                    unslotted.push_back(&entry);
+                    resume_unslotted.insert(entry.id);
+                }
+            }
+            const auto stage = std::find(taken.begin(), taken.end(), false);
+            if (fixed_host_cache_enabled() && stage != taken.end()) {
+                for (auto it = unslotted.rbegin(); it != unslotted.rend(); ++it) {
+                    json status = resume_install_host(slots[size_t(stage - taken.begin())], **it);
+                    n_host += status.value("outcome", "") == "installed_host";
+                    status["event"] = "install";
+                    resume_log(status);
+                    reported.insert((*it)->id);
+                }
+            }
+        }
+
         size_t n_installed = 0;
         for (const auto & entry : entries) {
+            if (reported.count(entry.id)) {
+                continue;
+            }
             json status;
             server_slot * dest = nullptr;
-            if (entry.reason == server_resume_reason::ok) {
+            if (entry.reason == server_resume_reason::ok && !resume_unslotted.count(entry.id)) {
                 const int32_t hint = entry.manifest.slot_hint;
                 if (hint >= 0 && size_t(hint) < slots.size() && !taken[size_t(hint)]) {
                     dest = &slots[size_t(hint)];
@@ -5485,8 +5565,7 @@ private:
                 status = {{"outcome", "skipped"}, {"reason", "no_free_slot"}};
             } else {
                 status = resume_install(*dest, entry.id, entry.manifest);
-                const std::string outcome = status.value("outcome", "");
-                if (outcome == "installed_full" || outcome == "installed_prefix") {
+                if (resume_installed(status)) {
                     taken[size_t(dest - slots.data())] = true;
                     n_installed++;
                 }
@@ -5495,8 +5574,30 @@ private:
             status["entry"] = entry.id;
             resume_log(status);
         }
-        SRV_INF("RESUME event=install_done entries=%zu installed=%zu t_ms=%.1f\n",
-                entries.size(), n_installed, (ggml_time_us() - t_start)/1000.0);
+        SRV_INF("RESUME event=install_done entries=%zu installed=%zu host=%zu t_ms=%.1f\n",
+                entries.size(), n_installed, n_host, (ggml_time_us() - t_start)/1000.0);
+    }
+
+    // One entry through an empty slot into the host prompt cache: installed as any other, saved by
+    // the door that saves an idle slot, and cleared. What the cache makes of its budget is its own.
+    json resume_install_host(server_slot & stage, const server_resume_entry & entry) {
+        json status = resume_install(stage, entry.id, entry.manifest);
+        if (resume_installed(status)) {
+            const std::string outcome = status["outcome"];
+            const prompt_save_result saved = stage.prompt_save(*prompt_cache);
+            if (prompt_save_durable(saved)) {
+                prompt_cache->update();
+                status["outcome"] = "installed_host";
+                status["restored"] = outcome;
+            } else {
+                status["outcome"] = "skipped";
+                status["reason"]  = "host_cache_rejected";
+            }
+            stage.prompt_clear(server_cache_destruction_reason::idle_reclaim);
+        }
+        stage.resume_entry_id.clear();
+        stage.resume_status = resume_public(status);
+        return status;
     }
 
     // one entry into one slot; the slot keeps the outcome for /slots
@@ -5521,6 +5622,11 @@ private:
         status["slot"]  = slot.id;
         slot.resume_status = resume_public(status);
         return status;
+    }
+
+    static bool resume_installed(const json & status) {
+        const std::string outcome = status.value("outcome", "");
+        return outcome == "installed_full" || outcome == "installed_prefix";
     }
 
     // what a client sees of an outcome: the error text is for the log, it can name a path of the host

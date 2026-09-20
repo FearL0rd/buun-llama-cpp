@@ -244,7 +244,13 @@ Per nonempty slot, most recently used first:
    saved as. A chunk of that entry is kept when its `prefix_digest`, the resume
    key and the adapter identity still match. Everything after the first mismatch
    is rewritten. A slot whose ledger shares less than one chunk with its entry
-   gets a new entry id.
+   looks for the entry of its conversation before it takes a new id: the entry
+   no slot holds whose chunks, all but the last, lead the ledger. That is how a
+   conversation that came back from the host cache, or was sent again after a
+   start that had no slot for it, goes on in its own entry. The last chunk is
+   excused because a client re-renders the last turn; the price is that a new
+   conversation sharing all but the last chunk of an unheld entry takes it
+   over, which costs the other conversation at most one chunk and its tail.
 4. Stream new objects: range blob into a staging buffer of one chunk (≈54 MB for
    a 27B TCQ cache, ≈210 MB at f16), XXH3 while writing, `sync_write` every
    64 MiB, `fsync`, rename from `tmp-*`.
@@ -266,8 +272,12 @@ first, and at most `max(8, 4 × n_parallel)` entries overall; the rest are
 unlinked. Entries of another key (a different KV type, another stream count on
 an SWA model) cannot be read by this server and say nothing about its
 conversations, so only the overall bound ends them: a run under other settings
-does not delete what the usual settings saved. An entry is not deleted merely
-because its
+does not delete what the usual settings saved. The same holds for entries of
+this key whose conversation is known to be without a slot: the ones that found
+no slot at install (§7), and, when there is a host cache, the one a slot held
+before another conversation took the slot. They count against the overall bound
+only, so a start with fewer slots does not end the conversations it had no slot
+for. An entry is not deleted merely because its
 conversation is not in a slot at save time. With unified KV and several slots
 this is what keeps the conversations that were evicted to the host cache during
 the run: their entries from the previous start survive, stale by the turns made
@@ -350,8 +360,15 @@ start; it never fails the load and never leaves half a slot.
 1. Take the namespace lock; enumerate `entries/*/commit` (bounded); parse
    header, JSON and ledger; check the resume key and adapter identity. Sort by
    `last_used`.
-2. Map entries to slots: `slot_hint` if free, otherwise any free slot; more
-   entries than slots leaves the oldest as `no_free_slot`.
+2. Map entries to slots: `slot_hint` if free, otherwise any free slot. More
+   entries of this key than slots: with a host prompt cache (`--cache-ram`,
+   fixed-type KV) the oldest go there first, one at a time through a slot that
+   is still empty: installed as below, saved by the call that saves an idle
+   slot, cleared (`installed_host`, oldest first so that the cache evicts it
+   first). The next request of such a conversation finds it by the ordinary
+   prefix match. The cache applies its own budget; a state it does not take is
+   `host_cache_rejected`. Without a host cache they are `no_free_slot`. In all
+   three cases the entry stays in the store (§4).
 3. Choose the install position `p`: the largest restorable position (§2.1) with
    `p < n_ctx_seq` of the destination. `p == N` is a full install, `0 < p < N` a
    prefix install, none is `context_too_small`.
@@ -406,6 +423,7 @@ One log line and one `/slots` field per entry. The string
 |---|---|
 | `installed_full` | `p == N` |
 | `installed_prefix` | `0 < p < N`; reports `p`, `N` and why (`context_smaller`, `cells_exhausted`) |
+| `installed_host` | no slot for the entry: restored through an empty slot into the host prompt cache; `restored` says full or prefix |
 | `skipped` | destination untouched |
 | `failed` | destination reset to empty |
 
@@ -418,7 +436,8 @@ One log line and one `/slots` field per entry. The string
 | `object_missing`, `object_size_mismatch`, `object_checksum_mismatch` | per object; a failed chunk ends the usable prefix at its `p0` if a restorable position remains below it, else `failed` |
 | `companion_missing` | a model with a partial part and no tail state at or below the fit position |
 | `context_too_small` | no restorable position fits |
-| `no_free_slot` | more entries than slots |
+| `no_free_slot` | more entries than slots and no host prompt cache; the entry is kept |
+| `host_cache_rejected` | more entries than slots and the host prompt cache did not take the state (its size limit); the entry is kept |
 | `entry_in_use` | the restore action named an entry another slot was restored from or saved as; two slots never write one entry |
 | `state_rejected` | the library refused a blob (type, shape, TCQ fingerprint) |
 | `unsupported_media`, `unsupported_vbr`, `unsupported_qsa`, `unsupported_positions`, `frontier_inconsistent` | capture-side skips, logged at save |
@@ -457,6 +476,14 @@ code, and pinned requests now see host entries. It needs `--cache-ram`, holds
 every entry in host memory, and loses chunk-level reads unless host entries
 learn chunk lists. It is the natural route for `--resume-host-cache` in P4, where
 the saved roots are host entries anyway.
+
+As built, the two meet for the entries that get no slot (§7 step 2): a host
+entry is a whole sequence image, a resume entry is range blobs and tail states,
+so the entry is installed into an empty slot and saved from there by the
+existing call. No second reader, and the host cache keeps its own format, budget
+and eviction. Measured on the 3090: 5 ms (dense 0.6B, 647 tokens) and 54 ms
+(hybrid 4B) per entry at start; the conversation's next turn reuses all of its
+tokens from the host cache and is token-identical to the one-process run.
 
 Open question for the maintainer: with `--kv-unified` and several slots, each
 launch moves the other idle slots to the host cache, so at shutdown usually one
@@ -524,8 +551,11 @@ Properties and limits of v1, as measured:
   position, so it needs an `early` or `turn` state inside the smaller context.
 - Every save of a hybrid conversation rewrites the frontier and turn states
   (two partial images), whatever the number of new tokens.
-- A restart with fewer slots keeps only that many entries of its key (§4): the
-  conversations that did not get a slot are dropped at the next save.
+- A restart with fewer slots keeps the entries it had no slot for (§4) and, with
+  `--cache-ram`, serves them from the host cache (§7). What is saved of such a
+  conversation is still only what a slot held at a save: turns made while it
+  lived in the host cache alone reach the store when it is next in a slot at a
+  save (P4 closes that).
 - Conversations that live only in the host prompt cache at shutdown are not
   saved (P4).
 - Slots with media, dynamic VBR and a QSA index are skipped with a reason.
