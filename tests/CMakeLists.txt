@@ -151,6 +151,14 @@ endif ()
 llama_build_and_test(test-server-recurrent-expansion.cpp)
 target_include_directories(test-server-recurrent-expansion PRIVATE ${PROJECT_SOURCE_DIR}/tools/server)
 
+if (NOT WIN32)
+    llama_build_and_test(
+        test-server-resume-store.cpp
+        ${PROJECT_SOURCE_DIR}/tools/server/server-resume-store.cpp)
+    target_include_directories(test-server-resume-store PRIVATE ${PROJECT_SOURCE_DIR}/tools/server)
+    target_link_libraries(test-server-resume-store PRIVATE vendor::hash)
+endif()
+
 llama_build_and_test(test-kv-cells.cpp)
 target_include_directories(test-kv-cells PRIVATE ${PROJECT_SOURCE_DIR}/src)
 

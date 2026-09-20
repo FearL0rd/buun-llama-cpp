@@ -1,7 +1,7 @@
 # Persistent server resume — format and install contract (P1)
 
 Status: **design contract for P2**. Implemented so far: the shutdown flag and
-the library calls of §3 (§10 items 1 and 2).
+the library calls of §3 and the store of §2 (§10 items 1 to 3).
 Companion of `server-resume-plan.md` (objective, P0 results, phases). Frozen
 2026-09-20 against `exp/server-resume`. Line anchors are from that branch; use the
 symbols when lines move. Independent review is deferred by the maintainer until a
@@ -247,8 +247,14 @@ this is what keeps the conversations that were evicted to the host cache during
 the run: their entries from the previous start survive, stale by the turns made
 since, until `--resume-host-cache` (P4) saves them properly.
 
-One writer per family namespace (`flock` on `writer.lock`, stale owner by pid
-and start time). A second server runs without persistence and says so.
+One writer per family namespace: `flock` on `writer.lock`, held for the life of
+the process. As built there is no stale-owner detection by pid and start time:
+the kernel drops the lock with its owner, so a killed server leaves nothing to
+detect. The pid written into the file is for a person looking at the directory.
+A second server runs without persistence and says so. Retention also removes an
+entry whose manifest is damaged; one of an unsupported version is kept, it may
+belong to a newer build. On Windows the store opens as `store_unwritable`
+(encoding and decoding are portable, the durable I/O is POSIX).
 
 ## 5. Resume compatibility key
 
@@ -430,8 +436,12 @@ entries that were live slots.
 2. **Done.** Library: range writer, append reader, version constant; test 11 of
    `test-save-load-state` (three blobs plus the partial state equal the whole
    state byte for byte, cross-layout install, `p_limit`, refusals).
-3. Store: root helper, lock, object and manifest I/O, bounded parsing, fault
-   seams (short write, `ENOSPC`, kill between object and manifest).
+3. **Done.** Store (`tools/server/server-resume-store`): 0700/0600 root helper,
+   lock, object and manifest I/O, bounded parsing (depth, counts, integer
+   ranges), fault seams (write stopped at half a payload, `ENOSPC` before an
+   object is published, kill between objects and manifest).
+   `test-server-resume-store`: after each stopped write a reopened store lists
+   the previous generation and every object of it verifies.
 4. Capture and install in the server, `--resume`, the `resume_entry` restore
    action, reason codes.
 5. Sleep/wake as the first end-to-end test; then restart on a dense, a hybrid and
