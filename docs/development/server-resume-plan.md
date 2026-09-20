@@ -733,9 +733,17 @@ Still required before moving on:
   edited and a replaced history (were 1308 and 1527). A kill inside such a save
   loses that entry and leaves nothing behind. Appends keep the old commit and
   duplicate at most one chunk and the tails.
-- [ ] **Recoverable VMM import:** the newly reached mapping helper aborts on
+- [x] **Recoverable VMM import:** the newly reached mapping helper aborts on
   physical exhaustion. State import must use the recoverable mapping operation
   and existing rollback, with a forced allocation-failure gate.
+  Done: whole-sequence import and range append map recoverably and fail through
+  their existing rollback; decode's mid-batch backstop is unchanged. Gate:
+  `tests/test-vbr-import-exhausted.cpp` takes the device down to 64 MiB free and
+  imports 448 MiB both ways — refused, no cells left, accepted again with the
+  memory back; each path aborted before. No server route reaches this map today
+  (slot files are off under dynamic VBR, the host restore declines an exhausted
+  destination before importing), so the test is at the library API. It becomes
+  a server path when resume takes dynamic VBR.
 - [ ] **Wrapped SWA fidelity:** establish the cause with exact row/position
   comparisons and same-token logits. Different batch sizes and coherent output
   are not an acceptance substitute.

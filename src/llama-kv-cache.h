@@ -873,6 +873,7 @@ private:
             const vbr_shared_scratch_binding & binding);
     void vbr_vmm_ensure_mapped(); // grow physical backing to the current cell watermark
     bool vbr_vmm_try_map(uint32_t wm); // same, recoverable: false on physical exhaustion
+    bool vbr_vmm_try_map_import();     // try_map to the cells a state import just positioned
 
     // Decode-time degrade controller (VMM mode only). The price order and its cursor stay
     // GLOBAL (layer-global price order); each step resolves the pool that owns its tensor.

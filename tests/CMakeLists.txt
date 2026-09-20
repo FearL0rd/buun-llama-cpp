@@ -885,6 +885,9 @@ if ((TARGET ggml-cuda OR TARGET ggml-hip) AND NOT GGML_BACKEND_DL)
         target_link_libraries(test-vbr-vmm PRIVATE ggml-hip)
     endif()
     llama_test(test-vbr-vmm LABEL "backend")
+
+    # exhausts the device on purpose, so it is run by hand with a model dynamic VBR can manage
+    llama_build(test-vbr-import-exhausted.cpp)
 endif()
 
 # the tensor API kernels come from a separate metallib - check they produce correct results

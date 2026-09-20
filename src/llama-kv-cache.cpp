@@ -4643,6 +4643,22 @@ void llama_kv_cache::vbr_vmm_ensure_mapped() {
     }
 }
 
+bool llama_kv_cache::vbr_vmm_try_map_import() {
+    // A state import positions its cells before any graph exists, so unlike the mid-batch
+    // backstop above it can still fail: the caller removes the cells it positioned and throws.
+    // Chunks mapped before the failure stay mapped, which the next growth skips over.
+    if (!vbr_vmm_active()) {
+        return true;
+    }
+    const uint32_t wm = vbr_watermark_cells(0);
+    if (!vbr_vmm_try_map(wm)) {
+        LLAMA_LOG_ERROR("%s: VBR VMM: physical map to %u cells failed (device memory exhausted) — "
+                "rejecting this state import\n", __func__, wm);
+        return false;
+    }
+    return true;
+}
+
 // mapped-physical bytes needed to back `wm_cells` of ONE pool's extents at the CURRENT per-tensor
 // tiers (page-rounded), plus that pool's up-front constants (rotation matrices)
 size_t llama_kv_cache::vbr_vmm_projected_bytes(const vbr_pool & p, uint32_t wm_cells) const {
@@ -13063,9 +13079,7 @@ void llama_kv_cache::state_append_range(llama_io_read_i & io, llama_seq_id seq_i
     slot_info sinfo;
 
     bool res = state_read_meta(io, strm, cell_count, sinfo, seq_id, nullptr, &append);
-    if (res && vbr_vmm_active()) {
-        vbr_vmm_ensure_mapped();
-    }
+    res = res && vbr_vmm_try_map_import();
 
     try {
         res = res && state_read_data(io, strm, cell_count, sinfo, append.n_keep);
@@ -13151,12 +13165,10 @@ const slot_info_vec_t *   sinfos_in) {
         res = res && state_read_meta(
                 io, strm, cell_count, sinfo, seq_id,
                 sinfos_in ? &(*sinfos_in)[s] : nullptr);
-        if (res && vbr_vmm_active()) {
-            // neither branch has grown the VMM physical backing yet: the whole-cache one positions
-            // cells directly, the per-sequence one goes through apply_ubatch(commit = false), which
-            // skips the mapping — state_read_data would write into unmapped VA
-            vbr_vmm_ensure_mapped();
-        }
+        // neither branch has grown the VMM physical backing yet: the whole-cache one positions
+        // cells directly, the per-sequence one goes through apply_ubatch(commit = false), which
+        // skips the mapping — state_read_data would write into unmapped VA
+        res = res && vbr_vmm_try_map_import();
 
         try {
             res = res && state_read_data(io, strm, cell_count, sinfo, cell_count);
