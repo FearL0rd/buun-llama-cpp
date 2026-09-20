@@ -5231,10 +5231,10 @@ private:
     llama_context * create_mtp_context() {
         auto cparams = common_context_params_to_llama(params_base);
         // Auto-fit mutates the target's llama_context_params, not params_base.  Reuse the
-        // realized target width here; otherwise n_ctx=0 expands the MTP cache to n_ctx_train even
+        // realized target total here; otherwise n_ctx=0 expands the MTP cache to n_ctx_train even
         // when the fitted target is much smaller.
         const auto mtp_context = common_speculative_mtp_context_params_resolve(
-            llama_n_ctx_seq(ctx_tgt), params_base.speculative.draft.n_ctx,
+            llama_n_ctx(ctx_tgt), params_base.speculative.draft.n_ctx,
             cparams.n_seq_max,
             cparams.kv_unified);
         cparams.n_ctx         = mtp_context.n_ctx;
@@ -7138,7 +7138,7 @@ private:
             if (spec_mtp && !combined_external_and_mtp) {
                 auto cparams = common_context_params_to_llama(params_dft);
                 const auto mtp_context = common_speculative_mtp_context_params_resolve(
-                    llama_n_ctx_seq(ctx_tgt), params_base.speculative.draft.n_ctx,
+                    llama_n_ctx(ctx_tgt), params_base.speculative.draft.n_ctx,
                     params_base.n_parallel,
                     cparams.kv_unified);
                 cparams.n_ctx      = mtp_context.n_ctx;
@@ -9045,7 +9045,7 @@ private:
             };
             plan_rec ? similarity_scan(std::true_type{}) : similarity_scan(std::false_type{});
 
-            if (ret != nullptr) {
+            if (ret != nullptr && !ret->prompt.tokens.empty()) {
                 const float f_keep = (f_sim_best*task.tokens.size()) / ret->prompt.tokens.size();
 
                 if (task.id_slot == -1) {
@@ -9230,6 +9230,16 @@ private:
 
                 update_cache = true;
             }
+        }
+
+        // Empty destinations have nothing to preserve, but still need a host
+        // lookup. In particular, pinned slots skip LRU and may have been
+        // emptied by unified-KV idle reclamation. This must not depend on the
+        // similarity scan being enabled. Execution keeps the normal cache,
+        // task-type and adapter-identity gates below.
+        if (ret && !ret->is_processing() && ret->prompt.tokens.empty() &&
+            task.params.cache_prompt) {
+            update_cache = true;
         }
 
         if (ret && ret->is_processing()) {
@@ -20960,6 +20970,34 @@ server_vbr_slot_selection_result
 server_vbr_slot_selection_for_test(
         server_cache_lease_fallback_provider * lease_fallback) {
     server_vbr_slot_selection_result result;
+    // Exercise the actual selection gate, including similarity-disabled and
+    // busy/cache-off controls. No model or live memory is needed for selection.
+    result.pinned_empty_lookup = true;
+    for (float similarity : { 0.0f, 0.5f }) {
+        for (bool busy : { false, true }) {
+            for (bool cache_prompt : { false, true }) {
+                server_context_impl context;
+                context.sleeping = true;
+                context.slot_prompt_similarity = similarity;
+                context.slots.resize(1);
+                auto & slot = context.slots.front();
+                slot.id = 0;
+                slot.state = busy ? SLOT_STATE_GENERATING : SLOT_STATE_IDLE;
+                server_task task(SERVER_TASK_TYPE_COMPLETION);
+                task.id_slot = 0;
+                task.params.cache_prompt = cache_prompt;
+                task.tokens = server_tokens(llama_tokens { 1, 2, 3 }, false);
+                for (bool preflight : { false, true }) {
+                    const auto selected = context.cache_plan_select_before_mutation(
+                        task, false, preflight);
+                    result.pinned_empty_lookup &= selected.target == &slot &&
+                        selected.update_cache == (!busy && cache_prompt) &&
+                        selected.selection_deferred_busy == busy &&
+                        slot.prompt.tokens.empty();
+                }
+            }
+        }
+    }
     enum class protection_mode {
         none,
         deferred_oldest,

@@ -2034,6 +2034,7 @@ void test_lifecycle_defaults_and_reuse_thresholds() {
     available_host_fallback vbr_selection_fallback;
     const auto vbr_selection = server_vbr_slot_selection_for_test(
         &vbr_selection_fallback);
+    CHECK(vbr_selection.pinned_empty_lookup);
     CHECK(vbr_selection.learned_selected_cold);
     CHECK(vbr_selection.learned_kept_hot);
     CHECK(vbr_selection.selection_was_pure);
