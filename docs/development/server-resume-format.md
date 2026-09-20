@@ -261,14 +261,24 @@ Per nonempty slot, most recently used first:
    saves, a fine-tune restores and refills cold, its save holds the fine-tune's
    chunks and tails (the bytes of a fresh fine-tune save); the same restore
    followed by an ordinary turn, and a restart after it, keep the base model's
-   chunks and `early` tail. A slot whose ledger shares less than one chunk with its entry
-   looks for the entry of its conversation before it takes a new id: the entry
-   no slot holds whose chunks, all but the last, lead the ledger. That is how a
-   conversation that came back from the host cache, or was sent again after a
-   start that had no slot for it, goes on in its own entry. The last chunk is
-   excused because a client re-renders the last turn; the price is that a new
-   conversation sharing all but the last chunk of an unheld entry takes it
-   over, which costs the other conversation at most one chunk and its tail.
+   chunks and `early` tail.
+
+   Which entry is a different question from which bytes. The entry of a
+   conversation is the one whose chunks, all but the last, lead the ledger: the
+   slot's own, else one no slot holds. That is how a conversation that came
+   back from the host cache, or was sent again after a start that had no slot
+   for it, goes on in its own entry. The last chunk is excused because a client
+   re-renders the last turn; the price is that a new conversation sharing all
+   but the last chunk of an entry takes it over, which costs the other
+   conversation at most one chunk and its tail. An entry of a single chunk
+   therefore goes with its slot. A shared first chunk is not enough: a second
+   agent with the same long system prompt gets its own entry and the first
+   keeps its history (measured: 5000 shared tokens, 12k and 6.5k conversations
+   through one slot of two; both restored, the first with its whole history).
+   One exception saves writes without costing anything: when the slot's
+   previous entry would not outlive this save under the retention rule below
+   (one slot, no host cache), the new conversation takes that entry and keeps
+   whatever leading chunks are still the live state.
 4. Stream new objects: range blob into a staging buffer of one chunk (≈54 MB for
    a 27B TCQ cache, ≈210 MB at f16), XXH3 while writing, `sync_write` every
    64 MiB, `fsync`, rename from `tmp-*`.
@@ -278,18 +288,24 @@ Per nonempty slot, most recently used first:
    directory. The entry is now the new generation.
 7. Unlink objects the new manifest does not reference.
 
-Replacement currently retains the old objects through step 4–7. For an append
-this duplicates at most one chunk and the changed tail states; an edited history
-can replace many chunks and approach a second snapshot. This does **not** meet
-the agreed disk-space bound and is a release blocker (plan §11).
-If the preflight says even that does not fit, the writer removes `commit` first
-(`fsync`), then unlinks the old objects, then writes. An interruption then loses
-that entry, which is the agreed trade. Other entries are never touched.
+Disk bound. What a save makes obsolete is decided before its bytes are written
+and goes first, free space or not. A save that replaces more than the last
+chunk of its entry (an edited history, a state that is no longer the stored
+bytes) removes `commit` first (`fsync`), unlinks the objects it does not keep,
+then writes. A save that needs a new entry applies the retention rule below
+first, counting the new entry. An interruption then loses the affected entry,
+which is the agreed trade; entries that are neither replaced nor due under
+retention are never touched. Only the append keeps the old commit until the new
+one is published, and it duplicates at most one chunk and the changed tail
+states; the preflight takes that away too when it would not fit. Measured as
+the peak of allocated bytes, sampled every 2 ms through the save, 13k-token
+dense entry of 794 MB: history edited one chunk in, peak 794 MB (was 1308);
+another conversation in the only slot, peak 794 MB (was 1527, both snapshots).
 
-Retention, with no knob: after the live slots are committed the namespace keeps
-at most `n_parallel` entries of this server's resume key, newest `last_used`
-first, and at most `max(8, 4 × n_parallel)` entries overall; the rest are
-unlinked. Entries of another key (a different KV type, another stream count on
+Retention, with no knob: the namespace keeps at most `n_parallel` entries of
+this server's resume key, the ones slots hold first, then newest `last_used`,
+and at most `max(8, 4 × n_parallel)` entries overall; the rest are unlinked,
+before a new entry is written and after the live slots are committed. Entries of another key (a different KV type, another stream count on
 an SWA model) cannot be read by this server and say nothing about its
 conversations, so only the overall bound ends them: a run under other settings
 does not delete what the usual settings saved. The same holds for entries of
@@ -529,9 +545,14 @@ holding the outcome of this section; a missing entry is `skipped` /
 `object_missing` with the destination unchanged. Paths of the
 host appear in the server log only, never in the response.
 
-Explicit slot `erase` does not yet retire persisted entries. This is a review
-blocker: retirement must identify the current conversation, not blindly delete
-an entry ID left attached to a slot by an earlier conversation (plan §11).
+Explicit slot `erase` ends the conversation on disk as well. The entry removed
+is the one of the conversation in the slot by the rule of §4 step 3, found at
+the time of the erase, not the id the slot saved into last: after another
+conversation took the slot that id still names the previous one. Measured:
+save, restart, erase, restart installs nothing; A saved and restored, B takes
+the slot and is erased unsaved, A's entry survives and installs at the next
+start; with both saved, erasing B's slot leaves A's entry alone. Within the
+last-chunk tradeoff an entry of a single chunk goes with its slot here too.
 
 ## 9. Install route: recommendation and alternative
 

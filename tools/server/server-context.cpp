@@ -5107,6 +5107,8 @@ private:
         for (auto & slot : slots) {
             if (slot.prompt.n_tokens() > 0) {
                 order.push_back(&slot);
+            } else {
+                resume_release_entry(slot);
             }
         }
         std::sort(order.begin(), order.end(), [](const server_slot * a, const server_slot * b) {
@@ -5126,17 +5128,64 @@ private:
             status["slot"]  = slot->id;
             resume_log(status);
         }
-        // one entry per slot of this resume key. What another configuration of this model family
-        // saved is not counted against the slots of this one, the overall bound is what ends it
-        resume_store->prune(
-            resume_key_hex, slots.size(), std::max<size_t>(8, 4*slots.size()), resume_unslotted);
+        const auto keep = resume_retention(0);
+        resume_store->prune(resume_key_hex, keep.n_keep_key, keep.n_keep_total, keep.held);
         SRV_INF("RESUME event=capture_done why=%s slots=%zu t_ms=%.1f\n",
                 why, order.size(), (ggml_time_us() - t_start)/1000.0);
     }
 
-    // The entry of the conversation in a slot. The slot's own, while its first chunk still leads
-    // the tokens. Else the conversation came back from the host cache or was sent again, and its
-    // entry is the one no slot holds whose chunks, but for the last, lead the tokens.
+    // What pruning keeps. One entry per slot of this resume key, the ones slots hold first; what
+    // another configuration of this model family saved is not counted against the slots of this
+    // one, nor are the conversations without a slot: the overall bound is what ends those.
+    struct resume_retention_t {
+        size_t n_keep_key;
+        size_t n_keep_total;
+        std::set<std::string> held;
+    };
+
+    resume_retention_t resume_retention(size_t n_new) const {
+        resume_retention_t keep;
+        keep.held = resume_unslotted;
+        size_t n_slotted = n_new;
+        for (const auto & slot : slots) {
+            n_slotted += !slot.resume_entry_id.empty() && keep.held.insert(slot.resume_entry_id).second;
+        }
+        keep.n_keep_key   = slots.size() - std::min(slots.size(), n_slotted);
+        keep.n_keep_total = std::max<size_t>(8, 4*slots.size()) - n_new;
+        return keep;
+    }
+
+    // the conversation of the slot's entry is no longer in the slot. It lives on in the host
+    // cache, if there is one
+    void resume_release_entry(server_slot & slot) {
+        if (!slot.resume_entry_id.empty() && fixed_host_cache_enabled()) {
+            resume_unslotted.insert(slot.resume_entry_id);
+        }
+        slot.resume_entry_id.clear();
+    }
+
+    // Explicit erase ends the conversation on disk as well. Its entry, which need not be the one
+    // the slot saved into last: that may be of the conversation the slot held before.
+    void resume_retire(server_slot & slot) {
+        if (!resume_active()) {
+            return;
+        }
+        const std::string entry = slot.prompt.n_tokens() == 0 ? std::string() :
+            resume_entry_of(slot, slot.prompt.tokens, resume_adapter_hex(slot));
+        if (entry == slot.resume_entry_id) {
+            slot.resume_entry_id.clear();
+        }
+        resume_release_entry(slot);
+        if (!entry.empty()) {
+            resume_store->remove_entry(entry);
+            resume_unslotted.erase(entry);
+            resume_log({{"event", "retire"}, {"outcome", "removed"}, {"entry", entry}, {"slot", slot.id}});
+        }
+    }
+
+    // The entry of the conversation in a slot: the one whose chunks, but for the last, lead the
+    // tokens. The slot's own, else one no slot holds: the conversation came back from the host
+    // cache or was sent again. A shared first chunk does not make two conversations one.
     std::string resume_entry_of(
             const server_slot & slot, const server_tokens & ids, const std::string & adapter_hex) const {
         const auto n_leading = [&](const server_resume_manifest & old) {
@@ -5159,7 +5208,7 @@ private:
             server_resume_manifest own;
             std::string error;
             if (resume_store->read_manifest(slot.resume_entry_id, own, error) == server_resume_reason::ok &&
-                n_leading(own) > 0) {
+                n_leading(own) + 1 >= own.chunks.size()) {
                 return slot.resume_entry_id;
             }
         }
@@ -5233,11 +5282,21 @@ private:
         const std::string adapter     = lora_config_identity(slot.lora);
         const std::string adapter_hex = resume_adapter_hex(slot);
 
-        // a conversation that was moved out of this slot lives on in the host cache, if there is one
         const std::string displaced = slot.resume_entry_id;
-        slot.resume_entry_id = resume_entry_of(slot, tokens, adapter_hex);
-        if (displaced != slot.resume_entry_id && !displaced.empty() && fixed_host_cache_enabled()) {
-            resume_unslotted.insert(displaced);
+        const std::string entry     = resume_entry_of(slot, tokens, adapter_hex);
+        if (entry != displaced) {
+            resume_release_entry(slot);
+            slot.resume_entry_id = entry;
+            if (entry.empty() && !displaced.empty()) {
+                // another conversation, or this one from further back than its last chunk. An
+                // entry that would not outlive this save leaves its leading chunks to the new one
+                const auto keep = resume_retention(1);
+                const auto due  = resume_store->victims(
+                    resume_key_hex, keep.n_keep_key, keep.n_keep_total, keep.held);
+                if (due.count(displaced)) {
+                    slot.resume_entry_id = displaced;
+                }
+            }
         }
 
         // what the entry of this conversation already holds
@@ -5460,10 +5519,17 @@ private:
             return skipped("provenance_limit");
         }
 
+        // Disk bound (§4 step 4): what this save makes obsolete goes before its bytes are written,
+        // but for the last chunk and the tails of an entry that is appended to. The entry that
+        // has to make room for a new one first, then an edited history's own commit.
         std::string error;
         bool replaced = false;
-        if (resume_store->free_bytes() < bytes_needed && have_old) {
-            // space-bounded replacement: give up the old commit, keep only what is reused
+        if (!have_old) {
+            const auto keep = resume_retention(1);
+            resume_store->prune(resume_key_hex, keep.n_keep_key, keep.n_keep_total, keep.held);
+        }
+        if (have_old && (old.chunks.size() > n_kept + 1 || resume_store->free_bytes() < bytes_needed)) {
+            // give up the old commit, keep only what is reused
             server_resume_manifest kept = old;
             kept.chunks.assign(next.chunks.begin(), next.chunks.begin() + n_kept);
             kept.tail_states.clear();
@@ -17060,6 +17126,7 @@ private:
                     // Erase token cache
                     const size_t n_erased = slot->prompt.tokens.size();
 
+                    resume_retire(*slot);
                     slot->prompt_clear();
 
                     auto res = std::make_unique<server_task_result_slot_erase>();

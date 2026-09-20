@@ -524,6 +524,7 @@ server_resume_reason server_resume_store::uncommit(const std::string &, std::str
 }
 
 void server_resume_store::remove_entry(const std::string &) const {}
+std::set<std::string> server_resume_store::victims(const std::string &, size_t, size_t, const std::set<std::string> &) const { return {}; }
 void server_resume_store::prune(const std::string &, size_t, size_t, const std::set<std::string> &) const {}
 uint64_t server_resume_store::free_bytes() const { return 0; }
 
@@ -994,20 +995,46 @@ void server_resume_store::remove_entry(const std::string & id) const {
     fs::remove_all(directory, ec);
 }
 
+// what prune() keeps of the listed entries. The held ones first: the overall bound takes others
+static std::set<std::string> retained(
+        const std::vector<server_resume_entry> & entries,
+        const std::string & resume_key, size_t n_keep_key, size_t n_keep_total,
+        const std::set<std::string> & held) {
+    std::set<std::string> keep;
+    size_t n_of_key = 0;
+    for (const bool pass_held : {true, false}) {
+        for (const auto & entry : entries) {
+            // a manifest of a newer format may be of use to the server that wrote it, a damaged one to nobody
+            if (entry.reason == server_resume_reason::manifest_corrupt || keep.size() >= n_keep_total ||
+                pass_held != (held.count(entry.id) > 0)) {
+                continue;
+            }
+            if (pass_held || entry.manifest.resume_key != resume_key || n_of_key++ < n_keep_key) {
+                keep.insert(entry.id);
+            }
+        }
+    }
+    return keep;
+}
+
+std::set<std::string> server_resume_store::victims(
+        const std::string & resume_key, size_t n_keep_key, size_t n_keep_total,
+        const std::set<std::string> & held) const {
+    const auto entries = list();
+    const auto keep = retained(entries, resume_key, n_keep_key, n_keep_total, held);
+    std::set<std::string> drop;
+    for (const auto & entry : entries) {
+        if (!keep.count(entry.id)) {
+            drop.insert(entry.id);
+        }
+    }
+    return drop;
+}
+
 void server_resume_store::prune(
         const std::string & resume_key, size_t n_keep_key, size_t n_keep_total,
         const std::set<std::string> & held) const {
-    std::set<std::string> keep;
-    size_t n_of_key = 0;
-    for (const auto & entry : list()) {
-        // a manifest of a newer format may be of use to the server that wrote it, a damaged one to nobody
-        if (entry.reason == server_resume_reason::manifest_corrupt || keep.size() >= n_keep_total) {
-            continue;
-        }
-        if (entry.manifest.resume_key != resume_key || held.count(entry.id) || n_of_key++ < n_keep_key) {
-            keep.insert(entry.id);
-        }
-    }
+    const auto keep = retained(list(), resume_key, n_keep_key, n_keep_total, held);
 
     std::error_code ec;
     std::vector<std::string> drop;

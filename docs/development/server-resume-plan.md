@@ -710,17 +710,29 @@ Still required before moving on:
   saves the fine-tune's bytes; an inherited append and a restart after it keep
   the producer's chunks. Known cost: the range blob names the sequence id, so a
   conversation that comes back in another slot is rewritten once.
-- [ ] **Conversation ownership:** the own-slot entry shortcut accepts a match of
+- [x] **Conversation ownership:** the own-slot entry shortcut accepts a match of
   only one chunk and can overwrite much more than the documented last-chunk
   tradeoff. Separate entry adoption from object identity; qualify long shared
   system prompts and returning host-cache conversations.
-- [ ] **Explicit erase:** retire the current conversation's disk entry, not a
+  Done: one rule for every entry, all chunks but the last lead the ledger; the
+  slot's previous entry is taken over only when retention would drop it in this
+  save anyway. Gate: 5000 shared tokens, two conversations through one slot of
+  two, both restored whole. Host-cache overflow and fewer-slots scenarios
+  repeat token-identical. Open: a single-chunk entry still goes with its slot.
+- [x] **Explicit erase:** retire the current conversation's disk entry, not a
   stale entry ID left attached to its slot. Qualify both restart → erase →
   restart and A → replace with B → erase B (A's entry must survive).
-- [ ] **Disk bound:** edited histories and replacement conversations can retain
+  Done, both gates, B unsaved and B saved.
+- [x] **Disk bound:** edited histories and replacement conversations can retain
   almost two inventories until post-save pruning. Honor invalidate-first even
   with plentiful free space, without deleting unrelated/held entries. Measure
   peak allocated bytes, not just appended-turn bytes written.
+  Done (contract §4): retention runs before a new entry is written and keeps
+  slot-held entries first; a save replacing more than its last chunk gives up
+  its commit first. Peak allocated bytes 794 MB on a 794 MB entry for both an
+  edited and a replaced history (were 1308 and 1527). A kill inside such a save
+  loses that entry and leaves nothing behind. Appends keep the old commit and
+  duplicate at most one chunk and the tails.
 - [ ] **Recoverable VMM import:** the newly reached mapping helper aborts on
   physical exhaustion. State import must use the recoverable mapping operation
   and existing rollback, with a forced allocation-failure gate.

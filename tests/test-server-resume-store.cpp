@@ -521,6 +521,11 @@ static void test_store(const std::string & root) {
     // an entry that is held for a conversation without a slot is not counted against the slots
     store->prune(KEY, 1, 8, {id});
     CHECK(store->list().size() == 3);
+    // what a prune would take is known before it, and the overall bound takes held entries last
+    CHECK(store->victims(KEY, 1, 8) == std::set<std::string>{id});
+    CHECK(store->victims(KEY, 1, 8, {id}).empty());
+    CHECK((store->victims(KEY, 2, 1, {id_old}) == std::set<std::string>{id, id_new}));
+    CHECK(store->list().size() == 3);
     store->prune(KEY, 1, 8);
     {
         const auto entries = store->list();

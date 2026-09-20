@@ -180,8 +180,13 @@ public:
     // keeps the entries used last, so many of the given resume key and so many overall, and drops
     // damaged manifests and directories that never got one. A server cannot read the entries of
     // another key, so only the overall bound ends those, never the number of its own slots.
-    // The same holds for the entries in `held`: conversations of this key that have no slot.
+    // The entries in `held` are kept before any other and are not counted against the key.
     void prune(
+            const std::string & resume_key, size_t n_keep_key, size_t n_keep_total,
+            const std::set<std::string> & held = {}) const;
+
+    // the committed entries prune() would drop
+    std::set<std::string> victims(
             const std::string & resume_key, size_t n_keep_key, size_t n_keep_total,
             const std::set<std::string> & held = {}) const;
 
