@@ -1709,7 +1709,8 @@ private:
     bool state_write_includes_cell(
             const llama_kv_cells & cells,
             uint32_t cell,
-            llama_seq_id seq_id) const;
+            llama_seq_id seq_id,
+            bool held_cells = false) const; // LLAMA_STATE_SEQ_FLAGS_SWA_HELD_CELLS
 
     void state_write_meta(llama_io_write_i & io, const cell_ranges_t & cr, llama_seq_id seq_id = -1) const;
     void state_write_data(llama_io_write_i & io, const cell_ranges_t & cr) const;

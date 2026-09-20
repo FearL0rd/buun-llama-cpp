@@ -1164,6 +1164,11 @@ extern "C" {
 // Getting the state for a seq_id with this flag invalidates all prior states gotten for that seq_id with this flag.
 #define LLAMA_STATE_SEQ_FLAGS_ON_DEVICE 2
 
+// Write every cell a sliding-window cache still holds for the sequence, not only the cells inside
+// the attention window of its last position. A state written this way keeps the slack a live cache
+// has behind the window, which is what lets a server reuse it without falling back to a checkpoint.
+#define LLAMA_STATE_SEQ_FLAGS_SWA_HELD_CELLS 4
+
     typedef uint32_t llama_state_seq_flags;
 
     LLAMA_API size_t llama_state_seq_get_size_ext(

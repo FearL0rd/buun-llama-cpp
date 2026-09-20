@@ -7695,11 +7695,12 @@ bool llama_kv_cache::vbr_capture_generation_record(
 bool llama_kv_cache::state_write_includes_cell(
         const llama_kv_cells & cells,
         uint32_t cell,
-        llama_seq_id seq_id) const {
+        llama_seq_id seq_id,
+        bool held_cells) const {
     if (cells.is_empty(cell) || (seq_id != -1 && !cells.seq_has(cell, seq_id))) {
         return false;
     }
-    if (seq_id == -1) {
+    if (seq_id == -1 || held_cells) {
         return true;
     }
     return !llama_hparams::is_masked_swa(
@@ -12917,7 +12918,7 @@ void llama_kv_cache::state_write(llama_io_write_i & io, llama_seq_id seq_id, lla
         return;
     }
 
-    GGML_UNUSED(flags);
+    const bool held_cells = (flags & LLAMA_STATE_SEQ_FLAGS_SWA_HELD_CELLS) != 0;
 
     state_write_prepare();
 
@@ -12935,7 +12936,7 @@ void llama_kv_cache::state_write(llama_io_write_i & io, llama_seq_id seq_id, lla
         uint32_t cell_range_begin = cells.size();
 
         for (uint32_t i = 0; i < cells.size(); ++i) {
-            if (state_write_includes_cell(cells, i, seq_id)) {
+            if (state_write_includes_cell(cells, i, seq_id, held_cells)) {
                 ++cell_count;
                 if (cell_range_begin == cells.size()) {
                     cell_range_begin = i;
