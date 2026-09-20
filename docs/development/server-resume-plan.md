@@ -1,6 +1,8 @@
 # Persistent server resume — design and implementation plan
 
-Status: **proposal; not implemented or reviewed for acceptance**.
+Status: **P0 to P2 implemented on `exp/server-resume` (fixed-type KV, `--resume`);
+P3 and P4 open; not reviewed for acceptance**. Contract, results and the limits
+of v1: `server-resume-format.md`.
 Created 2026-09-18 against master `ed774445c`.
 This is an engineering plan, not documentation of an available feature.
 
@@ -530,21 +532,29 @@ contract is unreviewed until then.
 
 ### P2 — Durable store and fixed-state vertical slice
 
-- [ ] Implement root resolution, private files, locking, streamed I/O, integrity
+- [x] Implement root resolution, private files, locking, streamed I/O, integrity
   checks, per-entry publication/invalidation and reference-safe garbage collection.
-- [ ] Add flags and coordinator through normal shutdown/startup control flow.
-- [ ] Fixed-state single-slot dense and hybrid save/restore; establish frontiers.
-- [ ] Save and restore the slot's context checkpoints as required companions
+- [x] Add flags and coordinator through normal shutdown/startup control flow.
+- [x] Fixed-state single-slot dense and hybrid save/restore; establish frontiers.
+- [x] Save and restore the slot's context checkpoints as required companions
   (hybrid: full; iSWA: partial images tied to the snapshot's base cache). Test a pure
   append and a rewind after restart on a hybrid and on an SWA model.
-- [ ] Route `/slots` restore by header: legacy files unchanged, resume entries
+- [x] Route `/slots` restore by header: legacy files unchanged, resume entries
   through the resume installer, refusal (never legacy install) on a failed
   resume check. Use it as the restart-free test entry point.
-- [ ] Fault-injection tests and uninterrupted-vs-resumed regression tests.
+- [x] Fault-injection tests and uninterrupted-vs-resumed regression tests.
 
 Gate: end-to-end same-model restart and deliberate family reuse, with resume-off
 cost effectively zero. Failed writes may lose affected entries, never admit corrupt
 state or destroy unrelated valid entries; record measured peak disk occupancy.
+
+Gate result: met for dense and hybrid models (token-identical continuations across
+restart, sleep/wake, rewind, fewer slots and a killed save) and for the family
+reuse measured in P0. SWA restores are numerically equivalent rather than
+bit-identical above the window (`server-resume-format.md` §10). Without `--resume`
+no resume code runs. Peak disk during a second save of a 221 MB hybrid entry:
+332 MB, i.e. the entry plus the objects being replaced. The retained-cell capture
+listed under P3 was needed already here and is in (`SWA_HELD_CELLS`).
 
 ### P3 — VBR, multiple slots and checkpoint selection
 
