@@ -13035,9 +13035,10 @@ const slot_info_vec_t *   sinfos_in) {
         res = res && state_read_meta(
                 io, strm, cell_count, sinfo, seq_id,
                 sinfos_in ? &(*sinfos_in)[s] : nullptr);
-        if (res && seq_id == -1 && vbr_vmm_active()) {
-            // the whole-cache branch positions cells directly (no apply_ubatch), so nothing has
-            // grown the VMM physical backing yet — state_read_data would write into unmapped VA
+        if (res && vbr_vmm_active()) {
+            // neither branch has grown the VMM physical backing yet: the whole-cache one positions
+            // cells directly, the per-sequence one goes through apply_ubatch(commit = false), which
+            // skips the mapping — state_read_data would write into unmapped VA
             vbr_vmm_ensure_mapped();
         }
 
