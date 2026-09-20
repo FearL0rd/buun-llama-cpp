@@ -3690,7 +3690,6 @@ private:
     std::string resume_key_hex;
     std::string resume_family_hex;
     bool resume_has_partial = false;
-    std::vector<uint8_t> resume_staging; // one object
     // entries of this key that found no slot at install: the next save keeps them
     std::set<std::string> resume_unslotted;
     uint64_t frontier_next_sequence_epoch = 1;
@@ -5250,7 +5249,6 @@ private:
         }
 
         server_resume_manifest next;
-        std::vector<server_resume_object_record *> to_write_chunks;
         size_t n_kept = 0;
         {
             server_resume_prefix_hasher hasher(tokens);
@@ -5419,7 +5417,12 @@ private:
             (slot.t_last_used > 0 ? std::max<int64_t>(0, ggml_time_us() - slot.t_last_used)/1000 : 0);
         next.slot_hint         = slot.id;
         next.producers         = old.producers;
-        const uint32_t producer = next.producer_index(resume_producer());
+        uint32_t producer;
+        try {
+            producer = next.producer_index(resume_producer());
+        } catch (const std::length_error &) {
+            return skipped("provenance_limit");
+        }
 
         std::string error;
         bool replaced = false;
@@ -5458,6 +5461,7 @@ private:
         };
 
         uint64_t bytes_written = 0;
+        std::vector<uint8_t> resume_staging; // one object; released on failures as well as success
         for (size_t i = n_kept; i < next.chunks.size(); ++i) {
             auto & rec = next.chunks[i];
             rec.gen = next.generation;
@@ -5586,7 +5590,9 @@ private:
             }
             json status;
             server_slot * dest = nullptr;
-            if (entry.reason == server_resume_reason::ok && !resume_unslotted.count(entry.id)) {
+            // Overflow was estimated before object/adapter admission. If a newer entry failed,
+            // try an older unreported entry in the slot it left free instead of cold-starting it.
+            if (entry.reason == server_resume_reason::ok) {
                 const int32_t hint = entry.manifest.slot_hint;
                 if (hint >= 0 && size_t(hint) < slots.size() && !taken[size_t(hint)]) {
                     dest = &slots[size_t(hint)];
@@ -5610,6 +5616,7 @@ private:
                 status = resume_install(*dest, entry.id, entry.manifest);
                 if (resume_installed(status)) {
                     taken[size_t(dest - slots.data())] = true;
+                    resume_unslotted.erase(entry.id);
                     n_installed++;
                 }
             }
@@ -5884,10 +5891,17 @@ private:
             std::sort(tails.begin(), tails.end(), [](const auto & a, const auto & b) {
                 return a.pos() < b.pos();
             });
+            tails.erase(std::remove_if(tails.begin(), tails.end(), [p](const auto & rec) {
+                return rec.pos() >= p;
+            }), tails.end());
+            // The recent turn is needed for the client's first re-render/rewind. Reserve the
+            // limited ring for the newest companions, then import them in chronological order.
+            const size_t limit = size_t(std::max(0, params_base.n_ctx_checkpoints));
+            if (tails.size() > limit) {
+                n_dropped += tails.size() - limit;
+                tails.erase(tails.begin(), tails.end() - limit);
+            }
             for (const auto & rec : tails) {
-                if (rec.pos() >= p) {
-                    continue;
-                }
                 std::vector<uint8_t> data;
                 std::string error;
                 bool ok = false;

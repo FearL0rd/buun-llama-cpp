@@ -14,6 +14,7 @@
 #include <limits>
 #include <random>
 #include <set>
+#include <stdexcept>
 
 #if !defined(_WIN32)
 #include <fcntl.h>
@@ -108,7 +109,7 @@ uint32_t server_resume_manifest::producer_index(const server_resume_producer & p
         return (uint32_t) (it - producers.begin());
     }
     if (producers.size() >= server_resume_limits::max_producers) {
-        return 0;
+        throw std::length_error("resume producer table is full; retaining the previous entry");
     }
     producers.push_back(producer);
     return (uint32_t) producers.size() - 1;
@@ -181,7 +182,7 @@ bool server_resume_manifest_validate(const server_resume_manifest & manifest, st
     std::set<int32_t> positions;
     for (const auto & tail : manifest.tail_states) {
         if (tail.kind != server_resume_object_kind::tail_state || tail.p1 != 0 || tail.p0 <= 0 ||
-            tail.p0 > manifest.n_tokens || tail.n_tokens != tail.p0 || tail.pos_max + 1 != tail.p0 ||
+            tail.p0 > manifest.n_tokens || tail.n_tokens != tail.p0 || tail.pos_max != tail.p0 - 1 ||
             tail.pos_min < 0 || tail.pos_min > tail.pos_max || tail.gen == 0 || tail.gen > manifest.generation ||
             !positions.insert(tail.p0).second) {
             error = "tail state position is invalid";
@@ -365,11 +366,13 @@ server_resume_reason server_resume_manifest_decode(
 
     const char * text = (const char *) data + HEADER_SIZE;
 
-    const json::parser_callback_t depth_limit = [](int depth, json::parse_event_t, json &) {
-        return depth <= limits::max_json_depth;
+    bool too_deep = false;
+    const json::parser_callback_t depth_limit = [&](int depth, json::parse_event_t, json &) {
+        too_deep |= depth > limits::max_json_depth;
+        return !too_deep;
     };
     const json doc = json::parse(text, text + json_bytes, depth_limit, false);
-    if (!doc.is_object()) {
+    if (too_deep || !doc.is_object()) {
         error = "manifest json";
         return server_resume_reason::manifest_corrupt;
     }
@@ -963,6 +966,11 @@ server_resume_reason server_resume_store::uncommit(const std::string & id, std::
         return server_resume_reason::io_error;
     }
     if (!sync_dir(directory)) {
+        // A known entry may already have been removed by retention. Erasing it is
+        // idempotent, but still make that absence durable before reporting success.
+        if (errno == ENOENT && sync_dir(dir + "/entries")) {
+            return server_resume_reason::ok;
+        }
         error = "cannot sync " + directory;
         return server_resume_reason::io_error;
     }

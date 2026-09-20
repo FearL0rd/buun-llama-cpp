@@ -104,7 +104,8 @@ struct server_resume_manifest {
 
     std::vector<uint8_t> ledger;
 
-    // index of an equal producer, added when there is none and room is left, else 0
+    // Index of an equal producer, or append it. Throws length_error if full rather
+    // than attributing newly written state to an unrelated producer.
     uint32_t producer_index(const server_resume_producer & producer);
 };
 

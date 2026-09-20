@@ -9,6 +9,8 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <limits>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -180,6 +182,7 @@ static void test_manifest_refusals() {
     { auto m = base(); m.chunks[0].kind = server_resume_object_kind::tail_state; CHECK(!valid(m)); }
     { auto m = base(); m.tail_states[0].p0 = 33; m.tail_states[0].n_tokens = 33; m.tail_states[0].pos_max = 32; CHECK(!valid(m)); }
     { auto m = base(); m.tail_states[0].pos_max = 30;       CHECK(!valid(m)); }
+    { auto m = base(); m.tail_states[0].pos_max = std::numeric_limits<int32_t>::max(); CHECK(!valid(m)); }
     { auto m = base(); m.tail_states[0].n_tokens = 31;      CHECK(!valid(m)); }
     { auto m = base(); m.tail_states[0].pos_min = 32;       CHECK(!valid(m)); }
     { auto m = base(); m.tail_states[0].role = "other";     CHECK(!valid(m)); }
@@ -204,14 +207,21 @@ static void test_manifest_refusals() {
         CHECK(valid(m));
     }
 
-    // a producer list that is full falls back to the first record instead of growing
+    // A full provenance table must never attribute new bytes to an unrelated producer.
     {
         auto m = base();
-        for (size_t i = 0; i < 40; ++i) {
+        for (size_t i = 1; i < server_resume_limits::max_producers; ++i) {
             m.producer_index(producer_of("model-" + std::to_string(i)));
         }
         CHECK(m.producers.size() == server_resume_limits::max_producers);
-        CHECK(m.producer_index(producer_of("one more")) == 0);
+        bool refused = false;
+        try {
+            m.producer_index(producer_of("one more"));
+        } catch (const std::length_error &) {
+            refused = true;
+        }
+        CHECK(refused);
+        CHECK(m.producer_index(producer_of("model")) == 0);
         CHECK(valid(m));
     }
 
@@ -225,6 +235,9 @@ static void test_manifest_refusals() {
     const std::string text((const char *) good.data() + 64, good.size() - 64 - base().ledger.size());
     CHECK(decode(raw_manifest(text)) == server_resume_reason::ok);
     CHECK(decode(raw_manifest(text, 2)) == server_resume_reason::format_unsupported);
+    CHECK(decode(raw_manifest(text.substr(0, text.size() - 1) +
+        ",\"unknown\":" + std::string(20, '[') + "0" + std::string(20, ']') + "}")) ==
+        server_resume_reason::manifest_corrupt);
 
     CHECK(decode(raw_manifest("not json")) == server_resume_reason::manifest_corrupt);
     CHECK(decode(raw_manifest("[1,2,3]")) == server_resume_reason::manifest_corrupt);
@@ -538,6 +551,8 @@ static void test_store(const std::string & root) {
     store->remove_entry(id_new);
     store->prune(KEY, 0, 0);
     CHECK(n_files(store->directory() + "/entries") == 0);
+    // An explicit erase remains successful if retention already removed the entry.
+    CHECK(store->uncommit(id, error) == server_resume_reason::ok);
 
     // an entries directory that is a link somewhere else is not followed
     store.reset();
