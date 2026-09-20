@@ -474,7 +474,7 @@ static void test_store(const std::string & root) {
         CHECK(entries.size() == 2 && entries[0].id == id && entries[1].id == id_bad);
         CHECK(entries.size() == 2 && entries[1].reason == server_resume_reason::manifest_corrupt);
     }
-    store->prune(8);
+    store->prune(KEY, 8, 8);
     CHECK(store->list().size() == 1);
     CHECK(!fs::exists(store->directory() + "/entries/" + id_bad));
 
@@ -496,11 +496,28 @@ static void test_store(const std::string & root) {
         server_resume_manifest other = manifest_of(16, 0);
         other.chunks.clear();
         other.last_used_unix_ms = 100;
+        other.resume_key = std::string(64, 'e');
         CHECK(add_generation(*store, id_old, other, 0, 16) == server_resume_reason::ok);
     }
     CHECK(n_files(store->directory() + "/entries") == 4);
     CHECK(store->list().size() == 3);
-    store->prune(2);
+    // the bound of this key leaves the entry of the other key alone, the overall bound does not
+    store->prune(KEY, 2, 8);
+    CHECK(n_files(store->directory() + "/entries") == 3);
+    CHECK(store->list().size() == 3);
+    store->prune(KEY, 1, 8);
+    {
+        const auto entries = store->list();
+        CHECK(entries.size() == 2);
+        CHECK(entries.size() == 2 && entries[0].id == id_new && entries[1].id == id_old);
+    }
+    {
+        server_resume_manifest other = manifest_of(16, 0);
+        other.chunks.clear();
+        other.last_used_unix_ms = 6000;
+        CHECK(add_generation(*store, id, other, 0, 16) == server_resume_reason::ok);
+    }
+    store->prune(KEY, 2, 2);
     {
         const auto entries = store->list();
         CHECK(n_files(store->directory() + "/entries") == 2);
@@ -516,7 +533,7 @@ static void test_store(const std::string & root) {
     CHECK(store->read_manifest(id, gone, error) == server_resume_reason::object_missing);
 
     store->remove_entry(id_new);
-    store->prune(0);
+    store->prune(KEY, 0, 0);
     CHECK(n_files(store->directory() + "/entries") == 0);
 
     // an entries directory that is a link somewhere else is not followed

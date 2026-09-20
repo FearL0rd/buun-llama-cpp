@@ -514,7 +514,7 @@ server_resume_reason server_resume_store::uncommit(const std::string &, std::str
 }
 
 void server_resume_store::remove_entry(const std::string &) const {}
-void server_resume_store::prune(size_t) const {}
+void server_resume_store::prune(const std::string &, size_t, size_t) const {}
 uint64_t server_resume_store::free_bytes() const { return 0; }
 
 #else
@@ -979,11 +979,15 @@ void server_resume_store::remove_entry(const std::string & id) const {
     fs::remove_all(directory, ec);
 }
 
-void server_resume_store::prune(size_t n_keep) const {
+void server_resume_store::prune(const std::string & resume_key, size_t n_keep_key, size_t n_keep_total) const {
     std::set<std::string> keep;
+    size_t n_of_key = 0;
     for (const auto & entry : list()) {
         // a manifest of a newer format may be of use to the server that wrote it, a damaged one to nobody
-        if (entry.reason != server_resume_reason::manifest_corrupt && keep.size() < n_keep) {
+        if (entry.reason == server_resume_reason::manifest_corrupt || keep.size() >= n_keep_total) {
+            continue;
+        }
+        if (entry.manifest.resume_key != resume_key || n_of_key++ < n_keep_key) {
             keep.insert(entry.id);
         }
     }

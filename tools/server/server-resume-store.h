@@ -171,8 +171,10 @@ public:
 
     void remove_entry(const std::string & id) const;
 
-    // keeps the n entries used last, and drops damaged manifests and directories that never got one
-    void prune(size_t n_keep) const;
+    // keeps the entries used last, so many of the given resume key and so many overall, and drops
+    // damaged manifests and directories that never got one. A server cannot read the entries of
+    // another key, so only the overall bound ends those, never the number of its own slots.
+    void prune(const std::string & resume_key, size_t n_keep_key, size_t n_keep_total) const;
 
     uint64_t free_bytes() const;
 
