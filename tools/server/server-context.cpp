@@ -435,10 +435,13 @@ std::string server_resume_hex(const uint8_t * data, size_t size) {
 }
 
 // SHA-256, domain buun.server.resume-prefix/v1, over the ledger's token ids [0, p) as LE u32.
+// A media chunk is a run of LLAMA_TOKEN_NULL cells: its first cell is followed by the chunk's
+// cell count and content id, so a text-only ledger hashes as it always did.
 // Positions are asked for in ascending order, so one pass over the ledger serves every object.
 class server_resume_prefix_hasher {
 public:
-    explicit server_resume_prefix_hasher(const llama_tokens & ids) : ids(ids) {
+    explicit server_resume_prefix_hasher(const server_tokens & tokens) :
+        tokens(tokens), ids(tokens.retention_token_ids()) {
         static constexpr char domain[] = "buun.server.resume-prefix/v1";
         writer.string(domain, sizeof(domain) - 1);
     }
@@ -447,6 +450,14 @@ public:
         GGML_ASSERT(p >= n && p <= ids.size());
         for (; n < p; ++n) {
             writer.u32(uint32_t(ids[n]));
+            if (ids[n] == LLAMA_TOKEN_NULL && n >= media_end) {
+                const auto & chunk = tokens.find_chunk(n); // throws when the cell starts no chunk
+                const char * id = mtmd_input_chunk_get_id(chunk.get());
+                const size_t n_cells = mtmd_input_chunk_get_n_tokens(chunk.get());
+                writer.u64(n_cells);
+                writer.string(id, id ? std::strlen(id) : 0);
+                media_end = n + n_cells;
+            }
         }
         auto copy = writer;
         const auto digest = copy.finish();
@@ -454,9 +465,11 @@ public:
     }
 
 private:
+    const server_tokens & tokens;
     const llama_tokens & ids;
     llama_sha256_writer writer;
     size_t n = 0;
+    size_t media_end = 0;
 };
 
 void server_slot_store_le_u32(std::vector<char> & out, uint32_t value) {
@@ -5027,6 +5040,9 @@ private:
         server_resume_producer out;
         out.model_name = model_name;
         out.model_file = std::filesystem::path(params_base.model.path).filename().string();
+        if (mctx) {
+            out.mmproj_file = std::filesystem::path(params_base.mmproj.path).filename().string();
+        }
         char desc[256] = {};
         if (llama_model_desc(model_tgt, desc, sizeof(desc)) > 0) {
             out.weight_type = desc;
@@ -5045,6 +5061,29 @@ private:
         SRV_INF("RESUME %s\n", status.dump().c_str());
     }
 
+    // Under M-RoPE the cells of a media chunk share positions, and a token range names cells by
+    // position. Media is stored only where a chunk of n cells takes n consecutive positions.
+    bool resume_media_positions_shared() const {
+        const auto rope = llama_model_rope_type(model_tgt);
+        return rope == LLAMA_ROPE_TYPE_MROPE || rope == LLAMA_ROPE_TYPE_IMROPE ||
+            rope == LLAMA_ROPE_TYPE_VISION;
+    }
+
+    // a prefix of n cells that ends inside a media chunk is no conversation
+    static bool resume_cuts_media(const server_tokens & tokens, size_t n) {
+        const llama_tokens & ids = tokens.retention_token_ids();
+        return n > 0 && n < ids.size() &&
+            ids[n - 1] == LLAMA_TOKEN_NULL && ids[n] == LLAMA_TOKEN_NULL &&
+            tokens.find_next_media_chunk(n - 1).second != n;
+    }
+
+    static int32_t resume_media_floor(const server_tokens & tokens, int32_t n) {
+        while (resume_cuts_media(tokens, size_t(std::max(n, 0)))) {
+            n--;
+        }
+        return n;
+    }
+
     // A slot checkpoint that can be stored as a tail state of the ledger.
     bool resume_checkpoint_storable(
             const server_slot & slot,
@@ -5055,6 +5094,7 @@ private:
             cp.n_tokens > 0 && cp.n_tokens < n_tokens &&
             cp.pos_max + 1 == cp.n_tokens &&
             cp.checkpoint_epoch == 0 && cp.checkpoint_epoch_swa == 0 &&
+            !resume_cuts_media(slot.prompt.tokens, size_t(cp.n_tokens)) &&
             checkpoint_frontier_is_current(slot, cp, adapter);
     }
 
@@ -5099,7 +5139,7 @@ private:
     // the tokens. Else the conversation came back from the host cache or was sent again, and its
     // entry is the one no slot holds whose chunks, but for the last, lead the tokens.
     std::string resume_entry_of(
-            const server_slot & slot, const llama_tokens & ids, const std::string & adapter_hex) const {
+            const server_slot & slot, const server_tokens & ids, const std::string & adapter_hex) const {
         const auto n_leading = [&](const server_resume_manifest & old) {
             size_t n = 0;
             if (old.resume_key == resume_key_hex &&
@@ -5157,11 +5197,15 @@ private:
         const int64_t t_start = ggml_time_us();
         const auto & tokens = slot.prompt.tokens;
         const int32_t n_tokens = int32_t(tokens.size());
-        if (tokens.has_media()) {
-            return skipped("unsupported_media");
-        }
-        if (tokens.pos_next() != n_tokens) {
+        if (tokens.pos_next() != n_tokens || (tokens.has_media() && resume_media_positions_shared())) {
             return skipped("unsupported_positions");
+        }
+        if (tokens.has_media()) {
+            // a chunk without a content id cannot be told from another
+            std::string identity;
+            if (!tokens.media_content_identity(n_tokens, identity)) {
+                return skipped("unsupported_media");
+            }
         }
         {
             std::vector<llama_memory_tree_child> tree;
@@ -5187,13 +5231,12 @@ private:
             return skipped("unsupported_positions");
         }
 
-        const llama_tokens & ids = tokens.get_tokens();
         const std::string adapter     = lora_config_identity(slot.lora);
         const std::string adapter_hex = resume_adapter_hex(slot);
 
         // a conversation that was moved out of this slot lives on in the host cache, if there is one
         const std::string displaced = slot.resume_entry_id;
-        slot.resume_entry_id = resume_entry_of(slot, ids, adapter_hex);
+        slot.resume_entry_id = resume_entry_of(slot, tokens, adapter_hex);
         if (displaced != slot.resume_entry_id && !displaced.empty() && fixed_host_cache_enabled()) {
             resume_unslotted.insert(displaced);
         }
@@ -5210,7 +5253,7 @@ private:
         std::vector<server_resume_object_record *> to_write_chunks;
         size_t n_kept = 0;
         {
-            server_resume_prefix_hasher hasher(ids);
+            server_resume_prefix_hasher hasher(tokens);
             bool keeping = have_old;
             for (int32_t p0 = 0; p0 < n_tokens; p0 += RESUME_CHUNK_TOKENS) {
                 const int32_t p1 = std::min(n_tokens, p0 + RESUME_CHUNK_TOKENS);
@@ -5271,8 +5314,8 @@ private:
             }
             std::sort(held_positions.begin(), held_positions.end());
 
-            server_resume_prefix_hasher hasher(ids);
-            const auto add_checkpoint = [&](const common_prompt_checkpoint & cp, const char * role) {
+            server_resume_prefix_hasher hasher(tokens);
+            const auto add_checkpoint =[&](const common_prompt_checkpoint & cp, const char * role) {
                 tail_source src;
                 src.rec.kind = server_resume_object_kind::tail_state;
                 src.rec.p0 = int32_t(cp.n_tokens);
@@ -5293,7 +5336,7 @@ private:
                     break;
                 }
                 const auto * rec = held_tail(pos);
-                server_resume_prefix_hasher early_hasher(ids);
+                server_resume_prefix_hasher early_hasher(tokens);
                 if (rec->prefix_digest == early_hasher.at(size_t(pos))) {
                     tail_source src;
                     src.rec = *rec;
@@ -5672,9 +5715,15 @@ private:
         llama_tokens serialized(envelope.serialized_tokens.size()/sizeof(llama_token));
         std::memcpy(serialized.data(), envelope.serialized_tokens.data(),
                     envelope.serialized_tokens.size());
-        server_tokens restored = server_tokens::deserialize(serialized, mctx != nullptr);
-        if (restored.has_media()) {
-            return skipped("unsupported_media");
+        // the key binds whether there is a projector, so media never meets a server without one
+        server_tokens restored;
+        try {
+            restored = server_tokens::deserialize(serialized, mctx != nullptr);
+        } catch (const std::exception &) {
+            return skipped("ledger_invalid");
+        }
+        if (restored.has_media() && resume_media_positions_shared()) {
+            return skipped("unsupported_positions");
         }
         const int32_t n_tokens = manifest.n_tokens;
         std::array<uint8_t, 32> token_digest = {};
@@ -5688,8 +5737,7 @@ private:
             return skipped("ledger_invalid");
         }
         {
-            const llama_tokens & ids = restored.get_tokens();
-            server_resume_prefix_hasher chunk_hasher(ids);
+            server_resume_prefix_hasher chunk_hasher(restored);
             for (const auto & rec : manifest.chunks) {
                 if (rec.prefix_digest != chunk_hasher.at(size_t(rec.p1))) {
                     return skipped("ledger_invalid");
@@ -5699,7 +5747,7 @@ private:
             std::sort(tails.begin(), tails.end(), [](const auto & a, const auto & b) {
                 return a.pos() < b.pos();
             });
-            server_resume_prefix_hasher tail_hasher(ids);
+            server_resume_prefix_hasher tail_hasher(restored);
             for (const auto & rec : tails) {
                 if (rec.prefix_digest != tail_hasher.at(size_t(rec.pos()))) {
                     return skipped("ledger_invalid");
@@ -5715,13 +5763,13 @@ private:
         std::vector<int32_t> candidates;
         if (resume_has_partial) {
             for (const auto & rec : manifest.tail_states) {
-                if (rec.pos() <= p_cap) {
+                if (rec.pos() <= p_cap && !resume_cuts_media(restored, size_t(rec.pos()))) {
                     candidates.push_back(rec.pos());
                 }
             }
             std::sort(candidates.rbegin(), candidates.rend());
-        } else if (p_cap > 0) {
-            candidates.push_back(p_cap);
+        } else if (resume_media_floor(restored, p_cap) > 0) {
+            candidates.push_back(resume_media_floor(restored, p_cap));
         }
         if (candidates.empty()) {
             return skipped("context_too_small");
@@ -5786,8 +5834,11 @@ private:
             }
             why_prefix = fail_reason;
             if (!resume_has_partial) {
-                // a dense model keeps the complete chunks
-                p = covered;
+                // a dense model keeps the complete chunks, up to the start of a media chunk they cut
+                p = resume_media_floor(restored, covered);
+                if (p < covered) {
+                    llama_memory_seq_rm(mem, slot.id, p, -1);
+                }
                 break;
             }
             // a partial model starts over at the largest tail state below the failure: what the

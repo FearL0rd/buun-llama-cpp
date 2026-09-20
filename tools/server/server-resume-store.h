@@ -74,6 +74,7 @@ struct server_resume_object_record {
 struct server_resume_producer {
     std::string model_name;
     std::string model_file; // basename
+    std::string mmproj_file; // basename, empty without a projector
     std::string weight_type;
     std::string build;
     std::string cache_type_k;

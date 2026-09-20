@@ -10,9 +10,11 @@ working product exists (one review is planned before the VBR phase), so every
 statement below is the author's reading of the code, not a reviewed result.
 
 Scope of v1: fixed-type KV (f16, q8_0, turbo, TCQ), dense, hybrid-recurrent and
-SWA/iSWA text models, one entry per conversation, direct install into a slot.
-Out of scope and refused with a reason: media slots, dynamic VBR (P3), drafter
-state (never saved), adapter changes between producer and consumer (P4).
+SWA/iSWA models, one entry per conversation, direct install into a slot. Images
+and audio are stored on models where a media chunk of n cells takes n consecutive
+positions (§4a). Out of scope and refused with a reason: media under M-RoPE,
+dynamic VBR (P3), drafter state (never saved), adapter changes between producer
+and consumer (P4).
 
 ## 1. Review of the real owners
 
@@ -127,11 +129,12 @@ JSON records:
 - `chunks[]`: `p0`, `p1`, `gen`, `bytes`, `xxh3`, `prefix_digest`, `producer`.
   `prefix_digest` is SHA-256 (domain `buun.server.resume-prefix/v1`) over the
   ledger's token ids `[0, p1)`: a chunk is bound to its whole prefix, because KV
-  depends on it.
+  depends on it. The first cell of a media chunk adds the chunk's cell count and
+  content id (§4a); a text-only ledger hashes the ids alone.
 - `tail_states[]`: `pos`, `pos_min`, `pos_max`, `n_tokens`, `gen`, `bytes`,
   `xxh3`, `prefix_digest`, `producer`, `role` (`frontier`, `turn`, `early`).
 - `producers[]`: provenance only, never a gate — model name and file basename as
-  loaded, weight quantization, build label, KV types, adapter labels, host
+  loaded, projector file basename (`mmproj_file`, optional), weight quantization, build label, KV types, adapter labels, host
   time. `producer` fields index this table; a conversation continued by a second
   model has chunks from both.
 - Object names are derived from the records, never stored, so a manifest cannot
@@ -235,7 +238,7 @@ Per nonempty slot, most recently used first:
    that was generating is saved "one behind": the sampled-but-undecoded token is
    simply not part of the entry. No decode, no draft-sequence change, no ring
    reset, no logits.
-2. Skip with a reason: media entries in the ledger, dynamic VBR, a Qwen4 QSA
+2. Skip with a reason: media under M-RoPE or without a content id (§4a), dynamic VBR, a Qwen4 QSA
    index (the index image is outside the partial state; unverified), positions
    that are not the identity, or a memory whose `pos_max + 1` differs from the
    ledger length on a model with a partial part (`frontier_inconsistent`). On a
@@ -292,6 +295,48 @@ entry whose manifest is damaged; one of an unsupported version is kept, it may
 belong to a newer build. On Windows the store opens as `store_unwritable`
 (encoding and decoding are portable, the durable I/O is POSIX).
 
+### 4a. Media
+
+The ledger already carries media: `server_tokens::serialize()` writes each image
+or audio chunk as a placeholder (cell count, position type, content id, no
+pixels or embeddings), a few hundred bytes per chunk. The content id is the
+SHA-256 of the file the client sent. The KV cells of a chunk are ordinary cells
+and go into the token ranges like any other.
+
+- **Positions.** A token range names cells by position and requires
+  `pos[i] == p0 + i`. That holds where a chunk of n cells takes n consecutive
+  positions (Gemma 3/4, SmolVLM, LLaVA-style). Under M-RoPE the cells of a chunk
+  share positions: a slot with media on a model whose RoPE type is MROPE, IMROPE
+  or VISION is skipped with `unsupported_positions`, at capture and at install.
+  Text-only conversations on such a model are stored as before.
+- **Identity.** Media cells are `LLAMA_TOKEN_NULL` in the ledger, so ids alone
+  would make two images equal. The prefix digest adds, at the first cell of a
+  chunk, the chunk's cell count and its content id. A chunk without an id is
+  `unsupported_media`.
+- **Boundaries.** A chunk boundary may fall inside a media chunk: objects are
+  data, and the digest of a boundary inside an image already covers the image. A
+  restore never stops inside one. A checkpoint whose frontier lies inside a
+  media chunk is not stored as a tail state, a tail state there is no restore
+  candidate, and on a dense model the cap of a smaller context, or the last
+  complete chunk after a failure, moves down to the first cell of the chunk.
+- **Projector.** The key binds whether a projector is loaded, not which one. A
+  follow-up request that sends the same file reuses the stored cells whichever
+  projector encoded them, the same kind of handoff as between two models of one
+  family (§5). `mmproj_file` in the producer record says which it was.
+
+Measured on the 3090: a three-turn conversation with two
+images, one of them across the first chunk boundary, over two restarts against
+the same conversation in one process. SmolVLM2-500M (dense, q8_0 KV) and Gemma 4
+E2B (SWA, turbo3_tcq KV, below and above the window): all turns token-identical,
+`cache_n` equal to the one-process run after each restart, so no image was
+encoded again. A 4096-token context that ends inside the first image restores
+the 4033 tokens before it. Two media conversations saved under `-np 2` and
+restarted under `-np 1` with a host cache: one `installed_host`, both continue
+identically. Qwen3.5-4B with a projector: media slots skipped with
+`unsupported_positions`, a text-only conversation identical across restarts.
+Before this change `--resume` with a projector loaded hit an assert at the first
+save, with or without media in the slot.
+
 ## 5. Resume compatibility key
 
 SHA-256, domain `buun.server.resume-compat/v1`, over:
@@ -304,7 +349,7 @@ SHA-256, domain `buun.server.resume-compat/v1`, over:
 | RoPE / YaRN parameters, `n_ctx_orig_yarn`, group-attention `n`/`w` | K is stored rotated |
 | Control vectors | state-affecting, like adapters |
 | `swa_full` | changes which SWA cells exist |
-| mmproj presence | conservative while media is unsupported |
+| mmproj presence | a ledger with media needs a projector to be read; which projector is provenance, not a gate (§4a) |
 | Stream count, on a model with SWA only (1 under unified KV, else `n_parallel`; 0 without SWA) | the SWA partial blob records it (§3). Base chunks and recurrent partial blobs do not, so a dense or hybrid conversation saved under `-np 2` continues under `-np 1`, measured bit-exact |
 
 | Left out | Becomes |
@@ -440,7 +485,9 @@ One log line and one `/slots` field per entry. The string
 | `host_cache_rejected` | more entries than slots and the host prompt cache did not take the state (its size limit); the entry is kept |
 | `entry_in_use` | the restore action named an entry another slot was restored from or saved as; two slots never write one entry |
 | `state_rejected` | the library refused a blob (type, shape, TCQ fingerprint) |
-| `unsupported_media`, `unsupported_vbr`, `unsupported_qsa`, `unsupported_positions`, `frontier_inconsistent` | capture-side skips, logged at save |
+| `unsupported_media` | a media chunk without a content id (§4a); capture-side skip, logged at save |
+| `unsupported_positions` | cells that do not take consecutive positions: media under M-RoPE (§4a). At capture, and at install when the ledger has media and the loaded model shares positions |
+| `unsupported_vbr`, `unsupported_qsa`, `frontier_inconsistent` | capture-side skips, logged at save |
 | `store_locked`, `store_unwritable`, `no_space`, `io_error` | store level; the server runs without persistence |
 | `checkpoints_dropped=<n>` | warning attached to an `installed_*` outcome |
 
@@ -558,4 +605,6 @@ Properties and limits of v1, as measured:
   save (P4 closes that).
 - Conversations that live only in the host prompt cache at shutdown are not
   saved (P4).
-- Slots with media, dynamic VBR and a QSA index are skipped with a reason.
+- Slots with media under M-RoPE, dynamic VBR and a QSA index are skipped with a
+  reason. Not measured for media: audio chunks, a chunk without a content id,
+  and a turn made after a prefix restore that ended at an image.

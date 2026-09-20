@@ -96,7 +96,8 @@ static bool header_sealed(const uint8_t * header) {
 
 bool server_resume_producer::operator==(const server_resume_producer & other) const {
     // the host time says when, not who
-    return model_name == other.model_name && model_file == other.model_file && weight_type == other.weight_type &&
+    return model_name == other.model_name && model_file == other.model_file &&
+        mmproj_file == other.mmproj_file && weight_type == other.weight_type &&
         build == other.build && cache_type_k == other.cache_type_k && cache_type_v == other.cache_type_v &&
         adapters == other.adapters;
 }
@@ -196,7 +197,7 @@ bool server_resume_manifest_validate(const server_resume_manifest & manifest, st
     }
 
     for (const auto & producer : manifest.producers) {
-        const std::string * texts[] = { &producer.model_name, &producer.model_file, &producer.weight_type,
+        const std::string * texts[] = { &producer.model_name, &producer.model_file, &producer.mmproj_file, &producer.weight_type,
             &producer.build, &producer.cache_type_k, &producer.cache_type_v };
         for (const auto * text : texts) {
             if (text->size() > MAX_STRING) {
@@ -298,6 +299,7 @@ std::vector<uint8_t> server_resume_manifest_encode(const server_resume_manifest 
         doc["producers"].push_back({
             { "model_name",   producer.model_name },
             { "model_file",   producer.model_file },
+            { "mmproj_file",  producer.mmproj_file },
             { "weight_type",  producer.weight_type },
             { "build",        producer.build },
             { "cache_type_k", producer.cache_type_k },
@@ -403,7 +405,8 @@ server_resume_reason server_resume_manifest_decode(
             server_resume_producer producer;
             producer.model_name   = in.at("model_name").get<std::string>();
             producer.model_file   = in.at("model_file").get<std::string>();
-            producer.weight_type  = in.at("weight_type").get<std::string>();
+            producer.mmproj_file  = in.value("mmproj_file", std::string()); // absent before media was stored
+            producer.weight_type = in.at("weight_type").get<std::string>();
             producer.build        = in.at("build").get<std::string>();
             producer.cache_type_k = in.at("cache_type_k").get<std::string>();
             producer.cache_type_v = in.at("cache_type_v").get<std::string>();
