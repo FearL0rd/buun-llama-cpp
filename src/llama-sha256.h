@@ -5,6 +5,12 @@
 #include <cstdint>
 #include <cstring>
 
+#if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))
+#define LLAMA_SHA256_X86 1
+#include <cpuid.h>
+#include <immintrin.h>
+#endif
+
 inline void llama_store_le_u32(uint8_t (&data)[4], uint32_t value) {
     for (size_t i = 0; i < sizeof(data); ++i) {
         data[i] = uint8_t(value >> (8*i));
@@ -35,6 +41,8 @@ inline uint64_t llama_load_le_u64(const uint8_t (&data)[8]) {
 
 // Compact SHA-256 for internal identity digests (adapter identities, VBR checkpoint
 // identity/policy/order digests). Callers version their own serialization domains.
+// Artifact payloads go through it too, several times each, so x86 uses the SHA
+// extensions where the CPU has them.
 class llama_sha256 {
 public:
     llama_sha256() {
@@ -48,17 +56,28 @@ public:
         const uint8_t * data = static_cast<const uint8_t *>(src);
         total_len += len;
 
-        while (len > 0) {
+        if (block_len > 0) {
             const size_t n = std::min(len, block.size() - block_len);
             memcpy(block.data() + block_len, data, n);
             block_len += n;
             data += n;
             len -= n;
-
-            if (block_len == block.size()) {
-                transform(block.data());
-                block_len = 0;
+            if (block_len < block.size()) {
+                return;
             }
+            transform(block.data(), 1);
+            block_len = 0;
+        }
+        // whole blocks are hashed where they are
+        const size_t n_blocks = len / block.size();
+        if (n_blocks > 0) {
+            transform(data, n_blocks);
+            data += n_blocks * block.size();
+            len -= n_blocks * block.size();
+        }
+        if (len > 0) {
+            memcpy(block.data(), data, len);
+            block_len = len;
         }
     }
 
@@ -93,18 +112,81 @@ private:
         return (x >> n) | (x << (32 - n));
     }
 
-    void transform(const uint8_t * data) {
-        static const uint32_t k[64] = {
-            0x428a2f98u, 0x71374491u, 0xb5c0fbcfu, 0xe9b5dba5u, 0x3956c25bu, 0x59f111f1u, 0x923f82a4u, 0xab1c5ed5u,
-            0xd807aa98u, 0x12835b01u, 0x243185beu, 0x550c7dc3u, 0x72be5d74u, 0x80deb1feu, 0x9bdc06a7u, 0xc19bf174u,
-            0xe49b69c1u, 0xefbe4786u, 0x0fc19dc6u, 0x240ca1ccu, 0x2de92c6fu, 0x4a7484aau, 0x5cb0a9dcu, 0x76f988dau,
-            0x983e5152u, 0xa831c66du, 0xb00327c8u, 0xbf597fc7u, 0xc6e00bf3u, 0xd5a79147u, 0x06ca6351u, 0x14292967u,
-            0x27b70a85u, 0x2e1b2138u, 0x4d2c6dfcu, 0x53380d13u, 0x650a7354u, 0x766a0abbu, 0x81c2c92eu, 0x92722c85u,
-            0xa2bfe8a1u, 0xa81a664bu, 0xc24b8b70u, 0xc76c51a3u, 0xd192e819u, 0xd6990624u, 0xf40e3585u, 0x106aa070u,
-            0x19a4c116u, 0x1e376c08u, 0x2748774cu, 0x34b0bcb5u, 0x391c0cb3u, 0x4ed8aa4au, 0x5b9cca4fu, 0x682e6ff3u,
-            0x748f82eeu, 0x78a5636fu, 0x84c87814u, 0x8cc70208u, 0x90befffau, 0xa4506cebu, 0xbef9a3f7u, 0xc67178f2u,
-        };
+    static constexpr uint32_t k[64] = {
+        0x428a2f98u, 0x71374491u, 0xb5c0fbcfu, 0xe9b5dba5u, 0x3956c25bu, 0x59f111f1u, 0x923f82a4u, 0xab1c5ed5u,
+        0xd807aa98u, 0x12835b01u, 0x243185beu, 0x550c7dc3u, 0x72be5d74u, 0x80deb1feu, 0x9bdc06a7u, 0xc19bf174u,
+        0xe49b69c1u, 0xefbe4786u, 0x0fc19dc6u, 0x240ca1ccu, 0x2de92c6fu, 0x4a7484aau, 0x5cb0a9dcu, 0x76f988dau,
+        0x983e5152u, 0xa831c66du, 0xb00327c8u, 0xbf597fc7u, 0xc6e00bf3u, 0xd5a79147u, 0x06ca6351u, 0x14292967u,
+        0x27b70a85u, 0x2e1b2138u, 0x4d2c6dfcu, 0x53380d13u, 0x650a7354u, 0x766a0abbu, 0x81c2c92eu, 0x92722c85u,
+        0xa2bfe8a1u, 0xa81a664bu, 0xc24b8b70u, 0xc76c51a3u, 0xd192e819u, 0xd6990624u, 0xf40e3585u, 0x106aa070u,
+        0x19a4c116u, 0x1e376c08u, 0x2748774cu, 0x34b0bcb5u, 0x391c0cb3u, 0x4ed8aa4au, 0x5b9cca4fu, 0x682e6ff3u,
+        0x748f82eeu, 0x78a5636fu, 0x84c87814u, 0x8cc70208u, 0x90befffau, 0xa4506cebu, 0xbef9a3f7u, 0xc67178f2u,
+    };
 
+    void transform(const uint8_t * data, size_t n_blocks) {
+#ifdef LLAMA_SHA256_X86
+        if (have_sha_ext()) {
+            transform_sha_ext(state.data(), data, n_blocks);
+            return;
+        }
+#endif
+        for (size_t i = 0; i < n_blocks; ++i) {
+            transform_block(data + i * block.size());
+        }
+    }
+
+#ifdef LLAMA_SHA256_X86
+    static bool have_sha_ext() {
+        static const bool value = [] {
+            unsigned a = 0, b = 0, c = 0, d = 0;
+            // SSSE3 and SSE4.1, then the SHA extensions
+            if (!__get_cpuid(1, &a, &b, &c, &d) || !(c & (1u << 9)) || !(c & (1u << 19))) {
+                return false;
+            }
+            return __get_cpuid_count(7, 0, &a, &b, &c, &d) && (b & (1u << 29));
+        }();
+        return value;
+    }
+
+    __attribute__((target("sha,sse4.1,ssse3")))
+    static void transform_sha_ext(uint32_t * state, const uint8_t * data, size_t n_blocks) {
+        const __m128i swap = _mm_set_epi64x(0x0c0d0e0f08090a0bll, 0x0405060700010203ll);
+        // the instructions want the state as ABEF and CDGH
+        __m128i tmp    = _mm_shuffle_epi32(_mm_loadu_si128((const __m128i *) &state[0]), 0xB1);
+        __m128i state1 = _mm_shuffle_epi32(_mm_loadu_si128((const __m128i *) &state[4]), 0x1B);
+        __m128i state0 = _mm_alignr_epi8(tmp, state1, 8);
+        state1 = _mm_blend_epi16(state1, tmp, 0xF0);
+
+        for (; n_blocks > 0; --n_blocks, data += 64) {
+            const __m128i save0 = state0;
+            const __m128i save1 = state1;
+            __m128i w[4];
+            for (size_t i = 0; i < 16; ++i) {
+                if (i < 4) {
+                    w[i] = _mm_shuffle_epi8(_mm_loadu_si128((const __m128i *) (data + 16*i)), swap);
+                } else {
+                    const __m128i prev = w[(i + 3) % 4];
+                    __m128i next = _mm_sha256msg1_epu32(w[i % 4], w[(i + 1) % 4]);
+                    next = _mm_add_epi32(next, _mm_alignr_epi8(prev, w[(i + 2) % 4], 4));
+                    w[i % 4] = _mm_sha256msg2_epu32(next, prev);
+                }
+                __m128i msg = _mm_add_epi32(w[i % 4], _mm_loadu_si128((const __m128i *) &k[4*i]));
+                state1 = _mm_sha256rnds2_epu32(state1, state0, msg);
+                msg    = _mm_shuffle_epi32(msg, 0x0E);
+                state0 = _mm_sha256rnds2_epu32(state0, state1, msg);
+            }
+            state0 = _mm_add_epi32(state0, save0);
+            state1 = _mm_add_epi32(state1, save1);
+        }
+
+        tmp    = _mm_shuffle_epi32(state0, 0x1B);
+        state1 = _mm_shuffle_epi32(state1, 0xB1);
+        _mm_storeu_si128((__m128i *) &state[0], _mm_blend_epi16(tmp, state1, 0xF0));
+        _mm_storeu_si128((__m128i *) &state[4], _mm_alignr_epi8(state1, tmp, 8));
+    }
+#endif
+
+    void transform_block(const uint8_t * data) {
         uint32_t w[64];
         for (size_t i = 0; i < 16; ++i) {
             w[i] = (uint32_t(data[4*i + 0]) << 24) |

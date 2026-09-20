@@ -451,6 +451,10 @@ public:
     const std::vector<vbr_artifact_allocation_view> &
         reference_allocations() const noexcept;
     vbr_artifact_status validate() const noexcept;
+    // Rebuild the prepared wire package of an exact (non-projected) reference.
+    // Payload sources borrow this view's storage, so the view must outlive
+    // every read of `out`.
+    vbr_artifact_status exact_package(vbr_artifact_package & out) const noexcept;
     vbr_artifact_resolve_status retain(
         vbr_artifact_package_view & output) const noexcept;
     void reset() noexcept;

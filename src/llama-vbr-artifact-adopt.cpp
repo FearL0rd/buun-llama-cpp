@@ -498,6 +498,13 @@ class vbr_kv_import_session {
                         return false;
                     }
                     const auto & unit = units[shard.shard_index];
+                    // The side stream is created by the first tier change or
+                    // capture. A cache restored right after a restart has seen
+                    // neither, so this import is its first user.
+                    if (pool->backend == nullptr && pool->be != nullptr &&
+                        pool->device >= 0) {
+                        pool->backend = pool->be->backend_init(pool->device);
+                    }
                     if (unit.first != pool || !unit.second ||
                         unit.second->t == nullptr || pool->vmm == nullptr ||
                         pool->be == nullptr || pool->backend == nullptr ||

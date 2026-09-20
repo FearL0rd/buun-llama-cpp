@@ -1723,6 +1723,21 @@ vbr_artifact_status vbr_artifact_package_view::validate() const noexcept {
             return vbr_artifact_status::ok;
         }
         vbr_artifact_package package;
+        const auto status = exact_package(package);
+        return status == vbr_artifact_status::ok ?
+            vbr_artifact_validate_prepared_package(package) : status;
+    } catch (...) {
+        return vbr_artifact_status::internal_error;
+    }
+}
+
+vbr_artifact_status vbr_artifact_package_view::exact_package(
+        vbr_artifact_package & out) const noexcept {
+    if (!storage_ || storage_->projected_sealed) {
+        return vbr_artifact_status::invalid_argument;
+    }
+    try {
+        vbr_artifact_package package;
         package.version = storage_->manifest.version;
         package.topologies = storage_->topologies;
         package.manifest = storage_->manifest;
@@ -1762,7 +1777,8 @@ vbr_artifact_status vbr_artifact_package_view::validate() const noexcept {
             companion.payload = view.payload->source();
             package.companions.push_back(std::move(companion));
         }
-        return vbr_artifact_validate_prepared_package(package);
+        out = std::move(package);
+        return vbr_artifact_status::ok;
     } catch (...) {
         return vbr_artifact_status::internal_error;
     }
