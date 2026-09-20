@@ -745,6 +745,24 @@ Still required before moving on:
   (slot files are off under dynamic VBR, the host restore declines an exhausted
   destination before importing), so the test is at the library API. It becomes
   a server path when resume takes dynamic VBR.
+  Extended before dynamic-VBR resume (asked for by the re-review): the gate now
+  starves the import with something to lose. Another sequence of 1024 tokens
+  lives beside the destination, and a third arm appends `[1024, 4096)` onto a
+  live prefix. Device down to 4 MiB free; after each refusal the prefix rows and
+  the other sequence's rows read back byte for byte as before, both sequences
+  keep decoding across the boundary where the controller settles the refusal,
+  and the import is accepted with memory back and reads back as saved. Passes on
+  a dense model, a hybrid one and Gemma 4 (two caches, a 30 MiB import); on the
+  latter two a range alone is not a decodable sequence, so those arms compare
+  rows and do not decode the destination. Controls, each a one-line library
+  break: the append unwind dropping the whole sequence fails the prefix arm, the
+  whole-import unwind clearing the cache fails on the other sequence.
+  The gate found one defect: a context freed with a refused import still
+  unsettled aborted in the tracker's destructor (the refusal is settled at the
+  next decode boundary, and there was none) — what a server does when it frees
+  its context right after a refused restore. The cache now runs the same
+  boundary drain once more when it is destroyed; the gate's last arm frees the
+  context on a refusal, and aborts without that call.
 - [x] **Wrapped SWA state fidelity:** establish the cause with exact row/position
   comparisons and same-token logits. Different batch sizes and coherent output
   are not an acceptance substitute.

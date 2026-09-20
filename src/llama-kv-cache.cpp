@@ -2108,6 +2108,12 @@ llama_kv_cache::llama_kv_cache(
 }
 
 llama_kv_cache::~llama_kv_cache() {
+    // A failure recorded after the last decode boundary (a refused state import, then the
+    // context is freed) is still unsettled here, and the tracker refuses to die owning one.
+    // Only the cache that owns the tracker settles: `other` may already be gone.
+    if (other == nullptr) {
+        vbr_recovery_settle();
+    }
     vbr_release_resources();
 }
 
@@ -3483,7 +3489,7 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::plan_slots(const std::vector<lla
     return res;
 }
 
-bool llama_kv_cache::update(llama_context * lctx, bool do_shift, const stream_copy_info & sc_info) {
+void llama_kv_cache::vbr_recovery_settle() {
     // This tracker's cache services its pending quarantines at the decode boundary
     // — perform the invalidation FIRST, then ack with the token; only the ack reclaims the
     // ring slot. Failures without capabilities resolve here too, keeping the ring live.
@@ -3513,6 +3519,10 @@ bool llama_kv_cache::update(llama_context * lctx, bool do_shift, const stream_co
         // breaks with an un-acked record that the ring proof still sees.
         tracker->try_rearm();
     }
+}
+
+bool llama_kv_cache::update(llama_context * lctx, bool do_shift, const stream_copy_info & sc_info) {
+    vbr_recovery_settle();
 
     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
     if (other) {

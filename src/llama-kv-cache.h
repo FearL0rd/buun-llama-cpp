@@ -1287,6 +1287,7 @@ private:
     void     seq_cp_impl(
             llama_seq_id seq_id_src, llama_seq_id seq_id_dst,
             llama_pos p0, llama_pos p1, bool publish_lineage);
+    void     vbr_recovery_settle(); // the boundary quarantine drain + re-arm
     vbr_generation_tracker *       vbr_generation_tracker_mut();
     const vbr_generation_tracker * vbr_generation_tracker_get() const;
     static bool vbr_generation_cell_has_seq_cb(
