@@ -183,8 +183,12 @@ bool server_resume_manifest_validate(const server_resume_manifest & manifest, st
 
     if (manifest.artifact) {
         const auto & artifact = *manifest.artifact;
-        if (artifact.kind != server_resume_object_kind::artifact || artifact.p0 != 0 || artifact.p1 != manifest.n_tokens ||
-            artifact.gen == 0 || artifact.gen > manifest.generation || !manifest.tail_states.empty()) {
+        // an artifact holds its partial state itself, a placement has the frontier's beside it
+        const size_t max_tails = manifest.placed() ? 1 : 0;
+        if ((artifact.kind != server_resume_object_kind::artifact && !manifest.placed()) ||
+            artifact.p0 != 0 || artifact.p1 != manifest.n_tokens ||
+            artifact.gen == 0 || artifact.gen > manifest.generation ||
+            manifest.tail_states.size() > max_tails) {
             error = "artifact does not hold the token range";
             return false;
         }
@@ -192,7 +196,14 @@ bool server_resume_manifest_validate(const server_resume_manifest & manifest, st
             return false;
         }
     }
-    if ((manifest.sequence_epoch != 0) != manifest.artifact.has_value()) {
+    if (manifest.placed() ? !server_resume_store::entry_id_valid(manifest.pool_entry) || manifest.pool_generation == 0
+                          : !manifest.pool_entry.empty() || manifest.pool_generation != 0 || manifest.pool_xxh3 != 0) {
+        error = "placement and pool do not go together";
+        return false;
+    }
+    // an artifact is bound to its epoch and chunks have none; a placement may carry one
+    const bool needs_epoch = manifest.artifact && !manifest.placed();
+    if (manifest.sequence_epoch != 0 ? !manifest.artifact : needs_epoch) {
         error = "sequence epoch and artifact do not go together";
         return false;
     }
@@ -332,8 +343,13 @@ std::vector<uint8_t> server_resume_manifest_encode(const server_resume_manifest 
         doc["tail_states"].push_back(object_record_to_json(tail));
     }
     if (manifest.artifact) {
-        doc["artifact"]       = object_record_to_json(*manifest.artifact);
+        doc[manifest.placed() ? "placement" : "artifact"] = object_record_to_json(*manifest.artifact);
         doc["sequence_epoch"] = manifest.sequence_epoch;
+    }
+    if (manifest.placed()) {
+        doc["pool_entry"]      = manifest.pool_entry;
+        doc["pool_generation"] = manifest.pool_generation;
+        doc["pool_xxh3"]       = manifest.pool_xxh3;
     }
     for (const auto & producer : manifest.producers) {
         doc["producers"].push_back({
@@ -446,6 +462,12 @@ server_resume_reason server_resume_manifest_decode(
         if (doc.contains("artifact")) {
             manifest.artifact       = object_record_from_json(doc.at("artifact"), server_resume_object_kind::artifact);
             manifest.sequence_epoch = get_int<uint64_t>(doc, "sequence_epoch");
+        } else if (doc.contains("placement")) {
+            manifest.artifact        = object_record_from_json(doc.at("placement"), server_resume_object_kind::placement);
+            manifest.sequence_epoch  = get_int<uint64_t>(doc, "sequence_epoch");
+            manifest.pool_entry      = doc.at("pool_entry").get<std::string>();
+            manifest.pool_generation = get_int<uint64_t>(doc, "pool_generation");
+            manifest.pool_xxh3       = get_int<uint64_t>(doc, "pool_xxh3");
         }
         for (const auto & in : producers) {
             server_resume_producer producer;
@@ -521,6 +543,8 @@ static std::string object_name(const server_resume_object_record & record) {
         std::snprintf(name, sizeof(name), "c-%" PRId32 "-%" PRId32 "-%" PRIu64, record.p0, record.p1, record.gen);
     } else if (record.kind == server_resume_object_kind::artifact) {
         std::snprintf(name, sizeof(name), "v-%" PRIu64, record.gen);
+    } else if (record.kind == server_resume_object_kind::placement) {
+        std::snprintf(name, sizeof(name), "p-%" PRIu64, record.gen);
     } else {
         std::snprintf(name, sizeof(name), "t-%" PRId32 "-%" PRIu64, record.p0, record.gen);
     }

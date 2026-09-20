@@ -74,6 +74,27 @@ vbr_precision_admission import_precision(
     return result;
 }
 
+// Destination pricing counts co-resident rows as occupancy. Children are priced
+// alike, so the fullest child bounds them all.
+uint64_t co_resident_cells(const server_vbr_artifact_import_target & request) noexcept {
+    const auto child_cells = [&](uint32_t child_id) {
+        uint64_t cells = 0;
+        for (const auto & co : request.co_residents) {
+            for (const auto & placement : co.placements) {
+                cells += placement.child_id == child_id ? placement.cells.size() : 0;
+            }
+        }
+        return cells;
+    };
+    uint64_t result = 0;
+    for (const auto & co : request.co_residents) {
+        for (const auto & placement : co.placements) {
+            result = std::max(result, child_cells(placement.child_id));
+        }
+    }
+    return result + request.unowned_cells;
+}
+
 // A refusal needs no payload authentication. A pass grants no authority: the
 // existing quote/validation path below repeats both projection and admission.
 bool import_preflight(
@@ -84,7 +105,7 @@ bool import_preflight(
     vbr_import_destination_projection destination;
     if (!vbr_explicit_import_destination_preflight(
             *request.memory, request.destination, package, frontier,
-            request.incoming_cells, destination)) {
+            request.incoming_cells, destination, co_resident_cells(request))) {
         return false;
     }
     output.destination_status = destination.status;
@@ -3526,7 +3547,8 @@ server_vbr_artifact_import_output server_vbr_artifact_store::import_package_impl
                 accounting_snapshot.serial, &representation_policy,
                 vbr_explicit_capture_representation_identity,
                 context.snapshot,
-                downward_projection, downward, schedule_quote, 0, request.incoming_cells);
+                downward_projection, downward, schedule_quote, 0, request.incoming_cells,
+                co_resident_cells(request));
         const auto incoming_has_companion = [&](
                 vbr_artifact_companion_kind kind) {
             return std::any_of(
@@ -3683,6 +3705,7 @@ server_vbr_artifact_import_output server_vbr_artifact_store::import_package_impl
             &package.manifest().token_block.tokens,
         };
         policy.destination_sequence = request.destination;
+        policy.co_residents = &request.co_residents;
         policy.adoption_nonce = impl_->next_reference++;
         if (policy.adoption_nonce == 0) {
             policy.adoption_nonce = impl_->next_reference++;

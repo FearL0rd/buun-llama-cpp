@@ -1,8 +1,8 @@
 # Persistent server resume — design and implementation plan
 
 Status: **P0 to P2 implemented on `exp/server-resume` (fixed-type KV, `--resume`);
-P3 first slice (dynamic VBR, one conversation per cache) implemented and not yet
-reviewed; P4 open; the blockers of the independent review (§11) are closed**. Contract, results and the limits
+P3 (dynamic VBR: every slot of a dense or hybrid cache, the most recent
+conversation of an iSWA cache) implemented and not yet reviewed; P4 open; the blockers of the independent review (§11) are closed**. Contract, results and the limits
 of v1: `server-resume-format.md`.
 Created 2026-09-18 against master `ed774445c`.
 This is an engineering plan, not documentation of an available feature.
@@ -637,13 +637,11 @@ Built as designed, with the tenantless capture trio (`prepare_host_payload` →
 `capture`, and `export_host_payload` / `ingest_host_payload` as the two new doors
 of the artifact store. What the gate found:
 
-- **One conversation per cache.** The exact capture is an image of the whole pool
-  with one sequence's placement, and the empty import is a whole-cache contract of
-  its owners. The multi-slot tier question above is therefore moot in this slice: a
-  start restores the most recently used conversation, a save writes only that one
-  (`cache_shared` for the rest, at save and at install, before any byte is read).
-  Lifting it is owners' work: an absent-destination import that preserves foreign
-  rows, and a capture narrowed to owned rows.
+- **One conversation per cache (first slice only; lifted by the second slice
+  below).** The exact capture is an image of the whole pool with one sequence's
+  placement, and the empty import is a whole-cache contract of its owners. The
+  first slice restored the most recently used conversation and skipped the rest
+  (`cache_shared`).
 - **Target emptiness includes the pool watermark.** The warmup leaves one; the
   install runs the idle boundary (`breathe`) first, as the host restore does.
 - **The pool's side stream is created lazily** by the first tier change or
@@ -671,8 +669,6 @@ of the artifact store. What the gate found:
   sleep scenario matched the reference text on a cold prefill. With a persistent
   resume under VBR the source now stays live (the multi-slot behaviour), and the
   harness has an `idle` scenario whose oracle is `cache_n`, not the text.
-- **One entry per resume key.** The slot budget of the route is one: the entries
-  of the conversations that share the cache are released and pruned at a save.
 - **`--cache-ram 0` has no artifact store**: nothing is persisted, warned at start.
 - The envelope carries drafter/accelerator companions (27B with MTP: three
   companions, identical tokens, acceptance unchanged).
@@ -688,6 +684,68 @@ clean on dense and hybrid. `test-vbr-artifact*` and `test-server-resume-store`
 pass. Open from the P3 list: shared payloads saved once and partial inventory
 admission (both need the multi-conversation import), checkpoint policy for VBR
 entries.
+
+#### P3 second slice: every slot of the cache (2026-09-20; format document §11)
+
+The first slice kept one conversation, which is not what `--resume` is for: a
+restart should give back the server that was stopped. Three routes were weighed:
+
+1. *One artifact per slot.* The exact capture is a pool image, so N slots cost N
+   images of the same rows on disk, and the import of the second one needs an
+   occupied destination that preserves foreign rows: new owners' machinery.
+2. *Persist the VBR host cache and let slots restore from it.* The projected
+   package of the host cache has no wire form; that is P4 and larger.
+3. *One image, co-resident placements (built).* The rows of every slot are
+   already in the image of the most recently used one. Saving where the other
+   sequences lie is 16 bytes per token, and the owners' empty import needs one
+   addition: a list of co-resident sequences whose rows validation authorizes,
+   the image install assigns and the tracker stamps. The wire format of the
+   artifact is unchanged, and nothing about tiers, budget or the host cache is.
+
+Library additions, all behind an empty default: `vbr_sequence_placement` (cache),
+`vbr_explicit_co_resident_placements` (capture side, refuses a child that holds
+one sequence only; `vbr_explicit_pool_single_sequence` says so ahead of a save),
+`co_residents` in the validation policy and the validated
+manifest, co-resident rows in `build_live_image`, `resident_cells` in the
+destination projection. The store passes `co_residents` and `unowned_cells`.
+
+What the gate found:
+
+- **A move lost the co-residents.** The hand-written move assignment of the
+  validated manifest did not carry the new member, so adoption saw none and the
+  placed slots came back without rows (`pos_max` -1). One line, and a unit check.
+- **A lone image was priced for one conversation.** A restart with fewer slots
+  imports an image whose watermark covers every conversation; under a tight
+  budget the destination was `exhausted`. The rows no sequence takes are now
+  priced (`unowned_cells`).
+- **iSWA admits one sequence per capture.** With three live slots every capture
+  was refused and nothing was saved. The save passes are terminal, so the other
+  slots leave the cache and the most recent conversation is saved alone.
+- **A save a few milliseconds after a request was refused** about one run in
+  three (`transfer_failed`, ring unavailable): an idle capture was in flight.
+  The save pass cancels and drains it first; 8 of 8 runs then saved. This
+  predates the second slice and affected every VBR save.
+- **Not a resume result, for the VBR owners:** iSWA with dynamic VBR and three
+  slots reuses no prefix on the next turn of any slot (`cache_n` 0 of 3047),
+  without `--resume` and without a restart; the same run on fixed-type KV
+  reuses 3047.
+
+Gate (RTX 3090, three slots, harness scenario `group`: fill three slots, restart,
+every slot must reuse its held prefix, `cache_n >= n_held - 1`; then an unchanged
+restart, a changed one, and a restart with one slot):
+
+| cell | result |
+|------|--------|
+| fixed-type KV, dense and hybrid: restart, sleep, rewind, smaller, fewer | pass |
+| dynamic VBR, dense and hybrid: the same, plus tier and group | pass |
+| dynamic VBR under `--vbr-vram 120M`, dense and hybrid: group | pass |
+| dynamic VBR, iSWA, one slot: group | pass |
+| dynamic VBR, iSWA, three slots: group | the 7 multi-slot reuse compares fail as in the owners' finding above; the save is `sole` |
+| fixed-type KV, iSWA: restart, sleep, fewer | f16 KV passes; turbo3_tcq reuses the full prefix (`cache_n` 9047 of 9047) and its text differs from the one-process reference, as it did before this slice |
+
+Limits: a placed conversation that gets no slot after a restart with fewer slots
+stays in the store until the image is next rewritten, then it is dropped (P4's
+host-cache staging is what would keep it). iSWA restores one conversation.
 
 ### P4 — Optional host-cache persistence and accelerator integration
 

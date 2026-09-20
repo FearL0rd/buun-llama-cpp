@@ -228,6 +228,19 @@ bool vbr_explicit_capture_runtime_pools(
     std::vector<vbr_explicit_capture_runtime_pool> & pools,
     uint32_t & attention_children) noexcept;
 
+// One placement per attention child for a sequence that shares the dense image
+// of another sequence's exact capture (see vbr_import_co_resident). Read at
+// the capture's quiescent point. False where a child is not live-guarded or
+// carries a QSA index: those admit a sole owner only.
+bool vbr_explicit_co_resident_placements(
+    llama_memory_i & memory,
+    llama_seq_id sequence,
+    std::vector<vbr_artifact_stream_placement> & output) noexcept;
+
+// True where such a child exists: the image of a capture holds its one
+// sequence and no placement of another, whatever the sequences are.
+bool vbr_explicit_pool_single_sequence(llama_memory_i & memory) noexcept;
+
 // Live-import inspection doors. They share the capture adapter's private
 // KV geometry access but are read-only: validation/staging consume the values,
 // and only vbr_adopt_empty_manifest may mutate the target.
@@ -243,7 +256,9 @@ bool vbr_explicit_import_destination_preflight(
     const vbr_artifact_package_view & package,
     uint64_t selected_frontier,
     uint64_t incoming_cells,
-    vbr_import_destination_projection & output) noexcept;
+    vbr_import_destination_projection & output,
+    // Cells of co-resident sequences restored inside the same image.
+    uint64_t resident_cells = 0) noexcept;
 
 enum class vbr_import_target_snapshot_status : uint8_t {
     actionable = 0,
@@ -281,7 +296,8 @@ vbr_explicit_import_target_schedule_snapshot(
     bool & downward_required,
     vbr_import_schedule_quote & schedule_quote,
     uint64_t selected_frontier = 0,
-    uint64_t incoming_cells = 0) noexcept;
+    uint64_t incoming_cells = 0,
+    uint64_t resident_cells = 0) noexcept;
 
 // Final transform-currency barrier shared by downward and the supported
 // same- and cross-domain upward reconstruction paths. The authenticated

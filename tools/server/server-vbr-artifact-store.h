@@ -359,6 +359,11 @@ struct server_vbr_artifact_import_target {
     llama_seq_id destination = -1;
     // Full incoming prompt occupancy; zero retains explicit-import behavior.
     uint64_t incoming_cells = 0;
+    // Other sequences restored from the same image. Whole empty imports only.
+    std::vector<vbr_import_co_resident> co_residents;
+    // Rows of the image no sequence of this import takes. They are under the
+    // watermark the image publishes, so the destination is priced with them.
+    uint64_t unowned_cells = 0;
     std::string execution_identity;
     std::string adapter_config_identity;
     bool previously_observed = false;

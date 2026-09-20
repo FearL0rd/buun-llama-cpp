@@ -1388,6 +1388,7 @@ public:
             vbr_import_destination_projection & output,
             uint64_t selected_frontier,
             uint64_t incoming_cells,
+            uint64_t resident_cells,
             llama_seq_id destination) noexcept {
         output = {};
         try {
@@ -1411,10 +1412,14 @@ public:
                     tree_child.child_id].wm_cells;
                 const uint64_t frontier = selected_frontier != 0
                     ? selected_frontier : parent_wm;
-                const uint64_t prefix_cells = selected_frontier != 0
-                    ? selected_frontier : package.manifest().token_block.tokens.size();
+                // Co-resident rows arrive inside the same image: they are
+                // occupancy on both sides, never suffix growth.
+                const uint64_t prefix_cells = resident_cells + (selected_frontier != 0
+                    ? selected_frontier : package.manifest().token_block.tokens.size());
+                const uint64_t occupancy = std::max(prefix_cells, incoming_cells + resident_cells);
                 if (parent_wm == 0 || parent_wm > UINT32_MAX || frontier == 0 ||
-                    frontier > parent_wm || incoming_cells > UINT32_MAX || prefix_cells > UINT32_MAX) {
+                    frontier > parent_wm || resident_cells > UINT32_MAX || incoming_cells > UINT32_MAX ||
+                    occupancy > UINT32_MAX) {
                     return false;
                 }
                 // Price the destination for the incoming request, not the
@@ -1423,11 +1428,9 @@ public:
                 child_state state;
                 state.cache = tree_child.attention;
                 const uint32_t wm = state.cache->vbr_import_watermark_cells(
-                    uint32_t(std::max(prefix_cells, incoming_cells)), uint32_t(prefix_cells),
-                    0, destination);
+                    uint32_t(occupancy), uint32_t(prefix_cells), 0, destination);
                 state.restore_watermark = state.cache->vbr_import_watermark_cells(
-                    uint32_t(std::max(prefix_cells, incoming_cells)), uint32_t(prefix_cells),
-                    uint32_t(frontier), destination);
+                    uint32_t(occupancy), uint32_t(prefix_cells), uint32_t(frontier), destination);
                 if (!state.cache->vbr_import_destination_input(
                         uint32_t(wm), state.input) ||
                     !state.cache->vbr_import_destination_pricing_begin(
@@ -1557,9 +1560,10 @@ public:
             vbr_import_schedule_quote & quote,
             uint64_t selected_frontier,
             uint64_t incoming_cells,
+            uint64_t resident_cells,
             llama_seq_id destination) noexcept {
         return project_import_destination(tree, package, quote.destination_,
-            selected_frontier, incoming_cells, destination);
+            selected_frontier, incoming_cells, resident_cells, destination);
     }
 
     static bool capture_metadata(
@@ -2225,7 +2229,8 @@ static bool import_target_snapshot_core(
     std::array<uint8_t, 32> * transform_tree_digest = nullptr,
     const std::vector<llama_memory_tree_child> * canonical_tree = nullptr,
     uint64_t selected_frontier = 0,
-    uint64_t incoming_cells = 0)
+    uint64_t incoming_cells = 0,
+    uint64_t resident_cells = 0)
     noexcept;
 
 
@@ -2509,7 +2514,58 @@ bool recurrent_target_empty(
            provider.target_empty(provider.context);
 }
 
+// An attention child whose rows a placement can name.
+bool co_resident_child(const llama_memory_tree_child & node) noexcept {
+    return node.qsa_index_owner == nullptr &&
+           node.dependency_mode ==
+               checkpoint_child_dependency_mode::live_guarded;
+}
+
 } // namespace
+
+bool vbr_explicit_pool_single_sequence(llama_memory_i & memory) noexcept {
+    try {
+        std::vector<llama_memory_tree_child> tree;
+        if (!llama_memory_tree_collect(&memory, tree)) {
+            return false;
+        }
+        return std::any_of(tree.begin(), tree.end(), [](const auto & node) {
+            return node.attention != nullptr && !co_resident_child(node);
+        });
+    } catch (...) {
+        return false;
+    }
+}
+
+bool vbr_explicit_co_resident_placements(
+        llama_memory_i & memory,
+        llama_seq_id sequence,
+        std::vector<vbr_artifact_stream_placement> & output) noexcept {
+    output.clear();
+    try {
+        std::vector<llama_memory_tree_child> tree;
+        if (!llama_memory_tree_collect(&memory, tree)) {
+            return false;
+        }
+        for (const auto & node : tree) {
+            if (node.attention == nullptr) {
+                continue;
+            }
+            vbr_artifact_stream_placement placement;
+            if (!co_resident_child(node) ||
+                !node.attention->vbr_sequence_placement(
+                    node.child_id, sequence, placement)) {
+                output.clear();
+                return false;
+            }
+            output.push_back(std::move(placement));
+        }
+        return !output.empty();
+    } catch (...) {
+        output.clear();
+        return false;
+    }
+}
 
 bool vbr_explicit_capture_runtime_pools(
         llama_memory_i & memory,
@@ -3891,14 +3947,15 @@ bool vbr_explicit_import_destination_preflight(
         const vbr_artifact_package_view & package,
         uint64_t selected_frontier,
         uint64_t incoming_cells,
-        vbr_import_destination_projection & output) noexcept {
+        vbr_import_destination_projection & output,
+        uint64_t resident_cells) noexcept {
     output = {};
     try {
         std::vector<llama_memory_tree_child> tree;
         return destination >= 0 && package &&
             llama_memory_tree_collect(&memory, tree) &&
             vbr_live_capture_adapter::project_import_destination(
-                tree, package, output, selected_frontier, incoming_cells, destination);
+                tree, package, output, selected_frontier, incoming_cells, resident_cells, destination);
     } catch (...) {
         return false;
     }
@@ -3994,7 +4051,8 @@ static bool import_target_snapshot_core(
         std::array<uint8_t, 32> * transform_tree_digest,
         const std::vector<llama_memory_tree_child> * canonical_tree,
         uint64_t selected_frontier,
-        uint64_t incoming_cells) noexcept {
+        uint64_t incoming_cells,
+        uint64_t resident_cells) noexcept {
     output = {};
     if (transform_projection) {
         *transform_projection = {};
@@ -4140,7 +4198,7 @@ static bool import_target_snapshot_core(
                 return false;
             }
             if (!vbr_live_capture_adapter::negotiate_import_destination(
-                    tree, package, *quote, selected_frontier, incoming_cells, destination)) {
+                    tree, package, *quote, selected_frontier, incoming_cells, resident_cells, destination)) {
                 output = {};
                 *quote = {};
                 return false;
@@ -4229,7 +4287,8 @@ vbr_explicit_import_target_schedule_snapshot(
         bool & downward_required,
         vbr_import_schedule_quote & schedule_quote,
         uint64_t selected_frontier,
-        uint64_t incoming_cells) noexcept {
+        uint64_t incoming_cells,
+        uint64_t resident_cells) noexcept {
     downward_projection = {};
     vbr_downward_policy_projection transform_projection;
     if (!import_target_snapshot_core(
@@ -4237,7 +4296,7 @@ vbr_explicit_import_target_schedule_snapshot(
         accounting_serial, representation_context, representation_identity,
         output, &transform_projection,
             &downward_required, &schedule_quote, nullptr, nullptr, nullptr,
-            selected_frontier, incoming_cells)) {
+            selected_frontier, incoming_cells, resident_cells)) {
         return vbr_import_target_snapshot_status::unavailable;
     }
     if (downward_required) {

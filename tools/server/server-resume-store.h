@@ -38,6 +38,7 @@ enum class server_resume_object_kind : uint32_t {
     base_chunk = 1, // base state of the token positions [p0, p1)
     tail_state = 2, // partial state taken when the sequence ended at p0; p1 is 0
     artifact   = 3, // one self-verifying envelope of the whole sequence [0, p1), streamed
+    placement  = 4, // where the sequence [0, p1) lies in the pool image of another entry's artifact
 };
 
 // bounds of a manifest, checked before anything is allocated from its numbers
@@ -110,15 +111,35 @@ struct server_resume_manifest {
     int64_t last_used_unix_ms = 0;
     int32_t slot_hint         = -1;
 
-    // Either the chunks tile [0, n_tokens), or one artifact holds the whole sequence and there are
-    // no chunks and no tail states.
+    // Either the chunks tile [0, n_tokens), or one object holds the whole sequence and there are
+    // no chunks. That object is an artifact, with no tail states, or a placement: the sequence
+    // is a co-resident of the pool image in the artifact of `pool_entry`, and only its frontier
+    // tail state is its own.
     std::vector<server_resume_object_record> chunks;
     std::vector<server_resume_object_record> tail_states;
     std::optional<server_resume_object_record> artifact;
     std::vector<server_resume_producer>      producers;
 
-    // artifact entries: the sequence epoch the envelope is bound to, so a restarted server can
-    // start its own counter above every epoch the store still holds
+    // placements: the artifact object the rows are in, by entry, generation and checksum
+    std::string pool_entry;
+    uint64_t    pool_generation = 0;
+    uint64_t    pool_xxh3       = 0;
+
+    bool placed() const { return artifact && artifact->kind == server_resume_object_kind::placement; }
+
+    // the rows are in the image `pool` is, as the entry `id` holds it now
+    bool placed_in(const std::string & id, const server_resume_object_record & pool) const {
+        return placed() && pool_entry == id && pool_generation == pool.gen && pool_xxh3 == pool.xxh3;
+    }
+
+    void place_in(const std::string & id, const server_resume_object_record & pool) {
+        pool_entry      = id;
+        pool_generation = pool.gen;
+        pool_xxh3       = pool.xxh3;
+    }
+
+    // The sequence epoch the state was captured under, so a restarted server can start its own
+    // counter above every epoch the store still holds. An artifact is bound to it.
     uint64_t sequence_epoch = 0;
 
     std::vector<uint8_t> ledger;

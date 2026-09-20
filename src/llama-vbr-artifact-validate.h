@@ -357,6 +357,16 @@ class vbr_staged_payloads;
 struct vbr_adopt_result;
 struct vbr_composite_publish_hooks;
 
+// Another sequence whose rows live in the same dense unit image as the
+// artifact's own reference. The artifact does not authenticate these rows: the
+// caller vouches for a record taken at the capture's quiescent point. Validation
+// admits only rows inside the image, disjoint from the reference's and from each
+// other, and only for a construction-empty whole import.
+struct vbr_import_co_resident {
+    llama_seq_id destination = -1;
+    std::vector<vbr_artifact_stream_placement> placements;
+};
+
 struct vbr_adopt_policy {
     using inspect_target_fn = bool (*)(
         const void * context,
@@ -385,6 +395,8 @@ struct vbr_adopt_policy {
     bool authorized = false;
     vbr_import_identity identity;
     llama_seq_id destination_sequence = -1;
+    // Co-residents publish under a fresh lineage: the import is live_rebased.
+    const std::vector<vbr_import_co_resident> * co_residents = nullptr;
     bool allow_native = true;
     bool allow_live_rebased = true;
     bool allow_downward = true;
@@ -572,6 +584,10 @@ public:
     }
     const vbr_artifact_token_block & token_block() const noexcept { return token_block_; }
     const std::vector<vbr_validated_child_plan> & children() const noexcept { return children_; }
+    // Already merged into every unit plan's authorized runs.
+    const std::vector<vbr_import_co_resident> & co_residents() const noexcept {
+        return co_residents_;
+    }
     const std::vector<vbr_validated_companion_plan> & companions() const noexcept {
         return companions_;
     }
@@ -637,6 +653,7 @@ private:
     vbr_import_identity authenticated_identity_;
     vbr_artifact_token_block token_block_;
     std::vector<vbr_validated_child_plan> children_;
+    std::vector<vbr_import_co_resident> co_residents_;
     std::vector<vbr_validated_companion_plan> companions_;
     std::vector<llama_cache_transaction_leaf> accounting_leaves_;
     vbr_tracker_install_plan tracker_install_;

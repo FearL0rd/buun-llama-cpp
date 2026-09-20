@@ -6742,6 +6742,41 @@ bool llama_kv_cache::vbr_generation_capture_live_guarded(
     return true;
 }
 
+bool llama_kv_cache::vbr_sequence_placement(
+        uint32_t child_id,
+        llama_seq_id seq_id,
+        vbr_artifact_stream_placement & output) const {
+    if (other != nullptr) {
+        return other->vbr_sequence_placement(child_id, seq_id, output);
+    }
+    output = {};
+    if (seq_id < 0 || static_cast<size_t>(seq_id) >= seq_to_stream.size() ||
+        seq_to_stream[seq_id] >= v_cells.size() || vbr_ownership_ == nullptr) {
+        return false;
+    }
+    const uint32_t stream = seq_to_stream[seq_id];
+    std::vector<uint32_t> owned_cells;
+    if (!vbr_ownership_->initialized(stream, seq_id) ||
+        !vbr_ownership_->available(stream, seq_id) ||
+        !vbr_ownership_->enumerate_owned(stream, seq_id, owned_cells)) {
+        return false;
+    }
+    const auto & cells = v_cells[stream];
+    output.child_id = child_id;
+    output.stream_index = stream;
+    output.source_sequence = seq_id;
+    output.computation_frontier = cells.seq_pos_max(seq_id) + 1;
+    output.cells.reserve(owned_cells.size());
+    for (uint32_t cell : owned_cells) {
+        if (cells.seq_count(cell) != 1 || cells.get_shift(cell) != 0) {
+            return false;
+        }
+        const auto & ext = cells.ext_get(cell);
+        output.cells.push_back({ cell, cells.pos_get(cell), ext.x, ext.y });
+    }
+    return !output.cells.empty();
+}
+
 // VBR_EXPLICIT_CAPTURE_STABILITY_REGION_BEGIN
 // Reviewed capture read authority: these private hooks snapshot and re-read live
 // generations to prove a byte capture stayed exact. They never perform

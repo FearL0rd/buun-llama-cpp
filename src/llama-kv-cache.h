@@ -291,6 +291,12 @@ public:
             vbr_checkpoint_generation_controller & output,
             vbr_artifact_stream_placement * placement = nullptr,
             vbr_explicit_generation_failure * failure = nullptr) const;
+    // Rows one sequence solely owns, for a co-resident record beside another
+    // sequence's exact capture. False on a shared or shifted row, or no rows.
+    bool vbr_sequence_placement(
+            uint32_t child_id,
+            llama_seq_id seq_id,
+            vbr_artifact_stream_placement & output) const;
     // effective bits/value of this cache at the CURRENT tensor types (llama_memory_i)
     double kv_bpv() const override;
 

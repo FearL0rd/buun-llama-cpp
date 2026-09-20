@@ -5134,6 +5134,11 @@ private:
             return;
         }
         const int64_t t_start = ggml_time_us();
+        // an idle capture in flight holds the transfer ring these captures need
+        if (vbr_idle_exact_capture) {
+            vbr_idle_exact_capture->session.cancel();
+            (void) finish_idle_exact_vbr_capture(false);
+        }
         std::vector<server_slot *> order;
         for (auto & slot : slots) {
             if (slot.prompt.n_tokens() > 0) {
@@ -5145,15 +5150,27 @@ private:
         std::sort(order.begin(), order.end(), [](const server_slot * a, const server_slot * b) {
             return a->t_last_used > b->t_last_used;
         });
-        for (size_t i = 0; i < order.size(); ++i) {
-            auto * slot = order[i];
+        // A cache with a child that holds one sequence only has no image to share, and its capture
+        // takes a sole owner. The cache goes away after this pass, so the others leave it now and
+        // the most recently used conversation is the one that is kept.
+        const bool sole = resume_vbr() && order.size() > 1 &&
+            vbr_explicit_pool_single_sequence(*llama_get_memory(ctx_tgt));
+        for (size_t i = 1; sole && i < order.size(); ++i) {
+            resume_release_entry(*order[i]);
+            order[i]->prompt_clear(server_cache_destruction_reason::idle_reclaim);
+        }
+        resume_group_t group;
+        group.members = &order;
+        for (auto * slot : order) {
             json status;
             try {
-                if (i < resume_slot_budget()) {
-                    status = resume_capture_slot(*slot);
+                if (slot->prompt.n_tokens() == 0) {
+                    status = resume_skipped("pool_unshared");
                 } else {
-                    resume_release_entry(*slot);
-                    status = resume_skipped("cache_shared");
+                    status = resume_capture_slot(*slot, group);
+                    if (sole) {
+                        status["sole"] = true;
+                    }
                 }
             } catch (const std::exception & e) {
                 status = {
@@ -5170,12 +5187,15 @@ private:
                 why, order.size(), (ggml_time_us() - t_start)/1000.0);
     }
 
-    // The conversations of this resume key the store keeps. A VBR artifact is an image of the
-    // whole pool and imports into an empty cache only: of the conversations sharing one, the most
-    // recent is the one a start brings back.
-    size_t resume_slot_budget() const {
-        return resume_vbr() ? 1 : slots.size();
-    }
+    // One save pass over a dynamic cache. A VBR artifact is an image of the whole pool and imports
+    // into an empty cache only, so the conversations sharing a pool are saved as one group: the
+    // artifact of the most recently used one, and for each other where its rows lie in that image.
+    struct resume_group_t {
+        const std::vector<server_slot *> * members = nullptr; // most recently used first
+        // the artifact of this pass and the entry it is in, once a member has one
+        std::string pool_entry;
+        server_resume_object_record pool;
+    };
 
     // What pruning keeps. One entry per budgeted slot of this resume key, the ones slots hold
     // first; what another configuration of this model family saved is not counted against the
@@ -5197,7 +5217,7 @@ private:
                 n_slotted += keep.live.insert(slot.resume_entry_id).second;
             }
         }
-        keep.n_keep_key   = resume_slot_budget() - std::min(resume_slot_budget(), n_slotted);
+        keep.n_keep_key   = slots.size() - std::min(slots.size(), n_slotted);
         keep.n_keep_total = std::max<size_t>(8, 4*slots.size()) - n_new;
         return keep;
     }
@@ -5358,7 +5378,7 @@ private:
         return true;
     }
 
-    json resume_capture_slot(server_slot & slot) {
+    json resume_capture_slot(server_slot & slot, resume_group_t & group) {
         const auto skipped = resume_skipped;
         const auto failed  = resume_failed;
 
@@ -5430,7 +5450,9 @@ private:
             have_old = resume_store->read_manifest(slot.resume_entry_id, old, error) == server_resume_reason::ok;
         }
         if (resume_vbr()) {
-            return resume_capture_artifact(slot, old, have_old, adapter, adapter_hex, t_start);
+            return group.pool_entry.empty()
+                ? resume_capture_artifact(slot, old, have_old, adapter, adapter_hex, t_start, group)
+                : resume_capture_placement(slot, old, have_old, adapter, adapter_hex, t_start, group);
         }
 
         // The same tokens can stand over another state: a cold refill, another model of the family,
@@ -5721,15 +5743,95 @@ private:
         };
     }
 
+    // a slot whose rows a save of a dynamic cache can record
+    static bool resume_vbr_storable(const server_slot & slot) {
+        const auto & tokens = slot.prompt.tokens;
+        return !tokens.empty() && tokens.pos_next() == llama_pos(tokens.size()) && !tokens.has_media() &&
+            slot.state == SLOT_STATE_IDLE && !slot.is_processing() && !slot.hard_lease_blocks_live_prefix();
+    }
+
+    // An epoch names one sequence of this execution, so the same tokens under the same epoch are
+    // the state the entry was taken from, at the tiers it had then or lower ones.
+    static bool resume_vbr_unchanged(const server_slot & slot, const server_resume_manifest & old) {
+        const auto & tokens = slot.prompt.tokens;
+        return old.artifact && old.sequence_epoch != 0 && old.sequence_epoch == slot.prompt.sequence_epoch &&
+            size_t(old.n_tokens) == tokens.size() &&
+            old.artifact->prefix_digest == server_resume_prefix_hasher(tokens).at(tokens.size());
+    }
+
+    // An entry leaves the disk, the commit first.
+    server_resume_reason resume_drop_entry(const std::string & id, std::string & error) {
+        const auto reason = resume_store->uncommit(id, error);
+        if (reason == server_resume_reason::ok) {
+            resume_store->remove_entry(id);
+        }
+        return reason;
+    }
+
+    // The image `pool` of the entry `id` still shows every other member as it is now. A member that
+    // joined or changed since is not in it, one that left is ignored by an install.
+    bool resume_group_current(
+            const server_slot & slot, const resume_group_t & group,
+            const std::string & id, const server_resume_object_record & pool) const {
+        return std::all_of(group.members->begin(), group.members->end(), [&](const server_slot * member) {
+            if (member == &slot || !resume_vbr_storable(*member)) {
+                return true;
+            }
+            server_resume_manifest placed;
+            std::string error;
+            return !member->resume_entry_id.empty() &&
+                resume_store->read_manifest(member->resume_entry_id, placed, error) == server_resume_reason::ok &&
+                placed.placed_in(id, pool) && resume_vbr_unchanged(*member, placed);
+        });
+    }
+
+    // a save of a dynamic cache that took the old entry off the disk and cannot put the new one there
+    json resume_vbr_abandon(
+            server_slot & slot, const std::string & id, server_resume_reason reason, const std::string & message) {
+        resume_store->remove_entry(id);
+        slot.resume_entry_id.clear();
+        return resume_failed(reason, message);
+    }
+
+    static bool resume_saved(const json & status) {
+        return status.value("outcome", "") == "saved";
+    }
+
+    // what a save of a dynamic cache ends with, whichever object holds the sequence
+    json resume_vbr_publish(
+            server_slot & slot, const std::string & id, const server_resume_manifest & next,
+            uint64_t bytes_written, int64_t t_start) {
+        std::string error;
+        const auto reason = resume_store->commit(id, next, error);
+        if (reason != server_resume_reason::ok) {
+            return bytes_written == 0 ? resume_failed(reason, error) : resume_vbr_abandon(slot, id, reason, error);
+        }
+        resume_store->sweep(id, next);
+        slot.resume_entry_id = id;
+        resume_unslotted.erase(id);
+        return json {
+            {"outcome", "saved"},
+            {"entry", id},
+            {"generation", next.generation},
+            {"n_tokens", next.n_tokens},
+            {"placed", next.placed()},
+            {"artifact_kept", bytes_written == 0},
+            {"bytes_written", bytes_written},
+            {"t_ms", (ggml_time_us() - t_start)/1000.0},
+        };
+    }
+
     // The dynamic route of a save: the owners' exact capture of the sequence, streamed into one
-    // object. An artifact is reused whole or not at all, and the one it replaces leaves the disk
-    // before the new one is written: the entry is lost rather than held twice.
+    // object. The capture is an image of the whole pool, so the slots saved after this one record
+    // only where their rows lie in it. An artifact is reused whole or not at all, and the one it
+    // replaces leaves the disk before the new one is written: the entry is lost rather than held twice.
     json resume_capture_artifact(
             server_slot & slot, const server_resume_manifest & old, bool have_old,
-            const std::string & adapter, const std::string & adapter_hex, int64_t t_start) {
+            const std::string & adapter, const std::string & adapter_hex, int64_t t_start,
+            resume_group_t & group) {
         const auto & tokens = slot.prompt.tokens;
         const int32_t n_tokens = int32_t(tokens.size());
-        if (slot.state != SLOT_STATE_IDLE || slot.is_processing() || slot.hard_lease_blocks_live_prefix()) {
+        if (!resume_vbr_storable(slot)) {
             return resume_skipped("slot_busy");
         }
 
@@ -5738,45 +5840,23 @@ private:
         resume_manifest_head(next, old, slot, adapter_hex);
 
         std::string error;
-        const auto publish = [&]() {
-            const auto reason = resume_store->commit(id, next, error);
-            if (reason == server_resume_reason::ok) {
-                resume_store->sweep(id, next);
-                slot.resume_entry_id = id;
-                resume_unslotted.erase(id);
-            }
-            return reason;
-        };
-        const auto saved = [&](uint64_t bytes_written) {
-            return json {
-                {"outcome", "saved"},
-                {"entry", id},
-                {"generation", next.generation},
-                {"n_tokens", n_tokens},
-                {"artifact_kept", bytes_written == 0},
-                {"bytes_written", bytes_written},
-                {"t_ms", (ggml_time_us() - t_start)/1000.0},
-            };
-        };
-
-        // An epoch names one sequence of this execution, so the same tokens under the same epoch
-        // are the state the artifact was taken from, at the tiers it had then or lower ones.
-        const std::string prefix_digest = server_resume_prefix_hasher(tokens).at(size_t(n_tokens));
-        if (have_old && old.artifact && old.artifact->prefix_digest == prefix_digest &&
-            old.n_tokens == n_tokens && old.sequence_epoch == slot.prompt.sequence_epoch) {
+        if (have_old && !old.placed() && resume_vbr_unchanged(slot, old) &&
+            resume_group_current(slot, group, id, *old.artifact)) {
             next.artifact       = old.artifact;
             next.sequence_epoch = old.sequence_epoch;
             next.ledger         = old.ledger;
             next.retain_producers({&*next.artifact});
-            const auto reason = publish();
-            return reason == server_resume_reason::ok ? saved(0) : resume_failed(reason, error);
+            // the commit on disk holds this artifact whether or not the new one replaces it
+            group.pool_entry = id;
+            group.pool       = *old.artifact;
+            return resume_vbr_publish(slot, id, next, 0, t_start);
         }
 
         server_resume_object_record rec;
         rec.kind = server_resume_object_kind::artifact;
         rec.p1   = n_tokens;
         rec.gen  = next.generation;
-        rec.prefix_digest = prefix_digest;
+        rec.prefix_digest = server_resume_prefix_hasher(tokens).at(size_t(n_tokens));
         next.retain_producers({});
         rec.producer = next.producer_index(resume_producer());
 
@@ -5794,23 +5874,44 @@ private:
                 {"reason", "capture_refused"},
                 {"status", server_vbr_artifact_capture_status_name(captured.status)},
                 {"phase", vbr_explicit_capture_phase_name(captured.phase)},
+                {"library", vbr_explicit_capture_status_name(captured.library_status)},
+                {"stream", vbr_capture_stream_status_name(captured.inner_stream_status)},
             };
         }
         const double capture_ms = (ggml_time_us() - t_start)/1000.0;
 
         if (have_old) {
-            const auto reason = resume_store->uncommit(id, error);
+            const auto reason = resume_drop_entry(id, error);
             if (reason != server_resume_reason::ok) {
                 return resume_failed(reason, error);
             }
-            resume_store->remove_entry(id);
         } else {
             resume_prune(1);
         }
+        // A member that held the pool's artifact until now is placed in this one next. Its
+        // artifact leaves the disk before this one is written, as the entry's own does.
+        for (auto * member : *group.members) {
+            server_resume_manifest held;
+            if (member != &slot && !member->resume_entry_id.empty() &&
+                resume_store->read_manifest(member->resume_entry_id, held, error) == server_resume_reason::ok &&
+                held.artifact && !held.placed() &&
+                resume_drop_entry(member->resume_entry_id, error) == server_resume_reason::ok) {
+                member->resume_entry_id.clear();
+            }
+        }
+        // a placed entry no slot holds had its rows in the image that went: it cannot come back
+        for (auto it = resume_unslotted.begin(); have_old && it != resume_unslotted.end();) {
+            server_resume_manifest held;
+            if (resume_store->read_manifest(*it, held, error) == server_resume_reason::ok &&
+                held.placed() && held.pool_entry == id &&
+                resume_drop_entry(*it, error) == server_resume_reason::ok) {
+                it = resume_unslotted.erase(it);
+            } else {
+                ++it;
+            }
+        }
         const auto abandon = [&](server_resume_reason reason, const std::string & message) {
-            resume_store->remove_entry(id);
-            slot.resume_entry_id.clear();
-            return resume_failed(reason, message);
+            return resume_vbr_abandon(slot, id, reason, message);
         };
         const uint64_t bytes_needed = captured.payload_bytes + captured.companion_bytes;
         if (resume_store->free_bytes() < bytes_needed) {
@@ -5843,13 +5944,186 @@ private:
         if (!resume_ledger_build(tokens, adapter, next.ledger)) {
             return abandon(server_resume_reason::io_error, "ledger");
         }
-        const auto committed = publish();
-        if (committed != server_resume_reason::ok) {
-            return abandon(committed, error);
+        json out = resume_vbr_publish(slot, id, next, rec.bytes, t_start);
+        if (resume_saved(out)) {
+            group.pool_entry = id;
+            group.pool       = rec;
+            out["capture_ms"] = capture_ms;
         }
-        json out = saved(rec.bytes);
-        out["capture_ms"] = capture_ms;
         return out;
+    }
+
+    // The payload of a placement object: the cells of one sequence in each attention child.
+    static constexpr uint32_t RESUME_PLACEMENT_MAGIC = 0x4c505352; // "RSPL"
+
+    static std::vector<uint8_t> resume_placement_encode(const std::vector<vbr_artifact_stream_placement> & placements) {
+        size_t n_cells = 0;
+        for (const auto & placement : placements) {
+            n_cells += placement.cells.size();
+        }
+        std::vector<uint8_t> out;
+        out.reserve(12 + 16*(placements.size() + n_cells));
+        const auto put = [&](uint32_t value) {
+            for (int shift = 0; shift < 32; shift += 8) {
+                out.push_back(uint8_t(value >> shift));
+            }
+        };
+        put(RESUME_PLACEMENT_MAGIC);
+        put(1);
+        put(uint32_t(placements.size()));
+        for (const auto & placement : placements) {
+            put(placement.child_id);
+            put(placement.stream_index);
+            put(uint32_t(placement.computation_frontier));
+            put(uint32_t(placement.cells.size()));
+            for (const auto & cell : placement.cells) {
+                put(cell.physical_cell);
+                put(uint32_t(cell.logical_position));
+                put(uint32_t(cell.ext_x));
+                put(uint32_t(cell.ext_y));
+            }
+        }
+        return out;
+    }
+
+    // Structure only. What the cells may be is the import's to say.
+    static bool resume_placement_decode(
+            const std::vector<uint8_t> & in, std::vector<vbr_artifact_stream_placement> & placements) {
+        size_t at = 0;
+        const auto get = [&](uint32_t & value) {
+            if (in.size() - at < 4) {
+                return false;
+            }
+            value = uint32_t(in[at]) | uint32_t(in[at + 1]) << 8 | uint32_t(in[at + 2]) << 16 | uint32_t(in[at + 3]) << 24;
+            at += 4;
+            return true;
+        };
+        uint32_t magic = 0, version = 0, count = 0;
+        if (!get(magic) || !get(version) || !get(count) || magic != RESUME_PLACEMENT_MAGIC || version != 1 ||
+            count > (in.size() - at)/16) {
+            return false;
+        }
+        placements.assign(count, {});
+        for (auto & placement : placements) {
+            uint32_t frontier = 0, n_cells = 0;
+            if (!get(placement.child_id) || !get(placement.stream_index) || !get(frontier) || !get(n_cells) ||
+                n_cells > (in.size() - at)/16) {
+                return false;
+            }
+            placement.computation_frontier = llama_pos(frontier);
+            placement.cells.assign(n_cells, {});
+            for (auto & cell : placement.cells) {
+                uint32_t pos = 0, ext_x = 0, ext_y = 0;
+                if (!get(cell.physical_cell) || !get(pos) || !get(ext_x) || !get(ext_y)) {
+                    return false;
+                }
+                cell.logical_position = llama_pos(pos);
+                cell.ext_x            = llama_pos(ext_x);
+                cell.ext_y            = llama_pos(ext_y);
+            }
+        }
+        return at == in.size();
+    }
+
+    // The other conversations of a dynamic cache: where the rows of the sequence lie in the pool
+    // image the group's artifact holds, and the partial state the image does not hold.
+    json resume_capture_placement(
+            server_slot & slot, const server_resume_manifest & old, bool have_old,
+            const std::string & adapter, const std::string & adapter_hex, int64_t t_start,
+            const resume_group_t & group) {
+        const auto & tokens = slot.prompt.tokens;
+        const int32_t n_tokens = int32_t(tokens.size());
+        if (!resume_vbr_storable(slot)) {
+            return resume_skipped("slot_busy");
+        }
+
+        const std::string id = have_old ? slot.resume_entry_id : server_resume_store::new_entry_id();
+        server_resume_manifest next;
+        resume_manifest_head(next, old, slot, adapter_hex);
+        next.place_in(group.pool_entry, group.pool);
+
+        if (have_old && old.placed_in(group.pool_entry, group.pool) && resume_vbr_unchanged(slot, old)) {
+            next.artifact       = old.artifact;
+            next.tail_states    = old.tail_states;
+            next.sequence_epoch = old.sequence_epoch;
+            next.ledger         = old.ledger;
+            std::vector<server_resume_object_record *> reused = {&*next.artifact};
+            for (auto & tail : next.tail_states) {
+                reused.push_back(&tail);
+            }
+            next.retain_producers(reused);
+            return resume_vbr_publish(slot, id, next, 0, t_start);
+        }
+
+        std::vector<vbr_artifact_stream_placement> placements;
+        if (!vbr_explicit_co_resident_placements(*llama_get_memory(ctx_tgt), slot.id, placements)) {
+            return json {{"outcome", "failed"}, {"reason", "capture_refused"}, {"status", "placement"}};
+        }
+        const std::vector<uint8_t> payload = resume_placement_encode(placements);
+        std::vector<uint8_t> frontier;
+        if (resume_has_partial) {
+            frontier.resize(llama_state_seq_get_size_ext(ctx_tgt, slot.id, RESUME_FRONTIER_FLAGS));
+            if (frontier.empty() || llama_state_seq_get_data_ext(
+                    ctx_tgt, frontier.data(), frontier.size(), slot.id, RESUME_FRONTIER_FLAGS) != frontier.size()) {
+                return json {{"outcome", "failed"}, {"reason", "state_rejected"}, {"error", "partial read"}};
+            }
+        }
+
+        std::string error;
+        if (have_old) {
+            const auto reason = resume_drop_entry(id, error);
+            if (reason != server_resume_reason::ok) {
+                return resume_failed(reason, error);
+            }
+        } else {
+            resume_prune(1);
+        }
+        const auto abandon = [&](server_resume_reason reason, const std::string & message) {
+            return resume_vbr_abandon(slot, id, reason, message);
+        };
+        if (resume_store->free_bytes() < payload.size() + frontier.size() + 1024*1024) {
+            return abandon(server_resume_reason::no_space, "placement");
+        }
+
+        const std::string prefix_digest = server_resume_prefix_hasher(tokens).at(size_t(n_tokens));
+        next.retain_producers({});
+        const uint32_t producer = next.producer_index(resume_producer());
+
+        server_resume_object_record rec;
+        rec.kind = server_resume_object_kind::placement;
+        rec.p1   = n_tokens;
+        rec.gen  = next.generation;
+        rec.prefix_digest = prefix_digest;
+        rec.producer = producer;
+        auto reason = resume_store->write_object(id, rec, payload.data(), payload.size(), error);
+        if (reason != server_resume_reason::ok) {
+            return abandon(reason, error);
+        }
+        next.artifact = rec;
+        if (resume_has_partial) {
+            server_resume_object_record tail;
+            tail.kind = server_resume_object_kind::tail_state;
+            tail.p0 = n_tokens;
+            tail.n_tokens = n_tokens;
+            tail.pos_max = n_tokens - 1;
+            // a windowed child shares no image, so the partial state here is a recurrent one
+            tail.pos_min = tail.pos_max;
+            tail.role = "frontier";
+            tail.gen = next.generation;
+            tail.prefix_digest = prefix_digest;
+            tail.producer = producer;
+            reason = resume_store->write_object(id, tail, frontier.data(), frontier.size(), error);
+            if (reason != server_resume_reason::ok) {
+                return abandon(reason, error);
+            }
+            next.tail_states.push_back(tail);
+        }
+
+        next.sequence_epoch = ensure_frontier_sequence_epoch(slot.prompt);
+        if (!resume_ledger_build(tokens, adapter, next.ledger)) {
+            return abandon(server_resume_reason::io_error, "ledger");
+        }
+        return resume_vbr_publish(slot, id, next, rec.bytes + frontier.size(), t_start);
     }
 
     // Contract §7. Entries go to their hinted slot when it is free, else to any free one.
@@ -5899,27 +6173,33 @@ private:
             }
         }
 
+        const auto free_slot = [&](int32_t hint) -> server_slot * {
+            if (hint >= 0 && size_t(hint) < slots.size() && !taken[size_t(hint)]) {
+                return &slots[size_t(hint)];
+            }
+            const auto it = std::find(taken.begin(), taken.end(), false);
+            return it == taken.end() ? nullptr : &slots[size_t(it - taken.begin())];
+        };
+        // A placed entry of this key comes back with the artifact its rows are in, in one import.
+        const auto placed_here = [&](const server_resume_entry & entry) {
+            return entry.reason == server_resume_reason::ok && entry.manifest.resume_key == resume_key_hex &&
+                entry.manifest.placed();
+        };
+        const auto pool_of = [&](const server_resume_entry & pool, const server_resume_entry & entry) {
+            const auto & artifact = pool.manifest.artifact;
+            return pool.reason == server_resume_reason::ok && artifact && !pool.manifest.placed() &&
+                entry.manifest.placed_in(pool.id, *artifact);
+        };
+
         size_t n_installed = 0;
         for (const auto & entry : entries) {
-            if (reported.count(entry.id)) {
+            if (reported.count(entry.id) || placed_here(entry)) {
                 continue;
             }
             json status;
-            server_slot * dest = nullptr;
             // Overflow was estimated before object/adapter admission. If a newer entry failed,
             // try an older unreported entry in the slot it left free instead of cold-starting it.
-            if (entry.reason == server_resume_reason::ok) {
-                const int32_t hint = entry.manifest.slot_hint;
-                if (hint >= 0 && size_t(hint) < slots.size() && !taken[size_t(hint)]) {
-                    dest = &slots[size_t(hint)];
-                } else {
-                    for (size_t i = 0; i < slots.size() && !dest; ++i) {
-                        if (!taken[i]) {
-                            dest = &slots[i];
-                        }
-                    }
-                }
-            }
+            server_slot * dest = entry.reason == server_resume_reason::ok ? free_slot(entry.manifest.slot_hint) : nullptr;
             if (entry.reason != server_resume_reason::ok) {
                 status = {
                     {"outcome", "skipped"},
@@ -5929,12 +6209,63 @@ private:
             } else if (!dest) {
                 status = {{"outcome", "skipped"}, {"reason", "no_free_slot"}};
             } else {
-                status = resume_install(*dest, entry.id, entry.manifest);
-                if (resume_installed(status)) {
-                    taken[size_t(dest - slots.data())] = true;
-                    resume_unslotted.erase(entry.id);
-                    n_installed++;
+                std::vector<resume_co_install> group;
+                taken[size_t(dest - slots.data())] = true;
+                for (const auto & other : entries) {
+                    if (!placed_here(other) || !pool_of(entry, other)) {
+                        continue;
+                    }
+                    // one that gets no slot is still in the image
+                    auto * slot = free_slot(other.manifest.slot_hint);
+                    if (slot) {
+                        taken[size_t(slot - slots.data())] = true;
+                    }
+                    group.push_back({&other, slot, nullptr});
                 }
+                status = resume_install(*dest, entry.id, entry.manifest, &group);
+                const auto settle = [&](server_slot & slot, const std::string & id, const json & outcome) {
+                    taken[size_t(&slot - slots.data())] = resume_installed(outcome);
+                    if (resume_installed(outcome)) {
+                        resume_unslotted.erase(id);
+                        n_installed++;
+                    }
+                };
+                settle(*dest, entry.id, status);
+                for (auto & co : group) {
+                    if (!co.slot) {
+                        continue;
+                    }
+                    if (co.status.is_null()) {
+                        co.status = resume_skipped("pool_not_installed");
+                    }
+                    settle(*co.slot, co.entry->id, co.status);
+                    co.status["event"] = "install";
+                    co.status["entry"] = co.entry->id;
+                    co.status["slot"]  = co.slot->id;
+                    co.status["pool"]  = entry.id;
+                    co.slot->resume_status = resume_public(co.status);
+                    resume_log(co.status);
+                    reported.insert(co.entry->id);
+                }
+            }
+            status["event"] = "install";
+            status["entry"] = entry.id;
+            resume_log(status);
+        }
+        // placed entries no import took with it
+        for (const auto & entry : entries) {
+            if (!placed_here(entry) || reported.count(entry.id)) {
+                continue;
+            }
+            json status = resume_skipped("no_free_slot");
+            if (std::none_of(entries.begin(), entries.end(), [&](const server_resume_entry & pool) {
+                    return pool_of(pool, entry);
+                })) {
+                // the image its rows were in is gone: it cannot come back
+                std::string error;
+                (void) resume_drop_entry(entry.id, error);
+                resume_unslotted.erase(entry.id);
+                status = {{"outcome", "dropped"}, {"reason", "pool_missing"}};
             }
             status["event"] = "install";
             status["entry"] = entry.id;
@@ -5966,9 +6297,23 @@ private:
         return status;
     }
 
-    // one entry into one slot; the slot keeps the outcome for /slots
+    // A conversation that comes back inside the pool image of another entry's artifact. The
+    // status stays null when the artifact did not get as far as its import. One without a slot
+    // stays in the store: its rows are in the image all the same, owned by no sequence.
+    struct resume_co_install {
+        const server_resume_entry * entry = nullptr;
+        server_slot * slot = nullptr;
+        json status;
+        // what the slot is established with once the import brought the rows
+        server_tokens tokens;
+        std::vector<uint8_t> tail;
+    };
+
+    // One entry into one slot; the slot keeps the outcome for /slots. An artifact brings the
+    // placed entries of `group` back into their slots with it.
     json resume_install(
-            server_slot & slot, const std::string & id, const server_resume_manifest & manifest) {
+            server_slot & slot, const std::string & id, const server_resume_manifest & manifest,
+            std::vector<resume_co_install> * group = nullptr) {
         json status;
         const auto holder = std::find_if(slots.begin(), slots.end(), [&](const server_slot & other) {
             return &other != &slot && other.resume_entry_id == id;
@@ -5978,10 +6323,23 @@ private:
             status = {{"outcome", "skipped"}, {"reason", "entry_in_use"}};
         } else {
             try {
-                status = resume_install_entry(slot, id, manifest);
+                status = resume_install_entry(slot, id, manifest, group);
             } catch (const std::exception & e) {
                 slot.mandatory_recovery_reset(server_cache_destruction_reason::restore_failure);
                 status = {{"outcome", "failed"}, {"reason", "state_rejected"}, {"error", e.what()}};
+                if (group) {
+                    // rows the image brought leave with their slots
+                    for (auto & co : *group) {
+                        if (!co.slot) {
+                            continue;
+                        }
+                        co.slot->mandatory_recovery_reset(server_cache_destruction_reason::restore_failure);
+                        co.slot->resume_entry_id.clear();
+                        if (co.status.is_null() || resume_installed(co.status)) {
+                            co.status = status;
+                        }
+                    }
+                }
             }
         }
         status["entry"] = id;
@@ -6002,7 +6360,8 @@ private:
     }
 
     json resume_install_entry(
-            server_slot & slot, const std::string & id, const server_resume_manifest & manifest) {
+            server_slot & slot, const std::string & id, const server_resume_manifest & manifest,
+            std::vector<resume_co_install> * group) {
         const auto skipped = resume_skipped;
 
         const int64_t t_start = ggml_time_us();
@@ -6016,12 +6375,37 @@ private:
             }
             return skipped("resume_key_mismatch");
         }
+        const std::string adapter = lora_config_identity(slot.lora);
+        server_tokens restored;
+        if (const char * why = resume_ledger_restore(slot, manifest, adapter, restored)) {
+            return skipped(why);
+        }
+        if (manifest.artifact || resume_vbr()) {
+            // the key keeps the two routes apart; an entry that crosses them anyway is not read
+            if (!manifest.artifact || !resume_vbr() || !vbr_artifact_store) {
+                return skipped("unsupported_artifact");
+            }
+            if (manifest.placed()) {
+                // its rows come back with the artifact of its pool, or not at all
+                return skipped("pool_not_installed");
+            }
+            return resume_install_artifact(slot, id, manifest, restored, adapter, t_start, group);
+        }
+        if (resume_has_partial != !manifest.tail_states.empty()) {
+            return skipped("companion_missing");
+        }
+        return resume_install_chunks(slot, id, manifest, std::move(restored), t_start);
+    }
+
+    // The tokens of an entry as `slot` would hold them, or why the entry is not read: the ledger
+    // is for this key and adapter, and every object of the manifest is bound to its tokens.
+    const char * resume_ledger_restore(
+            const server_slot & slot, const server_resume_manifest & manifest,
+            const std::string & adapter, server_tokens & restored) const {
+        const auto skipped = [](const char * why) { return why; };
         if (manifest.adapter_identity != resume_adapter_hex(slot)) {
             return skipped("adapter_mismatch");
         }
-
-        // the ledger
-        const std::string adapter = lora_config_identity(slot.lora);
         auto envelope = server_slot_envelope_parse_bytes(
             manifest.ledger.data(), manifest.ledger.size(), resume_key, adapter,
             uint32_t(llama_vocab_n_tokens(llama_model_get_vocab(model_tgt))),
@@ -6037,7 +6421,6 @@ private:
         std::memcpy(serialized.data(), envelope.serialized_tokens.data(),
                     envelope.serialized_tokens.size());
         // the key binds whether there is a projector, so media never meets a server without one
-        server_tokens restored;
         try {
             restored = server_tokens::deserialize(serialized, mctx != nullptr);
         } catch (const std::exception &) {
@@ -6075,19 +6458,20 @@ private:
                 }
             }
         }
-        if (manifest.artifact || resume_vbr()) {
-            // the key keeps the two routes apart; an entry that crosses them anyway is not read
-            if (!manifest.artifact || !resume_vbr() || !vbr_artifact_store) {
-                return skipped("unsupported_artifact");
-            }
-            if (manifest.artifact->prefix_digest != server_resume_prefix_hasher(restored).at(size_t(n_tokens))) {
-                return skipped("ledger_invalid");
-            }
-            return resume_install_artifact(slot, id, manifest, restored, adapter, t_start);
+        if (manifest.artifact &&
+            manifest.artifact->prefix_digest != server_resume_prefix_hasher(restored).at(size_t(n_tokens))) {
+            return skipped("ledger_invalid");
         }
-        if (resume_has_partial != !manifest.tail_states.empty()) {
-            return skipped("companion_missing");
-        }
+        return nullptr;
+    }
+
+    // The fixed route of an install: the chunks up to the largest position that fits, and the
+    // partial state taken there.
+    json resume_install_chunks(
+            server_slot & slot, const std::string & id, const server_resume_manifest & manifest,
+            server_tokens restored, int64_t t_start) {
+        const auto skipped = resume_skipped;
+        const int32_t n_tokens = manifest.n_tokens;
 
         // restorable positions below the context size, largest first
         const int32_t p_cap = std::min<int32_t>(n_tokens, slot.n_ctx - 1);
@@ -6194,18 +6578,12 @@ private:
             };
         }
 
-        // establish the slot the way a slot-file restore does, with no logits and no draft state
         if (p < n_tokens) {
             restored.keep_first(size_t(p));
         }
-        slot_restored_tokens_install(slot, std::move(restored), "resume_install");
-        common_speculative_sequence_transition(
-            slot.get_spec(), slot.id,
-            common_speculative_sequence_event::target_restored_without_draft);
-        slot_restored_tokens_publish(slot);
+        resume_establish(slot, std::move(restored));
         slot.resume_entry_id = id;
-        slot.t_last_used = std::max<int64_t>(
-            1, ggml_time_us() - 1000*std::max<int64_t>(0, resume_unix_ms() - manifest.last_used_unix_ms));
+        slot.t_last_used = resume_last_used(manifest);
 
         // the other tail states become checkpoints of the slot
         size_t n_imported = 0;
@@ -6262,18 +6640,105 @@ private:
         return status;
     }
 
+    // establish the slot the way a slot-file restore does, with no logits and no draft state
+    void resume_establish(server_slot & slot, server_tokens && tokens) {
+        slot_restored_tokens_install(slot, std::move(tokens), "resume_install");
+        common_speculative_sequence_transition(
+            slot.get_spec(), slot.id, common_speculative_sequence_event::target_restored_without_draft);
+        slot_restored_tokens_publish(slot);
+    }
+
+    // a restored slot is as old as its entry, so the next save keeps the order of the last one
+    int64_t resume_last_used(const server_resume_manifest & manifest) const {
+        return std::max<int64_t>(
+            1, ggml_time_us() - 1000*std::max<int64_t>(0, resume_unix_ms() - manifest.last_used_unix_ms));
+    }
+
+    // what keeps a sequence out of an import, whichever object it comes in
+    static const char * resume_vbr_inadmissible(
+            const server_tokens & tokens, const server_resume_manifest & manifest, const server_slot & slot) {
+        if (tokens.has_media()) {
+            return "unsupported_media";
+        }
+        return manifest.n_tokens > slot.n_ctx - 1 ? "context_too_small" : nullptr;
+    }
+
+    // What a placed entry needs before the import: its tokens, its rows in the image and the
+    // partial state the image does not hold. Null when it can go, else why it stays out.
+    json resume_co_prepare(resume_co_install & co, std::vector<vbr_artifact_stream_placement> & placements) {
+        const auto & manifest = co.entry->manifest;
+        const auto & slot = *co.slot;
+        if (const char * why = resume_ledger_restore(slot, manifest, lora_config_identity(slot.lora), co.tokens)) {
+            return resume_skipped(why);
+        }
+        if (const char * why = resume_vbr_inadmissible(co.tokens, manifest, slot)) {
+            return resume_skipped(why);
+        }
+        if (resume_has_partial != !manifest.tail_states.empty() ||
+            (resume_has_partial && manifest.tail_states[0].pos() != manifest.n_tokens)) {
+            return resume_skipped("companion_missing");
+        }
+        if (slot.state != SLOT_STATE_IDLE || slot.prompt.n_tokens() != 0 || !slot.prompt.checkpoints.empty() ||
+            slot.prompt.sequence_epoch != 0 || llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id) >= 0) {
+            return resume_skipped("slot_not_empty");
+        }
+        std::vector<uint8_t> payload;
+        std::string error;
+        auto reason = resume_store->read_object(co.entry->id, *manifest.artifact, payload, error);
+        if (reason == server_resume_reason::ok && resume_has_partial) {
+            reason = resume_store->read_object(co.entry->id, manifest.tail_states[0], co.tail, error);
+        }
+        if (reason != server_resume_reason::ok) {
+            return resume_failed(reason, error);
+        }
+        if (!resume_placement_decode(payload, placements)) {
+            return json {{"outcome", "failed"}, {"reason", "state_rejected"}, {"error", "placement"}};
+        }
+        return nullptr;
+    }
+
+    // The rows of a placed entry came with the image. Its partial state goes in now, and the slot
+    // is established with no logits and no draft state.
+    json resume_co_establish(resume_co_install & co) {
+        const auto & manifest = co.entry->manifest;
+        const auto & tail = co.tail;
+        auto & slot = *co.slot;
+        if ((resume_has_partial && llama_state_seq_set_data_ext(
+                ctx_tgt, tail.data(), tail.size(), slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) != tail.size()) ||
+            llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id) != manifest.n_tokens - 1) {
+            const llama_pos pos_max = llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id);
+            slot.mandatory_recovery_reset(server_cache_destruction_reason::restore_failure);
+            return json {
+                {"outcome", "failed"}, {"reason", "state_rejected"}, {"error", "placed state"},
+                {"pos_max", pos_max}, {"n_tokens", manifest.n_tokens},
+            };
+        }
+        resume_establish(slot, std::move(co.tokens));
+        // the epoch of the save, so the next one finds the sequence unchanged
+        slot.prompt.sequence_epoch = manifest.sequence_epoch;
+        slot.resume_entry_id = co.entry->id;
+        slot.t_last_used = resume_last_used(manifest);
+        return json {
+            {"outcome", "installed_full"},
+            {"p", manifest.n_tokens},
+            {"n_tokens", manifest.n_tokens},
+            {"placed", true},
+            {"bytes_read", manifest.artifact->bytes + tail.size()},
+        };
+    }
+
     // The dynamic route of an install: the artifact goes back through its owners' import into an
     // empty slot. It installs whole or the slot starts cold; the import says why it refused. The
-    // envelope is the owners', so it restores the drafter state it was captured with.
+    // envelope is the owners', so it restores the drafter state it was captured with. The image
+    // is of the whole pool: the placed entries of `group` come back in the same import, under
+    // their own sequences, and are established as a fixed install establishes a slot.
     json resume_install_artifact(
             server_slot & slot, const std::string & id, const server_resume_manifest & manifest,
-            const server_tokens & restored, const std::string & adapter, int64_t t_start) {
+            const server_tokens & restored, const std::string & adapter, int64_t t_start,
+            std::vector<resume_co_install> * group) {
         const auto & rec = *manifest.artifact;
-        if (restored.has_media()) {
-            return resume_skipped("unsupported_media");
-        }
-        if (manifest.n_tokens > slot.n_ctx - 1) {
-            return resume_skipped("context_too_small");
+        if (const char * why = resume_vbr_inadmissible(restored, manifest, slot)) {
+            return resume_skipped(why);
         }
         // The import takes an empty cache, not an empty slot. That also keeps two entries of one
         // sequence, saved before and after a rewind, out of two slots.
@@ -6327,20 +6792,49 @@ private:
             };
         }
 
+        // the other conversations of the image, each into an empty slot of its own
+        std::vector<resume_co_install *> ready;
+        std::vector<vbr_import_co_resident> residents;
+        // the rows of all placed entries, and of those that get no sequence in this import
+        uint64_t group_cells   = 0;
+        uint64_t unowned_cells = 0;
+        if (group) {
+            for (auto & co : *group) {
+                const uint64_t n_cells = uint64_t(co.entry->manifest.n_tokens);
+                group_cells += n_cells;
+                vbr_import_co_resident resident;
+                if (co.slot) {
+                    resident.destination = co.slot->id;
+                    co.status = resume_co_prepare(co, resident.placements);
+                }
+                if (co.slot && co.status.is_null()) {
+                    ready.push_back(&co);
+                    residents.push_back(std::move(resident));
+                } else {
+                    unowned_cells += n_cells;
+                }
+            }
+        }
+
         const llama_tokens & ids = restored.retention_token_ids();
-        vbr_import_publish_state publish_state;
-        publish_state.slot          = &slot;
-        publish_state.expect_tokens = &ids;
-        publish_state.expect_epoch  = manifest.sequence_epoch;
+        const auto import = [&](bool with_residents) {
+            vbr_import_publish_state publish_state;
+            publish_state.slot          = &slot;
+            publish_state.expect_tokens = &ids;
+            publish_state.expect_epoch  = manifest.sequence_epoch;
 
-        auto target = vbr_import_target_for(slot, memory, uint64_t(manifest.n_tokens), adapter);
-        target.publish_context = &publish_state;
-        target.prepare_publish = vbr_import_prepare_publish;
-        target.publish         = vbr_import_publish;
-
-        const auto imported = vbr_artifact_store->import_host_payload(std::move(target), payload);
-        if (imported.status != server_vbr_artifact_import_status::ok) {
-            slot.mandatory_recovery_reset(server_cache_destruction_reason::restore_failure);
+            auto target = vbr_import_target_for(slot, memory, uint64_t(manifest.n_tokens), adapter);
+            target.publish_context = &publish_state;
+            target.prepare_publish = vbr_import_prepare_publish;
+            target.publish         = vbr_import_publish;
+            target.unowned_cells = group_cells;
+            if (with_residents) {
+                target.co_residents  = std::move(residents);
+                target.unowned_cells = unowned_cells;
+            }
+            return vbr_artifact_store->import_host_payload(std::move(target), payload);
+        };
+        const auto refusal = [](const server_vbr_artifact_import_output & imported) {
             return json {
                 {"outcome", "failed"},
                 {"reason", imported.precision_refused ? "precision_refused" : "state_rejected"},
@@ -6353,12 +6847,31 @@ private:
                 {"deficit", imported.precision.deficit},
                 {"weight", imported.precision.weight},
             };
+        };
+
+        auto imported = import(!ready.empty());
+        if (imported.status != server_vbr_artifact_import_status::ok && !ready.empty()) {
+            // the image with the others in it was refused: the artifact's own sequence may still come
+            for (auto * co : ready) {
+                co->status = refusal(imported);
+                co->status["reason"] = "pool_refused";
+            }
+            ready.clear();
+            slot.mandatory_recovery_reset(server_cache_destruction_reason::restore_failure);
+            memory->breathe();
+            imported = import(false);
+        }
+        if (imported.status != server_vbr_artifact_import_status::ok) {
+            slot.mandatory_recovery_reset(server_cache_destruction_reason::restore_failure);
+            return refusal(imported);
         }
         common_speculative_sequence_transition(slot.get_spec(), slot.id, vbr_restore_event_for(payload));
         slot.bind_frontier_logits_to_prompt();
         slot.resume_entry_id = id;
-        slot.t_last_used = std::max<int64_t>(
-            1, ggml_time_us() - 1000*std::max<int64_t>(0, resume_unix_ms() - manifest.last_used_unix_ms));
+        slot.t_last_used = resume_last_used(manifest);
+        for (auto * co : ready) {
+            co->status = resume_co_establish(*co);
+        }
 
         return json {
             {"outcome", "installed_full"},
@@ -6368,6 +6881,7 @@ private:
             {"decision", vbr_import_decision_name(imported.decision)},
             {"units", imported.units},
             {"companions", imported.companions},
+            {"co_residents", ready.size()},
             {"bytes_read", rec.bytes},
             {"t_ms", (ggml_time_us() - t_start)/1000.0},
         };

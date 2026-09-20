@@ -1040,8 +1040,12 @@ class vbr_kv_import_session {
             const std::vector<const vbr_validated_child_plan *> & plans,
             const vbr_tracker_install_child & tracker_plan,
             const vbr_checkpoint_generation_controller & source,
+            const std::vector<vbr_import_co_resident> & co_residents,
             const vbr_occupied_replacement_guard * replacement = nullptr) noexcept {
         if (test_seam_) {
+            if (!co_residents.empty()) {
+                return false;
+            }
             return replacement
                 ? test_seam_->session_build_relocated_live_image(
                     child_id_, plans, tracker_plan, source, *replacement)
@@ -1150,6 +1154,42 @@ class vbr_kv_import_session {
                         }
                     }
                 }
+                // Co-resident rows arrived with the authorized runs; each
+                // publishes under its own sequence, never the destination's.
+                for (const auto & co : co_residents) {
+                    if (co.destination < 0 ||
+                        uint32_t(co.destination) >= cache_->n_seq_max ||
+                        co.destination == destination_) {
+                        return false;
+                    }
+                    for (const auto & placement : co.placements) {
+                        if (placement.child_id != child_id_) {
+                            continue;
+                        }
+                        if (placement.stream_index >= final_cells_.size()) {
+                            return false;
+                        }
+                        auto & cells = final_cells_[placement.stream_index];
+                        for (const auto & cell : placement.cells) {
+                            if (cell.physical_cell >= cells.size() ||
+                                cell.logical_position < 0 ||
+                                !cells.is_empty(cell.physical_cell)) {
+                                return false;
+                            }
+                            cells.pos_set(cell.physical_cell,
+                                          cell.logical_position);
+                            cells.ext_set(cell.physical_cell,
+                                { cell.ext_x, cell.ext_y });
+                            cells.seq_add(cell.physical_cell, co.destination);
+                            if (!final_ownership_->add_cell(
+                                    placement.stream_index, co.destination,
+                                    cell.physical_cell,
+                                    cell.logical_position)) {
+                                return false;
+                            }
+                        }
+                    }
+                }
             }
             // The allocation cursor is live metadata, not a mere search
             // optimization: unified/SWA placement may legally recycle a
@@ -1168,7 +1208,7 @@ class vbr_kv_import_session {
                         tracker_image_)
                     : !tracker->prepare_import_image(
                         tracker_plan, source, destination_, placements,
-                        tracker_image_))) {
+                        tracker_image_, &co_residents))) {
                 return false;
             }
             // Validation writes the target cursor on every unit plan, even
@@ -2187,6 +2227,7 @@ vbr_adopt_result vbr_adopt_empty_manifest(
                 if (!install || !source ||
                     !entry.second.session->build_live_image(
                         entry.second.plans, *install, *source,
+                        manifest->co_residents(),
                         manifest->occupied_replacement())) {
                     return fail(vbr_adopt_status::tracker_failed);
                 }
@@ -2359,7 +2400,8 @@ vbr_adopt_result vbr_adopt_empty_manifest(
                 const auto * source = source_controller(*manifest, entry.first);
                 if (!install || !source ||
                     !entry.second.session->build_live_image(
-                        entry.second.plans, *install, *source)) {
+                        entry.second.plans, *install, *source,
+                        manifest->co_residents())) {
                     return fail(vbr_adopt_status::tracker_failed);
                 }
             }

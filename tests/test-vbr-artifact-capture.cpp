@@ -3883,6 +3883,28 @@ static void test_dependency_scoped_projected_catalog_publication() {
           vbr_manifest_validation_status::topology_mismatch);
     CHECK(!refused_validation.proof);
 
+    // A prefix owns only part of the captured image, so it cannot vouch for
+    // co-resident rows.
+    vbr_artifact_attention_prefix_projection co_resident_projection;
+    CHECK(catalog.project_attention_prefix(
+              prefix_parent, prefix_request, {}, co_resident_projection) ==
+          vbr_artifact_prefix_projection_status::projected);
+    vbr_import_co_resident prefix_co_resident;
+    prefix_co_resident.destination = 13;
+    prefix_co_resident.placements.push_back({ 0, 0, 13, 1, { { 2, 0, 0, 0 } } });
+    const std::vector<vbr_import_co_resident> prefix_co_residents {
+        prefix_co_resident,
+    };
+    auto co_resident_policy = validation_policy;
+    co_resident_policy.co_residents = &prefix_co_residents;
+    auto co_resident_validation = vbr_validate_attention_prefix_projection(
+        validation_target, std::move(co_resident_projection),
+        co_resident_policy);
+    CHECK(co_resident_validation.status ==
+          vbr_manifest_validation_status::ownership_mismatch);
+    CHECK(co_resident_validation.decision == vbr_import_decision::reject);
+    CHECK(!co_resident_validation.proof);
+
     // Dropping the caller's package lease cannot retire storage while either
     // independently borrowed projection remains alive.
     prefix_parent.reset();

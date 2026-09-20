@@ -745,23 +745,55 @@ one. "No drafter state" is a property of the fixed route only. Measured with
 the MTP head of a 27B: three companions, identical tokens, acceptance
 unchanged (0.91–0.95).
 
-**One conversation per cache.** An artifact is an image of the whole pool up to
-its watermark with the placement of one sequence, and the owners' import takes
-an empty cache, not an empty slot ("empty import is a whole-child contract").
-With several slots sharing the unified cache:
+**Every slot of the cache, one image.** An artifact is an image of the whole
+pool up to its watermark with the placement of one sequence, and the owners'
+import takes an empty cache, not an empty slot ("empty import is a whole-child
+contract"). The rows of the other slots are already inside that image, so the
+route saves the image once and, for every other slot, where its rows lie:
 
-- a save writes the most recently used conversation and skips the others
-  (`cache_shared`); their earlier entries are released and pruned, so the
-  store holds one conversation per resume key on this route;
-- an install into a cache that already holds a conversation is skipped before
-  any byte is read (`cache_shared`), the entry kept;
-- more entries than slots is `no_free_slot`: the fixed route's staging into
-  the host cache is not available, the VBR host cache admits through its own
-  idle capture.
+- *Pool entry.* The most recently used slot whose capture succeeds writes the
+  artifact (`v-<gen>`, kind 3) as above.
+- *Placed entry.* Every other live slot writes a placement object (`p-<gen>`,
+  kind 4) and, on a hybrid model, one tail state at its frontier. The manifest
+  names the image it lies in: `pool_entry`, `pool_generation`, `pool_xxh3`. The
+  payload is little-endian: `u32 magic 'RSPL'`, `u32 version = 1`, `u32 count`,
+  then per placement `u32 child_id, stream_index, computation_frontier,
+  n_cells` and per cell `u32 physical_cell, i32 logical_position, ext_x,
+  ext_y`. That is 16 bytes per token per attention child; the recurrent tail
+  state of a 4B hybrid is about 52 MB.
+- *Install.* One empty import of the pool entry. The placed entries that match
+  its three pool fields and get a slot go in as co-residents: validation adds
+  their rows to the authorized runs, the image is installed with those rows
+  under their own sequence ids, and the generation tracker stamps them. The
+  decision is `live_rebased` (or `downward_rebase`), never `native_import`.
+  Each co-resident slot is then established as on the fixed route (tokens from
+  its ledger, the tail state into the recurrent child).
+- *Pricing.* The destination is priced with the rows of every placed entry of
+  the image, whether or not its sequence joins this import (`unowned_cells`
+  for those that do not), because the published watermark is the artifact's.
+- *Refusal.* If the owners refuse the import with co-residents, it is retried
+  once alone; the co-residents report `pool_refused` and start cold.
+- *Fewer slots.* A placed entry that gets no slot is `no_free_slot` and stays
+  in the store. It is dropped the next time the image is rewritten, and a
+  placed entry whose image is gone is dropped at install (`pool_missing`). A
+  placed entry is never installed alone (`pool_not_installed`).
+- *Unchanged restart.* When no slot changed and the group still names the same
+  image, every entry is kept (`artifact_kept`, no bytes written).
+- *Rewrite.* A changed primary rewrites the image. Before it is written, the
+  other members' artifact entries and the placed entries of the old image leave
+  the disk, so the store never holds two images of one cache.
 
-Lifting this needs an import into an absent destination that preserves foreign
-rows (the occupied-replacement guard already tracks them), and a capture
-narrowed to the owned rows; both belong to the artifact's owners.
+A cache with a child that holds one sequence only (the sliding-window child of
+an iSWA model, or a QSA index) has no image to share: the owners refuse the
+capture while other sequences are live. The save passes are terminal (shutdown,
+or sleep before the context is destroyed), so there the other slots leave the
+cache and the most recently used conversation is saved alone (`"sole": true`;
+the others report `pool_unshared`). Multi-slot restore therefore covers dense
+and hybrid models; an iSWA model restores its most recent conversation.
+
+An idle capture in flight holds the transfer ring, so a save pass cancels and
+drains it first; without that a save that follows a request by a few
+milliseconds is `capture_refused` (`transfer_failed`, ring unavailable).
 
 **The live slot is what gets saved.** With one slot, the VBR host cache's idle
 capture normally publishes the conversation to host memory and then clears the

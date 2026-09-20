@@ -2,6 +2,7 @@
 #include "llama-vbr-precision.h"
 
 #include "llama-cache-budget.h"
+#include "llama-cparams.h"
 #include "llama-vbr-identity-digest.h"
 
 #include <algorithm>
@@ -125,10 +126,55 @@ const vbr_artifact_unit_reference * find_reference(
     return found == manifest.unit_references.end() ? nullptr : &*found;
 }
 
+// Each child's co-resident rows, sorted. A co-resident names its own
+// destination, only streams the artifact itself placed, and rows no other
+// co-resident holds.
+bool co_resident_cells(
+        const std::vector<vbr_import_co_resident> & co_residents,
+        llama_seq_id destination,
+        const vbr_artifact_reference_manifest & manifest,
+        std::vector<std::vector<uint32_t>> & cells) {
+    std::set<llama_seq_id> destinations = { destination };
+    for (const auto & co : co_residents) {
+        if (co.destination < 0 || co.destination >= LLAMA_MAX_SEQ ||
+            co.placements.empty() ||
+            !destinations.insert(co.destination).second) {
+            return false;
+        }
+        for (const auto & placement : co.placements) {
+            if (placement.child_id >= cells.size() ||
+                placement.cells.empty() ||
+                std::none_of(
+                    manifest.stream_placements.begin(),
+                    manifest.stream_placements.end(),
+                    [&](const vbr_artifact_stream_placement & own) {
+                        return own.child_id == placement.child_id &&
+                               own.stream_index == placement.stream_index;
+                    })) {
+                return false;
+            }
+            for (const auto & cell : placement.cells) {
+                if (cell.logical_position < 0) {
+                    return false;
+                }
+                cells[placement.child_id].push_back(cell.physical_cell);
+            }
+        }
+    }
+    for (auto & child : cells) {
+        std::sort(child.begin(), child.end());
+        if (std::adjacent_find(child.begin(), child.end()) != child.end()) {
+            return false;
+        }
+    }
+    return true;
+}
+
 bool authorized_placement_plan(
         const vbr_artifact_reference_manifest & manifest,
         uint32_t child_id,
         const vbr_artifact_unit_reference & reference,
+        const std::vector<uint32_t> & co_cells,
         std::vector<vbr_artifact_stream_placement> & placements,
         std::vector<vbr_authorized_cell_run> & runs) {
     std::vector<uint32_t> cells;
@@ -152,6 +198,16 @@ bool authorized_placement_plan(
     }
     std::sort(cells.begin(), cells.end());
     cells.erase(std::unique(cells.begin(), cells.end()), cells.end());
+    if (!co_cells.empty()) {
+        // The dense image holds the co-residents' rows too; they transfer with
+        // the reference's own, and may not alias them.
+        const size_t own = cells.size();
+        cells.insert(cells.end(), co_cells.begin(), co_cells.end());
+        std::inplace_merge(cells.begin(), cells.begin() + own, cells.end());
+        if (std::adjacent_find(cells.begin(), cells.end()) != cells.end()) {
+            return false;
+        }
+    }
     for (uint32_t cell : cells) {
         if (runs.empty() ||
             uint64_t(runs.back().first_physical_cell) +
@@ -1110,6 +1166,7 @@ vbr_validated_manifest & vbr_validated_manifest::operator=(
         authenticated_identity_.tokens = &token_block_.tokens;
     }
     children_ = std::move(other.children_);
+    co_residents_ = std::move(other.co_residents_);
     companions_ = std::move(other.companions_);
     accounting_leaves_ = std::move(other.accounting_leaves_);
     tracker_install_ = std::move(other.tracker_install_);
@@ -1264,9 +1321,27 @@ vbr_manifest_validation_result vbr_validate_unit_manifest_snapshot(
             }
         }
 
+        std::vector<std::vector<uint32_t>> co_cells(target.children.size());
+        const bool has_co_residents =
+            policy.co_residents != nullptr && !policy.co_residents->empty();
+        if (has_co_residents) {
+            if (occupied_replacement) {
+                return terminal_result(
+                    vbr_manifest_validation_status::target_not_empty);
+            }
+            if (!co_resident_cells(
+                    *policy.co_residents, policy.destination_sequence,
+                    manifest, co_cells)) {
+                return terminal_result(
+                    vbr_manifest_validation_status::ownership_mismatch);
+            }
+        }
+
         std::vector<vbr_validated_child_plan> child_plans;
         vbr_tracker_install_plan tracker;
-        bool needs_live_rebase =
+        // Captured page generations cover the reference's rows only, so
+        // co-residents cannot be cloned natively.
+        bool needs_live_rebase = has_co_residents ||
             manifest.consistency.kind ==
                 vbr_artifact_consistency_kind::live_rebased;
         bool needs_downward = false;
@@ -1457,9 +1532,12 @@ vbr_manifest_validation_result vbr_validate_unit_manifest_snapshot(
             }
             std::vector<vbr_artifact_stream_placement> placements;
             std::vector<vbr_authorized_cell_run> runs;
+            const auto & unit_co_cells = co_cells[descriptor.child_id];
             if (!authorized_placement_plan(
                     manifest, descriptor.child_id, *reference,
-                    placements, runs)) {
+                    unit_co_cells, placements, runs) ||
+                (!unit_co_cells.empty() &&
+                 unit_co_cells.back() >= descriptor.wm_cells)) {
                 return terminal_result(
                     vbr_manifest_validation_status::ownership_mismatch);
             }
@@ -1986,6 +2064,9 @@ vbr_manifest_validation_result vbr_validate_unit_manifest_snapshot(
         proof->authenticated_identity_ = policy.identity;
         proof->token_block_ = manifest.token_block;
         proof->children_ = std::move(child_plans);
+        if (has_co_residents) {
+            proof->co_residents_ = *policy.co_residents;
+        }
         proof->companions_ = std::move(companion_plans);
         proof->accounting_leaves_ = std::move(leaves);
         proof->tracker_install_ = std::move(tracker);
@@ -2035,6 +2116,12 @@ vbr_manifest_validation_result vbr_validate_attention_prefix_projection(
         if (!policy.authorized) {
             return terminal_result(
                 vbr_manifest_validation_status::unauthorized);
+        }
+        if (policy.co_residents != nullptr && !policy.co_residents->empty()) {
+            // A projection packs a fresh dense destination; it has no image
+            // for other sequences to share.
+            return terminal_result(
+                vbr_manifest_validation_status::ownership_mismatch);
         }
         if (prefix_tokens == 0 || prefix_tokens > UINT32_MAX ||
             projection.parent_artifact() != source.artifact ||

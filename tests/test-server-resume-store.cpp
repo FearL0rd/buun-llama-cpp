@@ -667,6 +667,41 @@ static void test_artifact(const std::string & root) {
     { auto m = manifest; m.artifact->gen = 2; CHECK(!valid(m)); }
     { auto m = manifest; m.sequence_epoch = 0; CHECK(!valid(m)); }
     { auto m = manifest_of(48, 1); m.chunks.push_back(chunk_of(0, 48, 1)); m.sequence_epoch = 1; CHECK(!valid(m)); }
+    { auto m = manifest; m.pool_entry = id; m.pool_generation = 1; CHECK(!valid(m)); }
+
+    // a placement names the artifact its rows are in, and may carry the one tail state of its end
+    const std::string id_placed = server_resume_store::new_entry_id();
+    const std::vector<uint8_t> cells = pattern(640, 3);
+    server_resume_object_record placement;
+    placement.kind          = server_resume_object_kind::placement;
+    placement.p1            = 32;
+    placement.gen           = 1;
+    placement.prefix_digest = std::string(32, 'd');
+    CHECK(store->write_object(id_placed, placement, cells.data(), cells.size(), error) == server_resume_reason::ok);
+    CHECK(n_files(store->directory() + "/entries/" + id_placed) == 1);
+    CHECK(fs::exists(store->directory() + "/entries/" + id_placed + "/p-1"));
+
+    auto placed = manifest_of(32, 1);
+    placed.artifact        = placement;
+    placed.pool_entry      = id;
+    placed.pool_generation = record.gen;
+    placed.pool_xxh3       = record.xxh3;
+    placed.sequence_epoch  = 9;
+    CHECK(valid(placed) && placed.placed() && !manifest.placed());
+    CHECK(store->commit(id_placed, placed, error) == server_resume_reason::ok);
+    store->sweep(id_placed, placed);
+    CHECK(store->read_manifest(id_placed, read, error) == server_resume_reason::ok);
+    CHECK(read.placed() && read.pool_entry == id && read.pool_generation == record.gen &&
+          read.pool_xxh3 == record.xxh3 && read.sequence_epoch == 9);
+    CHECK(store->read_object(id_placed, *read.artifact, got, error) == server_resume_reason::ok && got == cells);
+
+    { auto m = placed; m.sequence_epoch = 0; CHECK(valid(m)); }
+    { auto m = placed; m.tail_states.push_back(tail_of(32, 1, "frontier")); CHECK(valid(m)); }
+    { auto m = placed; m.tail_states.push_back(tail_of(32, 1, "frontier")); m.tail_states.push_back(tail_of(16, 1, "turn")); CHECK(!valid(m)); }
+    { auto m = placed; m.pool_entry.clear(); CHECK(!valid(m)); }
+    { auto m = placed; m.pool_entry = "../escape"; CHECK(!valid(m)); }
+    { auto m = placed; m.pool_generation = 0; CHECK(!valid(m)); }
+    { auto m = placed; m.chunks.push_back(chunk_of(0, 32, 1)); CHECK(!valid(m)); }
 
     // a kept value is the first one stored, also for the next process
     CHECK(store->keep_value("execution-identity", "first", error) == "first");
@@ -677,7 +712,7 @@ static void test_artifact(const std::string & root) {
     store = server_resume_store::open(root, FAMILY, reason, error);
     CHECK(store != nullptr);
     CHECK(store->keep_value("execution-identity", "third", error) == "first");
-    CHECK(store->list().size() == 1);
+    CHECK(store->list().size() == 2);
 }
 
 int main() {
