@@ -245,8 +245,23 @@ Per nonempty slot, most recently used first:
    dense model extra KV positions are clipped by the range writer.
 3. Decide reuse: the slot remembers the entry id it was restored from or last
    saved as. A chunk of that entry is kept when its `prefix_digest`, the resume
-   key and the adapter identity still match. Everything after the first mismatch
-   is rewritten. A slot whose ledger shares less than one chunk with its entry
+   key and the adapter identity still match **and the live cells of its range
+   serialize to the object's size and checksum**. Everything after the first
+   mismatch is rewritten. Equal tokens do not prove an equal state: a request
+   with `cache_prompt: false`, a legacy slot restore or another conversation in
+   the slot recompute the cells, and after a restore from another model of the
+   family the recomputed cells are another model's. Reading the ranges back
+   costs 18 ms on a 9k-token hybrid 4B save (two 71 MB chunks and the short
+   last one; 135 ms against 117 ms). A tail state that the slot still holds
+   (the frontier, a checkpoint) is compared the same way. The `early` tail has
+   no live counterpart once it left the ring, so it is kept only while every
+   chunk under its position, the entry's shorter last chunk included, is the
+   live state: the pair then is the state the entry held when both were
+   written, which is what a prefix restore installs. Measured: base model
+   saves, a fine-tune restores and refills cold, its save holds the fine-tune's
+   chunks and tails (the bytes of a fresh fine-tune save); the same restore
+   followed by an ordinary turn, and a restart after it, keep the base model's
+   chunks and `early` tail. A slot whose ledger shares less than one chunk with its entry
    looks for the entry of its conversation before it takes a new id: the entry
    no slot holds whose chunks, all but the last, lead the ledger. That is how a
    conversation that came back from the host cache, or was sent again after a
@@ -384,7 +399,8 @@ Tail states saved per entry on a model with a partial part:
    and rewinds behind `N` even with thinking off; without this companion a
    hybrid reprocesses the whole history and an SWA model has no valid rewind.
 3. `early` — at most one: the earliest tail state the entry already holds whose
-   `prefix_digest` still matches, otherwise the slot's oldest retained
+   `prefix_digest` still matches and whose chunks below it are still the live
+   state (§4 step 3), otherwise the slot's oldest retained
    checkpoint. Once persisted it outlives the live ring, so a conversation that
    has been saved since its start keeps a checkpoint near its preamble. It is
    what a partial-prefix restore into a smaller context lands on.

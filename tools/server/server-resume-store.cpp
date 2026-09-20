@@ -33,6 +33,10 @@ static constexpr uint32_t HEADER_SIZE       = 64;
 static constexpr size_t   MAX_STRING        = 256;
 static constexpr size_t   MAX_ADAPTERS      = 32;
 
+bool server_resume_object_record::holds(const uint8_t * payload, size_t size) const {
+    return bytes == size && xxh3 == XXH3_64bits(payload, size);
+}
+
 const char * server_resume_reason_name(server_resume_reason reason) noexcept {
     switch (reason) {
         case server_resume_reason::ok:                       return "ok";

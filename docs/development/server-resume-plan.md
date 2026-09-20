@@ -698,12 +698,18 @@ First cleanup batch (focused gates tracked in the private review ledger):
 
 Still required before moving on:
 
-- [ ] **State identity:** token-prefix equality does not prove that stored KV or
+- [x] **State identity:** token-prefix equality does not prove that stored KV or
   recurrent bytes describe the current live state. Cold refill, family handoff,
   legacy restore, and slot replacement can invalidate this assumption. Verify
   serialized bytes or carry a proven lineage before reusing objects; never join
   old base state to a newly computed unrelated recurrent frontier. Include
   `cache_prompt:false` as a negative control.
+  Done by bytes (contract §4 step 3): an object is reused only when the live
+  range or tail serializes to its size and checksum, an `early` tail only over
+  chunks that do. Gates: cold refill under a fine-tune after a family restore
+  saves the fine-tune's bytes; an inherited append and a restart after it keep
+  the producer's chunks. Known cost: the range blob names the sequence id, so a
+  conversation that comes back in another slot is rewritten once.
 - [ ] **Conversation ownership:** the own-slot entry shortcut accepts a match of
   only one chunk and can overwrite much more than the documented last-chunk
   tradeoff. Separate entry adoption from object identity; qualify long shared

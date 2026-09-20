@@ -5248,19 +5248,41 @@ private:
             have_old = resume_store->read_manifest(slot.resume_entry_id, old, error) == server_resume_reason::ok;
         }
 
+        // The same tokens can stand over another state: a cold refill, another model of the family,
+        // a legacy restore. An object of the entry is reused only where it is the live state byte
+        // for byte, and what the entry holds beyond the live state (an early tail) only on top of
+        // chunks that are.
+        std::vector<uint8_t> resume_staging; // one object; released on failures as well as success
+        const auto chunk_is_live = [&](const server_resume_object_record & rec) {
+            const size_t size = llama_state_seq_get_size_range(ctx_tgt, slot.id, rec.p0, rec.p1);
+            if (size == 0 || size != rec.bytes) {
+                return false;
+            }
+            resume_staging.resize(size);
+            return llama_state_seq_get_data_range(
+                    ctx_tgt, resume_staging.data(), size, slot.id, rec.p0, rec.p1) == size &&
+                rec.holds(resume_staging.data(), size);
+        };
+
         server_resume_manifest next;
-        size_t n_kept = 0;
+        size_t  n_kept = 0;
+        int32_t n_live = 0; // tokens from 0 whose chunks in the entry are the live state
         {
             server_resume_prefix_hasher hasher(tokens);
-            bool keeping = have_old;
+            bool live = have_old;
             for (int32_t p0 = 0; p0 < n_tokens; p0 += RESUME_CHUNK_TOKENS) {
                 const int32_t p1 = std::min(n_tokens, p0 + RESUME_CHUNK_TOKENS);
                 const size_t i = size_t(p0/RESUME_CHUNK_TOKENS);
+                // the last chunk of the entry may be shorter than ours: not kept, but it counts
+                live = live && i < old.chunks.size() &&
+                    old.chunks[i].p0 == p0 && old.chunks[i].p1 <= p1 &&
+                    old.chunks[i].prefix_digest == hasher.at(size_t(old.chunks[i].p1)) &&
+                    chunk_is_live(old.chunks[i]);
+                if (live) {
+                    n_live = old.chunks[i].p1;
+                }
                 const std::string digest = hasher.at(size_t(p1));
-                keeping = keeping && i < old.chunks.size() &&
-                    old.chunks[i].p0 == p0 && old.chunks[i].p1 == p1 &&
-                    old.chunks[i].prefix_digest == digest;
-                if (keeping) {
+                if (live && old.chunks[i].p1 == p1) {
                     next.chunks.push_back(old.chunks[i]);
                     n_kept++;
                     continue;
@@ -5330,7 +5352,7 @@ private:
             // else the slot's oldest checkpoint
             bool have_early = false;
             for (const int32_t pos : held_positions) {
-                if (pos >= turn_pos) {
+                if (pos >= turn_pos || pos > n_live) {
                     break;
                 }
                 const auto * rec = held_tail(pos);
@@ -5363,13 +5385,27 @@ private:
                 src.rec.role = "frontier";
                 tails.push_back(std::move(src));
             }
+            const auto tail_is_live = [&](const tail_source & src, const server_resume_object_record & rec) {
+                if (src.checkpoint) {
+                    const auto & data = src.checkpoint->data_tgt;
+                    return rec.holds(data.data(), data.size());
+                }
+                const size_t size = llama_state_seq_get_size_ext(ctx_tgt, slot.id, RESUME_FRONTIER_FLAGS);
+                if (size == 0 || size != rec.bytes) {
+                    return false;
+                }
+                resume_staging.resize(size);
+                return llama_state_seq_get_data_ext(
+                        ctx_tgt, resume_staging.data(), size, slot.id, RESUME_FRONTIER_FLAGS) == size &&
+                    rec.holds(resume_staging.data(), size);
+            };
             for (auto & src : tails) {
                 if (src.held) {
                     continue;
                 }
                 src.rec.prefix_digest = hasher.at(size_t(src.rec.pos()));
                 const auto * rec = held_tail(src.rec.pos());
-                if (rec && rec->prefix_digest == src.rec.prefix_digest) {
+                if (rec && rec->prefix_digest == src.rec.prefix_digest && tail_is_live(src, *rec)) {
                     const std::string role = src.rec.role;
                     src.rec = *rec;
                     src.rec.role = role;
@@ -5461,7 +5497,6 @@ private:
         };
 
         uint64_t bytes_written = 0;
-        std::vector<uint8_t> resume_staging; // one object; released on failures as well as success
         for (size_t i = n_kept; i < next.chunks.size(); ++i) {
             auto & rec = next.chunks[i];
             rec.gen = next.generation;

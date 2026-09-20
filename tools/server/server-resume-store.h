@@ -68,6 +68,9 @@ struct server_resume_object_record {
     std::string role; // frontier, turn, early
 
     int32_t pos() const { return p0; }
+
+    // the object on disk is this payload, by size and checksum
+    bool holds(const uint8_t * payload, size_t size) const;
 };
 
 // provenance, never a gate
