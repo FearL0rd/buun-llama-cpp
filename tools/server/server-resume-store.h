@@ -184,15 +184,16 @@ public:
     // keeps the entries used last, so many of the given resume key and so many overall, and drops
     // damaged manifests and directories that never got one. A server cannot read the entries of
     // another key, so only the overall bound ends those, never the number of its own slots.
-    // The entries in `held` are kept before any other and are not counted against the key.
+    // Live-slot entries have first priority, then held overflow entries, then ordinary entries.
+    // Both live and held entries are excluded from the per-key count, but obey the overall cap.
     void prune(
             const std::string & resume_key, size_t n_keep_key, size_t n_keep_total,
-            const std::set<std::string> & held = {}) const;
+            const std::set<std::string> & held = {}, const std::set<std::string> & live = {}) const;
 
     // the committed entries prune() would drop
     std::set<std::string> victims(
             const std::string & resume_key, size_t n_keep_key, size_t n_keep_total,
-            const std::set<std::string> & held = {}) const;
+            const std::set<std::string> & held = {}, const std::set<std::string> & live = {}) const;
 
     uint64_t free_bytes() const;
 

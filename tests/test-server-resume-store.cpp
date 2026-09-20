@@ -532,6 +532,9 @@ static void test_store(const std::string & root) {
     CHECK(store->victims(KEY, 1, 8) == std::set<std::string>{id});
     CHECK(store->victims(KEY, 1, 8, {id}).empty());
     CHECK((store->victims(KEY, 2, 1, {id_old}) == std::set<std::string>{id, id_new}));
+    // Shrinking the slot count must not let newer overflow evict the oldest live slot.
+    CHECK((store->victims(KEY, 0, 1, {id, id_new}, {id_old}) == std::set<std::string>{id, id_new}));
+    CHECK((store->victims(KEY, 0, 2, {id, id_new}, {id_old}) == std::set<std::string>{id}));
     CHECK(store->list().size() == 3);
     store->prune(KEY, 1, 8);
     {
@@ -554,6 +557,14 @@ static void test_store(const std::string & root) {
     }
 
     // space-bounded replacement takes the entry out first
+    set_fault("uncommit", server_resume_reason::io_error);
+    CHECK(store->uncommit(id, error) == server_resume_reason::io_error);
+    set_fault(nullptr);
+    server_resume_manifest still_present;
+    CHECK(store->read_manifest(id, still_present, error) == server_resume_reason::ok);
+    set_fault("uncommit_sync", server_resume_reason::io_error);
+    CHECK(store->uncommit(id, error) == server_resume_reason::io_error);
+    set_fault(nullptr);
     CHECK(store->uncommit(id, error) == server_resume_reason::ok);
     CHECK(store->uncommit(id, error) == server_resume_reason::ok);
     CHECK(store->list().size() == 1);

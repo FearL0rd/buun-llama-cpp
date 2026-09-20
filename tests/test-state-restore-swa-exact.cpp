@@ -1,7 +1,8 @@
 // What a restored sliding-window sequence owes, and what it does not.
 //
-// Owed, asserted here: every K/V row the restored caches hold equals the live cache's row at the
-// same position, bit for bit, and two live runs of the same batches give the same logits.
+// Owed, asserted here: every K/V row saved by each route equals the live cache's row
+// at the same position, bit for bit (including older held rows on the ranged route);
+// and two live runs of the same batches give the same finite logits.
 // Not owed, reported here: the logits of the same next tokens. Cells land at other indices than
 // the live ring had them, and the attention kernels reduce over cells in index order. The `+M`
 // arms move an exact restore by M cells and nothing else, which is the control for that effect.
@@ -49,6 +50,39 @@ struct arm {
     std::string          name;
     llama_context_ptr    ctx;
     std::vector<float>   logits; // N_PROBE * n_vocab
+    bool                held = true;
+};
+
+// Canonicalize physical placement without discarding older held cells. Use the production
+// row serializers; the ordinary range API intentionally masks those cells and cannot test them.
+struct llama_kv_cache_state_test {
+    static std::vector<uint8_t> swa_rows(const llama_kv_cache * cache, bool held) {
+        cache->state_write_prepare();
+        const uint32_t stream = cache->seq_to_stream[0];
+        const auto & cells = cache->v_cells[stream];
+        std::vector<std::pair<llama_pos, uint32_t>> order;
+        for (uint32_t i = 0; i < cells.size(); ++i) {
+            if (cache->state_write_includes_cell(cells, i, 0, held)) {
+                order.emplace_back(cells.pos_get(i), i);
+            }
+        }
+        std::sort(order.begin(), order.end());
+        GGML_ASSERT(!order.empty());
+        llama_kv_cache::cell_ranges_t cr { stream, {} };
+        for (const auto & cell : order) {
+            if (!cr.data.empty() && cr.data.back().second == cell.second) {
+                cr.data.back().second++;
+            } else {
+                cr.data.emplace_back(cell.second, cell.second + 1);
+            }
+        }
+        row_collector out;
+        const uint32_t count = order.size();
+        out.write(&count, sizeof(count));
+        cache->state_write_meta(out, cr, 0);
+        cache->state_write_data(out, cr);
+        return out.buf;
+    }
 };
 
 static bool decode(llama_context * ctx, const std::vector<llama_token> & tokens, int p0, int p1, llama_seq_id seq, int n_batch) {
@@ -113,11 +147,16 @@ int main(int argc, char ** argv) {
     const std::vector<llama_token> tokens = common_tokenize(llama_init->context(), text, true);
 
     const llama_context_params cparams = common_context_params_to_llama(params);
+    const int wrapped_n = std::min<int>(4*n_swa + 137, params.n_ctx - N_OFFSET - N_PROBE - n_batch);
+    if (wrapped_n <= n_swa) {
+        fprintf(stderr, "FAILED - increase context size to exercise a wrapped window\n");
+        return 1;
+    }
 
     bool ok = true;
 
     // under the window the restored layout is the live one; over it the live ring has wrapped
-    for (const int n : { n_swa/2, std::min<int>(4*n_swa + 137, params.n_ctx - N_OFFSET - N_PROBE - n_batch) }) {
+    for (const int n : { n_swa/2, wrapped_n }) {
         GGML_ASSERT((int) tokens.size() >= n + N_PROBE);
         fprintf(stderr, "\n== %d tokens, window %d ==\n", n, n_swa);
 
@@ -143,6 +182,7 @@ int main(int argc, char ** argv) {
         // Over the window the held-cells tail fills the window cache, so the ranged +M arm has no room.
         auto add_restored = [&](const std::string & name, bool ranged, int offset) {
             arm a = { name, llama_context_ptr(llama_init_from_model(model, cparams)), {} };
+            a.held = ranged;
             llama_context * ctx = a.ctx.get();
             GGML_ASSERT(ctx);
             if (offset > 0) {
@@ -153,10 +193,19 @@ int main(int argc, char ** argv) {
                   llama_state_seq_set_data_ext(ctx, tail.data(), tail.size(), 0, TAIL_FLAGS) == tail.size()
                 : llama_state_seq_set_data(ctx, whole.data(), whole.size(), 0) == whole.size();
             if (!placed) {
-                fprintf(stderr, "%-22s could not be placed, arm dropped\n", name.c_str());
+                const bool optional = ranged && offset > 0 && n > n_swa;
+                fprintf(stderr, "%-22s could not be placed: %s\n", name.c_str(),
+                        optional ? "optional wrapped offset control skipped" : "FAILED required restore");
+                ok = ok && optional;
                 return;
             }
             llama_memory_seq_rm(llama_get_memory(ctx), 1, -1, -1);
+            if (ranged) {
+                const auto * restored_swa = iswa_of(ctx)->get_swa();
+                const auto * live_swa = iswa_of(live)->get_swa();
+                ok = ok && restored_swa->seq_pos_min(0) == live_swa->seq_pos_min(0) &&
+                           restored_swa->seq_pos_max(0) == live_swa->seq_pos_max(0);
+            }
             arms.push_back(std::move(a));
         };
         add_restored("restored whole",     false, 0);
@@ -164,20 +213,22 @@ int main(int argc, char ** argv) {
         add_restored("restored whole +M",  false, N_OFFSET);
         add_restored("restored ranged +M", true,  N_OFFSET);
 
-        // rows over the positions every arm holds
-        llama_pos swa_min = 0;
-        for (const arm & a : arms) {
-            swa_min = std::max(swa_min, iswa_of(a.ctx.get())->get_swa()->seq_pos_min(0));
-        }
+        // Whole-state restore owes the normal window; range+held-tail owes all held cells.
         const std::vector<uint8_t> base_rows = rows(iswa_of(live)->get_base(), 0, n);
-        const std::vector<uint8_t> swa_rows  = rows(iswa_of(live)->get_swa(), swa_min, n);
-        fprintf(stderr, "rows compared: base [0, %d) %zu bytes, window cache [%d, %d) %zu bytes\n",
-                n, base_rows.size(), swa_min, n, swa_rows.size());
+        const auto window_rows = llama_kv_cache_state_test::swa_rows(iswa_of(live)->get_swa(), false);
+        const auto held_rows = llama_kv_cache_state_test::swa_rows(iswa_of(live)->get_swa(), true);
+        if (n > n_swa && held_rows.size() <= window_rows.size()) {
+            fprintf(stderr, "FAILED - wrapped control has no older held rows to test\n");
+            ok = false;
+        }
+        fprintf(stderr, "rows compared: base [0, %d) %zu bytes, window %zu bytes, all held %zu bytes\n",
+                n, base_rows.size(), window_rows.size(), held_rows.size());
 
         for (arm & a : arms) {
             llama_kv_cache_iswa * mem = iswa_of(a.ctx.get());
             const bool same_base = rows(mem->get_base(), 0, n)       == base_rows;
-            const bool same_swa  = rows(mem->get_swa(),  swa_min, n) == swa_rows;
+            const bool same_swa = llama_kv_cache_state_test::swa_rows(mem->get_swa(), a.held) ==
+                                  (a.held ? held_rows : window_rows);
             const llama_pos held = mem->get_swa()->seq_pos_min(0);
 
             a.logits.resize((size_t) N_PROBE*n_vocab);
@@ -188,6 +239,12 @@ int main(int argc, char ** argv) {
 
             // against the live arm: same-token logits at every probe
             const std::vector<float> & ref = arms[0].logits;
+            const bool finite = std::all_of(a.logits.begin(), a.logits.end(),
+                                            [](float x) { return std::isfinite(x); });
+            if (!finite) {
+                fprintf(stderr, "%s: FAILED nonfinite logits\n", a.name.c_str());
+                ok = false;
+            }
             float  max_abs   = 0.0f;
             double max_kld   = 0.0;
             int    n_top1    = 0;

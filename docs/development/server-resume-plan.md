@@ -705,8 +705,9 @@ Still required before moving on:
   old base state to a newly computed unrelated recurrent frontier. Include
   `cache_prompt:false` as a negative control.
   Done by bytes (contract §4 step 3): an object is reused only when the live
-  range or tail serializes to its size and checksum, an `early` tail only over
-  chunks that do. Gates: cold refill under a fine-tune after a family restore
+  range or tail serializes to its size and checksum. The re-review removed
+  disk-only `early` reuse: base bytes cannot authenticate partial state. Early
+  checkpoints now come from the validated live ring. Gates: cold refill under a fine-tune after a family restore
   saves the fine-tune's bytes; an inherited append and a restart after it keep
   the producer's chunks. Known cost: the range blob names the sequence id, so a
   conversation that comes back in another slot is rewritten once.
@@ -744,19 +745,24 @@ Still required before moving on:
   (slot files are off under dynamic VBR, the host restore declines an exhausted
   destination before importing), so the test is at the library API. It becomes
   a server path when resume takes dynamic VBR.
-- [x] **Wrapped SWA fidelity:** establish the cause with exact row/position
+- [x] **Wrapped SWA state fidelity:** establish the cause with exact row/position
   comparisons and same-token logits. Different batch sizes and coherent output
   are not an acceptance substitute.
-  Done: `tests/test-state-restore-swa-exact.cpp` on Gemma-4 E2B (window 512,
-  f16 and q8_0 KV). Every restored K/V row, read back by position from both
-  caches, equals the live row bit for bit, below the window and across a
+  Re-reviewed: `tests/test-state-restore-swa-exact.cpp` on Gemma-4 E2B (window 512,
+  f16, q8_0 and turbo3_tcq KV). All saved rows, including older held rows on the
+  ranged route, read back by position from both caches, equal the live rows bit for bit, below the window and across a
   wrapped ring of 2185 tokens, for the whole-sequence restore and for the
   resume route. Two live runs give bit-equal logits. Same-token logits after
   a wrapped restore differ (max KLD 7e-9, top-1 8/8); the control reproduces
   that below the window with exact rows moved 200 cells along (max KLD 2e-6),
   where an unmoved restore is logit-exact. The cause is cell placement, which
   changes the attention kernels' reduction order and padding, not restored
-  data. Matching the live ring's layout on restore is not planned.
+  data in that comparison. The original test excluded older held-row payloads;
+  the re-review covers those too and requires successful zero-offset restores,
+  held-position bounds and finite logits. Failed arms can no longer silently
+  disappear. Matching the live ring's layout on restore
+  is not planned. The TCQ server continuation difference is still a limitation,
+  not a passing fidelity gate.
 - [x] **Qualification:** repeat dense/hybrid restart, rewind, sleep/wake and
   media gates after cleanup; verify missing-entry action leaves a live slot
   intact, host-cache overflow, resume-off PP/TG, and interrupted replacements.
@@ -795,3 +801,35 @@ Still required before moving on:
   inventory is added. Still deferred, and not covered by any P2 result:
   host-only conversations at shutdown, dynamic VBR, drafter and speculative
   companions, non-POSIX platforms.
+
+### Re-review of `7502c100a`
+
+The second independent review found and corrected three remaining cases:
+
+- Optional disk-only early tails could survive a cold refill without proof of
+  recurrent/SWA identity. Early now comes from a validated live checkpoint.
+  This trades indefinite historical checkpoint retention for a sound identity
+  rule; ordinary inherited chunks and live inherited checkpoints still reuse
+  their objects.
+- Erase ignored filesystem errors. Retirement now requires a durable uncommit,
+  preserves the live slot on failure, and retries a failed directory sync even
+  after the commit was unlinked. HTTP errors do not expose storage paths.
+- Unslotted entries could outrank an older live entry under the overall cap.
+  Live slots now have first priority; the same per-key and total caps apply.
+
+The SWA test now compares all held rows and requires every normal restore arm.
+Mutation controls demonstrate why this matters: the previous test succeeded
+when range append was forcibly refused and when older held rows were omitted;
+the revised test fails both controls. F16, Q8 and TCQ 3-bit pass the real
+state/finite-logit gates on Gemma-4 E2B. The known TCQ free-generation difference
+is not reclassified as an exact continuation pass.
+
+Fresh CUDA SM86 build: store unit test, 16 focused server gates (including
+failed unlink, repeated failed directory sync, disk bounds and interrupted
+replacement), and dense/hybrid range-state tests pass. The new early-tail and
+erase-unlink controls fail on `7502c100a` and pass with the fixes. Peak allocated
+bytes for the edited/replaced-history gates remain about 794 MB, not two
+inventories. No wire-format change, new flag, or inference-path optimization.
+The hardened Python harness also passes restart, rewind, sleep/wake,
+smaller-context, fewer-slot and host-overflow scenarios on dense and hybrid
+models. Failed requests and empty outputs are now errors, not matching results.

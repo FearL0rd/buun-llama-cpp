@@ -5140,6 +5140,7 @@ private:
         size_t n_keep_key;
         size_t n_keep_total;
         std::set<std::string> held;
+        std::set<std::string> live;
     };
 
     resume_retention_t resume_retention(size_t n_new) const {
@@ -5147,7 +5148,9 @@ private:
         keep.held = resume_unslotted;
         size_t n_slotted = n_new;
         for (const auto & slot : slots) {
-            n_slotted += !slot.resume_entry_id.empty() && keep.held.insert(slot.resume_entry_id).second;
+            if (!slot.resume_entry_id.empty()) {
+                n_slotted += keep.live.insert(slot.resume_entry_id).second;
+            }
         }
         keep.n_keep_key   = slots.size() - std::min(slots.size(), n_slotted);
         keep.n_keep_total = std::max<size_t>(8, 4*slots.size()) - n_new;
@@ -5156,7 +5159,7 @@ private:
 
     void resume_prune(size_t n_new) {
         const auto keep = resume_retention(n_new);
-        resume_store->prune(resume_key_hex, keep.n_keep_key, keep.n_keep_total, keep.held);
+        resume_store->prune(resume_key_hex, keep.n_keep_key, keep.n_keep_total, keep.held, keep.live);
     }
 
     // the conversation of the slot's entry is no longer in the slot. It lives on in the host
@@ -5170,18 +5173,43 @@ private:
 
     // Explicit erase ends the conversation on disk as well. Its entry, which need not be the one
     // the slot saved into last: that may be of the conversation the slot held before.
-    void resume_retire(server_slot & slot) {
+    bool resume_retire(server_slot & slot, std::string & error) {
         if (!resume_active()) {
-            return;
+            return true;
+        }
+        // A previous erase may have unlinked the commit but failed to sync its directory.
+        // Retry that durability step even though entry matching can no longer find it.
+        if (!slot.resume_entry_id.empty()) {
+            server_resume_manifest previous;
+            if (resume_store->read_manifest(slot.resume_entry_id, previous, error) == server_resume_reason::object_missing) {
+                if (resume_store->uncommit(slot.resume_entry_id, error) != server_resume_reason::ok) {
+                    resume_log({{"event", "retire"}, {"outcome", "failed"}, {"slot", slot.id}, {"error", error}});
+                    return false;
+                }
+                resume_store->remove_entry(slot.resume_entry_id);
+                resume_unslotted.erase(slot.resume_entry_id);
+                slot.resume_entry_id.clear();
+            }
         }
         const std::string entry = slot.prompt.n_tokens() == 0 ? std::string() :
             resume_entry_of(slot, slot.prompt.tokens, resume_adapter_hex(slot));
+        // Keep the selected conversation's identity if durable retirement needs a retry.
+        if (!entry.empty() && slot.resume_entry_id != entry) {
+            resume_release_entry(slot);
+            slot.resume_entry_id = entry;
+            resume_unslotted.erase(entry);
+        }
+        if (!entry.empty() && resume_store->uncommit(entry, error) != server_resume_reason::ok) {
+            resume_log({{"event", "retire"}, {"outcome", "failed"}, {"entry", entry}, {"slot", slot.id}, {"error", error}});
+            return false;
+        }
         resume_release_entry(slot);
         if (!entry.empty()) {
             resume_store->remove_entry(entry);
             resume_unslotted.erase(entry);
             resume_log({{"event", "retire"}, {"outcome", "removed"}, {"entry", entry}, {"slot", slot.id}});
         }
+        return true;
     }
 
     // The entry of the conversation in a slot: the one whose chunks, but for the last, lead the
@@ -5189,11 +5217,13 @@ private:
     // cache or was sent again. A shared first chunk does not make two conversations one.
     std::string resume_entry_of(
             const server_slot & slot, const server_tokens & ids, const std::string & adapter_hex) const {
+        const auto compatible = [&](const server_resume_manifest & old) {
+            return old.resume_key == resume_key_hex && old.adapter_identity == adapter_hex &&
+                   old.chunk_tokens == RESUME_CHUNK_TOKENS;
+        };
         const auto n_leading = [&](const server_resume_manifest & old) {
             size_t n = 0;
-            if (old.resume_key == resume_key_hex &&
-                old.adapter_identity == adapter_hex &&
-                old.chunk_tokens == RESUME_CHUNK_TOKENS) {
+            if (compatible(old)) {
                 server_resume_prefix_hasher hasher(ids);
                 while (n < old.chunks.size() &&
                        old.chunks[n].p0 == int32_t(n)*RESUME_CHUNK_TOKENS &&
@@ -5209,7 +5239,7 @@ private:
             server_resume_manifest own;
             std::string error;
             if (resume_store->read_manifest(slot.resume_entry_id, own, error) == server_resume_reason::ok &&
-                n_leading(own) + 1 >= own.chunks.size()) {
+                compatible(own) && n_leading(own) + 1 >= own.chunks.size()) {
                 return slot.resume_entry_id;
             }
         }
@@ -5293,7 +5323,7 @@ private:
                 // entry that would not outlive this save leaves its leading chunks to the new one
                 const auto keep = resume_retention(1);
                 const auto due  = resume_store->victims(
-                    resume_key_hex, keep.n_keep_key, keep.n_keep_total, keep.held);
+                    resume_key_hex, keep.n_keep_key, keep.n_keep_total, keep.held, keep.live);
                 if (due.count(displaced)) {
                     slot.resume_entry_id = displaced;
                 }
@@ -5310,8 +5340,7 @@ private:
 
         // The same tokens can stand over another state: a cold refill, another model of the family,
         // a legacy restore. An object of the entry is reused only where it is the live state byte
-        // for byte, and what the entry holds beyond the live state (an early tail) only on top of
-        // chunks that are.
+        // for byte. Base-cache equality does not establish recurrent or SWA tail identity.
         std::vector<uint8_t> resume_staging; // one object; released on failures as well as success
         const auto stage_range = [&](const server_resume_object_record & rec, size_t size) {
             resume_staging.resize(size);
@@ -5331,22 +5360,18 @@ private:
 
         server_resume_manifest next;
         size_t  n_kept = 0;
-        int32_t n_live = 0; // tokens from 0 whose chunks in the entry are the live state
         {
             server_resume_prefix_hasher hasher(tokens);
             bool live = have_old;
             for (int32_t p0 = 0; p0 < n_tokens; p0 += RESUME_CHUNK_TOKENS) {
                 const int32_t p1 = std::min(n_tokens, p0 + RESUME_CHUNK_TOKENS);
                 const size_t i = size_t(p0/RESUME_CHUNK_TOKENS);
-                // the last chunk of the entry may be shorter than ours: not kept, but it counts
+                // Only complete matching chunks can be carried over.
                 live = live && i < old.chunks.size() &&
-                    old.chunks[i].p0 == p0 && old.chunks[i].p1 <= p1 &&
+                    old.chunks[i].p0 == p0 && old.chunks[i].p1 == p1 &&
                     old.chunks[i].prefix_digest == hasher.at(size_t(old.chunks[i].p1)) &&
                     chunk_is_live(old.chunks[i]);
                 if (live) {
-                    n_live = old.chunks[i].p1;
-                }
-                if (live && old.chunks[i].p1 == p1) {
                     next.chunks.push_back(old.chunks[i]);
                     n_kept++;
                     continue;
@@ -5392,12 +5417,6 @@ private:
                     oldest = &cp;
                 }
             }
-            std::vector<int32_t> held_positions;
-            for (const auto & rec : old.tail_states) {
-                held_positions.push_back(rec.pos());
-            }
-            std::sort(held_positions.begin(), held_positions.end());
-
             server_resume_prefix_hasher hasher(tokens);
             const auto add_checkpoint =[&](const common_prompt_checkpoint & cp, const char * role) {
                 tail_source src;
@@ -5410,28 +5429,10 @@ private:
                 src.checkpoint = &cp;
                 tails.push_back(std::move(src));
             };
-            const int32_t turn_pos = turn ? int32_t(turn->n_tokens) : n_tokens;
-
-            // early: the earliest tail the entry already holds whose prefix is still ours,
-            // else the slot's oldest checkpoint
-            bool have_early = false;
-            for (const int32_t pos : held_positions) {
-                if (pos >= turn_pos || pos > n_live) {
-                    break;
-                }
-                const auto * rec = held_tail(pos);
-                server_resume_prefix_hasher early_hasher(tokens);
-                if (rec->prefix_digest == early_hasher.at(size_t(pos))) {
-                    tail_source src;
-                    src.rec = *rec;
-                    src.rec.role = "early";
-                    src.held = true;
-                    tails.push_back(std::move(src));
-                    have_early = true;
-                    break;
-                }
-            }
-            if (!have_early && oldest && oldest != turn) {
+            // A disk-only early tail has no live identity witness. Equal base rows cannot
+            // prove it (pure recurrent models have no base rows at all). Use a live checkpoint;
+            // the byte comparison below still reuses its stored object when it is unchanged.
+            if (oldest && oldest != turn) {
                 add_checkpoint(*oldest, "early");
             }
             if (turn) {
@@ -5459,9 +5460,6 @@ private:
                     rec.holds(resume_staging.data(), size);
             };
             for (auto & src : tails) {
-                if (src.held) {
-                    continue;
-                }
                 src.rec.prefix_digest = hasher.at(size_t(src.rec.pos()));
                 const auto * rec = held_tail(src.rec.pos());
                 if (rec && rec->prefix_digest == src.rec.prefix_digest && tail_is_live(src, *rec)) {
@@ -17132,7 +17130,11 @@ private:
                     // Erase token cache
                     const size_t n_erased = slot->prompt.tokens.size();
 
-                    resume_retire(*slot);
+                    std::string error;
+                    if (!resume_retire(*slot, error)) {
+                        send_error(task, "Unable to erase resume entry (see server log)", ERROR_TYPE_SERVER);
+                        break;
+                    }
                     slot->prompt_clear();
 
                     auto res = std::make_unique<server_task_result_slot_erase>();

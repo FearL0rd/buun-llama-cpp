@@ -1662,6 +1662,7 @@ private:
 
     friend class llama_kv_cache_iswa;
     friend struct llama_kv_cache_vbr_epoch_test;
+    friend struct llama_kv_cache_state_test;
 
     // TurboQuant rotation matrices (128x128, row-major stored)
     ggml_tensor * turbo_rotation = nullptr;      // R (forward rotation)

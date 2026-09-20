@@ -255,15 +255,15 @@ Per nonempty slot, most recently used first:
    family the recomputed cells are another model's. Reading the ranges back
    costs 18 ms on a 9k-token hybrid 4B save (two 71 MB chunks and the short
    last one; 135 ms against 117 ms). A tail state that the slot still holds
-   (the frontier, a checkpoint) is compared the same way. The `early` tail has
-   no live counterpart once it left the ring, so it is kept only while every
-   chunk under its position, the entry's shorter last chunk included, is the
-   live state: the pair then is the state the entry held when both were
-   written, which is what a prefix restore installs. Measured: base model
+   (the frontier, a checkpoint) is compared the same way. An `early` tail is
+   selected only from validated live checkpoints. Once it leaves the live ring,
+   its disk-only copy is not retained: matching base chunks do not authenticate
+   recurrent/SWA state, and pure recurrent models have no base payload at all.
+   Measured: base model
    saves, a fine-tune restores and refills cold, its save holds the fine-tune's
    chunks and tails (the bytes of a fresh fine-tune save); the same restore
    followed by an ordinary turn, and a restart after it, keep the base model's
-   chunks and `early` tail.
+   chunks. An inherited early checkpoint is reusable while still in the live ring.
 
    Which entry is a different question from which bytes. The entry of a
    conversation is the one whose chunks, all but the last, lead the ledger: the
@@ -422,12 +422,10 @@ Tail states saved per entry on a model with a partial part:
    checkpoint. P0: the first request after a restart re-renders the last reply
    and rewinds behind `N` even with thinking off; without this companion a
    hybrid reprocesses the whole history and an SWA model has no valid rewind.
-3. `early` — at most one: the earliest tail state the entry already holds whose
-   `prefix_digest` still matches and whose chunks below it are still the live
-   state (§4 step 3), otherwise the slot's oldest retained
-   checkpoint. Once persisted it outlives the live ring, so a conversation that
-   has been saved since its start keeps a checkpoint near its preamble. It is
-   what a partial-prefix restore into a smaller context lands on.
+3. `early` — at most one: the slot's oldest validated live checkpoint, when
+   distinct from `turn`. It can support a partial-prefix restore into a smaller
+   context. A subsequent save drops it once it leaves the live ring; preserving
+   disk-only early history would require a separate proof of state lineage.
 
 Budget: tail states 2 and 3 only. Each costs the model's fixed partial size
 (52.7 MB on a 4B hybrid, 156.9 MB on a 27B; 6 MiB on the measured SWA model),
@@ -638,14 +636,16 @@ entries that were live slots.
 
 Properties and limits of v1, as measured:
 
-- **A restored SWA conversation above the window is row-exact, not
+- **The measured SWA restored state is row-exact, not
   logit-exact.** `tests/test-state-restore-swa-exact.cpp` (Gemma-4 E2B, window
-  512, f16 and q8_0 KV) reads every K/V row back by position from both caches.
+  512, f16, q8_0 and turbo3_tcq KV) reads K/V rows back by position from both caches.
   After a whole-sequence restore and after the resume route (range append plus
-  the held-cells tail), across a wrapped ring of 2185 tokens, each row equals
-  the live row bit for bit. Two live runs give bit-equal logits, so nothing in
+  the held-cells tail), across a wrapped ring of 2185 tokens, each saved row
+  equals the live row bit for bit. The ranged route includes every older held
+  row, not just the shared attended window. Required restore arms must succeed,
+  and nonfinite logits fail the test. Two live runs give bit-equal logits, so nothing in
   the comparison is run-to-run noise. The logits of the same eight next tokens
-  still differ from live (max KLD 7e-9, top-1 8/8), and the control shows why:
+  still differ from live (f16 max KLD 7e-9, top-1 8/8), and the control shows why:
   below the window, where a restore is otherwise logit-exact, the same exact
   rows placed 200 cells further along differ by as much (max KLD 2e-6, top-1
   8/8). A restore compacts the sequence to the front of the cache while the

@@ -539,8 +539,8 @@ server_resume_reason server_resume_store::uncommit(const std::string &, std::str
 }
 
 void server_resume_store::remove_entry(const std::string &) const {}
-std::set<std::string> server_resume_store::victims(const std::string &, size_t, size_t, const std::set<std::string> &) const { return {}; }
-void server_resume_store::prune(const std::string &, size_t, size_t, const std::set<std::string> &) const {}
+std::set<std::string> server_resume_store::victims(const std::string &, size_t, size_t, const std::set<std::string> &, const std::set<std::string> &) const { return {}; }
+void server_resume_store::prune(const std::string &, size_t, size_t, const std::set<std::string> &, const std::set<std::string> &) const {}
 uint64_t server_resume_store::free_bytes() const { return 0; }
 
 #else
@@ -981,9 +981,19 @@ server_resume_reason server_resume_store::uncommit(const std::string & id, std::
         return server_resume_reason::io_error;
     }
     const std::string directory = entry_dir(id);
+    const auto injected = fault_at("uncommit");
+    if (injected != server_resume_reason::ok) {
+        error = "injected fault at uncommit";
+        return injected;
+    }
     if (unlink((directory + "/commit").c_str()) != 0 && errno != ENOENT) {
         error = errno_text("cannot remove", directory + "/commit", errno);
         return server_resume_reason::io_error;
+    }
+    const auto sync_failure = fault_at("uncommit_sync");
+    if (sync_failure != server_resume_reason::ok) {
+        error = "injected fault at uncommit_sync";
+        return sync_failure;
     }
     if (!sync_dir(directory)) {
         // A known entry may already have been removed by retention. Erasing it is
@@ -1014,17 +1024,18 @@ void server_resume_store::remove_entry(const std::string & id) const {
 static std::set<std::string> retained(
         const std::vector<server_resume_entry> & entries,
         const std::string & resume_key, size_t n_keep_key, size_t n_keep_total,
-        const std::set<std::string> & held) {
+        const std::set<std::string> & held, const std::set<std::string> & live) {
     std::set<std::string> keep;
     size_t n_of_key = 0;
-    for (const bool pass_held : {true, false}) {
+    for (const int priority : {0, 1, 2}) {
         for (const auto & entry : entries) {
+            const int entry_priority = live.count(entry.id) ? 0 : held.count(entry.id) ? 1 : 2;
             // a manifest of a newer format may be of use to the server that wrote it, a damaged one to nobody
             if (entry.reason == server_resume_reason::manifest_corrupt || keep.size() >= n_keep_total ||
-                pass_held != (held.count(entry.id) > 0)) {
+                priority != entry_priority) {
                 continue;
             }
-            if (pass_held || entry.manifest.resume_key != resume_key || n_of_key++ < n_keep_key) {
+            if (priority < 2 || entry.manifest.resume_key != resume_key || n_of_key++ < n_keep_key) {
                 keep.insert(entry.id);
             }
         }
@@ -1034,9 +1045,9 @@ static std::set<std::string> retained(
 
 std::set<std::string> server_resume_store::victims(
         const std::string & resume_key, size_t n_keep_key, size_t n_keep_total,
-        const std::set<std::string> & held) const {
+        const std::set<std::string> & held, const std::set<std::string> & live) const {
     const auto entries = list();
-    const auto keep = retained(entries, resume_key, n_keep_key, n_keep_total, held);
+    const auto keep = retained(entries, resume_key, n_keep_key, n_keep_total, held, live);
     std::set<std::string> drop;
     for (const auto & entry : entries) {
         if (!keep.count(entry.id)) {
@@ -1048,8 +1059,8 @@ std::set<std::string> server_resume_store::victims(
 
 void server_resume_store::prune(
         const std::string & resume_key, size_t n_keep_key, size_t n_keep_total,
-        const std::set<std::string> & held) const {
-    const auto keep = retained(list(), resume_key, n_keep_key, n_keep_total, held);
+        const std::set<std::string> & held, const std::set<std::string> & live) const {
+    const auto keep = retained(list(), resume_key, n_keep_key, n_keep_total, held, live);
 
     std::error_code ec;
     std::vector<std::string> drop;
