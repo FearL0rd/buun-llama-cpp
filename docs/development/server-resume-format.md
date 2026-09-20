@@ -1,7 +1,8 @@
 # Persistent server resume — format and install contract (P1)
 
-Status: **design contract for P2**. Implemented so far: the shutdown flag and
-the library calls of §3 and the store of §2 (§10 items 1 to 3).
+Status: **contract, implemented through P2** (§10 items 1 to 5, with the
+measured results and the limits of v1 there). Where the build differs from the
+first design the text says "as built".
 Companion of `server-resume-plan.md` (objective, P0 results, phases). Frozen
 2026-09-20 against `exp/server-resume`. Line anchors are from that branch; use the
 symbols when lines move. Independent review is deferred by the maintainer until a
@@ -199,8 +200,28 @@ Two findings that shape the server side:
   full state. The server decides "has a partial part" itself:
   `llama_model_is_hybrid || llama_model_is_recurrent || llama_model_n_swa > 0`.
 - The SWA partial blob is an ordinary KV-cache blob and carries `n_stream`. It
-  does **not** install across stream layouts. `kv_unified` therefore stays in
-  the resume key (§5). Recurrent partial blobs have no such word.
+  does **not** install across stream layouts. On a model with SWA the stream
+  count is therefore part of the resume key (§5). Recurrent partial blobs have
+  no such word, so dense and hybrid entries move between slot counts.
+
+One flag was added for the `frontier` tail state of an SWA model:
+
+```c
+// write every cell the sequence still holds in an SWA cache, not only the cells
+// inside the attention window
+#define LLAMA_STATE_SEQ_FLAGS_SWA_HELD_CELLS 4
+```
+
+The default SWA image holds exactly the window. The server's reuse check is more
+conservative than the window (`pos_min` must lie below
+`pos_next - n_swa`, minus one when the request brings no new token), so a restored
+exact-window image fails it on the first request and falls back to a checkpoint,
+reprocessing the turn since. The live cache passes the check because it still
+holds older cells. With the flag the frontier image carries those cells and the
+restored slot behaves as the live one did: measured on a 9k conversation, the
+first request after a restart reuses all 9047 tokens. The flag is additive and
+off by default; context checkpoints and the legacy slot files keep the
+exact-window image.
 
 ## 4. Capture (read-only)
 
@@ -240,8 +261,13 @@ If the preflight says even that does not fit, the writer removes `commit` first
 that entry, which is the agreed trade. Other entries are never touched.
 
 Retention, with no knob: after the live slots are committed the namespace keeps
-at most `n_parallel` entries, newest `last_used` first, whatever their resume
-key; the rest are unlinked. An entry is not deleted merely because its
+at most `n_parallel` entries of this server's resume key, newest `last_used`
+first, and at most `max(8, 4 × n_parallel)` entries overall; the rest are
+unlinked. Entries of another key (a different KV type, another stream count on
+an SWA model) cannot be read by this server and say nothing about its
+conversations, so only the overall bound ends them: a run under other settings
+does not delete what the usual settings saved. An entry is not deleted merely
+because its
 conversation is not in a slot at save time. With unified KV and several slots
 this is what keeps the conversations that were evicted to the host cache during
 the run: their entries from the previous start survive, stale by the turns made
@@ -269,7 +295,7 @@ SHA-256, domain `buun.server.resume-compat/v1`, over:
 | Control vectors | state-affecting, like adapters |
 | `swa_full` | changes which SWA cells exist |
 | mmproj presence | conservative while media is unsupported |
-| `kv_unified` | the SWA partial blob records the stream count (§3); base chunks alone would not need it |
+| Stream count, on a model with SWA only (1 under unified KV, else `n_parallel`; 0 without SWA) | the SWA partial blob records it (§3). Base chunks and recurrent partial blobs do not, so a dense or hybrid conversation saved under `-np 2` continues under `-np 1`, measured bit-exact |
 
 | Left out | Becomes |
 |---|---|
@@ -334,9 +360,11 @@ start; it never fails the load and never leaves half a slot.
    p_limit = p)`. Then the tail state at `p`, if the model has a partial part,
    through `llama_state_seq_set_data_ext(PARTIAL_ONLY)`.
    If the cache runs out of cells part-way (unified KV shares them between
-   slots): a dense model keeps the complete chunks it has; a model with a partial
-   part clears the sequence and retries once at the largest tail-state position
-   inside what did fit. No rewind of installed state is involved either way.
+   slots), or an object fails its check: a dense model keeps the complete chunks
+   it has; a model with a partial part clears the sequence and retries at the
+   largest tail-state position inside what did fit, and so on down the tail
+   states. The outcome names the first failure as its `why`. No rewind of
+   installed state is involved either way.
 5. Establish the slot exactly as `SLOT_RESTORE` does after a successful state
    install (frontier-record invalidation, recovery-reset bookkeeping, ledger
    truncated to `p`, fresh sequence epoch, retention publication), with no
@@ -391,6 +419,7 @@ One log line and one `/slots` field per entry. The string
 | `companion_missing` | a model with a partial part and no tail state at or below the fit position |
 | `context_too_small` | no restorable position fits |
 | `no_free_slot` | more entries than slots |
+| `entry_in_use` | the restore action named an entry another slot was restored from or saved as; two slots never write one entry |
 | `state_rejected` | the library refused a blob (type, shape, TCQ fingerprint) |
 | `unsupported_media`, `unsupported_vbr`, `unsupported_qsa`, `unsupported_positions`, `frontier_inconsistent` | capture-side skips, logged at save |
 | `store_locked`, `store_unwritable`, `no_space`, `io_error` | store level; the server runs without persistence |
@@ -404,6 +433,15 @@ route never reads a manifest. Empty slots are skipped without a line.
 library file under `--slot-save-path` and takes the unchanged legacy route; a
 `resume_entry` id is resolved inside the resume namespace and takes steps 3–7
 above. That endpoint is the restart-free test entry for the installer.
+
+As built: `POST /slots/<id>?action=restore` with `{"resume_entry": "<32 hex>"}`
+is accepted whenever the server runs with `--resume`, with or without
+`--slot-save-path`. A body carrying both `resume_entry` and `filename`, or an id
+that is not 32 hex digits, is a 400. The slot is cleared first, as a legacy
+restore does. The response is the usual restore result plus a `resume` object
+holding the outcome of this section; a missing entry is `skipped` /
+`object_missing` with the slot left empty. Paths of the
+host appear in the server log only, never in the response.
 
 ## 9. Install route: recommendation and alternative
 
@@ -442,8 +480,52 @@ entries that were live slots.
    object is published, kill between objects and manifest).
    `test-server-resume-store`: after each stopped write a reopened store lists
    the previous generation and every object of it verifies.
-4. Capture and install in the server, `--resume`, the `resume_entry` restore
-   action, reason codes.
-5. Sleep/wake as the first end-to-end test; then restart on a dense, a hybrid and
-   an SWA model: pure append, rewind, smaller context, fewer slots, changed
-   producer.
+4. **Done.** Capture and install in the server, `--resume`, `--resume-path`
+   (default: the llama.cpp cache directory), the `resume_entry` restore action,
+   reason codes, the held-cells flag of §3. Self-tests of the v3 envelope in
+   `test-server-prompt-cache`: ledger round trip, logits refused, the legacy and
+   the resume route refuse each other's envelopes, a changed key is
+   `resume_key_mismatch`.
+5. **Done**, single RTX 3090, TCQ 3-bit KV, 9k-token conversation, greedy
+   continuations compared token for token with the same conversation in one
+   process:
+
+   | | dense 0.6B | hybrid 4B | SWA (Gemma E2B) | hybrid 27B + MTP |
+   |---|---|---|---|---|
+   | entry size | 211 MB | 218 MB, 3 tail states | 16.5 MB | 582 MB |
+   | save at shutdown | 0.19 s | 0.20 s | 0.09 s | 0.43 s |
+   | install at startup | 54 ms | 70 ms | 4.6 ms | 184 ms (prefill: 9.6 s) |
+   | restart, sleep/wake, restore action | identical | identical | see below | identical |
+   | rewind | identical | identical | identical | |
+   | smaller context | prefix at 4607 | `context_too_small` (no tail state fits) | | |
+   | `-np 2` → `-np 1` | identical | identical | `resume_key_mismatch` by design | |
+   | second save after one more turn | 28 MB | 113 MB | | 319 MB |
+
+   A save killed part-way (SIGKILL 0.10–0.15 s after SIGTERM) leaves no entry on
+   a first save and the previous generation on a later one; the next start
+   installs that generation, continues identically and sweeps the leftovers.
+
+   With MTP the restored turn is text-identical; draft acceptance of that turn
+   is 0.89 against 0.96 in one process (code prompt, thinking off), because no
+   drafter state is saved and the draft context refills as the turn runs.
+
+Properties and limits of v1, as measured:
+
+- **SWA continuations are equivalent, not bit-identical, once the conversation
+  is longer than the window.** Below the window a restored conversation is
+  bit-identical. Above it the restored cells sit contiguously where the live
+  ring had wrapped, which changes the summation order of attention. The top-10
+  log-probabilities of the next turn differ from the one-process run by as much
+  as the same conversation differs from itself under another `-ub` (both with
+  f16 and with TCQ KV); the top token agreed at every probed position. A long
+  greedy continuation can therefore diverge, as it does between two batch
+  sizes. Dense and hybrid models restore bit-identically.
+- A prefix install on a model with a partial part lands only on a tail-state
+  position, so it needs an `early` or `turn` state inside the smaller context.
+- Every save of a hybrid conversation rewrites the frontier and turn states
+  (two partial images), whatever the number of new tokens.
+- A restart with fewer slots keeps only that many entries of its key (§4): the
+  conversations that did not get a slot are dropped at the next save.
+- Conversations that live only in the host prompt cache at shutdown are not
+  saved (P4).
+- Slots with media, dynamic VBR and a QSA index are skipped with a reason.
