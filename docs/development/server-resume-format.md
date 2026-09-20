@@ -1,0 +1,408 @@
+# Persistent server resume — format and install contract (P1)
+
+Status: **design contract for P2; nothing here is implemented**.
+Companion of `server-resume-plan.md` (objective, P0 results, phases). Frozen
+2026-09-20 against `exp/server-resume`. Line anchors are from that branch; use the
+symbols when lines move. Independent review is deferred by the maintainer until a
+working product exists (one review is planned before the VBR phase), so every
+statement below is the author's reading of the code, not a reviewed result.
+
+Scope of v1: fixed-type KV (f16, q8_0, turbo, TCQ), dense, hybrid-recurrent and
+SWA/iSWA text models, one entry per conversation, direct install into a slot.
+Out of scope and refused with a reason: media slots, dynamic VBR (P3), drafter
+state (never saved), adapter changes between producer and consumer (P4).
+
+## 1. Review of the real owners
+
+What P0 and the P1 code reading established, and what the design takes from it.
+
+| Owner | Fact | Consequence |
+|---|---|---|
+| Library sequence-state file (`llama-context.cpp`, file v3) | 24-byte header with the declared total size and one FNV-1a-64 over the whole payload; `llama_state_seq_file_snapshot_prepare` reads the whole file into host memory and hashes it before anything is installed; the writer buffers the whole payload, publishes by rename, no `fsync` | Integrity exists but is all-or-nothing: no appending, no partial read, no bounded staging, no durability. A resume entry cannot live in this container |
+| Per-sequence state blob (`llama_kv_cache::state_write`) | `n_stream`; per stream `cell_count`, a meta block (per cell `pos`, seq ids, optional ext), then per layer the K rows and the V rows of all written cells, then a TCQ footer when a TCQ type is present. Rows are contiguous per layer. Cells are written in cell-index order, which is not guaranteed to be position order | A token range is expressible as the same layout restricted to the cells of that range. No new blob grammar is needed, only a range filter and an ordering rule |
+| Single-sequence reader (`state_read_meta`) | Clears the destination sequence first, places all `cell_count` cells through `find_slot`, all-or-nothing; validates layer count, `v_trans`, per-layer type and row size, TCQ fingerprint | Installing a second chunk needs an append mode that does not clear the sequence. The structural checks stay the single authority for "does this blob fit this cache" |
+| Composite memories (hybrid, iSWA, hybrid-iSWA and relatives) | Write the base part (full-attention KV) unless `LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY`, then always the partial part (recurrent state, SWA cache) | The base part is position-addressable and chunkable. The partial part is a point-in-time image: it is valid only at the position where it was taken. A server context checkpoint is exactly such an image |
+| Slot semantic envelope `BUUNSLOT` v2 (`server-context.cpp`) | 224-byte header: counts, next position, five SHA-256 digests (runtime identity, adapter identity, token digest, serialized tokens, logits), then the serialized `server_tokens`, then optional logits. The parser refuses any other version, header size or unknown flag bit with `format_mismatch` | Reused as the entry's token ledger at version 3. Older builds refuse a v3 envelope at the header |
+| Slot runtime identity (`buun.server.slot-file-runtime-identity/v2`) | Hashes the build label, context sizes, slot layout and index next to the family digest and the KV settings; any difference reports `model_family_mismatch` | Resume needs its own key (§5) and its own reason codes (§8). The legacy identity is not changed |
+| `SERVER_TASK_TYPE_SLOT_RESTORE` | Defers while the slot is processing; parses the envelope; installs state; on failure runs `mandatory_recovery_reset(restore_failure)`; on success invalidates the frontier record, runs the slot's recovery-reset bookkeeping (drops the destination's checkpoints and draft state), sets the ledger, publishes the slot to the retention observer. It installs no checkpoints | This is the establishment path the resume installer reuses for the slot. Checkpoints need a second, existing door (next row) |
+| Host-cache restore (`server_prompt_cache::commit_restore_delivery`, `server_prompt_cache_mirror_restore_retention`) | Delivers a whole `server_prompt` (tokens and checkpoints) to the slot, then admits the checkpoints as a batch through the publish authority (`admit_live_checkpoints`) and attaches their release operations on the retention observer. Fail-closed: checkpoints that cannot be admitted are retired and dropped, the restore still stands | The owner door for imported checkpoints. Resume does not insert into `slot.prompt.checkpoints` by hand |
+| Checkpoint validity (`checkpoint_frontier_is_current`) | A checkpoint is usable only if its computation frontier carries this process's execution identity (random per model load), the slot's current sequence epoch, the current adapter identity, and token/position counts equal to the checkpoint's | A checkpoint read from disk can never pass as saved. Import is a named provenance transition that re-stamps it (§7) |
+| `SERVER_TASK_TYPE_SLOT_SAVE` | Mutates: a one-token target decode to align frontier logits, clears the draft sequence, resets the DFlash ring | Resume capture is a separate read-only path. It saves no logits |
+| Shutdown (`server.cpp`) | The inference loop returns, then `clean_up()` destroys the context. HTTP threads are still alive in between. A second signal exits from the handler. The router force-kills a child after 10 s | Save hook sits between the two. Per-entry commit, most recently used entry first, so a forced kill loses the tail of the list, not the store |
+| Sleep (`handle_sleeping_state`, `load_model`) | State is destroyed on sleep and the model reloaded on wake inside one process | Same save and restore calls; the first P2 integration test, no restart needed |
+| Streaming handlers (`server-http.cpp`) | A handler parked in the chunked provider is released only by the SSE ping timer (30 s) or a client disconnect | P2 prerequisite: a shutdown flag in the three `should_stop` closures. Without it a supervisor's grace period is spent waiting, not saving |
+| Durable I/O already in the tree | `llama-repack-cache.cpp`: `flock`, staged files, streamed hashing with `sync_write()` every 64 MiB, directory `fsync`, rename. `llama-vram-ledger.cpp`: 0700 directory with ownership check, stale-owner detection by pid and start time. `fs_get_cache_file` forbids subdirectories and `fs_create_directory_with_parents` creates 0755 | The store reuses these patterns behind its own root helper (0700 directories, 0600 files) on `fs_get_cache_directory()` |
+
+Correction to the plan's P0 notes: slot files do have a payload checksum (the
+library file header above). What is missing is a checksum on the raw state API and
+any integrity unit smaller than the whole file.
+
+## 2. Container: a directory of objects, manifest published last
+
+```text
+<fs_get_cache_directory()>/resume/<semantic-family-digest>/
+    writer.lock
+    entries/<entry-id>/
+        commit               manifest; atomic rename makes the entry visible
+        c-<p0>-<p1>-<gen>    base-state chunk for token positions [p0, p1)
+        t-<pos>-<gen>        tail state (recurrent / SWA part) taken at <pos>
+        tmp-*                staging; removed by the next writer
+```
+
+An entry is one conversation: one slot's sequence at one captured boundary.
+`<entry-id>` is 32 lowercase hex digits drawn at random when the conversation is
+first saved. `<gen>` is the manifest generation that wrote the object.
+
+Why not one file with appended chunks, which is how the chunk idea was first
+sketched: a single file needs its own extent allocator, a double commit record
+with torn-write reasoning, and truncation to give space back. With one object per
+file the filesystem is the allocator, `rename` is the commit, `unlink` returns
+space at once, and the existing repack-cache code is the template. Chunk overhead
+is unchanged (one 64-byte header and one block of rounding per ≈54 MB chunk on a
+27B TCQ cache, under 0.01 %). A 200k-token conversation is about 50 chunk files.
+A resume entry was never meant to be a portable single file (plan §6).
+
+Why not the library sequence file with a new envelope version inside it: see the
+first row of §1. The "header that declares a resume manifest" of plan §6 is
+therefore the manifest's own magic and version. Builds that predate it cannot
+open an entry at all: given a manifest by name they fail the library magic check.
+
+### 2.1 Object file (`c-*`, `t-*`)
+
+64-byte little-endian header, then the payload, nothing after it.
+
+| Offset | Size | Field |
+|---|---|---|
+| 0 | 8 | magic `BUUNRSMO` |
+| 8 | 4 | object format version = 1 |
+| 12 | 4 | header size = 64 |
+| 16 | 4 | kind: 1 = base chunk, 2 = tail state |
+| 20 | 4 | flags = 0 (unknown bits refuse the object) |
+| 24 | 8 | payload bytes |
+| 32 | 8 | XXH3-64 of the payload |
+| 40 | 4 | `p0` (chunk) or position (tail state) |
+| 44 | 4 | `p1` (chunk) or 0 |
+| 48 | 8 | manifest generation that wrote it |
+| 56 | 8 | XXH3-64 of bytes 0..55 |
+
+The file size must equal 64 + payload bytes. XXH3-64 (vendored under
+`vendor/hash`) detects corruption at memory-copy speed; SHA-256 stays the hash
+for identities. Neither authenticates: anyone who can write the store can forge
+it, as plan §6 already says.
+
+- **Base chunk payload** — the per-sequence state blob of §1 for the base part
+  only, restricted to cells with `p0 <= pos < p1`, **cells in ascending position
+  order**. Every chunk carries its own TCQ footer. Chunk boundaries are multiples
+  of `chunk_tokens` (4096 in v1, recorded per entry; a reader accepts any gapless
+  tiling). The last chunk of an entry may be short.
+- **Tail state payload** — the `LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY` blob of the
+  sequence taken when the sequence ended at `pos`. A server context checkpoint's
+  `data_tgt` is this blob already; the state at the captured boundary is the same
+  kind of image taken at save time. Dense models have no tail states.
+
+So for every model class an entry is *base chunks covering [0, N)* plus *tail
+states at some positions ≤ N*, and "the saved state" and "a checkpoint" stop being
+different things on disk:
+
+| Model class | Restorable positions |
+|---|---|
+| Dense | any `p <= N` |
+| Hybrid, SWA, hybrid-SWA | each `p` that has a tail state; `N` always has one |
+
+### 2.2 Manifest (`commit`)
+
+| Part | Content |
+|---|---|
+| Header, 64 bytes LE | magic `BUUNRSMM`, manifest format version = 1, header size, flags = 0, JSON bytes, ledger bytes, generation, XXH3-64 of JSON + ledger, XXH3-64 of the header |
+| JSON document | records below; UTF-8, at most 1 MiB, parsed with a depth limit |
+| Ledger | `BUUNSLOT` envelope **version 3**: the v2 layout, flag `RESUME_KEY_BOUND` (bit 2) set, `RUNTIME_FAMILY_BOUND` and `HAS_LOGITS` clear, the identity field holding the resume compatibility key (§5). The v3 parser accepts v2 only on the legacy route and v3 only on the resume route |
+
+JSON records:
+
+- `resume_key`, `family_digest`, `adapter_identity` (hex), duplicated from the
+  ledger for listing without parsing it.
+- `n_tokens`, `chunk_tokens`, `saved_unix_ms`, `last_used_unix_ms`, `slot_hint`.
+- `chunks[]`: `p0`, `p1`, `gen`, `bytes`, `xxh3`, `prefix_digest`, `producer`.
+  `prefix_digest` is SHA-256 (domain `buun.server.resume-prefix/v1`) over the
+  ledger's token ids `[0, p1)`: a chunk is bound to its whole prefix, because KV
+  depends on it.
+- `tail_states[]`: `pos`, `pos_min`, `pos_max`, `n_tokens`, `gen`, `bytes`,
+  `xxh3`, `prefix_digest`, `producer`, `role` (`frontier`, `turn`, `early`).
+- `producers[]`: provenance only, never a gate — model name and file basename as
+  loaded, weight quantization, build label, KV types, adapter labels, host
+  time. `producer` fields index this table; a conversation continued by a second
+  model has chunks from both.
+- Object names are derived from the records, never stored, so a manifest cannot
+  name a path.
+
+Bounded decode limits, checked before any allocation: manifest file ≤ 64 MiB;
+≤ 4096 chunks; ≤ 64 tail states; ≤ 16 producers; `n_tokens` ≤ 2^24; chunks tile
+`[0, n_tokens)` exactly; every tail state satisfies `pos <= n_tokens` and
+`pos_max + 1 == pos == n_tokens(record)`; every declared size equals the file's
+size; the ledger's token count equals `n_tokens` and its next position equals
+`n_tokens` (a slot whose positions are not the identity, for instance after a
+context shift, is not saved in v1).
+
+## 3. Library additions (P2)
+
+The range filter and the append reader are the only format work in the library.
+Both reuse `state_write_meta` / `state_write_data` and their readers.
+
+```c
+#define LLAMA_STATE_SEQ_FLAGS_BASE_ONLY 4   // complement of PARTIAL_ONLY
+
+// size / write the base part of seq_id restricted to positions [p0, p1),
+// cells in ascending position order
+size_t llama_state_seq_get_size_range(ctx, seq_id, p0, p1, flags);
+size_t llama_state_seq_get_data_range(ctx, dst, size, seq_id, p0, p1, flags);
+
+// append a range blob: does not clear the sequence; the blob's first position
+// must be the sequence's pos_max + 1 (or 0 on an empty sequence); cells at
+// pos >= p_limit are skipped; cell_count is bounded by (p1 - p0) before any
+// reservation. All-or-nothing per call: on failure the cells of this call
+// are removed and the earlier ones stay.
+size_t llama_state_seq_append_data(ctx, src, size, seq_id, p0, p1, p_limit, flags);
+```
+
+- Ascending position order is what lets `p_limit` cut a chunk by row count.
+- `cell_count` is today used for a batch reservation before it is compared with
+  the cache size; the append reader bounds it by the caller's range first.
+- A blob layout change must bump a new `LLAMA_STATE_SEQ_RANGE_VERSION`, which is
+  part of the resume key. With the build label out of the key this constant and
+  the reader's structural checks are what stop a stale layout.
+- Dynamic VBR keeps refusing (`state_write` throws after a degrade); P3.
+- Not yet verified, P2 test before `kv_unified` may leave the key: a blob written
+  under split KV installs under unified KV and the reverse.
+
+## 4. Capture (read-only)
+
+Runs on the inference thread after the loop has returned (shutdown) or before
+`destroy()` (sleep). Skipped when the server is already sleeping. Never from a
+signal handler or a destructor, and never after a failed startup.
+
+Per nonempty slot, most recently used first:
+
+1. `llama_synchronize`. Read the ledger (`slot.prompt.tokens`) as it is. A slot
+   that was generating is saved "one behind": the sampled-but-undecoded token is
+   simply not part of the entry. No decode, no draft-sequence change, no ring
+   reset, no logits.
+2. Skip with a reason: media entries in the ledger, dynamic VBR, a Qwen4 QSA
+   index (the index image is outside the partial state; unverified), positions
+   that are not the identity, or a memory whose `pos_max + 1` differs from the
+   ledger length on a model with a partial part (`frontier_inconsistent`). On a
+   dense model extra KV positions are clipped by the range writer.
+3. Decide reuse: the slot remembers the entry id it was restored from or last
+   saved as. A chunk of that entry is kept when its `prefix_digest`, the resume
+   key and the adapter identity still match. Everything after the first mismatch
+   is rewritten. A slot whose ledger shares less than one chunk with its entry
+   gets a new entry id.
+4. Stream new objects: range blob into a staging buffer of one chunk (≈54 MB for
+   a 27B TCQ cache, ≈210 MB at f16), XXH3 while writing, `sync_write` every
+   64 MiB, `fsync`, rename from `tmp-*`.
+5. Tail states per §6, copied from the slot's checkpoints (`data_tgt` only) and
+   one `PARTIAL_ONLY` read of the live sequence for the frontier.
+6. Write the manifest to `tmp-*`, `fsync`, rename over `commit`, `fsync` the
+   directory. The entry is now the new generation.
+7. Unlink objects the new manifest does not reference.
+
+Space-bounded replacement: the transient cost of step 4–7 is the replaced
+objects (at most one chunk and the changed tail states), not a second snapshot.
+If the preflight says even that does not fit, the writer removes `commit` first
+(`fsync`), then unlinks the old objects, then writes. An interruption then loses
+that entry, which is the agreed trade. Other entries are never touched.
+
+Retention, with no knob: after the live slots are committed the namespace keeps
+at most `n_parallel` entries, newest `last_used` first, whatever their resume
+key; the rest are unlinked. An entry is not deleted merely because its
+conversation is not in a slot at save time. With unified KV and several slots
+this is what keeps the conversations that were evicted to the host cache during
+the run: their entries from the previous start survive, stale by the turns made
+since, until `--resume-host-cache` (P4) saves them properly.
+
+One writer per family namespace (`flock` on `writer.lock`, stale owner by pid
+and start time). A second server runs without persistence and says so.
+
+## 5. Resume compatibility key
+
+SHA-256, domain `buun.server.resume-compat/v1`, over:
+
+| In the key | Why |
+|---|---|
+| Semantic family digest (v4) | structure and tokenizer; MTP head and pad token already unbound |
+| Manifest, object and `LLAMA_STATE_SEQ_RANGE_VERSION` numbers, byte order | portability versions instead of the build label |
+| `cache_type_k`, `cache_type_v` | the bytes are in that codec |
+| RoPE / YaRN parameters, `n_ctx_orig_yarn`, group-attention `n`/`w` | K is stored rotated |
+| Control vectors | state-affecting, like adapters |
+| `swa_full` | changes which SWA cells exist |
+| mmproj presence | conservative while media is unsupported |
+| `kv_unified` | until the cross-layout test of §3 passes |
+
+| Left out | Becomes |
+|---|---|
+| Build label (`llama_commit()`) | producer provenance |
+| `n_ctx`, `n_ctx_seq`, slot count, slot index | install-time fit (§8) |
+| Flash-attention type, `v_trans`, layer count, per-layer type and row size, TCQ codebook fingerprint | the state reader's structural checks |
+| `no_fused_gdn`, `logits_all` | provenance / irrelevant |
+| Weight values, quantization, file name | provenance; fine-tunes stay eligible by decision |
+
+The adapter identity stays a separate digest and must be equal in v1. The
+producer-to-consumer adapter transition of plan §2 is P4.
+
+Documented property of family reuse (plan §2, measured in P0): the restored
+history is a mixed-model history. The typical next token follows the consumer
+model (median KLD to the consumer's own prefill 3–6× below the distance between
+the two models under f16 KV, about 2× under TCQ, top-1 agreement 0.93–0.98);
+strongly history-determined predictions, mostly in the first ≈50 tokens, can
+follow the producer. This is kept, not gated. The manifest records the producer
+so that logs never call such a restore an exact-model hit.
+
+## 6. Checkpoint set and budget
+
+Tail states saved per entry on a model with a partial part:
+
+1. `frontier` at `N` — mandatory; it *is* the state. Without it only a dense
+   model could be restored.
+2. `turn` — mandatory when the slot holds one: the slot's newest context
+   checkpoint. P0: the first request after a restart re-renders the last reply
+   and rewinds behind `N` even with thinking off; without this companion a
+   hybrid reprocesses the whole history and an SWA model has no valid rewind.
+3. `early` — at most one: the earliest tail state the entry already holds whose
+   `prefix_digest` still matches, otherwise the slot's oldest retained
+   checkpoint. Once persisted it outlives the live ring, so a conversation that
+   has been saved since its start keeps a checkpoint near its preamble. It is
+   what a partial-prefix restore into a smaller context lands on.
+
+Budget: tail states 2 and 3 only. Each costs the model's fixed partial size
+(52.7 MB on a 4B hybrid, 156.9 MB on a 27B; 6 MiB on the measured SWA model),
+install 4–12 ms. More than three is opt-in and not part of v1. Pinning a
+checkpoint at the preamble boundary in the live ring would make `early`
+reliable; that belongs to the checkpoint owners and is only noted here.
+
+Partial SWA images are valid only on the base chunks of the same entry; they are
+never shared between entries.
+
+## 7. Install and the checkpoint import transition
+
+Runs at the tail of `load_model`, after the slots exist and before readiness
+(startup and wake). Failure of any entry degrades that conversation to a cold
+start; it never fails the load and never leaves half a slot.
+
+1. Take the namespace lock; enumerate `entries/*/commit` (bounded); parse
+   header, JSON and ledger; check the resume key and adapter identity. Sort by
+   `last_used`.
+2. Map entries to slots: `slot_hint` if free, otherwise any free slot; more
+   entries than slots leaves the oldest as `no_free_slot`.
+3. Choose the install position `p`: the largest restorable position (§2.1) with
+   `p < n_ctx_seq` of the destination. `p == N` is a full install, `0 < p < N` a
+   prefix install, none is `context_too_small`.
+4. For each chunk with `p0 < p`: verify header, size and XXH3 while reading into
+   the one-chunk staging buffer, then `llama_state_seq_append_data(...,
+   p_limit = p)`. Then the tail state at `p`, if the model has a partial part,
+   through `llama_state_seq_set_data_ext(PARTIAL_ONLY)`.
+   If the cache runs out of cells part-way (unified KV shares them between
+   slots): a dense model keeps the complete chunks it has; a model with a partial
+   part clears the sequence and retries once at the largest tail-state position
+   inside what did fit. No rewind of installed state is involved either way.
+5. Establish the slot exactly as `SLOT_RESTORE` does after a successful state
+   install (frontier-record invalidation, recovery-reset bookkeeping, ledger
+   truncated to `p`, fresh sequence epoch, retention publication), with no
+   frontier logits. The next request decodes at least one token and gets its own.
+   Speculative state: event `target_restored_without_draft`; drafters rebind as
+   in the `--mmproj-gpu-swap` path.
+6. Import tail states with `pos <= p` other than the one installed in step 4 as
+   context checkpoints — transition `resume_import`:
+   - new `common_prompt_checkpoint` with `n_tokens`, `pos_min`, `pos_max` and
+     `data_tgt` from the record; `data_dft`, `data_qsa`, `accel` empty; VBR
+     epochs 0;
+   - computation frontier filled exactly as the checkpoint creation site fills it
+     (inline there today; P2 factors that into one helper used by both), so it
+     carries this process's execution identity, the slot's new sequence epoch,
+     the current adapter identity, `token_count = n_tokens` and
+     `next_position = pos_max + 1`;
+   - cache-family binding of the slot with the producer recorded, never relabeled
+     as computed here;
+   - admitted through the creation/host-restore door (retention publish,
+     `admit_live_checkpoints`, release operations). Fail-closed: a checkpoint
+     that is not admitted is dropped and reported; the install stands.
+7. Any failure after step 4 began: `mandatory_recovery_reset(restore_failure)`
+   on the slot, reason logged, next entry.
+
+Rewinds of restored state happen only through the server's `pos_min` guard or a
+restored checkpoint. Resume code never calls `llama_memory_seq_rm` on SWA or
+recurrent state (P0: it succeeds and the output is silently wrong). It does not
+need to: `p_limit` cuts the last chunk while it is read.
+
+Open P2 check: a checkpoint restore with empty `data_dft` while a drafter is
+active must take the target-only speculative transition.
+
+## 8. Outcomes and reason codes
+
+One log line and one `/slots` field per entry. The string
+`model_family_mismatch` is never produced by resume.
+
+| Outcome | Meaning |
+|---|---|
+| `installed_full` | `p == N` |
+| `installed_prefix` | `0 < p < N`; reports `p`, `N` and why (`context_smaller`, `cells_exhausted`) |
+| `skipped` | destination untouched |
+| `failed` | destination reset to empty |
+
+| Reason | When |
+|---|---|
+| `resume_key_mismatch` | key differs (KV type, RoPE, versions …); the differing field is not recoverable from a hash, so the log prints the producer's provenance next to the current settings |
+| `adapter_mismatch` | adapter identity differs |
+| `format_unsupported` | unknown manifest/object/envelope version or flag |
+| `manifest_corrupt`, `ledger_invalid` | checksum, bounds or token validation |
+| `object_missing`, `object_size_mismatch`, `object_checksum_mismatch` | per object; a failed chunk ends the usable prefix at its `p0` if a restorable position remains below it, else `failed` |
+| `companion_missing` | a model with a partial part and no tail state at or below the fit position |
+| `context_too_small` | no restorable position fits |
+| `no_free_slot` | more entries than slots |
+| `state_rejected` | the library refused a blob (type, shape, TCQ fingerprint) |
+| `unsupported_media`, `unsupported_vbr`, `unsupported_qsa`, `unsupported_positions`, `frontier_inconsistent` | capture-side skips, logged at save |
+| `store_locked`, `store_unwritable`, `no_space`, `io_error` | store level; the server runs without persistence |
+| `checkpoints_dropped=<n>` | warning attached to an `installed_*` outcome |
+
+**No silent downgrade.** An entry that fails a check is skipped or failed with
+its reason. It is never installed by the legacy slot-file route, and the legacy
+route never reads a manifest. Empty slots are skipped without a line.
+
+`/slots/<id>?action=restore` routes by what it is given: a `filename` is a legacy
+library file under `--slot-save-path` and takes the unchanged legacy route; a
+`resume_entry` id is resolved inside the resume namespace and takes steps 3–7
+above. That endpoint is the restart-free test entry for the installer.
+
+## 9. Install route: recommendation and alternative
+
+Recommended for v1, and what §7 describes: **direct slot install**. It reuses an
+establishment path that P0 exercised across restart and sleep/wake, streams
+chunks straight into the cache with one chunk of staging, and supports prefix
+installs.
+
+Alternative kept open: install entries as **host prompt-cache entries** and let
+ordinary prefix matching pull them into whichever slot a request lands on. It
+gets slot mapping, fewer-slots handling and checkpoint delivery from existing
+code, and pinned requests now see host entries. It needs `--cache-ram`, holds
+every entry in host memory, and loses chunk-level reads unless host entries
+learn chunk lists. It is the natural route for `--resume-host-cache` in P4, where
+the saved roots are host entries anyway.
+
+Open question for the maintainer: with `--kv-unified` and several slots, each
+launch moves the other idle slots to the host cache, so at shutdown usually one
+conversation is live. The retention rule of §4 keeps the others' previous
+entries, but they are stale by the turns made since the last start. Exact
+coverage for that configuration needs P4, or an earlier decision to save host
+entries that were live slots.
+
+## 10. What P2 builds from this
+
+1. Shutdown flag in the streaming `should_stop` closures (30 s wait).
+2. Library: `BASE_ONLY`, range writer, append reader, version constant; tests in
+   `test-save-load-state` (range tiling equals the whole blob's effect, append
+   equals one-shot, `p_limit`, cross-layout).
+3. Store: root helper, lock, object and manifest I/O, bounded parsing, fault
+   seams (short write, `ENOSPC`, kill between object and manifest).
+4. Capture and install in the server, `--resume`, the `resume_entry` restore
+   action, reason codes.
+5. Sleep/wake as the first end-to-end test; then restart on a dense, a hybrid and
+   an SWA model: pure append, rewind, smaller context, fewer slots, changed
+   producer.

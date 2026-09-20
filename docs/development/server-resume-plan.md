@@ -46,6 +46,16 @@ computed by fine-tune A generally differ from a fresh prefill under fine-tune B.
 Reusing them is an intentional mixed-model history, also relevant to switching
 LoRAs or weight quantizations. Measure this separately from same-model resume.
 
+Measured in P0 (4B hybrid, stock vs. a fine-tune, identical prefill by one model
+loaded by the other, four text windows, 4k and 16k histories) and kept as
+documented behaviour, not gated: the typical next token follows the consumer
+model — median KLD to the consumer's own prefill is 3–6× below the distance
+between the two models under f16 KV and about 2× under turbo3_tcq, top-1
+agreement 0.93–0.98 — while strongly history-determined predictions, mostly in
+the first ≈50 tokens, can follow the model that produced the KV. Means are
+tail-driven (2 of 24 cells exceed the model distance), so quote medians and
+tails. The manifest records the producer.
+
 Separate the following identities:
 
 | Identity | Purpose |
@@ -267,21 +277,23 @@ Do not promise arbitrary cross-backend or cross-build binary state portability.
 
 ## 6. Storage layout, safety, and concurrency
 
-Proposed namespace:
+Namespace (schema frozen in `server-resume-format.md`):
 
 ```text
 <fs_get_cache_directory()>/resume/<semantic-family-digest>/
     writer.lock
-    entries/<entry-id>/commit
-    objects/<content-digest>
+    entries/<entry-id>/commit              manifest, published last
+    entries/<entry-id>/c-<p0>-<p1>-<gen>   base-state chunk, token range
+    entries/<entry-id>/t-<pos>-<gen>       recurrent/SWA state at a position
 ```
 
 Each independently published entry record references payload objects and carries
 format versions, compatibility metadata, producer provenance, token ledgers,
 checkpoint dependencies, and sizes/digests. Entry kinds include live-slot roots
 and optional retained-prefix roots. A small commit record distinguishes completed
-entries from interrupted replacement. Exact on-disk schema is a Phase 2 deliverable,
-not frozen by this illustration.
+entries from interrupted replacement. A content-addressed object pool shared
+between entries (`objects/<content-digest>`) is deferred: v1 stores a prefix that
+several conversations share once per entry.
 
 Files are not independent just because they are separate. A slot's KV, recurrent
 state, token ledger, and required checkpoint/speculative companions must describe
@@ -336,20 +348,26 @@ save|restore` writes and reads one slot's tokens plus its per-sequence state beh
 a versioned `BUUNSLOT` header that the restore handler authenticates before the
 state blob reaches the library. P0 measured what it lacks for resume: no lifecycle
 hook, no checkpoint companion (hybrid and SWA models reprocess the history, and an
-SWA rewind of restored state is silently wrong), no payload checksum, a runtime
-identity bound to the build label, context size and slot layout, no file when
-dynamic VBR is active, and a save that is not read-only.
+SWA rewind of restored state is silently wrong), one checksum over the whole file
+that is only checkable after reading all of it into host memory (no partial read,
+no appending, no bounded staging, no `fsync`), a runtime identity bound to the
+build label, context size and slot layout, no file when dynamic VBR is active,
+and a save that is not read-only.
 
 Resume does not fork the format. One envelope family, two install routes:
 
-- The header is versioned. A file without a resume manifest (the current version)
-  takes the legacy route unchanged: strict runtime identity, sequence state only.
-- A header that declares a resume manifest (next version or a flag bit) takes the
-  resume installer: resume compatibility key, per-section checksums, required
-  companions, rewinds only through the server's `pos_min` guard or a restored
-  checkpoint, resume reason codes.
-- Both routes share the state serializer and the state blob layout. The manifest,
-  checksums and companions are additive sections; there is one reader to maintain.
+- A library sequence-state file (the current container) takes the legacy route
+  unchanged: strict runtime identity, sequence state only.
+- A resume manifest (its own magic and version, holding a version-3 slot
+  envelope as the token ledger) takes the resume installer: resume compatibility
+  key, per-object checksums, required companions, rewinds only through the
+  server's `pos_min` guard or a restored checkpoint, resume reason codes. P1
+  settled that the declaration is the manifest's own header rather than a flag
+  inside the library file, because that container's declared length and
+  whole-payload checksum rule out chunks.
+- Both routes share the state serializer and the state blob layout: a chunk is
+  that layout restricted to a token range. The manifest, checksums and companions
+  are additive; there is one reader to maintain.
 - **No silent downgrade.** A file that declares a manifest and fails any resume
   check (checksum, missing companion, key mismatch) is refused with its reason. It
   is never installed through the legacy route as state only.
@@ -474,27 +492,41 @@ mandatory companions before freezing the format or promising broad coverage.
 
 ### P1 — Design review and format contract
 
-- [ ] Review lifecycle ordering, identity, checkpoint dependencies and failure
-  recovery against the real owners identified in P0.
-- [ ] Freeze a versioned manifest/object contract, bounded decode limits and
-  provenance transition rules; separate portability versions from build labels.
-- [ ] Decide checkpoint selection, payload chunking, entry boundaries and
-  space-bounded replacement ordering using P0 results; no backup generation.
-- [ ] Specify unsupported configurations and observable cold-fallback outcomes.
-- [ ] Specify the envelope contract of §6 "Relationship to `--slot-save-path`
-  files": header version or flag that declares a resume manifest, section table
-  with per-section checksums, route selection in the `/slots` restore handler,
-  the no-silent-downgrade rule, and the resume reason codes (distinct from
-  `model_family_mismatch`).
-- [ ] Define the resume compatibility key: what it hashes, what it leaves out
-  (build label, context size, slot count and index, KV layout, pad token id,
-  presence of an MTP layer), and which of those become install-time checks
-  (enough cells, KV type, layer shapes) instead of identity.
-- [ ] Define the checkpoint companion section as the partial (recurrent/SWA)
-  per-sequence state blob measured in P0, mandatory for hybrid and SWA models.
+The contract is `server-resume-format.md`; section numbers below refer to it.
 
-Gate: no unresolved correctness/ownership findings; performance questions have
-explicit experiments. Independent adversarial review is owed, not yet performed.
+- [x] Review lifecycle ordering, identity, checkpoint dependencies and failure
+  recovery against the real owners identified in P0. (§1, §4, §7)
+- [x] Freeze a versioned manifest/object contract, bounded decode limits and
+  provenance transition rules; separate portability versions from build labels.
+  (§2, §5, §7 `resume_import`)
+- [x] Decide checkpoint selection, payload chunking, entry boundaries and
+  space-bounded replacement ordering using P0 results; no backup generation.
+  Token-range chunks of 4096 tokens, one entry per conversation, at most three
+  recurrent/SWA states per entry, replaced objects as the only transient cost,
+  invalidate-first when even that does not fit. (§2, §4, §6)
+- [x] Specify unsupported configurations and observable cold-fallback outcomes.
+  (§4 step 2, §8)
+- [x] Specify the envelope contract of §6 "Relationship to `--slot-save-path`
+  files": what declares a resume manifest, per-object checksums, route selection
+  in the `/slots` restore handler, the no-silent-downgrade rule, and the resume
+  reason codes (distinct from `model_family_mismatch`). (§2, §8)
+- [x] Define the resume compatibility key: what it hashes, what it leaves out,
+  and which of those become install-time checks. A smaller context is not a
+  refusal: the entry installs up to the largest restorable position that fits
+  (`installed_prefix`). (§5, §7, §8)
+- [x] Define the checkpoint companion as the partial (recurrent/SWA)
+  per-sequence state blob measured in P0, mandatory for hybrid and SWA models.
+  The state at the saved boundary is the same kind of object. (§2.1, §6)
+
+Open for the maintainer (§9 of the contract): direct slot install is recommended
+for v1 with host-cache entry install kept for P4; unified KV with several slots
+saves one live conversation per shutdown and keeps the others' earlier entries.
+
+Gate: no unresolved correctness/ownership findings known to the author;
+performance questions have explicit experiments (P2 tests listed in §10 of the
+contract). Independent adversarial review is deferred by the maintainer until a
+working product exists, with one review planned before the VBR phase; the
+contract is unreviewed until then.
 
 ### P2 — Durable store and fixed-state vertical slice
 
@@ -570,8 +602,9 @@ fallbacks for any deferred feature must be documented before release.
     continuation is silently wrong. Install must go through the server's
     `pos_min` guard or a checkpoint; resume code never rewinds SWA state itself.
   - The state API refuses a wrong KV type, wrong model, too-small context and a
-    truncated blob without crashing. It has no payload checksum: the file format
-    needs one. f16 and undegraded VBR states are mutually accepted.
+    truncated blob without crashing. The raw state API has no payload checksum
+    (corrected in P1: the library sequence file does carry one FNV-1a-64 over
+    the whole payload). f16 and undegraded VBR states are mutually accepted.
   - The semantic family digest hashes `n_layer_all`, `n_layer_nextn` and the pad
     token id, so a fine-tune without the base's MTP layer is a different family.
     §2 needs a KV-compatibility key or an explicit override to keep fine-tunes
@@ -610,3 +643,23 @@ fallbacks for any deferred feature must be documented before release.
     target's total capacity, and a pinned empty slot performs the host lookup
     (pinned follow-ups reuse the full prefix), so host-cache restores are
     visible to pinned requests.
+- 2026-09-20: P1 contract written (`server-resume-format.md`), unreviewed by
+  maintainer decision until a working product exists.
+  - Family handoff measured over four text windows and two history lengths; the
+    behaviour is kept and documented in §2 (an earlier single-window reading
+    that mean reuse error stays below the model distance was too strong).
+  - An entry is a directory of objects: base-state chunks by token range, each
+    the existing state blob layout restricted to that range, plus recurrent/SWA
+    states at positions, plus a manifest published last by rename. Chunking
+    costs under 0.01 % in size. A smaller context installs a prefix instead of
+    refusing: any position on a dense model, a saved recurrent/SWA position on
+    the others.
+  - The library needs a base-only flag, a position-range writer and an append
+    reader; the state serializer itself is unchanged.
+  - Checkpoints read from disk cannot pass the server's validity test (per-load
+    execution identity, sequence epoch), so import re-stamps them as a named
+    transition and admits them through the door host-cache restores use.
+  - The build label, context size, slot count and index leave the identity; a
+    resume key keeps the family, the KV types, RoPE/YaRN and format versions.
+  - Correction: slot files carry a whole-file FNV-1a-64; the missing pieces are
+    smaller integrity units, streaming and durability.
