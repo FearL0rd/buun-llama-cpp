@@ -505,6 +505,9 @@ static void test_store(const std::string & root) {
     store->prune(KEY, 2, 8);
     CHECK(n_files(store->directory() + "/entries") == 3);
     CHECK(store->list().size() == 3);
+    // an entry that is held for a conversation without a slot is not counted against the slots
+    store->prune(KEY, 1, 8, {id});
+    CHECK(store->list().size() == 3);
     store->prune(KEY, 1, 8);
     {
         const auto entries = store->list();

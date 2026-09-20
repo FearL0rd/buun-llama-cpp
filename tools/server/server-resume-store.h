@@ -9,6 +9,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -174,7 +175,10 @@ public:
     // keeps the entries used last, so many of the given resume key and so many overall, and drops
     // damaged manifests and directories that never got one. A server cannot read the entries of
     // another key, so only the overall bound ends those, never the number of its own slots.
-    void prune(const std::string & resume_key, size_t n_keep_key, size_t n_keep_total) const;
+    // The same holds for the entries in `held`: conversations of this key that have no slot.
+    void prune(
+            const std::string & resume_key, size_t n_keep_key, size_t n_keep_total,
+            const std::set<std::string> & held = {}) const;
 
     uint64_t free_bytes() const;
 
