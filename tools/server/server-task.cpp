@@ -1690,7 +1690,7 @@ json server_task_result_slot_save_load::to_json() {
         };
     }
 
-    return json {
+    json out = {
         { "id_slot",    id_slot },
         { "filename",   filename },
         { "n_restored", n_tokens },
@@ -1699,6 +1699,10 @@ json server_task_result_slot_save_load::to_json() {
             { "restore_ms", t_ms }
         }},
     };
+    if (!resume.is_null()) {
+        out["resume"] = resume;
+    }
+    return out;
 }
 
 //

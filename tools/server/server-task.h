@@ -213,6 +213,7 @@ struct server_task {
         int id_slot;
         std::string filename;
         std::string filepath;
+        std::string resume_entry; // restore from the resume store instead of a file
     };
     slot_action slot_action;
 
@@ -625,6 +626,8 @@ struct server_task_result_slot_save_load : server_task_result {
     size_t n_tokens;
     size_t n_bytes;
     double t_ms;
+
+    json resume; // outcome of a restore from the resume store
 
     virtual json to_json() override;
 };

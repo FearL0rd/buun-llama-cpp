@@ -298,6 +298,10 @@ void test_slot_frontier_logits_companion() {
     CHECK(result.nonfinite_logits_refused);
     CHECK(result.torn_companion_refused);
     CHECK(result.missing_companion_is_cold);
+    CHECK(result.resume_ledger_round_trip);
+    CHECK(result.resume_ledger_refuses_logits);
+    CHECK(result.resume_routes_do_not_cross);
+    CHECK(result.resume_key_mutation_refused);
     CHECK(result.destination_slot_rebound);
     CHECK(result.destination_epoch_rebound);
     CHECK(result.source_process_epoch_not_reused);

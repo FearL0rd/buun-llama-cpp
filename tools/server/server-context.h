@@ -64,6 +64,10 @@ struct server_slot_frontier_logits_test_result {
     bool nonfinite_logits_refused = false;
     bool torn_companion_refused = false;
     bool missing_companion_is_cold = false;
+    bool resume_ledger_round_trip = false;
+    bool resume_ledger_refuses_logits = false;
+    bool resume_routes_do_not_cross = false;
+    bool resume_key_mutation_refused = false;
     bool destination_slot_rebound = false;
     bool destination_epoch_rebound = false;
     bool source_process_epoch_not_reused = false;
