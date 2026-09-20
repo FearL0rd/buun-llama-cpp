@@ -1,7 +1,8 @@
 # Persistent server resume — design and implementation plan
 
 Status: **P0 to P2 implemented on `exp/server-resume` (fixed-type KV, `--resume`);
-P3 and P4 open; independent review found acceptance blockers (see §11)**. Contract, results and the limits
+P3 first slice (dynamic VBR, one conversation per cache) implemented and not yet
+reviewed; P4 open; the blockers of the independent review (§11) are closed**. Contract, results and the limits
 of v1: `server-resume-format.md`.
 Created 2026-09-18 against master `ed774445c`.
 This is an engineering plan, not documentation of an available feature.
@@ -558,8 +559,8 @@ listed under P3 was needed already here and is in (`SWA_HELD_CELLS`).
 
 ### P3 — VBR, multiple slots and checkpoint selection
 
-- [ ] Reuse artifact capture/stream/import; preserve tiers, companions and lineage.
-- [ ] Reconstruct fresh accounting/leases; no serialized live process handles.
+- [x] Reuse artifact capture/stream/import; preserve tiers, companions and lineage.
+- [x] Reconstruct fresh accounting/leases; no serialized live process handles.
 - [ ] Save shared payloads once, restore under current budgets, handle partial
   inventory admission without partial-slot publication.
 - [ ] Implement measured historical checkpoint policy and qualify SWA/iSWA,
@@ -568,6 +569,125 @@ listed under P3 was needed already here and is in (`SWA_HELD_CELLS`).
 
 Gate: degraded VBR + hybrid multi-slot restart, prefix extension/rewind, and shared
 prefix tests pass. This is required for the fork's default cache configuration.
+
+#### P3 route (design, traced against the code before implementation)
+
+Under dynamic VBR a fixed-type state blob is not a restore source: the library
+refuses a save taken after any degrade, and an entry-tier save stops restoring once
+the target cache has degraded. The artifact system is the owner of tiered KV, so a
+resume entry under VBR holds **one artifact object** instead of chunks and tails.
+
+Save, per slot, at the same two capture points as the fixed route:
+
+1. The slot-capture control route's **exact** capture (`build_capture_request` →
+   `server_vbr_artifact_store::capture`). It already covers plain-attention slots
+   and carries the recurrent/SWA companions. The projected idle route is not a wire
+   form: its unit ids live in the projected domains and its shards carry Merkle
+   roots, not payloads.
+2. The store rebuilds the package from the catalog view (the builder the view's
+   own `validate()` uses, factored out) and runs `vbr_artifact_encode` into a
+   streamed resume object. The catalog reference is released after the write.
+3. The manifest names the object and the artifact's manifest digest; an unchanged
+   slot is not rewritten. A changed one replaces the entry's object, old commit
+   given up first (the disk bound of §7).
+
+Load, per entry and free slot:
+
+1. `vbr_artifact_decode` from the streamed object under bounded limits, the payload
+   consumer staging segment chains; nothing is kept on a failed verdict.
+2. The store re-ingests through the catalog's capture-sink door (`begin_capture` /
+   `begin_unit` / `accept_verified_segment` / `seal_unit` /
+   `accept_verified_companion` / `publish_reference`): budget admission, accounting
+   and dedup are the catalog's, freshly made in this process.
+3. The existing control import (`server_vbr_artifact_store::import`) installs the
+   reference into the empty slot: schedule quote, destination pricing under the
+   current budget, transcode, precision gate, companions, no-fail publication.
+   Anything but `ok` leaves the slot empty and the request prefills cold.
+
+Process-bound values:
+
+- `frontier_execution_identity` is digest-covered in three layers of the artifact and
+  compared at import. With resume active under VBR the server persists the identity
+  in the family namespace and adopts it at model load, before anything derives from
+  it. Everything else bearing the identity is an in-process object that does not
+  survive the process. A second server of the family does not get the writer lock,
+  runs without persistence, and keeps a random identity.
+- `sequence_epoch` comes with the artifact and the slot adopts it, so the counter of
+  the new process starts above the highest epoch in the store.
+- Codebook and companion identities hash the build commit: an entry of another
+  build is refused by validation and the slot starts cold. Resume under VBR is
+  same-build.
+
+Import never lowers the live cache to the artifact's tiers: it prices the
+destination from the live tiers and the memory fit, transcodes the artifact up to
+that, and refuses a unit more than one rung below its destination. The running
+server meets the same case whenever an emptied cache resets to its entry tiers
+before a host restore. Whether a multi-slot restart reaches the saved tiers (the
+first slot is imported into a cache the others have not filled yet) is measured in
+the gate before any policy is added.
+
+Not in the first slice: partial-prefix restore of an artifact, checkpoints of a VBR
+entry (VBR host entries carry none today), conversations beyond the slot count
+(the VBR host cache takes projected packages), media.
+
+#### P3 first slice as built (2026-09-20; contract in the format document §11)
+
+Built as designed, with the tenantless capture trio (`prepare_host_payload` →
+`transfer_host_payload` → `publish_host_payload`) in place of the control route's
+`capture`, and `export_host_payload` / `ingest_host_payload` as the two new doors
+of the artifact store. What the gate found:
+
+- **One conversation per cache.** The exact capture is an image of the whole pool
+  with one sequence's placement, and the empty import is a whole-cache contract of
+  its owners. The multi-slot tier question above is therefore moot in this slice: a
+  start restores the most recently used conversation, a save writes only that one
+  (`cache_shared` for the rest, at save and at install, before any byte is read).
+  Lifting it is owners' work: an absent-destination import that preserves foreign
+  rows, and a capture narrowed to owned rows.
+- **Target emptiness includes the pool watermark.** The warmup leaves one; the
+  install runs the idle boundary (`breathe`) first, as the host restore does.
+- **The pool's side stream is created lazily** by the first tier change or
+  capture. A cache restored right after a start has seen neither, so the import's
+  `prepare_backing` now creates it.
+- **Hashing dominated**: about 13 SHA-256 passes over the payload per save or
+  install. `llama_sha256` takes whole blocks in place and uses the SHA extensions
+  on x86; a 353 MB artifact went from 13.6 s to 2.6 s (save) and 16.2 s to 2.9 s
+  (install). The pass count itself is unchanged.
+- **Sleep/wake under VBR aborted on wake, with or without `--resume`**: the
+  artifact store and the host prompt cache outlived the accounting ledger they
+  report to, because a reload replaces the authority first. `destroy()` now
+  releases both.
+- **Tier behaviour, measured**: same budget on both sides restores at every
+  depth (`native_import`, `live_rebased`, `downward_rebase`); a degraded artifact
+  against an unconstrained target is `precision_refused` (two rungs), a
+  full-precision artifact against a budget that cannot hold it `state_rejected`.
+  A `downward_rebase` is lossy by one rung and its greedy continuation can differ
+  from an unrestarted server; the others were token-identical.
+- **Idle displacement emptied the slot before a save.** With one slot the idle
+  capture publishes the conversation to the host cache and clears the live slot
+  about 0.4 s after a turn; the projected package has no wire form, so a stop or
+  a sleep after any idle moment saved nothing and released the previous entry.
+  The first gate missed it: every scenario stopped right after a turn, and the
+  sleep scenario matched the reference text on a cold prefill. With a persistent
+  resume under VBR the source now stays live (the multi-slot behaviour), and the
+  harness has an `idle` scenario whose oracle is `cache_n`, not the text.
+- **One entry per resume key.** The slot budget of the route is one: the entries
+  of the conversations that share the cache are released and pruned at a save.
+- **`--cache-ram 0` has no artifact store**: nothing is persisted, warned at start.
+- The envelope carries drafter/accelerator companions (27B with MTP: three
+  companions, identical tokens, acceptance unchanged).
+
+Gate status: restart ×2, sleep/wake ×2, idle-then-stop, rewind, live restore
+action, degraded restore, smaller context, fewer slots and overflow pass on dense;
+restart, sleep, idle-then-stop and degraded restore on hybrid; MTP on the 27B. On
+hybrid, a conversation that returns from the VBR host cache after another took the
+slot restores (`cache_n` 9344 of 9696) but its greedy continuation differs from the
+reference, identically without `--resume`: a host-cache observation for its owners,
+not a resume result. Fixed-route regression rerun
+clean on dense and hybrid. `test-vbr-artifact*` and `test-server-resume-store`
+pass. Open from the P3 list: shared payloads saved once and partial inventory
+admission (both need the multi-conversation import), checkpoint policy for VBR
+entries.
 
 ### P4 — Optional host-cache persistence and accelerator integration
 
@@ -673,6 +793,26 @@ fallbacks for any deferred feature must be documented before release.
     resume key keeps the family, the KV types, RoPE/YaRN and format versions.
   - Correction: slot files carry a whole-file FNV-1a-64; the missing pieces are
     smaller integrity units, streaming and durability.
+- 2026-09-20: P3 first slice (dynamic VBR), unreviewed. Details under P3 in §9
+  and in `server-resume-format.md` §11.
+  - A VBR entry is one streamed object holding the VBR artifact envelope,
+    companions included; capture and import go through the artifact store's
+    existing doors, and the envelope's own validation decides precision.
+  - The execution identity the envelope is bound to is kept in the namespace,
+    and the sequence-epoch counter starts above every stored epoch.
+  - An exact capture images the whole pool and an empty import takes the whole
+    cache, so a save keeps the most recently used conversation of a shared
+    cache and an install refuses (`cache_shared`) once another slot holds
+    tokens. Several conversations per cache need an import beside live rows
+    and a capture narrowed to one sequence, both in the VBR artifact system.
+  - Found on the way: a reload after `--sleep-idle-seconds` under VBR aborted
+    without `--resume` too (the artifact store and the host cache outlived the
+    ledger they report to); a cache that never degraded had no side stream for
+    the import; SHA-256 of a payload ran scalar at about 0.3 GB/s.
+  - Measured on a 3090: dense and hybrid restart, sleep, rewind, action restore,
+    fewer slots, overflow, a smaller context, degraded budgets, tier mismatch in
+    both directions (refused, never silently rebased up), MTP companions; the
+    fixed route re-run unchanged.
 
 ## 11. P0–P2 independent review — before VBR
 

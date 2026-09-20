@@ -1,7 +1,7 @@
 # Persistent server resume — format and install contract (P1)
 
 Status: **contract, implemented through P2** (§10 items 1 to 5, with the
-measured results and the limits of v1 there). Where the build differs from the
+measured results and the limits of v1 there) **and P3** (§11, dynamic VBR). Where the build differs from the
 first design the text says "as built".
 Companion of `server-resume-plan.md` (objective, P0 results, phases). Frozen
 2026-09-20 against `exp/server-resume`. Line anchors are from that branch; use the
@@ -12,9 +12,10 @@ statement below is the author's reading of the code, not a reviewed result.
 Scope of v1: fixed-type KV (f16, q8_0, turbo, TCQ), dense, hybrid-recurrent and
 SWA/iSWA models, one entry per conversation, direct install into a slot. Images
 and audio are stored on models where a media chunk of n cells takes n consecutive
-positions (§4a). Out of scope and refused with a reason: media under M-RoPE,
-dynamic VBR (P3), drafter state (never saved), adapter changes between producer
-and consumer (P4).
+positions (§4a). Dynamic VBR takes its own route through the same entries (§11,
+P3). Out of scope and refused with a reason: media under M-RoPE, drafter state
+on the fixed route (never saved), adapter changes between producer and consumer
+(P4).
 
 ## 1. Review of the real owners
 
@@ -46,10 +47,12 @@ any integrity unit smaller than the whole file.
 ```text
 <fs_get_cache_directory()>/resume/<semantic-family-digest>/
     writer.lock
+    execution-identity       dynamic VBR only (§11)
     entries/<entry-id>/
         commit               manifest; atomic rename makes the entry visible
         c-<p0>-<p1>-<gen>    base-state chunk for token positions [p0, p1)
         t-<pos>-<gen>        tail state (recurrent / SWA part) taken at <pos>
+        v-<gen>              dynamic VBR artifact of the whole sequence (§11)
         tmp-*                staging; removed by the next writer
 ```
 
@@ -240,7 +243,7 @@ Per nonempty slot, most recently used first:
    that was generating is saved "one behind": the sampled-but-undecoded token is
    simply not part of the entry. No decode, no draft-sequence change, no ring
    reset, no logits.
-2. Skip with a reason: media under M-RoPE or without a content id (§4a), dynamic VBR, a Qwen4 QSA
+2. Skip with a reason: media under M-RoPE or without a content id (§4a), a Qwen4 QSA
    index (the index image is outside the partial state; unverified), positions
    that are not the identity, or a memory whose `pos_max + 1` differs from the
    ledger length on a model with a partial part (`frontier_inconsistent`). On a
@@ -531,7 +534,8 @@ One log line and one `/slots` field per entry. The string
 | `state_rejected` | the library refused a blob (type, shape, TCQ fingerprint) |
 | `unsupported_media` | a media chunk without a content id (§4a); capture-side skip, logged at save |
 | `unsupported_positions` | cells that do not take consecutive positions: media under M-RoPE (§4a). At capture, and at install when the ledger has media and the loaded model shares positions |
-| `unsupported_vbr`, `unsupported_qsa`, `frontier_inconsistent` | capture-side skips, logged at save |
+| `unsupported_qsa`, `frontier_inconsistent` | capture-side skips, logged at save |
+| `unsupported_artifact`, `capture_refused`, `slot_busy`, `cache_shared`, `slot_not_empty`, `precision_refused`, `execution_identity_unavailable` | dynamic VBR route (§11) |
 | `store_locked`, `store_unwritable`, `no_space`, `io_error` | store level; the server runs without persistence |
 | `checkpoints_dropped=<n>` | warning attached to an `installed_*` outcome |
 | `provenance_limit` | capture skipped before disk mutation because the objects this save carries over already come from 16 producers and the current producer is new; the previous entry is retained rather than misattributing new bytes |
@@ -670,6 +674,114 @@ Properties and limits of v1, as measured:
   save (P4 closes that).
 - Conversations that live only in the host prompt cache at shutdown are not
   saved (P4).
-- Slots with media under M-RoPE, dynamic VBR and a QSA index are skipped with a
-  reason. Not measured for media: audio chunks, a chunk without a content id,
-  and a turn made after a prefix restore that ended at an image.
+- Slots with media under M-RoPE and a QSA index are skipped with a reason; so
+  is media under dynamic VBR (§11). Not measured for media: audio chunks, a
+  chunk without a content id, and a turn made after a prefix restore that ended
+  at an image.
+
+## 11. Dynamic VBR route (P3, as built)
+
+Under `-ctk vbr` the library sequence state refuses (§3), and the bytes of a
+cache whose tiers move cannot be cut into token ranges. The entry therefore
+carries one object instead of chunks and tail states: the VBR artifact that the
+VBR host prompt cache already captures, validates and imports. Resume owns the
+file and the entry; the artifact's owners own every byte inside it and every
+decision about it. One envelope family, two install routes, no downgrade from
+one to the other: an artifact entry is never read by the fixed route, and a
+chunked entry is never offered to the import.
+
+**Entry.** The manifest holds `artifact` (an object record of kind 3: `p1 =
+n_tokens`, `gen`, `bytes`, `xxh3`, `prefix_digest`, `producer`) and
+`sequence_epoch`, with `chunks[]` and `tail_states[]` empty; the validator
+accepts either shape, never both, and an artifact only together with a non-zero
+epoch. The object `v-<gen>` has the 64-byte object header of §2.1 followed by
+the artifact's own self-verifying wire format, streamed in both directions: it
+is never held in one buffer on the way to or from disk (limit 256 GiB, checked
+against the declared size, not allocated from it).
+
+**Key.** The resume key of §5 gains the build label (`llama_commit()`) when
+dynamic VBR is active: the artifact format and the degrade tables are not
+versioned apart from the build, so v1 is same-build only. A different build
+lists nothing to install and leaves the entries alone.
+
+**Execution identity and epoch.** An artifact is bound to the execution
+identity and the sequence epoch of its capture. Both outlive the process with
+the store: the first server of a namespace writes its identity to
+`execution-identity` (first writer wins, later servers adopt it), and the epoch
+counter starts above every epoch an entry still holds, so no epoch is handed
+out twice. A namespace whose identity cannot be read or written runs without
+persistence (`execution_identity_unavailable`).
+
+**Capture.** Exact capture of the idle slot through the owners' prepare /
+transfer / publish, with no tenant and no host-cache admission, then the
+owners' export into the object stream. A slot that is not idle is `slot_busy`;
+a capture the owners refuse is `capture_refused` with their status and phase.
+A save whose tokens, length and epoch equal the entry's keeps the artifact
+(`artifact_kept`, no bytes written, 28 ms): under one epoch the same tokens are
+the state the artifact was taken from. Otherwise the previous entry is
+uncommitted and removed before the new artifact is written, so the disk never
+holds two. A crash inside that window loses the conversation on disk; that is
+the chosen side of the tradeoff (loss of the affected cache over twice the
+disk). A rewind in a slot re-saves into the slot's entry.
+
+**Install.** Into an empty slot of an empty cache: the clear, the idle boundary
+(`breathe`, which releases the watermark a warmup or a cleared prompt leaves),
+the owners' ingest from the object stream and their import with the same
+publish pair the host cache uses. It installs whole or the slot starts cold;
+the outcome carries the owners' decision (`native_import`, `live_rebased`,
+`downward_rebase`) or their refusal statuses. The import never retiers the
+target, and transcodes artifact bytes by at most one rung; an artifact more
+than one rung below what the target holds is `precision_refused` (measured: an
+artifact saved under a 120 MB KV budget against an unconstrained target), and
+one the target cannot hold is `state_rejected` with `destination=invalid`
+(the reverse). The same budget on both sides restores at every depth
+measured. After a `downward_rebase` the greedy continuation can differ from a
+server that never restarted, because one rung of transcoding is lossy; the
+native and live-rebased imports measured token-identical.
+
+**The envelope is the owners'.** It carries the companions the capture had:
+recurrent state, and the drafter or accelerator state of a server that runs
+one. "No drafter state" is a property of the fixed route only. Measured with
+the MTP head of a 27B: three companions, identical tokens, acceptance
+unchanged (0.91–0.95).
+
+**One conversation per cache.** An artifact is an image of the whole pool up to
+its watermark with the placement of one sequence, and the owners' import takes
+an empty cache, not an empty slot ("empty import is a whole-child contract").
+With several slots sharing the unified cache:
+
+- a save writes the most recently used conversation and skips the others
+  (`cache_shared`); their earlier entries are released and pruned, so the
+  store holds one conversation per resume key on this route;
+- an install into a cache that already holds a conversation is skipped before
+  any byte is read (`cache_shared`), the entry kept;
+- more entries than slots is `no_free_slot`: the fixed route's staging into
+  the host cache is not available, the VBR host cache admits through its own
+  idle capture.
+
+Lifting this needs an import into an absent destination that preserves foreign
+rows (the occupied-replacement guard already tracks them), and a capture
+narrowed to the owned rows; both belong to the artifact's owners.
+
+**The live slot is what gets saved.** With one slot, the VBR host cache's idle
+capture normally publishes the conversation to host memory and then clears the
+live slot. The projected package it is left in has no wire form (unit ids in the
+projected domains, Merkle roots in place of payloads), so a save after an idle
+moment would find nothing to capture. With a persistent resume active the idle
+capture still publishes but leaves the source live, as it already does in a
+multi-slot unified cache; a returning conversation then restores through the
+owners' occupied-replacement route, which needs room for both conversations in
+the context. The cost is that an idle server keeps its cache mapped.
+
+**Needs the artifact store.** The store exists with the VBR host cache. Under
+`--cache-ram 0` a save is `unsupported_artifact` and the server warns at start
+that nothing is persisted. Media is `unsupported_media` on this route.
+
+Measured (RTX 3090, NVMe; 0.6B dense, 4B hybrid, 27B with MTP): restart ×2,
+sleep/wake ×2, rewind, live restore through the slot action and a degraded
+cache restore token-identical to one process that never stopped. 353 MB dense
+artifact: save 2.6 s, install 2.9 s; 255–280 MB hybrid artifact of 6–6.7k
+tokens: save 1.8 s (capture 0.7 s), install 2.0 s. The remainder is hashing:
+the artifact's encode and decode hash the payload about 13 times, which is why
+`llama_sha256` uses the SHA extensions on x86 (1.8 GB/s against 0.32 GB/s; the
+same save took 13.6 s before).

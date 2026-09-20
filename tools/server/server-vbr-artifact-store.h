@@ -422,6 +422,13 @@ struct server_vbr_artifact_import_output {
     uint64_t companion_bytes = 0;
 };
 
+// why an ingest returned no payload
+struct server_vbr_artifact_ingest_output {
+    vbr_artifact_status decode_status = vbr_artifact_status::internal_error;
+    vbr_capture_stream_status stream_status =
+        vbr_capture_stream_status::_count;
+};
+
 // A lower-precision variant may be useful only while negotiation is still
 // representation-dependent and before adoption has begun moving payload.
 bool server_vbr_artifact_import_variant_fallback_safe(
@@ -561,6 +568,21 @@ public:
     bool retain_host_payload(
         const std::string & reference,
         const std::string & tenant_key,
+        std::shared_ptr<const server_prompt_cache_vbr_payload> & payload)
+        noexcept;
+
+    // Persistence seam. Export streams one exact cache-owned package through
+    // the wire codec. Ingest is its inverse: the decoded envelope re-enters
+    // the catalog through the verified-segment door a live capture uses, so
+    // the result is an ordinary retirement-owned payload for
+    // import_host_payload. Same build and device layout only.
+    vbr_artifact_status export_host_payload(
+        const server_prompt_cache_vbr_payload & payload,
+        const vbr_artifact_stream_writer & writer,
+        uint64_t max_encoded_bytes) noexcept;
+    server_vbr_artifact_ingest_output ingest_host_payload(
+        const vbr_artifact_stream_reader & reader,
+        uint64_t encoded_bytes,
         std::shared_ptr<const server_prompt_cache_vbr_payload> & payload)
         noexcept;
 

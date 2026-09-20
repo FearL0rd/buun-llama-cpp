@@ -586,9 +586,110 @@ static void test_store(const std::string & root) {
     CHECK(reason == server_resume_reason::store_unwritable);
 }
 
+// one streamed object in place of the chunks: never in one buffer, its checksum known at the end
+static void test_artifact(const std::string & root) {
+    server_resume_reason reason;
+    std::string error;
+    auto store = server_resume_store::open(root, FAMILY, reason, error);
+    CHECK(store);
+    if (!store) {
+        return;
+    }
+
+    const std::string id = server_resume_store::new_entry_id();
+    const std::vector<uint8_t> payload = pattern(300000, 9);
+
+    server_resume_object_record record;
+    record.kind          = server_resume_object_kind::artifact;
+    record.p1            = 48;
+    record.gen           = 1;
+    record.prefix_digest = std::string(32, 'c');
+
+    const auto produce = [&](const server_resume_store::put_fn & put) {
+        for (size_t done = 0; done < payload.size(); done += 4099) {
+            if (!put(payload.data() + done, std::min<size_t>(4099, payload.size() - done))) {
+                return false;
+            }
+        }
+        return true;
+    };
+    CHECK(store->write_object_stream(id, record, produce, error) == server_resume_reason::ok);
+    CHECK(record.holds(payload.data(), payload.size()));
+
+    auto manifest = manifest_of(48, 1);
+    manifest.artifact       = record;
+    manifest.sequence_epoch = 7;
+    CHECK(store->commit(id, manifest, error) == server_resume_reason::ok);
+    store->sweep(id, manifest);
+
+    server_resume_manifest read;
+    CHECK(store->read_manifest(id, read, error) == server_resume_reason::ok);
+    CHECK(read.artifact && read.artifact->kind == server_resume_object_kind::artifact && read.chunks.empty());
+    CHECK(read.artifact->bytes == payload.size() && read.artifact->xxh3 == record.xxh3 && read.sequence_epoch == 7);
+
+    std::vector<uint8_t> got;
+    const auto consume_all = [&](const server_resume_store::get_fn & get) {
+        got.assign(payload.size(), 0);
+        return get(got.data(), 1000) && get(got.data() + 1000, got.size() - 1000);
+    };
+    CHECK(store->read_object_stream(id, *read.artifact, consume_all, error) == server_resume_reason::ok);
+    CHECK(got == payload);
+
+    // a consumer that stops early, or asks for more than the object holds, has not read the object
+    CHECK(store->read_object_stream(id, *read.artifact,
+        [&](const server_resume_store::get_fn & get) { return get(got.data(), 1000); }, error) != server_resume_reason::ok);
+    CHECK(store->read_object_stream(id, *read.artifact,
+        [&](const server_resume_store::get_fn & get) { got.resize(payload.size() + 1); return get(got.data(), got.size()); }, error) !=
+        server_resume_reason::ok);
+
+    // one changed byte is found at the end of the stream
+    const std::string path = store->directory() + "/entries/" + id + "/v-1";
+    {
+        std::fstream file(path, std::ios::in | std::ios::out | std::ios::binary);
+        file.seekp(64 + 200000);
+        file.put((char) (payload[200000] ^ 1));
+    }
+    CHECK(store->read_object_stream(id, *read.artifact, consume_all, error) == server_resume_reason::object_checksum_mismatch);
+
+    // a producer that gives up leaves nothing behind
+    const std::string id_failed = server_resume_store::new_entry_id();
+    CHECK(store->write_object_stream(id_failed, record,
+        [&](const server_resume_store::put_fn & put) { put(payload.data(), 100); return false; }, error) != server_resume_reason::ok);
+    CHECK(n_files(store->directory() + "/entries/" + id_failed) == 0);
+
+    // an artifact stands in for the chunks, never beside them, and carries no tail states
+    const auto valid = [](const server_resume_manifest & m) { std::string e; return server_resume_manifest_validate(m, e); };
+    CHECK(valid(manifest));
+    { auto m = manifest; m.chunks.push_back(chunk_of(0, 48, 1)); CHECK(!valid(m)); }
+    { auto m = manifest; m.tail_states.push_back(tail_of(48, 1, "frontier")); CHECK(!valid(m)); }
+    { auto m = manifest; m.artifact->p1 = 47; CHECK(!valid(m)); }
+    { auto m = manifest; m.artifact->kind = server_resume_object_kind::base_chunk; CHECK(!valid(m)); }
+    { auto m = manifest; m.artifact->gen = 2; CHECK(!valid(m)); }
+    { auto m = manifest; m.sequence_epoch = 0; CHECK(!valid(m)); }
+    { auto m = manifest_of(48, 1); m.chunks.push_back(chunk_of(0, 48, 1)); m.sequence_epoch = 1; CHECK(!valid(m)); }
+
+    // a kept value is the first one stored, also for the next process
+    CHECK(store->keep_value("execution-identity", "first", error) == "first");
+    CHECK(store->keep_value("execution-identity", "second", error) == "first");
+    CHECK(store->keep_value("../escape", "x", error).empty());
+    CHECK(store->keep_value("other", "not printable", error).empty());
+    store.reset();
+    store = server_resume_store::open(root, FAMILY, reason, error);
+    CHECK(store != nullptr);
+    CHECK(store->keep_value("execution-identity", "third", error) == "first");
+    CHECK(store->list().size() == 1);
+}
+
 int main() {
     test_manifest_round_trip();
     test_manifest_refusals();
+
+    {
+        const std::string root = (fs::temp_directory_path() / ("test-server-resume-artifact-" + server_resume_store::new_entry_id())).string();
+        test_artifact(root);
+        std::error_code ec;
+        fs::remove_all(root, ec);
+    }
 
     const std::string root = (fs::temp_directory_path() / ("test-server-resume-store-" + server_resume_store::new_entry_id())).string();
     test_store(root);

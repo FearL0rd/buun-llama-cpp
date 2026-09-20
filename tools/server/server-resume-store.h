@@ -8,7 +8,9 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <memory>
+#include <optional>
 #include <set>
 #include <string>
 #include <vector>
@@ -35,6 +37,7 @@ const char * server_resume_reason_name(server_resume_reason reason) noexcept;
 enum class server_resume_object_kind : uint32_t {
     base_chunk = 1, // base state of the token positions [p0, p1)
     tail_state = 2, // partial state taken when the sequence ended at p0; p1 is 0
+    artifact   = 3, // one self-verifying envelope of the whole sequence [0, p1), streamed
 };
 
 // bounds of a manifest, checked before anything is allocated from its numbers
@@ -48,6 +51,12 @@ struct server_resume_limits {
     static constexpr int      max_json_depth     = 6;
     static constexpr size_t   max_entries_listed = 1024;
     static constexpr uint64_t max_object_bytes   = 8ull * 1024 * 1024 * 1024;
+    // an artifact is never held in one buffer, so nothing is allocated from this number
+    static constexpr uint64_t max_artifact_bytes = 256ull * 1024 * 1024 * 1024;
+
+    static constexpr uint64_t max_bytes(server_resume_object_kind kind) {
+        return kind == server_resume_object_kind::artifact ? max_artifact_bytes : max_object_bytes;
+    }
 };
 
 struct server_resume_object_record {
@@ -101,9 +110,16 @@ struct server_resume_manifest {
     int64_t last_used_unix_ms = 0;
     int32_t slot_hint         = -1;
 
+    // Either the chunks tile [0, n_tokens), or one artifact holds the whole sequence and there are
+    // no chunks and no tail states.
     std::vector<server_resume_object_record> chunks;
     std::vector<server_resume_object_record> tail_states;
+    std::optional<server_resume_object_record> artifact;
     std::vector<server_resume_producer>      producers;
+
+    // artifact entries: the sequence epoch the envelope is bound to, so a restarted server can
+    // start its own counter above every epoch the store still holds
+    uint64_t sequence_epoch = 0;
 
     std::vector<uint8_t> ledger;
 
@@ -132,7 +148,8 @@ struct server_resume_entry {
 };
 
 // test seam: called at named points of a write, a returned reason other than ok is injected there.
-// points: object_write (half of the payload is on disk), object_publish, manifest_publish
+// points: object_write (the payload is on disk without its header), object_publish, manifest_publish,
+// value_publish, uncommit, uncommit_sync
 using server_resume_fault_fn = server_resume_reason (*)(const char * point);
 void server_resume_store_set_fault(server_resume_fault_fn fn) noexcept;
 
@@ -170,6 +187,21 @@ public:
         const std::string & id, server_resume_object_record & record,
         const uint8_t * payload, size_t size, std::string & error);
 
+    // The same object without one buffer of its size. `produce` pushes the payload through `put`
+    // in order; `consume` pulls it through `get`. Both return false to give up. The checksum of a
+    // read is known only after the last byte, so `consume` has to hold what it read privately
+    // until this returns ok.
+    using put_fn = std::function<bool(const uint8_t * data, size_t size)>;
+    using get_fn = std::function<bool(uint8_t * data, size_t size)>;
+
+    server_resume_reason write_object_stream(
+        const std::string & id, server_resume_object_record & record,
+        const std::function<bool(const put_fn & put)> & produce, std::string & error);
+
+    server_resume_reason read_object_stream(
+        const std::string & id, const server_resume_object_record & record,
+        const std::function<bool(const get_fn & get)> & consume, std::string & error) const;
+
     // publishes the manifest: the entry is this generation from here on
     server_resume_reason commit(const std::string & id, const server_resume_manifest & manifest, std::string & error);
 
@@ -196,6 +228,10 @@ public:
             const std::set<std::string> & held = {}, const std::set<std::string> & live = {}) const;
 
     uint64_t free_bytes() const;
+
+    // A short printable value of the namespace that outlives the process: the stored one, else
+    // `fresh` is stored and returned. Empty when it can be neither read nor stored.
+    std::string keep_value(const std::string & name, const std::string & fresh, std::string & error);
 
 private:
     server_resume_store() = default;

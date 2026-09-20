@@ -140,7 +140,7 @@ static bool is_hex(const std::string & text, size_t max_size) {
 }
 
 static bool object_record_valid(const server_resume_object_record & record, size_t n_producers, std::string & error) {
-    if (record.bytes == 0 || record.bytes > server_resume_limits::max_object_bytes) {
+    if (record.bytes == 0 || record.bytes > server_resume_limits::max_bytes(record.kind)) {
         error = "object size out of bounds";
         return false;
     }
@@ -166,7 +166,7 @@ bool server_resume_manifest_validate(const server_resume_manifest & manifest, st
         error = "chunk size out of bounds";
         return false;
     }
-    if (manifest.chunks.empty() || manifest.chunks.size() > limits::max_chunks ||
+    if (manifest.chunks.empty() == !manifest.artifact || manifest.chunks.size() > limits::max_chunks ||
         manifest.tail_states.size() > limits::max_tail_states ||
         manifest.producers.empty() || manifest.producers.size() > limits::max_producers) {
         error = "record count out of bounds";
@@ -181,7 +181,23 @@ bool server_resume_manifest_validate(const server_resume_manifest & manifest, st
         return false;
     }
 
-    int32_t next = 0;
+    if (manifest.artifact) {
+        const auto & artifact = *manifest.artifact;
+        if (artifact.kind != server_resume_object_kind::artifact || artifact.p0 != 0 || artifact.p1 != manifest.n_tokens ||
+            artifact.gen == 0 || artifact.gen > manifest.generation || !manifest.tail_states.empty()) {
+            error = "artifact does not hold the token range";
+            return false;
+        }
+        if (!object_record_valid(artifact, manifest.producers.size(), error)) {
+            return false;
+        }
+    }
+    if ((manifest.sequence_epoch != 0) != manifest.artifact.has_value()) {
+        error = "sequence epoch and artifact do not go together";
+        return false;
+    }
+
+    int32_t next = manifest.artifact ? manifest.n_tokens : 0;
     for (const auto & chunk : manifest.chunks) {
         if (chunk.kind != server_resume_object_kind::base_chunk || chunk.p0 != next || chunk.p1 <= chunk.p0 ||
             chunk.p1 > manifest.n_tokens || chunk.gen == 0 || chunk.gen > manifest.generation) {
@@ -243,7 +259,7 @@ static json object_record_to_json(const server_resume_object_record & record) {
         { "prefix_digest", record.prefix_digest },
         { "producer",      record.producer },
     };
-    if (record.kind == server_resume_object_kind::base_chunk) {
+    if (record.kind != server_resume_object_kind::tail_state) {
         out["p0"] = record.p0;
         out["p1"] = record.p1;
     } else {
@@ -282,7 +298,7 @@ static server_resume_object_record object_record_from_json(const json & in, serv
     record.xxh3          = get_int<uint64_t>(in, "xxh3");
     record.prefix_digest = in.at("prefix_digest").get<std::string>();
     record.producer      = get_int<uint32_t>(in, "producer");
-    if (kind == server_resume_object_kind::base_chunk) {
+    if (kind != server_resume_object_kind::tail_state) {
         record.p0 = get_int<int32_t>(in, "p0");
         record.p1 = get_int<int32_t>(in, "p1");
     } else {
@@ -314,6 +330,10 @@ std::vector<uint8_t> server_resume_manifest_encode(const server_resume_manifest 
     }
     for (const auto & tail : manifest.tail_states) {
         doc["tail_states"].push_back(object_record_to_json(tail));
+    }
+    if (manifest.artifact) {
+        doc["artifact"]       = object_record_to_json(*manifest.artifact);
+        doc["sequence_epoch"] = manifest.sequence_epoch;
     }
     for (const auto & producer : manifest.producers) {
         doc["producers"].push_back({
@@ -423,6 +443,10 @@ server_resume_reason server_resume_manifest_decode(
         for (const auto & tail : tail_states) {
             manifest.tail_states.push_back(object_record_from_json(tail, server_resume_object_kind::tail_state));
         }
+        if (doc.contains("artifact")) {
+            manifest.artifact       = object_record_from_json(doc.at("artifact"), server_resume_object_kind::artifact);
+            manifest.sequence_epoch = get_int<uint64_t>(doc, "sequence_epoch");
+        }
         for (const auto & in : producers) {
             server_resume_producer producer;
             producer.model_name   = in.at("model_name").get<std::string>();
@@ -495,6 +519,8 @@ static std::string object_name(const server_resume_object_record & record) {
     char name[96];
     if (record.kind == server_resume_object_kind::base_chunk) {
         std::snprintf(name, sizeof(name), "c-%" PRId32 "-%" PRId32 "-%" PRIu64, record.p0, record.p1, record.gen);
+    } else if (record.kind == server_resume_object_kind::artifact) {
+        std::snprintf(name, sizeof(name), "v-%" PRIu64, record.gen);
     } else {
         std::snprintf(name, sizeof(name), "t-%" PRId32 "-%" PRIu64, record.p0, record.gen);
     }
@@ -528,6 +554,16 @@ server_resume_reason server_resume_store::write_object(
     return server_resume_reason::io_error;
 }
 
+server_resume_reason server_resume_store::write_object_stream(
+        const std::string &, server_resume_object_record &, const std::function<bool(const put_fn &)> &, std::string &) {
+    return server_resume_reason::io_error;
+}
+
+server_resume_reason server_resume_store::read_object_stream(
+        const std::string &, const server_resume_object_record &, const std::function<bool(const get_fn &)> &, std::string &) const {
+    return server_resume_reason::io_error;
+}
+
 server_resume_reason server_resume_store::commit(const std::string &, const server_resume_manifest &, std::string &) {
     return server_resume_reason::io_error;
 }
@@ -542,6 +578,8 @@ void server_resume_store::remove_entry(const std::string &) const {}
 std::set<std::string> server_resume_store::victims(const std::string &, size_t, size_t, const std::set<std::string> &, const std::set<std::string> &) const { return {}; }
 void server_resume_store::prune(const std::string &, size_t, size_t, const std::set<std::string> &, const std::set<std::string> &) const {}
 uint64_t server_resume_store::free_bytes() const { return 0; }
+
+std::string server_resume_store::keep_value(const std::string &, const std::string &, std::string &) { return {}; }
 
 #else
 
@@ -593,6 +631,27 @@ static bool sync_dir(const std::string & path) {
     return dir.fd >= 0 && fsync(dir.fd) == 0;
 }
 
+// the payload checksum of an object that is never in one buffer
+struct xxh3_stream {
+    XXH3_state_t * state = XXH3_createState();
+
+    xxh3_stream() {
+        if (state && XXH3_64bits_reset(state) != XXH_OK) {
+            XXH3_freeState(state);
+            state = nullptr;
+        }
+    }
+    ~xxh3_stream() { XXH3_freeState(state); }
+
+    xxh3_stream(const xxh3_stream &) = delete;
+    xxh3_stream & operator=(const xxh3_stream &) = delete;
+
+    bool update(const uint8_t * data, size_t size) {
+        return state && XXH3_64bits_update(state, data, size) == XXH_OK;
+    }
+    uint64_t digest() const { return XXH3_64bits_digest(state); }
+};
+
 static bool write_all(int fd, const uint8_t * data, size_t size) {
     while (size > 0) {
         const ssize_t n = write(fd, data, std::min<size_t>(size, 16u * 1024 * 1024));
@@ -623,59 +682,116 @@ static bool read_all(int fd, uint8_t * data, size_t size) {
     return true;
 }
 
-// header and payload into a staging file, synced, then renamed to its name. a reader never sees a part
-static server_resume_reason publish_file(
-        const std::string & directory, const std::string & name, const char * fault_point,
-        const uint8_t * header, const uint8_t * payload, size_t size, std::string & error) {
-    const std::string staged = directory + "/tmp-" + server_resume_store::new_entry_id();
+// A file written under a staging name, synced, then renamed to its name: a reader never sees a part.
+// Whatever is not published is removed, except after an injected fault, which is a kill.
+struct staged_file {
+    const std::string directory;
+    const std::string path;
+    fd_guard          file;
+    size_t            unsynced = 0;
+    bool              keep     = false;
+    int               err      = 0; // of the write that failed
 
-    fd_guard file(open(staged.c_str(), O_CREAT | O_EXCL | O_WRONLY | O_CLOEXEC | O_NOFOLLOW, 0600));
-    if (file.fd < 0) {
-        error = errno_text("cannot create", staged, errno);
-        return reason_from_errno(errno);
-    }
+    // a streamed producer puts field by field: small puts leave as one write
+    static constexpr size_t coalesce = 1u << 20;
+    std::vector<uint8_t>    pending;
 
-    server_resume_reason reason = server_resume_reason::ok;
+    explicit staged_file(const std::string & directory) :
+        directory(directory), path(directory + "/tmp-" + server_resume_store::new_entry_id()),
+        file(open(path.c_str(), O_CREAT | O_EXCL | O_WRONLY | O_CLOEXEC | O_NOFOLLOW, 0600)) {}
 
-    const auto fail = [&](server_resume_reason why, const std::string & text) {
-        reason = why;
-        error  = text;
+    ~staged_file() {
         file.reset();
-        unlink(staged.c_str());
-        return reason;
-    };
-
-    if (header && !write_all(file.fd, header, HEADER_SIZE)) {
-        return fail(reason_from_errno(errno), errno_text("cannot write", staged, errno));
-    }
-
-    // bound the dirty pages of a large object instead of leaving them all to the final sync
-    constexpr size_t sync_every = 64u * 1024 * 1024;
-    for (size_t done = 0; done < size; ) {
-        const size_t n = std::min(sync_every, size - done);
-        if (!write_all(file.fd, payload + done, n) || fdatasync(file.fd) != 0) {
-            return fail(reason_from_errno(errno), errno_text("cannot write", staged, errno));
+        if (!keep) {
+            unlink(path.c_str());
         }
-        done += n;
     }
 
-    if (fsync(file.fd) != 0) {
-        return fail(reason_from_errno(errno), errno_text("cannot sync", staged, errno));
-    }
-    file.reset();
-
-    reason = fault_at(fault_point);
-    if (reason != server_resume_reason::ok) {
-        // an injected fault is a kill: the staging file stays, the name is not published
-        error = std::string("injected fault at ") + fault_point;
-        return reason;
+    // of the write that failed, else of the call that just failed
+    server_resume_reason failed(const char * what, std::string & error) const {
+        const int e = err != 0 ? err : errno;
+        error = errno_text(what, path, e);
+        return reason_from_errno(e);
     }
 
-    if (rename(staged.c_str(), (directory + "/" + name).c_str()) != 0) {
-        return fail(reason_from_errno(errno), errno_text("cannot publish", directory + "/" + name, errno));
+    bool put(const uint8_t * data, size_t size) {
+        if (pending.size() + size > coalesce && !flush()) {
+            return false;
+        }
+        if (size >= coalesce) {
+            return write_synced(data, size);
+        }
+        pending.insert(pending.end(), data, data + size);
+        return true;
     }
-    return server_resume_reason::ok;
-}
+
+    bool flush() {
+        const bool ok = write_synced(pending.data(), pending.size());
+        pending.clear();
+        return ok;
+    }
+
+    bool write_synced(const uint8_t * data, size_t size) {
+        // bound the dirty pages of a large object instead of leaving them all to the final sync
+        constexpr size_t sync_every = 64u * 1024 * 1024;
+        while (size > 0) {
+            const size_t n = std::min(size, sync_every - unsynced);
+            if (!write_all(file.fd, data, n)) {
+                err = errno;
+                return false;
+            }
+            data     += n;
+            size     -= n;
+            unsynced += n;
+            if (unsynced == sync_every) {
+                if (fdatasync(file.fd) != 0) {
+                    err = errno;
+                    return false;
+                }
+                unsynced = 0;
+            }
+        }
+        return true;
+    }
+
+    // over the bytes reserved for it at the start of the file, after a flush
+    bool put_header(const uint8_t * header) {
+        for (size_t done = 0; done < HEADER_SIZE; ) {
+            const ssize_t n = pwrite(file.fd, header + done, HEADER_SIZE - done, (off_t) done);
+            if (n < 0 && errno == EINTR) {
+                continue;
+            }
+            if (n <= 0) {
+                return false;
+            }
+            done += (size_t) n;
+        }
+        return true;
+    }
+
+    server_resume_reason publish(const std::string & name, const char * fault_point, std::string & error) {
+        if (!flush()) {
+            return failed("cannot write", error);
+        }
+        if (fsync(file.fd) != 0) {
+            return failed("cannot sync", error);
+        }
+        file.reset();
+
+        const server_resume_reason injected = fault_at(fault_point);
+        if (injected != server_resume_reason::ok) {
+            keep  = true;
+            error = std::string("injected fault at ") + fault_point;
+            return injected;
+        }
+
+        if (rename(path.c_str(), (directory + "/" + name).c_str()) != 0) {
+            return failed("cannot publish", error);
+        }
+        keep = true;
+        return server_resume_reason::ok;
+    }
+};
 
 std::unique_ptr<server_resume_store> server_resume_store::open(
         const std::string & cache_root, const std::string & family_digest,
@@ -801,17 +917,11 @@ std::vector<server_resume_entry> server_resume_store::list() const {
     return entries;
 }
 
-server_resume_reason server_resume_store::read_object(
-        const std::string & id, const server_resume_object_record & record,
-        std::vector<uint8_t> & payload, std::string & error) const {
-    if (!entry_id_valid(id) || record.bytes == 0 || record.bytes > server_resume_limits::max_object_bytes) {
-        error = "object record out of bounds";
-        return server_resume_reason::object_size_mismatch;
-    }
-
-    const std::string path = entry_dir(id) + "/" + object_name(record);
-
-    fd_guard file(::open(path.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW));
+// the object of the record, its header verified against it, positioned at the payload
+static server_resume_reason open_object(
+        const std::string & path, const server_resume_object_record & record, fd_guard & file, std::string & error) {
+    file.reset();
+    file.fd = open(path.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
     if (file.fd < 0) {
         error = errno_text("cannot open", path, errno);
         return errno == ENOENT ? server_resume_reason::object_missing : server_resume_reason::io_error;
@@ -851,12 +961,95 @@ server_resume_reason server_resume_store::read_object(
         return server_resume_reason::object_checksum_mismatch;
     }
 
-    payload.resize((size_t) record.bytes);
-    if (!read_all(file.fd, payload.data(), payload.size())) {
+    return server_resume_reason::ok;
+}
+
+server_resume_reason server_resume_store::read_object(
+        const std::string & id, const server_resume_object_record & record,
+        std::vector<uint8_t> & payload, std::string & error) const {
+    if (record.bytes > server_resume_limits::max_object_bytes) {
+        error = "object record out of bounds";
+        return server_resume_reason::object_size_mismatch;
+    }
+    return read_object_stream(id, record, [&](const get_fn & get) {
+        payload.resize((size_t) record.bytes);
+        return get(payload.data(), payload.size());
+    }, error);
+}
+
+server_resume_reason server_resume_store::read_object_stream(
+        const std::string & id, const server_resume_object_record & record,
+        const std::function<bool(const get_fn & get)> & consume, std::string & error) const {
+    if (!entry_id_valid(id) || record.bytes == 0 || record.bytes > server_resume_limits::max_bytes(record.kind)) {
+        error = "object record out of bounds";
+        return server_resume_reason::object_size_mismatch;
+    }
+
+    const std::string path = entry_dir(id) + "/" + object_name(record);
+
+    fd_guard file(-1);
+    const server_resume_reason opened = open_object(path, record, file, error);
+    if (opened != server_resume_reason::ok) {
+        return opened;
+    }
+
+    xxh3_stream checksum;
+    if (!checksum.state) {
+        error = "out of memory";
+        return server_resume_reason::io_error;
+    }
+    // a streamed consumer gets field by field: small gets come out of one read ahead
+    constexpr size_t     read_ahead = 1u << 20;
+    std::vector<uint8_t> ahead;
+    size_t               ahead_pos = 0;
+    uint64_t             unread    = record.bytes; // of the file
+    uint64_t             left      = record.bytes; // of the consumer
+    bool                 read_fail = false;
+
+    const auto fill = [&](uint8_t * data, size_t size) {
+        read_fail = !read_all(file.fd, data, size);
+        unread -= size;
+        return !read_fail;
+    };
+    const get_fn get = [&](uint8_t * data, size_t size) {
+        if (size > left) {
+            return false;
+        }
+        left -= size;
+        uint8_t * out = data;
+        for (size_t need = size; need > 0; ) {
+            if (ahead_pos == ahead.size()) {
+                if (need >= read_ahead) {
+                    if (!fill(out, need)) {
+                        return false;
+                    }
+                    break;
+                }
+                ahead.resize((size_t) std::min<uint64_t>(read_ahead, unread));
+                ahead_pos = 0;
+                if (!fill(ahead.data(), ahead.size())) {
+                    return false;
+                }
+            }
+            const size_t n = std::min(need, ahead.size() - ahead_pos);
+            std::memcpy(out, ahead.data() + ahead_pos, n);
+            ahead_pos += n;
+            out       += n;
+            need      -= n;
+        }
+        return checksum.update(data, size);
+    };
+
+    const bool consumed = consume(get);
+    if (read_fail) {
         error = "cannot read " + path;
         return server_resume_reason::io_error;
     }
-    if (!record.holds(payload.data(), payload.size())) {
+    if (!consumed || left != 0) {
+        error = "payload not accepted: " + path;
+        return server_resume_reason::object_checksum_mismatch;
+    }
+    if (checksum.digest() != record.xxh3) {
         error = "payload checksum: " + path;
         return server_resume_reason::object_checksum_mismatch;
     }
@@ -867,7 +1060,17 @@ server_resume_reason server_resume_store::read_object(
 server_resume_reason server_resume_store::write_object(
         const std::string & id, server_resume_object_record & record,
         const uint8_t * payload, size_t size, std::string & error) {
-    if (!entry_id_valid(id) || size == 0 || size > server_resume_limits::max_object_bytes || record.gen == 0) {
+    if (size == 0 || size > server_resume_limits::max_object_bytes) {
+        error = "object out of bounds";
+        return server_resume_reason::io_error;
+    }
+    return write_object_stream(id, record, [&](const put_fn & put) { return put(payload, size); }, error);
+}
+
+server_resume_reason server_resume_store::write_object_stream(
+        const std::string & id, server_resume_object_record & record,
+        const std::function<bool(const put_fn & put)> & produce, std::string & error) {
+    if (!entry_id_valid(id) || record.gen == 0) {
         error = "object out of bounds";
         return server_resume_reason::io_error;
     }
@@ -883,10 +1086,52 @@ server_resume_reason server_resume_store::write_object(
         return server_resume_reason::io_error;
     }
 
-    record.bytes = size;
-    record.xxh3  = XXH3_64bits(payload, size);
+    staged_file staged(directory);
+    if (staged.file.fd < 0) {
+        return staged.failed("cannot create", error);
+    }
 
+    // the header holds the size and the checksum, so it is written over its place once they are known
     uint8_t header[HEADER_SIZE] = {};
+    if (!staged.put(header, HEADER_SIZE)) {
+        return staged.failed("cannot write", error);
+    }
+
+    xxh3_stream checksum;
+    if (!checksum.state) {
+        error = "out of memory";
+        return server_resume_reason::io_error;
+    }
+    uint64_t bytes = 0;
+
+    const put_fn put = [&](const uint8_t * data, size_t size) {
+        if (size > server_resume_limits::max_bytes(record.kind) - bytes || !staged.put(data, size)) {
+            return false;
+        }
+        bytes += size;
+        return checksum.update(data, size);
+    };
+
+    const bool produced = produce(put) && staged.flush();
+    if (staged.err != 0) {
+        return staged.failed("cannot write", error);
+    }
+    if (!produced || bytes == 0) {
+        error = "object payload was not produced";
+        return server_resume_reason::io_error;
+    }
+
+    // the seam for a write that stops part-way: what is on disk is a staging file without its header
+    const server_resume_reason injected = fault_at("object_write");
+    if (injected != server_resume_reason::ok) {
+        staged.keep = true;
+        error = "injected fault at object_write";
+        return injected;
+    }
+
+    record.bytes = bytes;
+    record.xxh3  = checksum.digest();
+
     std::memcpy(header, OBJECT_MAGIC, 8);
     put_u32(header +  8, SERVER_RESUME_OBJECT_VERSION);
     put_u32(header + 12, HEADER_SIZE);
@@ -899,20 +1144,10 @@ server_resume_reason server_resume_store::write_object(
     put_u64(header + 48, record.gen);
     header_seal(header);
 
-    // the seam for a write that stops part-way: what is on disk is a staging file with half a payload
-    const server_resume_reason injected = fault_at("object_write");
-    if (injected != server_resume_reason::ok) {
-        const std::string staged = directory + "/tmp-" + new_entry_id();
-        fd_guard file(::open(staged.c_str(), O_CREAT | O_EXCL | O_WRONLY | O_CLOEXEC | O_NOFOLLOW, 0600));
-        if (file.fd >= 0) {
-            write_all(file.fd, header, HEADER_SIZE);
-            write_all(file.fd, payload, size / 2);
-        }
-        error = "injected fault at object_write";
-        return injected;
+    if (!staged.put_header(header)) {
+        return staged.failed("cannot write", error);
     }
-
-    return publish_file(directory, object_name(record), "object_publish", header, payload, size, error);
+    return staged.publish(object_name(record), "object_publish", error);
 }
 
 server_resume_reason server_resume_store::commit(
@@ -939,7 +1174,14 @@ server_resume_reason server_resume_store::commit(
         return server_resume_reason::manifest_corrupt;
     }
 
-    const server_resume_reason reason = publish_file(directory, "commit", "manifest_publish", nullptr, data.data(), data.size(), error);
+    staged_file staged(directory);
+    if (staged.file.fd < 0) {
+        return staged.failed("cannot create", error);
+    }
+    if (!staged.put(data.data(), data.size())) {
+        return staged.failed("cannot write", error);
+    }
+    const server_resume_reason reason = staged.publish("commit", "manifest_publish", error);
     if (reason != server_resume_reason::ok) {
         return reason;
     }
@@ -961,6 +1203,9 @@ void server_resume_store::sweep(const std::string & id, const server_resume_mani
     }
     for (const auto & tail : manifest.tail_states) {
         keep.insert(object_name(tail));
+    }
+    if (manifest.artifact) {
+        keep.insert(object_name(*manifest.artifact));
     }
 
     std::error_code ec;
@@ -1085,6 +1330,49 @@ uint64_t server_resume_store::free_bytes() const {
         return 0;
     }
     return (uint64_t) vfs.f_bavail * vfs.f_frsize;
+}
+
+std::string server_resume_store::keep_value(const std::string & name, const std::string & fresh, std::string & error) {
+    const auto valid = [](const std::string & value) {
+        return !value.empty() && value.size() <= MAX_STRING &&
+            std::all_of(value.begin(), value.end(), [](char c) { return c > ' ' && c < 0x7f; });
+    };
+    if (name.empty() || !std::all_of(name.begin(), name.end(), [](char c) { return (c >= 'a' && c <= 'z') || c == '-'; })) {
+        error = "value name is not valid";
+        return {};
+    }
+
+    const std::string path = dir + "/" + name;
+    {
+        fd_guard file(::open(path.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW));
+        char text[MAX_STRING + 1];
+        const ssize_t n = file.fd < 0 ? -1 : read(file.fd, text, sizeof(text));
+        std::string stored(text, (size_t) std::max<ssize_t>(n, 0));
+        if (valid(stored)) {
+            return stored;
+        }
+    }
+    if (!valid(fresh)) {
+        error = "value is not storable";
+        return {};
+    }
+
+    staged_file staged(dir);
+    if (staged.file.fd < 0) {
+        staged.failed("cannot create", error);
+        return {};
+    }
+    if (!staged.put((const uint8_t *) fresh.data(), fresh.size())) {
+        staged.failed("cannot write", error);
+        return {};
+    }
+    if (staged.publish(name, "value_publish", error) != server_resume_reason::ok || !sync_dir(dir)) {
+        if (error.empty()) {
+            error = "cannot sync " + dir;
+        }
+        return {};
+    }
+    return fresh;
 }
 
 #endif

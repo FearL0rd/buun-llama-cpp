@@ -13,8 +13,10 @@
 #include <algorithm>
 #include <array>
 #include <cstring>
+#include <map>
 #include <random>
 #include <stdexcept>
+#include <tuple>
 #include <utility>
 
 bool server_vbr_companion_codec_for(
@@ -1612,6 +1614,20 @@ private:
     status status_ = status::not_called;
 };
 
+// A freshly published reference becomes a cache-owned payload, or is discarded.
+std::shared_ptr<const server_prompt_cache_vbr_payload> adopt_fresh_reference(
+        llama_vbr_artifact_catalog & catalog,
+        llama_cache_acct_artifact_id reference) {
+    std::vector<llama_cache_acct_artifact_id> references { reference };
+    std::vector<vbr_artifact_package_view> packages;
+    if (!catalog.claim_fresh_host_batch(references, packages) ||
+        packages.size() != 1) {
+        (void) catalog.discard_unowned_reference(reference);
+        return nullptr;
+    }
+    return server_prompt_cache_vbr_payload::adopt(std::move(packages.front()));
+}
+
 } // namespace
 
 bool server_vbr_artifact_store_test_door::import_transport_policy(
@@ -2436,21 +2452,8 @@ server_vbr_artifact_store::publish_host_payload(
             operation.reset();
             return output;
         }
-        std::vector<llama_cache_acct_artifact_id> references {
-            result.sink.reference_artifact,
-        };
-        std::vector<vbr_artifact_package_view> packages;
-        if (!impl_->catalog.claim_fresh_host_batch(
-                references, packages) || packages.size() != 1) {
-            (void) impl_->catalog.discard_unowned_reference(
-                result.sink.reference_artifact);
-            output.status = server_vbr_artifact_capture_status::internal_error;
-            impl_->counters.internal_error++;
-            operation.reset();
-            return output;
-        }
-        payload = server_prompt_cache_vbr_payload::adopt(
-            std::move(packages.front()));
+        payload = adopt_fresh_reference(
+            impl_->catalog, result.sink.reference_artifact);
         if (!payload) {
             output.status = server_vbr_artifact_capture_status::internal_error;
             impl_->counters.internal_error++;
@@ -3763,6 +3766,188 @@ bool server_vbr_artifact_store::retain_host_payload(
     payload = server_prompt_cache_vbr_payload::adopt_owned(
         std::move(package));
     return bool(payload);
+}
+
+vbr_artifact_status server_vbr_artifact_store::export_host_payload(
+        const server_prompt_cache_vbr_payload & payload,
+        const vbr_artifact_stream_writer & writer,
+        uint64_t max_encoded_bytes) noexcept {
+    if (!payload.accounted_by(impl_->ledger) ||
+        !impl_->catalog.owns_host_package(payload.package())) {
+        return vbr_artifact_status::invalid_argument;
+    }
+    vbr_artifact_package package;
+    const auto status = payload.package().exact_package(package);
+    return status == vbr_artifact_status::ok
+        ? vbr_artifact_encode(package, writer, max_encoded_bytes)
+        : status;
+}
+
+namespace {
+
+// Decode hands payload bytes over before the package is known to be valid, so
+// every stream is held privately until the decoder reports the whole envelope
+// verified.
+struct ingest_staging {
+    using key = std::tuple<bool, uint32_t, uint32_t, bool>;
+    std::map<key, std::shared_ptr<artifact_segment_chain>> chains;
+    bool verified = false;
+
+    static bool consume(
+            void * context,
+            vbr_artifact_section_kind section,
+            uint32_t object_index,
+            uint32_t shard_index,
+            bool clean_stash,
+            uint64_t offset,
+            uint64_t total_size,
+            const uint8_t * data,
+            size_t size) noexcept {
+        try {
+            auto & self = *static_cast<ingest_staging *>(context);
+            const bool companion = section ==
+                vbr_artifact_section_kind::companion_payload;
+            if (!companion &&
+                section != vbr_artifact_section_kind::unit_blob) {
+                return false;
+            }
+            auto & chain = self.chains[
+                key { companion, object_index, shard_index, clean_stash }];
+            if (!chain) {
+                chain = std::make_shared<artifact_segment_chain>(total_size);
+            }
+            return chain->size() == offset && chain->append(data, size);
+        } catch (...) {
+            return false;
+        }
+    }
+
+    static void finish(void * context, bool verified) noexcept {
+        static_cast<ingest_staging *>(context)->verified = verified;
+    }
+
+    std::shared_ptr<const artifact_segment_chain> take(
+            bool companion,
+            uint32_t object_index,
+            uint32_t shard_index,
+            bool clean_stash) {
+        const auto found = chains.find(
+            key { companion, object_index, shard_index, clean_stash });
+        return found == chains.end() ? nullptr : std::move(found->second);
+    }
+};
+
+} // namespace
+
+server_vbr_artifact_ingest_output
+server_vbr_artifact_store::ingest_host_payload(
+        const vbr_artifact_stream_reader & reader,
+        uint64_t encoded_bytes,
+        std::shared_ptr<const server_prompt_cache_vbr_payload> & payload)
+        noexcept {
+    payload.reset();
+    server_vbr_artifact_ingest_output output;
+    try {
+        ingest_staging staging;
+        const vbr_artifact_payload_consumer consumer {
+            &staging, ingest_staging::consume, ingest_staging::finish,
+        };
+        vbr_artifact_decode_limits limits;
+        limits.max_total_bytes = encoded_bytes;
+        vbr_artifact_package package;
+        output.decode_status = vbr_artifact_decode(
+            reader, encoded_bytes, limits, &consumer, package);
+        if (output.decode_status != vbr_artifact_status::ok ||
+            !staging.verified) {
+            return output;
+        }
+        // The catalog binds one topology set for its lifetime; an envelope
+        // written under another device layout is not re-homed here.
+        llama_cache_budget_config budget;
+        if (package.topologies != impl_->topologies ||
+            !impl_->sample_budget(impl_->budget_context, budget) ||
+            !impl_->catalog.prepare_capture_package(package)) {
+            return output;
+        }
+        auto build = impl_->catalog.begin_capture(
+            package, budget, {}, output.stream_status);
+        if (!build) {
+            return output;
+        }
+        const auto segment = [&](vbr_unit_build & unit, uint32_t unit_index,
+                                 uint32_t shard_index, bool clean_stash) {
+            vbr_verified_segment verified;
+            verified.unit_index = unit_index;
+            verified.shard_index = shard_index;
+            verified.clean_stash = clean_stash;
+            verified.bytes = staging.take(
+                false, unit_index, shard_index, clean_stash);
+            if (!verified.bytes) {
+                return vbr_capture_stream_status::missing_segment;
+            }
+            verified.streaming_digest =
+                vbr_capture_stream_digest(*verified.bytes);
+            return unit.accept_verified_segment(verified);
+        };
+        for (uint32_t i = 0; i < package.companions.size(); ++i) {
+            vbr_verified_companion verified;
+            verified.companion_index = i;
+            verified.bytes = staging.take(true, i, 0, false);
+            if (!verified.bytes) {
+                output.stream_status =
+                    vbr_capture_stream_status::missing_segment;
+                return output;
+            }
+            verified.streaming_digest =
+                vbr_capture_stream_digest(*verified.bytes);
+            output.stream_status = build->accept_verified_companion(verified);
+            if (output.stream_status != vbr_capture_stream_status::ok) {
+                return output;
+            }
+        }
+        for (uint32_t i = 0; i < package.unit_blobs.size(); ++i) {
+            auto unit = build->begin_unit(i, output.stream_status);
+            if (!unit) {
+                return output;
+            }
+            const auto & descriptor = package.unit_blobs[i].descriptor;
+            for (const auto & shard : descriptor.shards) {
+                output.stream_status =
+                    segment(*unit, i, shard.shard_index, false);
+                if (output.stream_status != vbr_capture_stream_status::ok) {
+                    return output;
+                }
+            }
+            if (descriptor.clean_stash_state ==
+                    vbr_artifact_clean_stash_state::present) {
+                for (const auto & shard : descriptor.clean_stash.shards) {
+                    output.stream_status =
+                        segment(*unit, i, shard.shard_index, true);
+                    if (output.stream_status !=
+                            vbr_capture_stream_status::ok) {
+                        return output;
+                    }
+                }
+            }
+            output.stream_status = unit->seal_unit();
+            if (output.stream_status != vbr_capture_stream_status::ok) {
+                return output;
+            }
+        }
+        const auto published = build->publish_reference();
+        output.stream_status = published.status;
+        build.reset();
+        if (published.status != vbr_capture_stream_status::ok ||
+            published.reference_artifact.v == 0) {
+            return output;
+        }
+        payload = adopt_fresh_reference(
+            impl_->catalog, published.reference_artifact);
+        return output;
+    } catch (...) {
+        payload.reset();
+        return output;
+    }
 }
 
 const server_vbr_artifact_store_counters &
