@@ -196,6 +196,9 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     target_include_directories(test-recurrent-state-rollback PRIVATE ${PROJECT_SOURCE_DIR}/src)
     llama_build(test-vbr-swa-window.cpp)
     target_include_directories(test-vbr-swa-window PRIVATE ${PROJECT_SOURCE_DIR}/src)
+    # run by hand with a sliding-window model
+    llama_build(test-state-restore-swa-exact.cpp)
+    target_include_directories(test-state-restore-swa-exact PRIVATE ${PROJECT_SOURCE_DIR}/src)
 
     llama_build(test-vbr-representation-epoch.cpp)
     target_include_directories(test-vbr-representation-epoch PRIVATE ${PROJECT_SOURCE_DIR}/src)

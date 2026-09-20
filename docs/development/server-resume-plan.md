@@ -551,7 +551,7 @@ state or destroy unrelated valid entries; record measured peak disk occupancy.
 Initial measurements: dense and hybrid models had token-identical continuations
 across restart, sleep/wake, rewind, fewer slots and a killed save. Family reuse
 was measured separately in P0. These do not close the review findings in §11. SWA
-above-window fidelity remains unexplained (`server-resume-format.md` §10). Without `--resume`
+above the window is row-exact, not logit-exact (`server-resume-format.md` §10). Without `--resume`
 no resume code runs. Peak disk during a second save of a 221 MB hybrid entry:
 332 MB, i.e. the entry plus the objects being replaced. The retained-cell capture
 listed under P3 was needed already here and is in (`SWA_HELD_CELLS`).
@@ -744,9 +744,19 @@ Still required before moving on:
   (slot files are off under dynamic VBR, the host restore declines an exhausted
   destination before importing), so the test is at the library API. It becomes
   a server path when resume takes dynamic VBR.
-- [ ] **Wrapped SWA fidelity:** establish the cause with exact row/position
+- [x] **Wrapped SWA fidelity:** establish the cause with exact row/position
   comparisons and same-token logits. Different batch sizes and coherent output
   are not an acceptance substitute.
+  Done: `tests/test-state-restore-swa-exact.cpp` on Gemma-4 E2B (window 512,
+  f16 and q8_0 KV). Every restored K/V row, read back by position from both
+  caches, equals the live row bit for bit, below the window and across a
+  wrapped ring of 2185 tokens, for the whole-sequence restore and for the
+  resume route. Two live runs give bit-equal logits. Same-token logits after
+  a wrapped restore differ (max KLD 7e-9, top-1 8/8); the control reproduces
+  that below the window with exact rows moved 200 cells along (max KLD 2e-6),
+  where an unmoved restore is logit-exact. The cause is cell placement, which
+  changes the attention kernels' reduction order and padding, not restored
+  data. Matching the live ring's layout on restore is not planned.
 - [ ] **Qualification:** repeat dense/hybrid restart, rewind, sleep/wake and
   media gates after cleanup; verify missing-entry action leaves a live slot
   intact, host-cache overflow, resume-off PP/TG, and interrupted replacements.

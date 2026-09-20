@@ -630,14 +630,21 @@ entries that were live slots.
 
 Properties and limits of v1, as measured:
 
-- **SWA above-window fidelity remains unqualified.** Below the window the
-  measured restored conversation was bit-identical; above it the top-10
-  log-probabilities differed despite agreement on the probed top tokens.
-  Physical ring placement and reduction order are a hypothesis, not an
-  established cause. A different-`-ub` control does not prove restore correctness.
-  Qualification needs matched-token logits and serialized position/row checks
-  across a wrapped held-cells round trip. Dense and hybrid continuations were
-  identical in the measured cases, not proof for every restore path.
+- **A restored SWA conversation above the window is row-exact, not
+  logit-exact.** `tests/test-state-restore-swa-exact.cpp` (Gemma-4 E2B, window
+  512, f16 and q8_0 KV) reads every K/V row back by position from both caches.
+  After a whole-sequence restore and after the resume route (range append plus
+  the held-cells tail), across a wrapped ring of 2185 tokens, each row equals
+  the live row bit for bit. Two live runs give bit-equal logits, so nothing in
+  the comparison is run-to-run noise. The logits of the same eight next tokens
+  still differ from live (max KLD 7e-9, top-1 8/8), and the control shows why:
+  below the window, where a restore is otherwise logit-exact, the same exact
+  rows placed 200 cells further along differ by as much (max KLD 2e-6, top-1
+  8/8). A restore compacts the sequence to the front of the cache while the
+  live ring has wrapped, so the rows sit at other cell indices and the
+  attention kernels reduce over them in another order and padding. Dense and
+  hybrid continuations were identical in the measured cases, not proof for
+  every restore path.
 - A prefix install on a model with a partial part lands only on a tail-state
   position, so it needs an `early` or `turn` state inside the smaller context.
 - Every save of a hybrid conversation rewrites the frontier and turn states
