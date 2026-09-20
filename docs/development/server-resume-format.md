@@ -530,6 +530,7 @@ One log line and one `/slots` field per entry. The string
 | `context_too_small` | no restorable position fits |
 | `no_free_slot` | more entries than slots and no host prompt cache; the entry is kept |
 | `host_cache_rejected` | more entries than slots and the host prompt cache did not take the state (its size limit); the entry is kept |
+| `host_restore_refused` | save side, dynamic VBR: the owners' restore did not bring a hosted conversation into the staging slot (§11); an entry it had from an earlier pass is kept |
 | `entry_in_use` | the restore action named an entry another slot was restored from or saved as; two slots never write one entry |
 | `state_rejected` | the library refused a blob (type, shape, TCQ fingerprint) |
 | `unsupported_media` | a media chunk without a content id (§4a); capture-side skip, logged at save |
@@ -804,6 +805,37 @@ capture still publishes but leaves the source live, as it already does in a
 multi-slot unified cache; a returning conversation then restores through the
 owners' occupied-replacement route, which needs room for both conversations in
 the context. The cost is that an idle server keeps its cache mapped.
+
+**The host cache goes through a slot.** A conversation that lives in the VBR
+host cache alone is a projected package, which no file can hold. It is saved
+and brought back by the two doors the owners already have, with no file kind
+of its own:
+
+- *Save.* After the slots are saved, the hosted states of the running
+  execution identity and adapter configuration are listed (no media; not an
+  earlier state of a saved slot or of another hosted state; the newest up to
+  the entry bound, `max(8, 4 x slots)`). The most recently used slot is the
+  stage, the other slots leave the cache, and the entries of all of them are
+  held. Each hosted conversation is restored into the stage by the owners'
+  automatic restore, replacing what the stage holds, and saved as an ordinary
+  pool entry (`"hosted": true` in the event) with a last-used time older than
+  every slot's, in the order of the host cache. A refused replacement is
+  retried once into a cleared stage; a refusal after that is
+  `host_restore_refused` and the entry the conversation had from an earlier
+  pass, if any, stays.
+- *Load.* The first artifact entry, newest first, is the pool entry of the
+  cache and takes its slot with its co-residents. Every other artifact entry
+  is a hosted one: it is installed into an empty staging slot (the install
+  above), published by the owners' idle capture run to completion, and the
+  stage is cleared, oldest first so that the host cache's own order returns.
+  The outcome is `installed_host`; an entry that is not published stays in the
+  store (`host_cache_rejected`). This runs before the pool entry is
+  installed, the cache being empty in between.
+- *Cost.* One artifact per hosted conversation, and one restore and capture
+  of each at save, one install and capture at load (measured on the 0.6B
+  dense, 353 MB each: about 2.9 s per conversation either way). An image
+  covers the cache up to its watermark, so a conversation restored above the
+  one it replaced costs up to twice its size on disk.
 
 **Needs the artifact store.** The store exists with the VBR host cache. Under
 `--cache-ram 0` a save is `unsupported_artifact` and the server warns at start

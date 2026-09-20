@@ -5045,6 +5045,15 @@ private:
         return server_vbr_dynamic_active(params_base);
     }
 
+    // a conversation that leaves its slot lives on in a host cache, of either kind
+    bool resume_host_cache() const {
+        return fixed_host_cache_enabled() || resume_vbr_host_cache();
+    }
+
+    bool resume_vbr_host_cache() const {
+        return resume_vbr() && params_base.vbr_prompt_cache && prompt_cache && vbr_artifact_store;
+    }
+
     // An artifact is bound to the execution identity and the sequence epoch of its capture. Both
     // outlive the process with the store: the identity is the one of the namespace, and no epoch
     // an entry still holds is handed out again. Runs before anything derives from the identity.
@@ -5161,6 +5170,7 @@ private:
         }
         resume_group_t group;
         group.members = &order;
+        std::vector<const server_slot *> saved;
         for (auto * slot : order) {
             json status;
             try {
@@ -5181,10 +5191,109 @@ private:
             status["why"]   = why;
             status["slot"]  = slot->id;
             resume_log(status);
+            if (resume_saved(status)) {
+                saved.push_back(slot);
+            }
         }
+        const size_t n_hosted = resume_vbr_host_cache()
+            ? resume_capture_hosted(why, order.empty() ? slots.front() : *order.front(), saved) : 0;
         resume_prune(0);
-        SRV_INF("RESUME event=capture_done why=%s slots=%zu t_ms=%.1f\n",
-                why, order.size(), (ggml_time_us() - t_start)/1000.0);
+        SRV_INF("RESUME event=capture_done why=%s slots=%zu hosted=%zu t_ms=%.1f\n",
+                why, order.size(), n_hosted, (ggml_time_us() - t_start)/1000.0);
+    }
+
+    // The conversations a dynamic cache holds in the host cache alone. An artifact there has no
+    // form a file can take, so each comes back into a slot by the owners' restore, is saved as a
+    // slot's conversation is and gives way to the next. The cache goes away after this pass and
+    // the slots are saved by now: one of them is the stage, each restore replacing what it holds,
+    // and the others leave so that the image saved is of one conversation.
+    size_t resume_capture_hosted(const char * why, server_slot & stage,
+                                 const std::vector<const server_slot *> & saved) {
+        const std::string adapter = lora_config_identity(stage.lora);
+        const auto leads = [](const server_tokens & a, const server_tokens & b) {
+            return a.size() <= b.size() && a.get_common_prefix(b) == a.size();
+        };
+        // copies: publishing what a restore replaces may evict states
+        std::vector<server_tokens> hosted;
+        for (const auto & state : prompt_cache->states) {
+            const auto & tokens = state.prompt.tokens;
+            if (state.payload.kind() != server_prompt_cache_payload_kind::vbr_artifact ||
+                tokens.empty() || tokens.has_media() || state.adapter_config_key != adapter ||
+                state.vbr_execution_identity != frontier_execution_identity) {
+                continue;
+            }
+            // the copy of a saved slot, or an earlier state of a conversation that is saved later on
+            const auto led = [&](const server_tokens & other) { return leads(tokens, other); };
+            if (std::any_of(saved.begin(), saved.end(), [&](const server_slot * slot) {
+                    return led(slot->prompt.tokens);
+                }) || std::any_of(hosted.begin(), hosted.end(), led)) {
+                continue;
+            }
+            hosted.erase(std::remove_if(hosted.begin(), hosted.end(), [&](const server_tokens & other) {
+                return leads(other, tokens);
+            }), hosted.end());
+            hosted.push_back(tokens.clone());
+        }
+        // no more than the store keeps, the newest of them
+        const size_t bound  = resume_entry_bound();
+        const size_t n_room = bound - std::min(bound, saved.size());
+        hosted.erase(hosted.begin(), hosted.end() - std::min(hosted.size(), n_room));
+        if (hosted.empty()) {
+            return 0;
+        }
+        // The entries of the slots are held as the hosted ones are. Those are older than any slot's,
+        // the oldest first as the cache has them.
+        int64_t t_used = ggml_time_us();
+        for (auto & slot : slots) {
+            if (slot.prompt.n_tokens() > 0) {
+                t_used = std::min(t_used, slot.t_last_used);
+                // A replacement wants what it replaces held by the host cache, and a stage that
+                // is not gives way as the others do.
+                if (&slot != &stage || !ensure_vbr_replacement_recovery(slot)) {
+                    resume_stage_clear(slot);
+                }
+            }
+            resume_release_entry(slot);
+        }
+        std::vector<server_slot *> one { &stage };
+        size_t n_saved = 0;
+        for (size_t i = 0; i < hosted.size(); ++i) {
+            json status;
+            try {
+                server_task task(SERVER_TASK_TYPE_COMPLETION);
+                task.tokens = std::move(hosted[i]);
+                task.params.cache_prompt = true;
+                const auto restore = [&]() {
+                    return try_automatic_vbr_restore(stage, task, {}) && stage.prompt.n_tokens() > 0;
+                };
+                bool restored = restore();
+                if (!restored) {
+                    // a cache with no room for two conversations takes one into an empty stage
+                    resume_stage_clear(stage);
+                    restored = restore();
+                }
+                if (restored) {
+                    // the image reaches as far as the cache has been written
+                    llama_memory_breathe(llama_get_memory(ctx_tgt));
+                    // 10 ms apart, and never a time that reads as unused
+                    stage.t_last_used = std::max<int64_t>(1, t_used - int64_t(hosted.size() - i)*10000);
+                    resume_group_t solo;
+                    solo.members = &one;
+                    status = resume_capture_slot(stage, solo);
+                } else {
+                    status = resume_skipped("host_restore_refused");
+                }
+            } catch (const std::exception & e) {
+                status = resume_failed(server_resume_reason::io_error, e.what());
+            }
+            n_saved += resume_saved(status);
+            resume_release_entry(stage);
+            status["event"]  = "capture";
+            status["why"]    = why;
+            status["hosted"] = true;
+            resume_log(status);
+        }
+        return n_saved;
     }
 
     // One save pass over a dynamic cache. A VBR artifact is an image of the whole pool and imports
@@ -5208,6 +5317,11 @@ private:
         std::set<std::string> live;
     };
 
+    // the overall bound: every entry of the store, whatever holds it
+    size_t resume_entry_bound() const {
+        return std::max<size_t>(8, 4*slots.size());
+    }
+
     resume_retention_t resume_retention(size_t n_new) const {
         resume_retention_t keep;
         keep.held = resume_unslotted;
@@ -5218,7 +5332,7 @@ private:
             }
         }
         keep.n_keep_key   = slots.size() - std::min(slots.size(), n_slotted);
-        keep.n_keep_total = std::max<size_t>(8, 4*slots.size()) - n_new;
+        keep.n_keep_total = resume_entry_bound() - n_new;
         return keep;
     }
 
@@ -5230,7 +5344,7 @@ private:
     // the conversation of the slot's entry is no longer in the slot. It lives on in the host
     // cache, if there is one
     void resume_release_entry(server_slot & slot) {
-        if (!slot.resume_entry_id.empty() && fixed_host_cache_enabled()) {
+        if (!slot.resume_entry_id.empty() && resume_host_cache()) {
             resume_unslotted.insert(slot.resume_entry_id);
         }
         slot.resume_entry_id.clear();
@@ -6148,21 +6262,30 @@ private:
         size_t n_host = 0;
         std::set<std::string> reported;
         {
+            // A dynamic cache takes one image, that of the most recently used artifact and the
+            // entries placed in it. Every other artifact is a conversation the host cache had.
+            const bool vbr_host = resume_vbr_host_cache();
+            bool have_pool = false;
             std::vector<const server_resume_entry *> unslotted;
             size_t n_free = size_t(std::count(taken.begin(), taken.end(), false));
             for (const auto & entry : entries) {
                 if (entry.reason != server_resume_reason::ok || entry.manifest.resume_key != resume_key_hex) {
                     continue;
                 }
-                if (n_free > 0) {
+                const bool artifact = vbr_host && !entry.manifest.placed();
+                const bool hosted   = artifact && have_pool;
+                have_pool = have_pool || artifact;
+                if (!hosted && n_free > 0) {
                     n_free--;
-                } else {
+                    continue;
+                }
+                resume_unslotted.insert(entry.id);
+                if (hosted || !resume_vbr()) {
                     unslotted.push_back(&entry);
-                    resume_unslotted.insert(entry.id);
                 }
             }
             const auto stage = std::find(taken.begin(), taken.end(), false);
-            if (fixed_host_cache_enabled() && stage != taken.end()) {
+            if (resume_host_cache() && stage != taken.end()) {
                 for (auto it = unslotted.rbegin(); it != unslotted.rend(); ++it) {
                     json status = resume_install_host(slots[size_t(stage - taken.begin())], **it);
                     n_host += status.value("outcome", "") == "installed_host";
@@ -6281,20 +6404,47 @@ private:
         json status = resume_install(stage, entry.id, entry.manifest);
         if (resume_installed(status)) {
             const std::string outcome = status["outcome"];
-            const prompt_save_result saved = stage.prompt_save(*prompt_cache);
-            if (prompt_save_durable(saved)) {
-                prompt_cache->update();
+            if (resume_host_publish(stage)) {
                 status["outcome"] = "installed_host";
                 status["restored"] = outcome;
             } else {
                 status["outcome"] = "skipped";
                 status["reason"]  = "host_cache_rejected";
             }
-            stage.prompt_clear(server_cache_destruction_reason::idle_reclaim);
+            resume_stage_clear(stage);
         }
         stage.resume_entry_id.clear();
         stage.resume_status = resume_public(status);
         return status;
+    }
+
+    // The door that saves an idle slot, of whichever host cache there is. A dynamic cache has the
+    // owners' idle capture, run now rather than at the next quiet moment.
+    bool resume_host_publish(server_slot & stage) {
+        if (!resume_vbr()) {
+            const bool durable = prompt_save_durable(stage.prompt_save(*prompt_cache));
+            if (durable) {
+                prompt_cache->update();
+            }
+            return durable;
+        }
+        size_t n_published = 0;
+        auto capture = queue_tasks.try_begin_idle_capture();
+        if (capture) {
+            n_published += publish_idle_vbr_batch(capture);
+        }
+        if (vbr_idle_exact_capture) {
+            n_published += finish_idle_exact_vbr_capture(true, true);
+        }
+        return n_published > 0 || vbr_idle_source_durable(stage);
+    }
+
+    // a staging slot gives its conversation up, what the draft context has of it as well
+    void resume_stage_clear(server_slot & stage) {
+        if (!vbr_clear_idle_source(stage)) {
+            stage.prompt_clear(server_cache_destruction_reason::idle_reclaim);
+        }
+        llama_memory_breathe(llama_get_memory(ctx_tgt));
     }
 
     // A conversation that comes back inside the pool image of another entry's artifact. The
@@ -6867,6 +7017,9 @@ private:
         }
         common_speculative_sequence_transition(slot.get_spec(), slot.id, vbr_restore_event_for(payload));
         slot.bind_frontier_logits_to_prompt();
+        // the import published the prompt alone: without a live retention instance the slot is
+        // no source for an idle capture, and its conversation goes with the next one to take it
+        slot_restored_tokens_publish(slot);
         slot.resume_entry_id = id;
         slot.t_last_used = resume_last_used(manifest);
         for (auto * co : ready) {

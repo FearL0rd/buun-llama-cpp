@@ -744,8 +744,80 @@ restart, a changed one, and a restart with one slot):
 | fixed-type KV, iSWA: restart, sleep, fewer | f16 KV passes; turbo3_tcq reuses the full prefix (`cache_n` 9047 of 9047) and its text differs from the one-process reference, as it did before this slice |
 
 Limits: a placed conversation that gets no slot after a restart with fewer slots
-stays in the store until the image is next rewritten, then it is dropped (P4's
-host-cache staging is what would keep it). iSWA restores one conversation.
+stays in the store until the image is next rewritten, then it is dropped. iSWA
+restores one conversation in a slot; the others come back through the host cache
+when there is one (next section).
+
+#### P3 second slice, stage 2: the VBR host cache (2026-09-20; format document §11)
+
+A server with fewer slots than conversations keeps most of them in the host
+cache, and a restart that gives back the slots only loses them. Two routes:
+
+1. *Write the host cache's packages.* A hosted artifact is a projected package:
+   packed rows, no pool image, and no wire form. Giving it one is a new format
+   and a new import door in the owners' store.
+2. *Round trip through a slot (built).* The owners already turn a hosted
+   package into a live conversation (`try_automatic_vbr_restore`) and a live
+   conversation into a hosted package (the idle capture). The save pass is
+   terminal, so after the slots are saved one of them is a stage: each hosted
+   conversation is restored into it, saved as a slot's conversation is, and
+   replaced by the next. At load every artifact entry after the first is
+   installed into an empty staging slot, published by the owners' idle capture
+   run synchronously, and cleared, oldest first, as the fixed route does with
+   `resume_install_host`. No library change, no new file kind, and serving is
+   untouched.
+
+What is saved: the hosted states of the running execution identity and adapter
+configuration, without media, that are not an earlier state of a saved slot or
+of another hosted state; the newest of them up to the entry bound, which is now
+`max(8, 4 x slots)`.
+
+What the gate found:
+
+- **A resumed slot never reached the host cache.** The install did not publish
+  the restored tokens to the retention owner, so the idle capture saw nothing
+  to keep. One call (`slot_restored_tokens_publish`).
+- **The restore goes through the occupied door.** The stage keeps what it holds
+  and each restore replaces it (the owners' occupied replacement), after the
+  stage's own conversation is made durable in the host cache so that the
+  one-slot handoff gate does not divert to the empty door. A cache with no room
+  for two conversations refuses the replacement; the stage is then cleared and
+  the restore retried into it.
+- **For the VBR owners, not a resume result:** the empty-destination import
+  refuses a hosted package whose rows were not at physical cell 0 when it was
+  captured (`stage_failed`, `source_hash_mismatch`). `stage_child` in
+  `llama-vbr-artifact-stage.cpp` takes `first_physical_cell * row_bytes` as the
+  offset into a payload that is packed (measured: first cell 3047, 3047 rows,
+  payload of 3159 rows). Any package captured after an occupied restore has
+  such rows. In plain serving this is a silent cold prefill; the occupied door
+  takes the same packages without complaint (6 of 6 in a run without restarts).
+- **A pool image is as long as the cache has been written, not as the
+  conversation is.** After an occupied replacement the rows lie above the ones
+  they replaced, and the image of a 3161-token conversation covers 6400 cells
+  (734 MB against 353 MB). This holds for a live slot in ordinary serving too,
+  it does not grow past two conversations, and the watermark only shrinks once
+  the upper cells are free. Disk and load time of such an entry double.
+- **Under a tight budget the owners' occupied restore declines**
+  (`destination=exhausted`) with or without a restart, so the hosted
+  conversations are kept across the restart and reuse nothing in either case.
+- **A hybrid's hosted state ends at its last checkpoint** (2996 of 3047), with
+  or without a restart.
+
+Gate (harness scenario `host`: one slot, three conversations in turn, then two
+rounds of restart and one more turn of each; `P2_HOST_CTL=1` is the same without
+the restarts):
+
+| cell | result |
+|------|--------|
+| dynamic VBR, dense, one slot, three conversations | 6 of 6 reuse the full prefix; every save pass saves both hosted conversations |
+| dynamic VBR, dense, two slots, five conversations | 10 of 10; four hosted conversations saved per pass |
+| dynamic VBR, hybrid | reuse equals the run without restarts (2996, then 3108 to 3110); the live conversation reuses more (3047, 3161) |
+| dynamic VBR, dense, `--vbr-vram 120M` | both hosted conversations saved and republished on every pass; reuse 0 as in the run without restarts |
+| regressions: group (dense, hybrid, tight, iSWA one slot), restart, sleep; fixed-type restart, fewer, overflow | pass |
+
+Limits: a wake from sleep with requests already queued refuses the idle session
+the publication needs, and the hosted entries stay on disk until the next start.
+Hosted media conversations are not saved.
 
 ### P4 — Optional host-cache persistence and accelerator integration
 
@@ -871,6 +943,9 @@ fallbacks for any deferred feature must be documented before release.
     fewer slots, overflow, a smaller context, degraded budgets, tier mismatch in
     both directions (refused, never silently rebased up), MTP companions; the
     fixed route re-run unchanged.
+- 2026-09-20: P3 second slice, unreviewed. Stage 1 restores every slot of a
+  dynamic cache from one image; stage 2 takes the VBR host cache through a
+  staging slot in both directions. Details and gates under P3 in §9.
 
 ## 11. P0–P2 independent review — before VBR
 
