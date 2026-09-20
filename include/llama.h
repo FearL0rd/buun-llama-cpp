@@ -722,6 +722,7 @@ extern "C" {
     // state. This is deliberately NOT a model-weight identity: it excludes
     // tensor values, quantization, model names, paths, and timestamps while
     // binding effective state-producing structure and tokenizer semantics.
+    // An appended MTP drafter head and the pad token id are not bound.
     LLAMA_API bool llama_model_semantic_family_digest(
             const struct llama_model * model,
             uint8_t digest[32]);

@@ -410,6 +410,27 @@ static bool test_seq_file_integrity(
             return false;
         }
     }
+    // An appended MTP head is a drafter, not target state: the family covers
+    // the trunk only, so a model with and without its MTP head matches.
+    const bool mtp_excluded =
+        model->hparams.has_mtp() && model->hparams.n_layer() > 0;
+    const uint32_t il_last =
+        (mtp_excluded ? model->hparams.n_layer() : model->hparams.n_layer_all) - 1;
+    if (has_family_identity && mtp_excluded) {
+        auto & hp = model->hparams;
+        const auto saved_hp = hp;
+        hp.n_ff_arr[hp.n_layer_all - 1] += 1;
+        bool mtp_stable = family_now() == family;
+        hp = saved_hp;
+        hp.n_layer_all  -= hp.n_layer_nextn;
+        hp.n_layer_nextn = 0;
+        mtp_stable = mtp_stable && family_now() == family;
+        hp = saved_hp;
+        if (!mtp_stable) {
+            LOG_ERR("%s: MTP head shape or presence changed family identity\n", __func__);
+            return false;
+        }
+    }
     const auto require_family_mutation = [&](auto & field, auto replacement,
                                               const char * label) {
         const auto saved = field;
@@ -434,10 +455,10 @@ static bool test_seq_file_integrity(
             model->hparams.n_expert + 1, "expert count") ||
         !require_family_mutation(model->hparams.n_expert_used_arr[0],
             model->hparams.n_expert_used_arr[0] + 1, "selected expert count") ||
-        !require_family_mutation(model->hparams.n_expert_used_arr[model->hparams.n_layer_all - 1],
-            model->hparams.n_expert_used_arr[model->hparams.n_layer_all - 1] + 1, "last-block selected expert count") ||
-        !require_family_mutation(model->hparams.n_ff_exp_arr[model->hparams.n_layer_all - 1],
-            model->hparams.n_ff_exp_arr[model->hparams.n_layer_all - 1] + 1, "last-block expert width") ||
+        !require_family_mutation(model->hparams.n_expert_used_arr[il_last],
+            model->hparams.n_expert_used_arr[il_last] + 1, "last-block selected expert count") ||
+        !require_family_mutation(model->hparams.n_ff_exp_arr[il_last],
+            model->hparams.n_ff_exp_arr[il_last] + 1, "last-block expert width") ||
         !require_family_mutation(model->hparams.n_expert_shared,
             model->hparams.n_expert_shared + 1, "shared expert topology") ||
         !require_family_mutation(model->hparams.n_expert_groups,
