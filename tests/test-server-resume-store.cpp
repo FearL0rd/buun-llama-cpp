@@ -223,6 +223,13 @@ static void test_manifest_refusals() {
         CHECK(refused);
         CHECK(m.producer_index(producer_of("model")) == 0);
         CHECK(valid(m));
+
+        // a save that carries over only the last model's objects frees the rest of the table
+        m.chunks[0].producer = server_resume_limits::max_producers - 1;
+        m.retain_producers({ &m.chunks[0] });
+        CHECK(m.producers.size() == 1 && m.chunks[0].producer == 0);
+        CHECK(m.producers[0] == producer_of("model-" + std::to_string(server_resume_limits::max_producers - 1)));
+        CHECK(m.producer_index(producer_of("one more")) == 1);
     }
 
     // content the sums vouch for, refused on its own

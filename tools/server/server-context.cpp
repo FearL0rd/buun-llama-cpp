@@ -5512,6 +5512,19 @@ private:
             (slot.t_last_used > 0 ? std::max<int64_t>(0, ggml_time_us() - slot.t_last_used)/1000 : 0);
         next.slot_hint         = slot.id;
         next.producers         = old.producers;
+        {
+            // who wrote what this save replaces leaves the table with it
+            std::vector<server_resume_object_record *> reused;
+            for (size_t i = 0; i < n_kept; ++i) {
+                reused.push_back(&next.chunks[i]);
+            }
+            for (auto & src : tails) {
+                if (src.held) {
+                    reused.push_back(&src.rec);
+                }
+            }
+            next.retain_producers(reused);
+        }
         uint32_t producer;
         try {
             producer = next.producer_index(resume_producer());

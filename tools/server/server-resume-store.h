@@ -110,6 +110,10 @@ struct server_resume_manifest {
     // Index of an equal producer, or append it. Throws length_error if full rather
     // than attributing newly written state to an unrelated producer.
     uint32_t producer_index(const server_resume_producer & producer);
+
+    // Keep only the producers `records` refer to and renumber those records. A save calls this
+    // with the records it carries over, so the table holds who wrote the entry's current objects.
+    void retain_producers(const std::vector<server_resume_object_record *> & records);
 };
 
 // structure only: bounds, gapless tiling of [0, n_tokens), tail state positions, producer indices

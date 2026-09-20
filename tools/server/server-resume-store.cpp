@@ -119,6 +119,21 @@ uint32_t server_resume_manifest::producer_index(const server_resume_producer & p
     return (uint32_t) producers.size() - 1;
 }
 
+void server_resume_manifest::retain_producers(const std::vector<server_resume_object_record *> & records) {
+    constexpr uint32_t unused = UINT32_MAX;
+    std::vector<uint32_t>               index(producers.size(), unused);
+    std::vector<server_resume_producer> retained;
+    for (server_resume_object_record * record : records) {
+        uint32_t & at = index.at(record->producer);
+        if (at == unused) {
+            at = (uint32_t) retained.size();
+            retained.push_back(std::move(producers[record->producer]));
+        }
+        record->producer = at;
+    }
+    producers = std::move(retained);
+}
+
 static bool is_hex(const std::string & text, size_t max_size) {
     return !text.empty() && text.size() <= max_size &&
         std::all_of(text.begin(), text.end(), [](char c) { return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'); });
