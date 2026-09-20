@@ -1,7 +1,7 @@
 # Persistent server resume — design and implementation plan
 
 Status: **P0 to P2 implemented on `exp/server-resume` (fixed-type KV, `--resume`);
-P3 and P4 open; not reviewed for acceptance**. Contract, results and the limits
+P3 and P4 open; independent review found acceptance blockers (see §11)**. Contract, results and the limits
 of v1: `server-resume-format.md`.
 Created 2026-09-18 against master `ed774445c`.
 This is an engineering plan, not documentation of an available feature.
@@ -548,10 +548,10 @@ Gate: end-to-end same-model restart and deliberate family reuse, with resume-off
 cost effectively zero. Failed writes may lose affected entries, never admit corrupt
 state or destroy unrelated valid entries; record measured peak disk occupancy.
 
-Gate result: met for dense and hybrid models (token-identical continuations across
-restart, sleep/wake, rewind, fewer slots and a killed save) and for the family
-reuse measured in P0. SWA restores are numerically equivalent rather than
-bit-identical above the window (`server-resume-format.md` §10). Without `--resume`
+Initial measurements: dense and hybrid models had token-identical continuations
+across restart, sleep/wake, rewind, fewer slots and a killed save. Family reuse
+was measured separately in P0. These do not close the review findings in §11. SWA
+above-window fidelity remains unexplained (`server-resume-format.md` §10). Without `--resume`
 no resume code runs. Peak disk during a second save of a 221 MB hybrid entry:
 332 MB, i.e. the entry plus the objects being replaced. The retained-cell capture
 listed under P3 was needed already here and is in (`SWA_HELD_CELLS`).
@@ -673,3 +673,58 @@ fallbacks for any deferred feature must be documented before release.
     resume key keeps the family, the KV types, RoPE/YaRN and format versions.
   - Correction: slot files carry a whole-file FNV-1a-64; the missing pieces are
     smaller integrity units, streaming and durability.
+
+## 11. P0–P2 independent review — before VBR
+
+Review base: `08826ad6e`; reviewed head: `655037231`. Three independent
+code reviews covered structure, resource costs, and correctness. The object
+directory/container and existing state-owner integration are worth retaining;
+no wholesale rewrite is proposed. Implementation is not yet accepted for P3.
+
+First cleanup batch (focused gates tracked in the private review ledger):
+
+- [x] Store retirement is idempotent for already-pruned entries. Connecting it
+  to explicit slot erase awaits the conversation-ownership fix below.
+- [x] Unreported overflow entries can fill slots left empty by failed imports.
+  Host-cache staging retains its existing path; test that separately.
+- [x] Limited checkpoint budgets select recent companions before optional early
+  history, then import in chronological order.
+- [x] Release chunk staging on failed captures as well as successful ones.
+- [x] Refuse producer-table overflow instead of assigning new bytes to producer
+  zero. Report `provenance_limit` before changing disk state.
+- [x] Reject over-depth JSON rather than silently dropping its nested fields;
+  avoid signed overflow in tail-position validation.
+- [x] Exclude the POSIX research probe from Windows example builds.
+
+Still required before moving on:
+
+- [ ] **State identity:** token-prefix equality does not prove that stored KV or
+  recurrent bytes describe the current live state. Cold refill, family handoff,
+  legacy restore, and slot replacement can invalidate this assumption. Verify
+  serialized bytes or carry a proven lineage before reusing objects; never join
+  old base state to a newly computed unrelated recurrent frontier. Include
+  `cache_prompt:false` as a negative control.
+- [ ] **Conversation ownership:** the own-slot entry shortcut accepts a match of
+  only one chunk and can overwrite much more than the documented last-chunk
+  tradeoff. Separate entry adoption from object identity; qualify long shared
+  system prompts and returning host-cache conversations.
+- [ ] **Explicit erase:** retire the current conversation's disk entry, not a
+  stale entry ID left attached to its slot. Qualify both restart → erase →
+  restart and A → replace with B → erase B (A's entry must survive).
+- [ ] **Disk bound:** edited histories and replacement conversations can retain
+  almost two inventories until post-save pruning. Honor invalidate-first even
+  with plentiful free space, without deleting unrelated/held entries. Measure
+  peak allocated bytes, not just appended-turn bytes written.
+- [ ] **Recoverable VMM import:** the newly reached mapping helper aborts on
+  physical exhaustion. State import must use the recoverable mapping operation
+  and existing rollback, with a forced allocation-failure gate.
+- [ ] **Wrapped SWA fidelity:** establish the cause with exact row/position
+  comparisons and same-token logits. Different batch sizes and coherent output
+  are not an acceptance substitute.
+- [ ] **Qualification:** repeat dense/hybrid restart, rewind, sleep/wake and
+  media gates after cleanup; verify missing-entry action leaves a live slot
+  intact, host-cache overflow, resume-off PP/TG, and interrupted replacements.
+- [ ] **Remaining design decisions:** explicitly qualify projector-independent
+  approximate reuse; compact unreferenced producer records before the table
+  fills; measure range-enumeration cost at long context. Keep deferred host-only,
+  VBR, speculative-companion and platform support distinct from passing P2 tests.

@@ -263,8 +263,10 @@ Per nonempty slot, most recently used first:
    directory. The entry is now the new generation.
 7. Unlink objects the new manifest does not reference.
 
-Space-bounded replacement: the transient cost of step 4–7 is the replaced
-objects (at most one chunk and the changed tail states), not a second snapshot.
+Replacement currently retains the old objects through step 4–7. For an append
+this duplicates at most one chunk and the changed tail states; an edited history
+can replace many chunks and approach a second snapshot. This does **not** meet
+the agreed disk-space bound and is a release blocker (plan §11).
 If the preflight says even that does not fit, the writer removes `commit` first
 (`fsync`), then unlinks the old objects, then writes. An interruption then loses
 that entry, which is the agreed trade. Other entries are never touched.
@@ -433,8 +435,9 @@ start; it never fails the load and never leaves half a slot.
    frontier logits. The next request decodes at least one token and gets its own.
    Speculative state: event `target_restored_without_draft`; drafters rebind as
    in the `--mmproj-gpu-swap` path.
-6. Import tail states with `pos <= p` other than the one installed in step 4 as
-   context checkpoints — transition `resume_import`:
+6. Select the newest tail states with `pos < p` within the configured checkpoint
+   budget, then import them chronologically as context checkpoints — transition
+   `resume_import`. This retains the recent turn before optional early history:
    - new `common_prompt_checkpoint` with `n_tokens`, `pos_min`, `pos_max` and
      `data_tgt` from the record; `data_dft`, `data_qsa`, `accel` empty; VBR
      epochs 0;
@@ -490,6 +493,7 @@ One log line and one `/slots` field per entry. The string
 | `unsupported_vbr`, `unsupported_qsa`, `frontier_inconsistent` | capture-side skips, logged at save |
 | `store_locked`, `store_unwritable`, `no_space`, `io_error` | store level; the server runs without persistence |
 | `checkpoints_dropped=<n>` | warning attached to an `installed_*` outcome |
+| `provenance_limit` | capture skipped before disk mutation because all 16 producer records are occupied and the current producer is new; the previous entry is retained rather than misattributing new bytes |
 
 **No silent downgrade.** An entry that fails a check is skipped or failed with
 its reason. It is never installed by the legacy slot-file route, and the legacy
@@ -503,11 +507,15 @@ above. That endpoint is the restart-free test entry for the installer.
 As built: `POST /slots/<id>?action=restore` with `{"resume_entry": "<32 hex>"}`
 is accepted whenever the server runs with `--resume`, with or without
 `--slot-save-path`. A body carrying both `resume_entry` and `filename`, or an id
-that is not 32 hex digits, is a 400. The slot is cleared first, as a legacy
-restore does. The response is the usual restore result plus a `resume` object
+that is not 32 hex digits, is a 400. The manifest is read before the slot is
+cleared. The response is the usual restore result plus a `resume` object
 holding the outcome of this section; a missing entry is `skipped` /
-`object_missing` with the slot left empty. Paths of the
+`object_missing` with the destination unchanged. Paths of the
 host appear in the server log only, never in the response.
+
+Explicit slot `erase` does not yet retire persisted entries. This is a review
+blocker: retirement must identify the current conversation, not blindly delete
+an entry ID left attached to a slot by an earlier conversation (plan §11).
 
 ## 9. Install route: recommendation and alternative
 
@@ -585,15 +593,14 @@ entries that were live slots.
 
 Properties and limits of v1, as measured:
 
-- **SWA continuations are equivalent, not bit-identical, once the conversation
-  is longer than the window.** Below the window a restored conversation is
-  bit-identical. Above it the restored cells sit contiguously where the live
-  ring had wrapped, which changes the summation order of attention. The top-10
-  log-probabilities of the next turn differ from the one-process run by as much
-  as the same conversation differs from itself under another `-ub` (both with
-  f16 and with TCQ KV); the top token agreed at every probed position. A long
-  greedy continuation can therefore diverge, as it does between two batch
-  sizes. Dense and hybrid models restore bit-identically.
+- **SWA above-window fidelity remains unqualified.** Below the window the
+  measured restored conversation was bit-identical; above it the top-10
+  log-probabilities differed despite agreement on the probed top tokens.
+  Physical ring placement and reduction order are a hypothesis, not an
+  established cause. A different-`-ub` control does not prove restore correctness.
+  Qualification needs matched-token logits and serialized position/row checks
+  across a wrapped held-cells round trip. Dense and hybrid continuations were
+  identical in the measured cases, not proof for every restore path.
 - A prefix install on a model with a partial part lands only on a tail-state
   position, so it needs an `early` or `turn` state inside the smaller context.
 - Every save of a hybrid conversation rewrites the frontier and turn states
