@@ -757,10 +757,41 @@ Still required before moving on:
   where an unmoved restore is logit-exact. The cause is cell placement, which
   changes the attention kernels' reduction order and padding, not restored
   data. Matching the live ring's layout on restore is not planned.
-- [ ] **Qualification:** repeat dense/hybrid restart, rewind, sleep/wake and
+- [x] **Qualification:** repeat dense/hybrid restart, rewind, sleep/wake and
   media gates after cleanup; verify missing-entry action leaves a live slot
   intact, host-cache overflow, resume-off PP/TG, and interrupted replacements.
-- [ ] **Remaining design decisions:** explicitly qualify projector-independent
+  Done on the cleaned-up head, RTX 3090, TCQ 3-bit KV unless noted. All 14
+  review gates pass (missing-entry action, interrupted replacement among them).
+  Greedy continuations against one process: hybrid 17/17 (restart, sleep,
+  rewind, fewer slots, host-cache overflow, restore action, killed save,
+  fine-tune handoff); dense 18/18 with the kill 0.04 s after SIGTERM, the 0.6B
+  save finishing inside the default delay; media 3/3 on SmolVLM2 (q8_0 KV) and
+  on Gemma-4 E2B. M-RoPE media is skipped as designed, so that cell restores
+  nothing: its second turn is a cold prefill of the history and differs in text
+  from the reference's cached turn under TCQ 3-bit, q8_0 and f16 alike, which
+  is the server without resume. SWA 8/8 with f16 KV; with TCQ 3-bit the turns
+  after a restart or wake diverge in text (contract §10).
+  The earlier dense smaller-context continuation had never run: both requests
+  overflowed the smaller context and the harness compared two failures as equal.
+  With a history that fits it is token-identical, against a live and a cold
+  reference; the harness now refuses an empty reference. Resume off, against
+  master at the review base, 9000-token prefill and 256 generated tokens, three
+  runs in each build order: dense 2000 vs 2000 t/s prefill, 83.4 vs 83.7 t/s
+  generation; hybrid 3169 vs 3164 and 114.6 vs 114.7. The build that runs first
+  in a pair is ahead by 0.2–0.6 % in either order.
+- [x] **Remaining design decisions:** explicitly qualify projector-independent
   approximate reuse; compact unreferenced producer records before the table
   fills; measure range-enumeration cost at long context. Keep deferred host-only,
   VBR, speculative-companion and platform support distinct from passing P2 tests.
+  Done. Projector: presence stays in the key, the file stays provenance; one
+  model under its projector at two precisions continues token-identically
+  (contract §4a), differently trained projectors were not available. Producers:
+  a save keeps the records of the objects it carries over, so a conversation
+  refilled by another model lists that model alone. Range enumeration at 131072
+  tokens, 32 chunks: asking every chunk's size, which is the cell scan alone,
+  takes 13 ms (1.3 ms at 32768); reading all chunks takes 271 ms against 191 ms
+  for the whole sequence on the dense 0.6B (3.06 GB) and 88 ms against 61 ms on
+  the hybrid 4B (0.88 GB). The scan is 2–15 % of a chunked read, so no cell
+  inventory is added. Still deferred, and not covered by any P2 result:
+  host-only conversations at shutdown, dynamic VBR, drafter and speculative
+  companions, non-POSIX platforms.

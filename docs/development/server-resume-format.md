@@ -136,7 +136,9 @@ JSON records:
 - `producers[]`: provenance only, never a gate — model name and file basename as
   loaded, projector file basename (`mmproj_file`, optional), weight quantization, build label, KV types, adapter labels, host
   time. `producer` fields index this table; a conversation continued by a second
-  model has chunks from both.
+  model has chunks from both. A save keeps the records of the objects it carries
+  over and drops the rest, so the table lists who wrote what the entry holds
+  now, not everyone who ever wrote to it.
 - Object names are derived from the records, never stored, so a manifest cannot
   name a path.
 
@@ -356,6 +358,12 @@ and go into the token ranges like any other.
   follow-up request that sends the same file reuses the stored cells whichever
   projector encoded them, the same kind of handoff as between two models of one
   family (§5). `mmproj_file` in the producer record says which it was.
+  Measured for one model with its projector at two precisions (SmolVLM2-500M,
+  Q8_0 saved, f16 resumed, q8_0 KV): the two later turns, one of them a
+  text-only question about the stored image, are token-identical to the f16
+  projector reading the same history cold. Two differently trained projectors
+  for one model were not available to measure; that case is approximate reuse
+  by the same decision as a fine-tune, not a measured one.
 
 Measured on the 3090: a three-turn conversation with two
 images, one of them across the first chunk boundary, over two restarts against
@@ -525,7 +533,7 @@ One log line and one `/slots` field per entry. The string
 | `unsupported_vbr`, `unsupported_qsa`, `frontier_inconsistent` | capture-side skips, logged at save |
 | `store_locked`, `store_unwritable`, `no_space`, `io_error` | store level; the server runs without persistence |
 | `checkpoints_dropped=<n>` | warning attached to an `installed_*` outcome |
-| `provenance_limit` | capture skipped before disk mutation because all 16 producer records are occupied and the current producer is new; the previous entry is retained rather than misattributing new bytes |
+| `provenance_limit` | capture skipped before disk mutation because the objects this save carries over already come from 16 producers and the current producer is new; the previous entry is retained rather than misattributing new bytes |
 
 **No silent downgrade.** An entry that fails a check is skipped or failed with
 its reason. It is never installed by the legacy slot-file route, and the legacy
@@ -616,7 +624,7 @@ entries that were live slots.
    | install at startup | 54 ms | 70 ms | 4.6 ms | 184 ms (prefill: 9.6 s) |
    | restart, sleep/wake, restore action | identical | identical | see below | identical |
    | rewind | identical | identical | identical | |
-   | smaller context | prefix at 4607 | `context_too_small` (no tail state fits) | | |
+   | smaller context | prefix at 4607, continuation identical | `context_too_small` (no tail state fits) | | |
    | `-np 2` → `-np 1` | identical | identical | `resume_key_mismatch` by design | |
    | second save after one more turn | 28 MB | 113 MB | | 319 MB |
 
@@ -642,9 +650,12 @@ Properties and limits of v1, as measured:
   rows placed 200 cells further along differ by as much (max KLD 2e-6, top-1
   8/8). A restore compacts the sequence to the front of the cache while the
   live ring has wrapped, so the rows sit at other cell indices and the
-  attention kernels reduce over them in another order and padding. Dense and
-  hybrid continuations were identical in the measured cases, not proof for
-  every restore path.
+  attention kernels reduce over them in another order and padding. In the
+  server, the restart, sleep/wake and rewind continuations of the 9k-token SWA
+  conversation are token-identical with f16 KV; with TCQ 3-bit KV the turns
+  after a restart or a wake diverge in text (rewind and the first turn do
+  not). Dense and hybrid continuations were identical in the measured cases,
+  not proof for every restore path.
 - A prefix install on a model with a partial part lands only on a tail-state
   position, so it needs an `early` or `turn` state inside the smaller context.
 - Every save of a hybrid conversation rewrites the frontier and turn states
