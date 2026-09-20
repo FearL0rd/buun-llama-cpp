@@ -372,8 +372,11 @@ E2B (SWA, turbo3_tcq KV, below and above the window): all turns token-identical,
 `cache_n` equal to the one-process run after each restart, so no image was
 encoded again. A 4096-token context that ends inside the first image restores
 the 4033 tokens before it. Two media conversations saved under `-np 2` and
-restarted under `-np 1` with a host cache: one `installed_host`, both continue
-identically. Qwen3.5-4B with a projector: media slots skipped with
+restarted under `-np 1` with a host cache, on SmolVLM2: one `installed_host`,
+both continue identically. On Gemma 4 the stream count is part of the resume
+key (§5), so that restart installs nothing (`resume_key_mismatch`) and both
+conversations prefill cold: identical to the one-process run under f16 KV, one
+of the two second turns in other words under TCQ 3-bit. Qwen3.5-4B with a projector: media slots skipped with
 `unsupported_positions`, a text-only conversation identical across restarts.
 Before this change `--resume` with a projector loaded hit an assert at the first
 save, with or without media in the slot.

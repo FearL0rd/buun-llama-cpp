@@ -772,7 +772,10 @@ Still required before moving on:
   rewind, fewer slots, host-cache overflow, restore action, killed save,
   fine-tune handoff); dense 18/18 with the kill 0.04 s after SIGTERM, the 0.6B
   save finishing inside the default delay; media 3/3 on SmolVLM2 (q8_0 KV) and
-  on Gemma-4 E2B. M-RoPE media is skipped as designed, so that cell restores
+  on Gemma-4 E2B. The two-conversation `-np 2` → `-np 1` media restart is
+  identical on SmolVLM2; on Gemma-4 it is a `resume_key_mismatch` by design, so
+  both conversations prefill cold: identical under f16 KV, one second turn in
+  other words under TCQ 3-bit. M-RoPE media is skipped as designed, so that cell restores
   nothing: its second turn is a cold prefill of the history and differs in text
   from the reference's cached turn under TCQ 3-bit, q8_0 and f16 alike, which
   is the server without resume. SWA 8/8 with f16 KV; with TCQ 3-bit the turns
