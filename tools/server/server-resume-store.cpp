@@ -856,7 +856,7 @@ server_resume_reason server_resume_store::read_object(
         error = "cannot read " + path;
         return server_resume_reason::io_error;
     }
-    if (XXH3_64bits(payload.data(), payload.size()) != record.xxh3) {
+    if (!record.holds(payload.data(), payload.size())) {
         error = "payload checksum: " + path;
         return server_resume_reason::object_checksum_mismatch;
     }

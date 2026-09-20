@@ -5128,8 +5128,7 @@ private:
             status["slot"]  = slot->id;
             resume_log(status);
         }
-        const auto keep = resume_retention(0);
-        resume_store->prune(resume_key_hex, keep.n_keep_key, keep.n_keep_total, keep.held);
+        resume_prune(0);
         SRV_INF("RESUME event=capture_done why=%s slots=%zu t_ms=%.1f\n",
                 why, order.size(), (ggml_time_us() - t_start)/1000.0);
     }
@@ -5155,6 +5154,11 @@ private:
         return keep;
     }
 
+    void resume_prune(size_t n_new) {
+        const auto keep = resume_retention(n_new);
+        resume_store->prune(resume_key_hex, keep.n_keep_key, keep.n_keep_total, keep.held);
+    }
+
     // the conversation of the slot's entry is no longer in the slot. It lives on in the host
     // cache, if there is one
     void resume_release_entry(server_slot & slot) {
@@ -5172,9 +5176,6 @@ private:
         }
         const std::string entry = slot.prompt.n_tokens() == 0 ? std::string() :
             resume_entry_of(slot, slot.prompt.tokens, resume_adapter_hex(slot));
-        if (entry == slot.resume_entry_id) {
-            slot.resume_entry_id.clear();
-        }
         resume_release_entry(slot);
         if (!entry.empty()) {
             resume_store->remove_entry(entry);
@@ -5312,14 +5313,19 @@ private:
         // for byte, and what the entry holds beyond the live state (an early tail) only on top of
         // chunks that are.
         std::vector<uint8_t> resume_staging; // one object; released on failures as well as success
-        const auto chunk_is_live = [&](const server_resume_object_record & rec) {
-            const size_t size = llama_state_seq_get_size_range(ctx_tgt, slot.id, rec.p0, rec.p1);
-            if (size == 0 || size != rec.bytes) {
-                return false;
-            }
+        const auto stage_range = [&](const server_resume_object_record & rec, size_t size) {
             resume_staging.resize(size);
             return llama_state_seq_get_data_range(
-                    ctx_tgt, resume_staging.data(), size, slot.id, rec.p0, rec.p1) == size &&
+                ctx_tgt, resume_staging.data(), size, slot.id, rec.p0, rec.p1) == size;
+        };
+        const auto stage_frontier = [&](size_t size) {
+            resume_staging.resize(size);
+            return llama_state_seq_get_data_ext(
+                ctx_tgt, resume_staging.data(), size, slot.id, RESUME_FRONTIER_FLAGS) == size;
+        };
+        const auto chunk_is_live = [&](const server_resume_object_record & rec) {
+            const size_t size = llama_state_seq_get_size_range(ctx_tgt, slot.id, rec.p0, rec.p1);
+            return size != 0 && size == rec.bytes && stage_range(rec, size) &&
                 rec.holds(resume_staging.data(), size);
         };
 
@@ -5340,7 +5346,6 @@ private:
                 if (live) {
                     n_live = old.chunks[i].p1;
                 }
-                const std::string digest = hasher.at(size_t(p1));
                 if (live && old.chunks[i].p1 == p1) {
                     next.chunks.push_back(old.chunks[i]);
                     n_kept++;
@@ -5350,7 +5355,7 @@ private:
                 rec.kind = server_resume_object_kind::base_chunk;
                 rec.p0 = p0;
                 rec.p1 = p1;
-                rec.prefix_digest = digest;
+                rec.prefix_digest = hasher.at(size_t(p1));
                 next.chunks.push_back(std::move(rec));
             }
         }
@@ -5450,12 +5455,7 @@ private:
                     return rec.holds(data.data(), data.size());
                 }
                 const size_t size = llama_state_seq_get_size_ext(ctx_tgt, slot.id, RESUME_FRONTIER_FLAGS);
-                if (size == 0 || size != rec.bytes) {
-                    return false;
-                }
-                resume_staging.resize(size);
-                return llama_state_seq_get_data_ext(
-                        ctx_tgt, resume_staging.data(), size, slot.id, RESUME_FRONTIER_FLAGS) == size &&
+                return size != 0 && size == rec.bytes && stage_frontier(size) &&
                     rec.holds(resume_staging.data(), size);
             };
             for (auto & src : tails) {
@@ -5513,7 +5513,7 @@ private:
         next.slot_hint         = slot.id;
         next.producers         = old.producers;
         {
-            // who wrote what this save replaces leaves the table with it
+            // drop the producers no carried-over object refers to
             std::vector<server_resume_object_record *> reused;
             for (size_t i = 0; i < n_kept; ++i) {
                 reused.push_back(&next.chunks[i]);
@@ -5538,8 +5538,7 @@ private:
         std::string error;
         bool replaced = false;
         if (!have_old) {
-            const auto keep = resume_retention(1);
-            resume_store->prune(resume_key_hex, keep.n_keep_key, keep.n_keep_total, keep.held);
+            resume_prune(1);
         }
         if (have_old && (old.chunks.size() > n_kept + 1 || resume_store->free_bytes() < bytes_needed)) {
             // give up the old commit, keep only what is reused
@@ -5580,10 +5579,7 @@ private:
             auto & rec = next.chunks[i];
             rec.gen = next.generation;
             rec.producer = producer;
-            resume_staging.resize(chunk_sizes[i]);
-            if (llama_state_seq_get_data_range(
-                    ctx_tgt, resume_staging.data(), resume_staging.size(),
-                    slot.id, rec.p0, rec.p1) != chunk_sizes[i]) {
+            if (!stage_range(rec, chunk_sizes[i])) {
                 return abandon(server_resume_reason::io_error, "range read");
             }
             const auto reason = resume_store->write_object(
@@ -5602,10 +5598,7 @@ private:
                     const auto & data = src.checkpoint->data_tgt;
                     reason = resume_store->write_object(id, src.rec, data.data(), data.size(), error);
                 } else {
-                    resume_staging.resize(frontier_size);
-                    if (llama_state_seq_get_data_ext(
-                            ctx_tgt, resume_staging.data(), resume_staging.size(),
-                            slot.id, RESUME_FRONTIER_FLAGS) != frontier_size) {
+                    if (!stage_frontier(frontier_size)) {
                         return abandon(server_resume_reason::io_error, "partial read");
                     }
                     reason = resume_store->write_object(

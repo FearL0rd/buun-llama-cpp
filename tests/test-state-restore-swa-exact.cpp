@@ -195,8 +195,10 @@ int main(int argc, char ** argv) {
                 const float * p = ref.data()      + (size_t) i*n_vocab;
                 const float * q = a.logits.data() + (size_t) i*n_vocab;
                 double zp = 0.0, zq = 0.0;
-                const float mp = *std::max_element(p, p + n_vocab);
-                const float mq = *std::max_element(q, q + n_vocab);
+                const float * top_p = std::max_element(p, p + n_vocab);
+                const float * top_q = std::max_element(q, q + n_vocab);
+                const float mp = *top_p;
+                const float mq = *top_q;
                 for (int v = 0; v < n_vocab; ++v) {
                     max_abs = std::max(max_abs, std::fabs(p[v] - q[v]));
                     zp += std::exp((double) p[v] - mp);
@@ -208,7 +210,7 @@ int main(int argc, char ** argv) {
                     kld += std::exp(lp)*(lp - (q[v] - mq - std::log(zq)));
                 }
                 max_kld = std::max(max_kld, kld);
-                n_top1 += std::max_element(p, p + n_vocab) - p == std::max_element(q, q + n_vocab) - q;
+                n_top1 += top_p - p == top_q - q;
             }
             const bool same_logits = std::memcmp(ref.data(), a.logits.data(), ref.size()*sizeof(float)) == 0;
 
