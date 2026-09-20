@@ -1,6 +1,7 @@
 # Persistent server resume — format and install contract (P1)
 
-Status: **design contract for P2; nothing here is implemented**.
+Status: **design contract for P2**. Implemented so far: the shutdown flag and
+the library calls of §3 (§10 items 1 and 2).
 Companion of `server-resume-plan.md` (objective, P0 results, phases). Frozen
 2026-09-20 against `exp/server-resume`. Line anchors are from that branch; use the
 symbols when lines move. Independent review is deferred by the maintainer until a
@@ -143,36 +144,63 @@ size; the ledger's token count equals `n_tokens` and its next position equals
 `n_tokens` (a slot whose positions are not the identity, for instance after a
 context shift, is not saved in v1).
 
-## 3. Library additions (P2)
+## 3. Library additions (implemented in P2)
 
-The range filter and the append reader are the only format work in the library.
+The range writer and the append reader are the only format work in the library.
 Both reuse `state_write_meta` / `state_write_data` and their readers.
 
 ```c
-#define LLAMA_STATE_SEQ_FLAGS_BASE_ONLY 4   // complement of PARTIAL_ONLY
+#define LLAMA_STATE_SEQ_RANGE_VERSION 1
 
-// size / write the base part of seq_id restricted to positions [p0, p1),
-// cells in ascending position order
-size_t llama_state_seq_get_size_range(ctx, seq_id, p0, p1, flags);
-size_t llama_state_seq_get_data_range(ctx, dst, size, seq_id, p0, p1, flags);
+// size / write the base part of seq_id for positions [p0, p1), cells in
+// ascending position order. 0 on failure
+size_t llama_state_seq_get_size_range(ctx, seq_id, p0, p1);
+size_t llama_state_seq_get_data_range(ctx, dst, size, seq_id, p0, p1);
 
-// append a range blob: does not clear the sequence; the blob's first position
-// must be the sequence's pos_max + 1 (or 0 on an empty sequence); cells at
-// pos >= p_limit are skipped; cell_count is bounded by (p1 - p0) before any
-// reservation. All-or-nothing per call: on failure the cells of this call
-// are removed and the earlier ones stay.
-size_t llama_state_seq_append_data(ctx, src, size, seq_id, p0, p1, p_limit, flags);
+// append a range blob: does not clear the sequence; p0 must be the sequence's
+// pos_max + 1 in the base cache (0 on an empty sequence); cells at
+// pos >= p_limit are read and dropped. All-or-nothing per call: on failure the
+// cells of this call are removed and the earlier ones stay. 0 on failure
+size_t llama_state_seq_append_data(ctx, src, size, seq_id, p0, p1, p_limit);
 ```
 
-- Ascending position order is what lets `p_limit` cut a chunk by row count.
-- `cell_count` is today used for a batch reservation before it is compared with
-  the cache size; the append reader bounds it by the caller's range first.
-- A blob layout change must bump a new `LLAMA_STATE_SEQ_RANGE_VERSION`, which is
-  part of the resume key. With the build label out of the key this constant and
-  the reader's structural checks are what stop a stale layout.
-- Dynamic VBR keeps refusing (`state_write` throws after a degrade); P3.
-- Not yet verified, P2 test before `kv_unified` may leave the key: a blob written
-  under split KV installs under unified KV and the reverse.
+Range blob: 16 bytes `{magic "gqsr", LLAMA_STATE_SEQ_RANGE_VERSION, p0, p1}`,
+then `cell_count`, the meta block and the data block of §1 for one stream.
+
+- **No `n_stream` word.** A range belongs to one sequence, so the blob is the
+  same under unified and split KV and installs under either. Tested both ways on
+  a dense, a hybrid and an SWA model.
+- **No `BASE_ONLY` flag and no `flags` argument**, as first sketched: the range
+  calls are base-only by definition. Composite memories forward them to their
+  attention / base cache. A purely recurrent memory writes an empty payload
+  (blob size 16 means "no base part"); memory classes without an
+  implementation throw, which the API reports as 0.
+- **Ranges are strict.** The writer refuses a sequence that does not hold
+  exactly the positions `p0 .. p1-1`; the reader requires `cell_count == p1 - p0`,
+  `pos[i] == p0 + i` and the blob's `p0`/`p1` to equal the caller's. That bounds
+  `cell_count` before the batch reservation it feeds.
+- Ascending position order is what lets `p_limit` cut a chunk by row count: the
+  reader places the first `p_limit - p0` cells and skips the remaining rows of
+  every layer block.
+- The reader does not check for trailing bytes; the store's exact file size and
+  checksum cover that.
+- A blob layout change bumps `LLAMA_STATE_SEQ_RANGE_VERSION`, which is part of
+  the resume key. With the build label out of the key this constant and the
+  reader's structural checks are what stop a stale layout.
+- Dynamic VBR keeps refusing (the writer shares `state_write`'s settle/refuse
+  step); P3.
+- `llama_memory_seq_pos_max` on a composite memory is the minimum over both
+  parts, so it stays -1 until the partial part is installed. Code that tracks an
+  install in progress counts chunks; it does not ask the memory.
+
+Two findings that shape the server side:
+
+- `PARTIAL_ONLY` is ignored by a plain KV cache: on a dense model it writes the
+  full state. The server decides "has a partial part" itself:
+  `llama_model_is_hybrid || llama_model_is_recurrent || llama_model_n_swa > 0`.
+- The SWA partial blob is an ordinary KV-cache blob and carries `n_stream`. It
+  does **not** install across stream layouts. `kv_unified` therefore stays in
+  the resume key (§5). Recurrent partial blobs have no such word.
 
 ## 4. Capture (read-only)
 
@@ -235,7 +263,7 @@ SHA-256, domain `buun.server.resume-compat/v1`, over:
 | Control vectors | state-affecting, like adapters |
 | `swa_full` | changes which SWA cells exist |
 | mmproj presence | conservative while media is unsupported |
-| `kv_unified` | until the cross-layout test of §3 passes |
+| `kv_unified` | the SWA partial blob records the stream count (§3); base chunks alone would not need it |
 
 | Left out | Becomes |
 |---|---|
@@ -395,10 +423,13 @@ entries that were live slots.
 
 ## 10. What P2 builds from this
 
-1. Shutdown flag in the streaming `should_stop` closures (30 s wait).
-2. Library: `BASE_ONLY`, range writer, append reader, version constant; tests in
-   `test-save-load-state` (range tiling equals the whole blob's effect, append
-   equals one-shot, `p_limit`, cross-layout).
+1. **Done.** Shutdown flag in the `should_stop` closures. SIGTERM mid-prefill on
+   the 27B at 32k exits in 0.7–2.8 s (was 30 s), mid-decode in 0.3 s. Residual: a
+   stream attached to a conversation pipe (`X-Conversation-Id`) polls only the
+   pipe's cancel flag and still waits for its ping.
+2. **Done.** Library: range writer, append reader, version constant; test 11 of
+   `test-save-load-state` (three blobs plus the partial state equal the whole
+   state byte for byte, cross-layout install, `p_limit`, refusals).
 3. Store: root helper, lock, object and manifest I/O, bounded parsing, fault
    seams (short write, `ENOSPC`, kill between object and manifest).
 4. Capture and install in the server, `--resume`, the `resume_entry` restore
