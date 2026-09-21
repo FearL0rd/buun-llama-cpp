@@ -5009,6 +5009,52 @@ int main(int argc, char ** argv) {
                 sidecar_registry.read(*sidecar_a) == std::vector<uint8_t>({ 11, 12, 13, 14 }),
             "registry did not select the weight_map copy of a duplicated sidecar tensor");
 
+    {
+        // Recover only omitted names; explicit assignments still select the
+        // authoritative copy, and unlisted duplicates remain ambiguous.
+        const auto path = dir.path / "index-omissions";
+        std::filesystem::create_directories(path);
+        write_shard(path / "model-00001-of-00002.safetensors", shard_a_header, { 1, 2, 3, 4, 5, 6 });
+        write_shard(path / "model-00002-of-00002.safetensors", shard_b_header, { 7, 8, 9, 10, 11, 12, 13, 14 });
+        const auto index = path / "model.safetensors.index.json";
+        for (const auto mode : {llama_safetensors_io_mode::BUFFERED, llama_safetensors_io_mode::MMAP}) {
+            write_text(index,
+                R"({"weight_map":{"a":"model-00001-of-00002.safetensors","fp8":"model-00002-of-00002.safetensors"}})");
+            const auto recovered = llama_safetensors_registry::load(path, mode);
+            const auto * recovered_packed = recovered.find("packed");
+            require(recovered_packed && recovered.read(*recovered_packed) == std::vector<uint8_t>({ 5, 6 }),
+                    "registry did not recover an unlisted tensor from an indexed shard");
+            const auto * assigned = recovered.find("a");
+            require(assigned && recovered.read(*assigned) == std::vector<uint8_t>({ 1, 2, 3, 4 }),
+                    "recovery replaced an explicitly assigned tensor with its duplicate");
+
+            const auto rejects_with = [&](const char * expected) {
+                try {
+                    (void) llama_safetensors_registry::load(path, mode);
+                } catch (const std::runtime_error & error) {
+                    return std::string(error.what()).find(expected) != std::string::npos;
+                }
+                return false;
+            };
+            write_text(index,
+                R"({"weight_map":{"packed":"model-00001-of-00002.safetensors","fp8":"model-00002-of-00002.safetensors"}})");
+            require(rejects_with("duplicate safetensors tensor 'a'"),
+                    "registry guessed which unlisted duplicate to recover");
+
+            // An unlisted fp8 adds enough entries to hide the missing packed
+            // tensor from a completeness check based only on registry size.
+            write_text(index,
+                R"({"weight_map":{"a":"model-00001-of-00002.safetensors","packed":"model-00002-of-00002.safetensors"}})");
+            require(rejects_with("weight_map tensor 'packed' is missing from its shard"),
+                    "recovery concealed an explicit assignment to the wrong shard");
+
+            write_text(index,
+                R"({"weight_map":{"a":"model-00001-of-00002.safetensors","missing":"model-00002-of-00002.safetensors"}})");
+            require(rejects_with("weight_map tensor 'missing' is missing from its shard"),
+                    "recovered extras concealed an indexed tensor absent from all shards");
+        }
+    }
+
     // The index is authoritative; a tensor missing from its assigned shard
     // must still be rejected before any model allocation begins.
     write_text(
