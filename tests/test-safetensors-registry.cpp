@@ -4409,7 +4409,7 @@ int main(int argc, char ** argv) try {
                     adapters.read(*weight) == weights && adapters.file_type() == LLAMA_FTYPE_MOSTLY_Q8_0,
                 "BitsAndBytes INT8 weight binding is wrong");
         require(scale.has_value() && scale->target_type == GGML_TYPE_F32 &&
-                    scale->target_shape == std::vector<int64_t>({ rows }) &&
+                    scale->target_shape == std::vector<int64_t>{ rows } &&
                     scale->materialization == llama_safetensors_quant_materialization::BNB_INT8_SCALE,
                 "BitsAndBytes INT8 scale binding is wrong");
         require(input.has_value() && input->target_type == GGML_TYPE_I32 &&
