@@ -139,7 +139,12 @@ source_spec quantized_or_plain(
                     std::vector<transform_kind> transforms,
                     const std::string & plain_name) {
     if (auto binding = quant.bind(module, role)) {
-        return { binding->primary, std::move(transforms), std::move(binding) };
+        // NB: copy the primary BEFORE any std::move in this statement. MSVC
+        // 19.44 was observed building an empty `name` from a non-empty
+        // `binding->primary` when the copy shared a braced-init with
+        // `std::move(binding)` (indeterminately-sequenced arguments).
+        std::string name = binding->primary;
+        return { std::move(name), std::move(transforms), std::move(binding) };
     }
     if (quant.applies(module)) {
         return { {}, std::move(transforms), std::nullopt };
@@ -1538,7 +1543,14 @@ bool llama_safetensors_qwen35_importer::describe(
     } catch (const unsupported_target &) {
         return false;
     }
-    if (spec.part_targets.empty() && registry_.find(spec.name) == nullptr) {
+    // A resolved quantization binding carries its own physical source (e.g.
+    // EXL3 trellis parts); the literal `.weight` name need not exist. But an
+    // applies-but-unbound module resolves an EMPTY name — that case must still
+    // fail here, or the first consumer of spec.name throws on "" instead.
+    // Only a binding with a non-empty primary exempts the literal check.
+    if (spec.part_targets.empty() &&
+        (!spec.quant || spec.quant->primary.empty()) &&
+        registry_.find(spec.name) == nullptr) {
         return false;
     }
     if (!spec.part_targets.empty() && spec.stack_parts) {
@@ -1740,7 +1752,14 @@ std::vector<uint8_t> llama_safetensors_qwen35_importer::materialize(const std::s
             }
             return fused;
         }
-        const llama_safetensors_tensor & source_desc = require_tensor(registry_, spec.name);
+        // The source descriptor follows the physical source: the binding's
+        // primary when a binding resolved with a non-empty primary (e.g. EXL3
+        // trellis parts, or scale sign vectors), else the literal name. Scale
+        // bindings materialize RAW, so their dense transform path still needs
+        // a valid descriptor — of the primary, not the absent `.weight`.
+        const bool bound_source = spec.quant && !spec.quant->primary.empty();
+        const llama_safetensors_tensor & source_desc =
+            require_tensor(registry_, bound_source ? spec.quant->primary : spec.name);
         std::vector<uint8_t> result = !spec.hqq_scale.empty() ?
             repack_hqq_experts_q4_0(registry_, spec) :
             (spec.quant ? quant_->read(*spec.quant) : registry_.read(source_desc));
