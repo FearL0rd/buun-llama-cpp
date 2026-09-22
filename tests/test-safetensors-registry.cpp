@@ -332,9 +332,73 @@ std::unique_ptr<llama_safetensors_importer> make_importer(const std::filesystem:
     throw std::runtime_error("unsupported test importer architecture");
 }
 
+void test_qwen35_exl3_source_names(const std::filesystem::path & root) {
+    // Bound EXL3 sources have no literal .weight/.weight_scale. In particular,
+    // MSVC must copy the resolved source name before moving its binding into
+    // Qwen3.5's source_spec constructor (issue #136).
+    const auto path = root / "qwen35-exl3-source-names";
+    const std::string prefix = "model.layers.0.linear_attn.";
+    std::vector<tensor_fixture> tensors;
+    for (const auto & [module, rows] : std::vector<std::pair<std::string, uint64_t>>{
+            {prefix + "in_proj_qkv", 256}, {prefix + "in_proj_z", 128}, {"lm_head", 128}}) {
+        std::vector<uint8_t> signs(256), scales(rows * 2);
+        for (size_t i = 1; i < signs.size(); i += 2) signs[i] = 0x3c; // F16 1.0
+        for (size_t i = 1; i < scales.size(); i += 2) scales[i] = 0x3c;
+        tensors.push_back({module + ".trellis", "I16", {8, rows / 16, 32},
+                           std::vector<uint8_t>(8 * (rows / 16) * 32 * 2)});
+        tensors.push_back({module + ".mul1", "I32", {}, std::vector<uint8_t>(4)});
+        tensors.push_back({module + ".suh", "F16", {128}, signs});
+        tensors.push_back({module + ".svh", "F16", {rows}, scales});
+    }
+    write_single_shard_model(path, tensors);
+    write_text(path / "tokenizer.json", "{}");
+    const json config = {
+        {"model_type", "qwen3_5_text"}, {"num_hidden_layers", 64},
+        {"linear_num_key_heads", 1}, {"linear_num_value_heads", 2},
+        {"linear_key_head_dim", 64}, {"linear_value_head_dim", 64},
+        {"quantization_config", {{"quant_method", "exl3"}}},
+    };
+    for (auto mode : {llama_safetensors_io_mode::BUFFERED, llama_safetensors_io_mode::MMAP}) {
+        llama_safetensors_qwen35_importer importer(path, config, mode);
+        for (const auto & [target, rows] : std::vector<std::pair<std::string, int64_t>>{
+                {"blk.0.attn_qkv", 256}, {"blk.0.attn_gate", 128}, {"output", 128}}) {
+            for (const char * suffix : {".weight", ".scale", ".input_scale"}) {
+                const std::string name = target + suffix;
+                ggml_type type;
+                std::array<int64_t, GGML_MAX_DIMS> ne;
+                require(importer.describe(name, type, ne), "EXL3 physical source name was lost");
+                const bool weight = std::string(suffix) == ".weight";
+                require(type == (weight ? GGML_TYPE_EXL3_2 : GGML_TYPE_F16), "EXL3 binding type changed");
+                require(ne[0] == (weight || std::string(suffix) == ".input_scale" ? 128 : rows) &&
+                        ne[1] == (weight ? rows : 1), "EXL3 binding shape changed");
+                const size_t bytes = ggml_row_size(type, ne[0]) * ne[1];
+                const auto data = importer.materialize(name, type, bytes);
+                require(data.size() == bytes, "EXL3 bound source failed to materialize");
+                if (!weight) {
+                    for (size_t i = 0; i < data.size(); ++i) {
+                        require(data[i] == (i % 2 ? 0x3c : 0), "EXL3 sign vector changed");
+                    }
+                }
+                importer.bind(name);
+            }
+        }
+        ggml_type type;
+        std::array<int64_t, GGML_MAX_DIMS> ne;
+        require(!importer.describe("blk.1.attn_qkv.weight", type, ne),
+                "EXL3 source-name fix accepted an unbound missing tensor");
+        importer.validate_complete();
+    }
+}
+
 }  // namespace
 
-int main(int argc, char ** argv) {
+int main(int argc, char ** argv) try {
+    if (argc == 2 && std::string(argv[1]) == "exl3-source-names") {
+        temp_dir dir;
+        test_qwen35_exl3_source_names(dir.path);
+        std::cout << "EXL3 source-name regression passed\n";
+        return 0;
+    }
     if (argc == 4 && std::string(argv[1]) == "load-only") {
         const bool native = std::string(argv[3]) == "native";
         require(native || std::string(argv[3]) == "gguf", "load-only source must be native or gguf");
@@ -1004,6 +1068,8 @@ int main(int argc, char ** argv) {
                          "EXL3 with a missing sign vector was accepted");
     }
 
+    test_qwen35_exl3_source_names(dir.path);
+
     {
         // Streamed stacked experts must retain exact expert order. The PLE
         // table has a different (already canonical) on-disk layout.
@@ -1337,12 +1403,13 @@ int main(int argc, char ** argv) {
     // even when the producer declares Linear first (Syv's INT8 embeddings).
     {
         auto config = llama_safetensors_json::parse(packed_int4_symmetric_config);
+        // ordered_json insertion can invalidate references to sibling members.
+        config["quantization_config"]["ignore"] = { "ignored" };
         auto & groups = config["quantization_config"]["config_groups"];
         groups["int4"]["targets"] = { "Linear" };
         groups["embedding"] = groups["int4"];
         groups["embedding"]["targets"] = { "re:.*embed_tokens$" };
         groups["embedding"]["weights"]["num_bits"] = 8;
-        config["quantization_config"]["ignore"] = { "ignored" };
         auto parsed = llama_safetensors_quant_config::from_json(config);
         require(parsed.match("model.language_model.embed_tokens")->num_bits == 8,
                 "Linear class fallback shadows the INT8 embedding exception");
@@ -5082,4 +5149,7 @@ int main(int argc, char ** argv) {
     require(unsupported_rejected, "Qwen3.5 importer accepted an unsupported model contract");
 
     return 0;
+} catch (const std::exception & error) {
+    std::cerr << "test-safetensors-registry: " << error.what() << '\n';
+    return 1;
 }
