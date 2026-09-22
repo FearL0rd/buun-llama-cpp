@@ -1563,7 +1563,7 @@ struct mmq_args {
     int64_t ncols_opt; // value to optimize the tile size against, launch grid still uses ncols_max
 };
 
-bool ggml_cuda_mmq_nvfp4_tma(const mmq_args & args, cudaStream_t stream);
+bool ggml_cuda_mmq_nvfp4_tma(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream);
 
 static size_t mmq_get_nbytes_shared(const ggml_cuda_mmq_config & config, const int cc) {
     const size_t nbs_ids = config.J*sizeof(int);
@@ -1683,7 +1683,7 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
     if constexpr (type == GGML_TYPE_NVFP4 && J == 128 && !fallback) {
         // Preserve the original dispatch's accumulation grouping. A TMA tile
         // owns a complete K row; never replace a split-K/fixup contraction.
-        if (block_nums_stream_k.x == unsigned(ntiles_dst) && ggml_cuda_mmq_nvfp4_tma(args, stream)) {
+        if (block_nums_stream_k.x == unsigned(ntiles_dst) && ggml_cuda_mmq_nvfp4_tma(ctx, args, stream)) {
             return;
         }
     }
