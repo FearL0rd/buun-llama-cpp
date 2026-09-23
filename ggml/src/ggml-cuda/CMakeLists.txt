@@ -154,6 +154,13 @@ if (CUDAToolkit_FOUND)
                              ${GGML_HEADERS_CUDA}
                              ${GGML_SOURCES_CUDA}
                             )
+
+    # sm70 vendor headers (cute/cutlass/flash) resolve their internal
+    # "cute/..." / "cutlass/..." includes relative to the vendor root.
+    if (EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/sm70-vendor")
+        target_include_directories(ggml-cuda PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/sm70-vendor")
+    endif()
+
     target_include_directories(ggml-cuda PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/bsa_vendor")
 
     # The native F32-channel FP8 provider is compiled into the backend, not
