@@ -451,6 +451,10 @@ public:
     const std::vector<vbr_artifact_allocation_view> &
         reference_allocations() const noexcept;
     vbr_artifact_status validate() const noexcept;
+    // Reuse publication authentication only for immutable catalog metadata
+    // whose owned backing still has its verified revisions. Legacy/unproven
+    // packages use validate(); final import barriers must also use validate().
+    vbr_artifact_status validate_authenticated() const noexcept;
     vbr_artifact_resolve_status retain(
         vbr_artifact_package_view & output) const noexcept;
     void reset() noexcept;

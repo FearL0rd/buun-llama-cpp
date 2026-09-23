@@ -750,13 +750,33 @@ artifact_segment_chain::artifact_segment_chain(
 }
 artifact_segment_chain::~artifact_segment_chain() = default;
 artifact_segment_chain::artifact_segment_chain(
-        artifact_segment_chain &&) noexcept = default;
+        artifact_segment_chain && other) noexcept : impl_(std::move(other.impl_)) {
+    other.invalidate_revision();
+}
 artifact_segment_chain & artifact_segment_chain::operator=(
-        artifact_segment_chain &&) noexcept = default;
+        artifact_segment_chain && other) noexcept {
+    if (this != &other) {
+        invalidate_revision();
+        other.invalidate_revision();
+        impl_ = std::move(other.impl_);
+    }
+    return *this;
+}
+
+void artifact_segment_chain::invalidate_revision() noexcept {
+    // Saturate at the permanently invalid value instead of allowing ABA on wrap.
+    if (revision_ != 0) {
+        revision_ = revision_ == UINT64_MAX ? 0 : revision_ + 1;
+    }
+}
+
+uint64_t artifact_segment_chain::content_revision() const noexcept {
+    return impl_ ? revision_ : 0;
+}
 
 bool artifact_segment_chain::append(
         const uint8_t * data, size_t size) noexcept {
-    if ((!data && size != 0) || impl_->authenticated_closed ||
+    if (!impl_ || (!data && size != 0) || impl_->authenticated_closed ||
         size > std::numeric_limits<uint64_t>::max() - impl_->total ||
         (impl_->stream_digest_enabled &&
          size > impl_->stream_digest_expected - impl_->total)) {
@@ -786,7 +806,7 @@ bool artifact_segment_chain::append_owned(
 bool artifact_segment_chain::append_storage(
         std::shared_ptr<std::vector<uint8_t>> bytes) noexcept {
     try {
-        if (!bytes || impl_->authenticated_closed ||
+        if (!impl_ || !bytes || impl_->authenticated_closed ||
             bytes->size() > std::numeric_limits<uint64_t>::max() -
                 impl_->total ||
             (impl_->stream_digest_enabled &&
@@ -822,6 +842,7 @@ bool artifact_segment_chain::append_storage(
             }
             impl_->segment_ends.reserve(next);
         }
+        invalidate_revision();
         impl_->segments.push_back({
             std::move(bytes), 0, uint64_t(size),
         });

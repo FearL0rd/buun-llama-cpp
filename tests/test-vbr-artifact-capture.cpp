@@ -303,7 +303,10 @@ static void test_segment_chain_offsets() {
     artifact_segment_chain chain;
     const uint8_t a[] = { 0, 1, 2 };
     const uint8_t b[] = { 3, 4, 5, 6, 7 };
+    const auto initial_revision = chain.content_revision();
+    CHECK(initial_revision != 0);
     CHECK(chain.append(a, sizeof(a)));
+    CHECK(chain.content_revision() != initial_revision);
     CHECK(chain.append(b, sizeof(b)));
     CHECK(chain.size() == 8);
     CHECK(chain.segment_count() == 2);
@@ -328,7 +331,17 @@ static void test_segment_chain_offsets() {
     CHECK(known_size.append(b, sizeof(b)));
     CHECK(vbr_capture_stream_digest(known_size) ==
           vbr_capture_stream_digest(chain));
+    const auto full_revision = known_size.content_revision();
     CHECK(!known_size.append(&one, 1));
+    CHECK(known_size.content_revision() == full_revision);
+
+    artifact_segment_chain moved(std::move(known_size));
+    CHECK(known_size.content_revision() == 0);
+    CHECK(!known_size.append(&one, 1));
+    known_size = std::move(moved);
+    CHECK(known_size.content_revision() != 0);
+    CHECK(known_size.content_revision() != full_revision);
+    CHECK(moved.content_revision() == 0);
 
     auto incomplete = std::make_unique<artifact_segment_chain>(8);
     CHECK(incomplete->append(a, sizeof(a)));

@@ -1790,6 +1790,28 @@ static void test_catalog_streaming_protocol() {
     CHECK(adopted_state.published == 1);
     CHECK(adopted_state.adopted == 1);
 
+    {
+        vbr_artifact_package_view original, deduplicated, retained;
+        CHECK(f.catalog->resolve_reference(streamed.reference_artifact, original) ==
+              vbr_artifact_resolve_status::ok);
+        CHECK(f.catalog->resolve_reference(adopted.reference_artifact, deduplicated) ==
+              vbr_artifact_resolve_status::ok);
+        CHECK(deduplicated.retain(retained) == vbr_artifact_resolve_status::ok);
+        CHECK(original.validate_authenticated() == vbr_artifact_status::ok);
+        CHECK(deduplicated.validate_authenticated() == vbr_artifact_status::ok);
+        CHECK(retained.validate_authenticated() == vbr_artifact_status::ok);
+        CHECK(original.units()[0].payload_shards[0] ==
+              deduplicated.units()[0].payload_shards[0]);
+        auto chain = std::const_pointer_cast<artifact_segment_chain>(
+            original.units()[0].payload_shards[0]);
+        const uint8_t extra = 0;
+        CHECK(chain->append(&extra, 1));
+        // This single-unit legacy route still uses full validation.
+        CHECK(original.validate_authenticated() != vbr_artifact_status::ok);
+        CHECK(deduplicated.validate_authenticated() != vbr_artifact_status::ok);
+        CHECK(retained.validate_authenticated() != vbr_artifact_status::ok);
+    }
+
     catalog_fixture fake_equivalent;
     const auto fake_first = publish_fixture(*fake_equivalent.catalog,
         fake_equivalent.package,
@@ -3922,6 +3944,97 @@ struct validator_fixture {
     }
 };
 
+static void test_catalog_authentication_reuse() {
+    vbr_artifact_package_view empty;
+    CHECK(empty.validate_authenticated() == vbr_artifact_status::invalid_argument);
+
+    // Replacing even identical bytes must invalidate publication evidence.
+    // Full validation still succeeds, distinguishing reuse from a fresh hash.
+    for (int kind = 0; kind < 3; ++kind) {
+        validator_fixture f;
+        CHECK(f.view.validate_authenticated() == vbr_artifact_status::ok);
+        // Dedup must retain the original backing's authenticated revision,
+        // not the different revision of the newly submitted chain.
+        vbr_capture_stream_status status;
+        auto build = f.base.catalog->begin_capture(f.base.package, f.base.budget, {}, status);
+        CHECK(build && status == vbr_capture_stream_status::ok);
+        auto unit = build->begin_unit(0, status);
+        CHECK(unit && status == vbr_capture_stream_status::ok);
+        for (const auto & completion : f.base.completions()) {
+            auto segment = verified_segment(completion, 1);
+            CHECK(unit->accept_verified_segment(segment) == vbr_capture_stream_status::ok);
+        }
+        CHECK(unit->seal_unit() == vbr_capture_stream_status::ok);
+        auto companion = std::make_shared<artifact_segment_chain>();
+        CHECK(companion->append(f.base.storage.recurrent.bytes.data(),
+                                f.base.storage.recurrent.bytes.size()));
+        vbr_verified_companion verified;
+        verified.companion_index = 0;
+        verified.bytes = companion;
+        verified.streaming_digest = vbr_capture_stream_digest(*companion);
+        CHECK(build->accept_verified_companion(verified) == vbr_capture_stream_status::ok);
+        const auto published = build->publish_reference();
+        CHECK(published.status == vbr_capture_stream_status::ok);
+        CHECK(published.adopted);
+        vbr_artifact_package_view deduplicated, retained;
+        CHECK(f.base.catalog->resolve_reference(published.reference_artifact, deduplicated) ==
+              vbr_artifact_resolve_status::ok);
+        CHECK(f.view.retain(retained) == vbr_artifact_resolve_status::ok);
+        CHECK(deduplicated.validate_authenticated() == vbr_artifact_status::ok);
+        CHECK(retained.validate_authenticated() == vbr_artifact_status::ok);
+        auto backing = kind == 0 ? f.view.units()[0].payload_shards[0] :
+                       kind == 1 ? f.view.units()[0].stash_shards[0] :
+                                   f.view.companions()[0].payload;
+        auto chain = std::const_pointer_cast<artifact_segment_chain>(backing);
+        std::vector<uint8_t> bytes(chain->size());
+        CHECK(chain->read(0, bytes.data(), bytes.size()));
+        artifact_segment_chain replacement;
+        CHECK(replacement.append(bytes.data(), bytes.size()));
+        *chain = std::move(replacement);
+        CHECK(f.view.validate() == vbr_artifact_status::ok);
+        CHECK(f.view.validate_authenticated() == vbr_artifact_status::checksum_mismatch);
+
+        CHECK(retained.validate_authenticated() == vbr_artifact_status::checksum_mismatch);
+        // Companions belong to each reference; only payload/stash are deduped.
+        CHECK(deduplicated.validate_authenticated() == (kind == 2
+            ? vbr_artifact_status::ok : vbr_artifact_status::checksum_mismatch));
+
+        vbr_artifact_package_view resolved;
+        CHECK(f.base.catalog->resolve_reference(f.reference_artifact, resolved) ==
+              vbr_artifact_resolve_status::ok);
+        CHECK(resolved.validate_authenticated() == vbr_artifact_status::checksum_mismatch);
+
+        artifact_segment_chain moved(std::move(*chain));
+        CHECK(f.view.validate() == vbr_artifact_status::malformed);
+        CHECK(f.view.validate_authenticated() == vbr_artifact_status::checksum_mismatch);
+        *chain = std::move(moved);
+        CHECK(f.view.validate() == vbr_artifact_status::ok);
+        CHECK(f.view.validate_authenticated() == vbr_artifact_status::checksum_mismatch);
+        bytes[0] ^= 1;
+        artifact_segment_chain corrupt;
+        CHECK(corrupt.append(bytes.data(), bytes.size()));
+        *chain = std::move(corrupt);
+        CHECK(f.view.validate() != vbr_artifact_status::ok);
+        CHECK(f.view.validate_authenticated() == vbr_artifact_status::checksum_mismatch);
+    }
+
+    // Legacy publication has no reusable evidence and must still hash bytes.
+    validator_fixture legacy(true);
+    auto chain = std::const_pointer_cast<artifact_segment_chain>(
+        legacy.view.units()[0].payload_shards[0]);
+    std::vector<uint8_t> bytes(chain->size());
+    CHECK(chain->read(0, bytes.data(), bytes.size()));
+    artifact_segment_chain replacement;
+    CHECK(replacement.append(bytes.data(), bytes.size()));
+    *chain = std::move(replacement);
+    CHECK(legacy.view.validate_authenticated() == vbr_artifact_status::ok);
+    bytes[0] ^= 1;
+    artifact_segment_chain corrupt;
+    CHECK(corrupt.append(bytes.data(), bytes.size()));
+    *chain = std::move(corrupt);
+    CHECK(legacy.view.validate_authenticated() != vbr_artifact_status::ok);
+}
+
 static vbr_manifest_validation_result validate(
         validator_fixture & fixture,
         const vbr_target_validation_snapshot & target,
@@ -5131,6 +5244,25 @@ static vbr_adopt_stage_policy stage_policy_for(
 }
 
 static void test_validated_manifest_staging() {
+    {
+        validator_fixture changed(false, 0, true);
+        auto validated = validate(changed, changed.target, changed.policy);
+        CHECK(validated.proof);
+        auto chain = std::const_pointer_cast<artifact_segment_chain>(
+            changed.view.units()[0].payload_shards[0]);
+        std::vector<uint8_t> bytes(chain->size());
+        CHECK(chain->read(0, bytes.data(), bytes.size()));
+        artifact_segment_chain replacement;
+        CHECK(replacement.append(bytes.data(), bytes.size()));
+        *chain = std::move(replacement);
+        const auto baseline_ops = changed.base.ledger.snapshot().live_ops;
+        llama_cache_budget_config budget;
+        const auto policy = stage_policy_for(changed, budget);
+        auto refused = vbr_stage_validated_manifest(std::move(validated.proof), policy);
+        CHECK(refused.status == vbr_adopt_stage_status::source_hash_mismatch);
+        CHECK(!refused.staged);
+        CHECK(changed.base.ledger.snapshot().live_ops == baseline_ops);
+    }
     validator_fixture fixture(false, 0, true);
     auto validated = validate(fixture, fixture.target, fixture.policy);
     CHECK(validated.status == vbr_manifest_validation_status::validated);
@@ -9658,6 +9790,7 @@ int main(int argc, char ** argv) {
     test_prompt_cache_vbr_payload_fanout_lifetime();
     test_prompt_cache_vbr_same_frontier_variants();
     test_sequence_projected_capture_union();
+    test_catalog_authentication_reuse();
     test_manifest_validator_matrix();
     test_validated_manifest_staging();
 #ifdef VBR_PROMPT_CACHE_PUBLICATION_TEST
