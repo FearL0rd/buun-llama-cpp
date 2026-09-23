@@ -1746,6 +1746,7 @@ struct server_slot {
                 return prompt_save_result::failed;
             }
             auto & entry = staged.front();
+            entry.fixed_pos_min = llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), id);
             // An idle save has no active task and therefore keeps the
             // historical automatic-main default. Checkpoint pricing below is
             // intentionally the opposite polarity: no request means no
@@ -1788,7 +1789,9 @@ struct server_slot {
         }
     }
 
-    bool prompt_load(server_prompt_cache & prompt_cache, const server_tokens & tokens, const std::string & adapter_config_key, common_cache_plan_record * obs = nullptr) {
+    bool prompt_load(server_prompt_cache & prompt_cache, const server_tokens & tokens, const std::string & adapter_config_key,
+                     common_cache_plan_record * obs = nullptr,
+                     const server_prompt_cache_reuse_context * reuse = nullptr) {
         // No-restore is a successful identity operation. Seed the out-value
         // with the live lineage; a committed host restore overwrites it with
         // delivery.cache_family inside load_impl.
@@ -1797,7 +1800,7 @@ struct server_slot {
             server_prompt_cache_restore_shape::none;
         bool res = prompt_cache.load(prompt, tokens, ctx_tgt, ctx_dft, id,
                                      adapter_config_key, restore_shape, obs,
-                                     &restored_family);
+                                     &restored_family, reuse);
         if (!res) {
             SLT_WRN(*this, "%s", "failed to load prompt from cache\n");
         } else {
@@ -4710,22 +4713,8 @@ private:
             const server_slot & slot,
             const common_prompt_checkpoint & checkpoint,
             const std::string & adapter_identity) const {
-        const auto & frontier = checkpoint.computation_frontier;
-        if (!frontier.valid() ||
-            frontier.sequence_epoch != slot.prompt.sequence_epoch ||
-            frontier.execution_identity != frontier_execution_identity ||
-            frontier.adapter_config_identity != adapter_identity ||
-            frontier.token_count != checkpoint.n_tokens ||
-            checkpoint.pos_max < 0 ||
-            frontier.next_position <= 0 ||
-            frontier.next_position - 1 != checkpoint.pos_max) {
-            return false;
-        }
-
-        std::string media_identity;
-        return slot.prompt.tokens.media_content_identity(
-                   frontier.token_count, media_identity) &&
-               media_identity == frontier.media_content_identity;
+        return server_prompt_checkpoint_frontier_is_current(
+            slot.prompt, checkpoint, frontier_execution_identity, adapter_identity);
     }
 
     bool active_prefix_enabled() const {
@@ -9402,6 +9391,34 @@ private:
 
             recurrent_shrink_for_prefill("before prompt cache save/load");
 
+            std::optional<server_prompt_cache_reuse_context> reuse;
+            if (!selection_deferred_busy && fixed_host_cache_enabled() &&
+                task.type == SERVER_TASK_TYPE_COMPLETION && task.params.cache_prompt &&
+                (llama_model_is_recurrent(model_tgt) || llama_model_is_hybrid(model_tgt))) {
+                if (!incoming_adapter_ready) {
+                    cache_plan_derive_incoming_adapter(task, *ret, stage1_inventory);
+                }
+                // aLoRA and shifted/chunk reuse have additional replay constraints;
+                // keep their existing selection until those can be quoted here too.
+                if (incoming_adapter_matches && !lora_all_alora(ret->lora) &&
+                    task.params.n_cache_reuse == 0) {
+                    reuse.emplace();
+                    reuse->live_pos_min = llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), ret->id);
+                    reuse->n_swa = n_swa;
+                    reuse->frontier_required = ret->frontier_ratchet_flipped;
+                    if (reuse->frontier_required) {
+                        reuse->execution_identity = frontier_execution_identity;
+                    }
+                    const size_t lcp = ret->prompt.tokens.get_common_prefix(task.tokens);
+                    if (server_prompt_cache_reusable_prefix(ret->prompt, task.tokens,
+                            lcp, reuse->live_pos_min, *reuse, incoming_adapter) < lcp) {
+                        // A large token overlap may still need a cold replay. Allow
+                        // host lookup even when the legacy 50%-loss gate stays shut.
+                        update_cache = true;
+                    }
+                }
+            }
+
             // note: prompt_save() itself is a no-op when the slot's context is empty
 
             // A deferred busy slot retains the directive of its in-flight
@@ -9423,6 +9440,19 @@ private:
                 // complete reuse plan runs; it does not gain destruction
                 // authority to skip this save.
                 if (legacy_update_cache || retention_capacity_transition.preserve_source) {
+                    server_cache_recovery_pin incoming_pin;
+                    if (reuse) {
+                        const auto source = prompt_cache->select(
+                            ret->prompt, task.tokens, incoming_adapter, &*reuse);
+                        llama_cache_acct_artifact_id artifact;
+                        std::vector<llama_cache_acct_op_id> ops;
+                        // Save-time token-prefix dedup is not a recurrent
+                        // rewind proof. If durability can be proved, pin the
+                        // incoming image through this save. Otherwise preserve
+                        // the save and let the subsequent lookup reselect safely.
+                        (void) prompt_cache->acquire_durable_recovery(
+                            source, artifact, ops, incoming_pin);
+                    }
                     ret->prompt_save(*prompt_cache);
                 }
 
@@ -9447,7 +9477,7 @@ private:
                 if (incoming_adapter_matches) {
                     // Per-entry host rows ride the shipped lookup without a separate scan.
                     if (!ret->prompt_load(*prompt_cache, task.tokens, incoming_adapter,
-                                          request_cache_plan)) {
+                                          request_cache_plan, reuse ? &*reuse : nullptr)) {
                         cache_plan_host_restore_failed(
                             *ret, request_cache_plan);
                     }
@@ -16690,7 +16720,7 @@ private:
                             const bool has_new_tokens = (n_past < slot.task->n_tokens());
 
                             // the largest pos_min required for a checkpoint to be useful
-                            const auto pos_min_thold = std::max(0, pos_next - n_swa - (has_new_tokens ? 0 : 1));
+                            const auto pos_min_thold = server_prompt_checkpoint_reuse_threshold(pos_next, n_swa, has_new_tokens);
 
                             if (n_past > 0 && n_past <= slot.prompt.n_tokens()) {
                                 const auto pos_min = llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), slot.id);
@@ -17129,8 +17159,9 @@ private:
                                                 slot.cache_plan->restore_attempt_failed = true;
                                             }
                                         } else if (!do_reset) {
-                                            pos_next = std::min(pos_next, std::max(it->pos_min + 1, it->pos_max));
-                                            n_past = std::min(slot.prompt.tokens.size_up_to_pos(pos_next), (size_t) it->n_tokens);
+                                            const auto restored = server_prompt_checkpoint_reuse_geometry(slot.prompt.tokens, *it, pos_next);
+                                            pos_next = restored.pos_next;
+                                            n_past = restored.n_tokens;
                                             if (slot.retention_reuse_pending &&
                                                 slot.retention_reuse_tokens != 0) {
                                                 // Credit only the stateful

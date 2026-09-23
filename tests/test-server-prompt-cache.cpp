@@ -3943,6 +3943,206 @@ void test_host_load_short_prefix_clone_fault() {
     }
 }
 
+void test_recurrent_reusable_prefix() {
+    CHECK(server_prompt_checkpoint_reuse_threshold(4, 0, true) == 4);
+    CHECK(server_prompt_checkpoint_reuse_threshold(4, 0, false) == 3);
+    CHECK(server_prompt_checkpoint_reuse_threshold(4, 2, false) == 1);
+    CHECK(server_prompt_checkpoint_reuse_threshold(4, 8, true) == 0);
+    server_prompt prompt;
+    prompt.tokens = server_tokens(llama_tokens { 1, 2, 3, 4, 5, 6 }, false);
+    const server_tokens incoming(llama_tokens { 1, 2, 3, 4, 9 }, false);
+    server_prompt_cache_reuse_context context;
+    context.execution_identity = "execution";
+    const auto reusable = [&](size_t lcp, llama_pos pos_min) {
+        return server_prompt_cache_reusable_prefix(
+            prompt, incoming, lcp, pos_min, context, "adapter");
+    };
+    CHECK(reusable(0, 5) == 0);
+    CHECK(reusable(4, -1) == 0); // token ledger without state
+    CHECK(reusable(4, 3) == 4);  // directly appendable
+    CHECK(reusable(4, 5) == 0);  // no recurrent rewind available
+    prompt.checkpoints.emplace_back();
+    auto & checkpoint = prompt.checkpoints.back();
+    checkpoint.n_tokens = 2;
+    checkpoint.pos_min = checkpoint.pos_max = 1;
+    CHECK(reusable(4, 5) == 0); // empty payload
+    fill_checkpoint_bytes(checkpoint.data_tgt, 8, 1);
+    CHECK(reusable(4, 5) == 2);
+    checkpoint.pos_min = checkpoint.pos_max = 4;
+    checkpoint.n_tokens = 5;
+    CHECK(reusable(4, 5) == 0); // checkpoint is beyond divergence
+    checkpoint.pos_min = checkpoint.pos_max = 3;
+    checkpoint.n_tokens = 4;
+    CHECK(reusable(4, 5) == 4); // boundary is inclusive in token count
+    checkpoint.checkpoint_epoch = 1;
+    CHECK(reusable(4, 5) == 0);
+    checkpoint.checkpoint_epoch = 0;
+    context.frontier_required = true;
+    CHECK(reusable(4, 5) == 0); // missing sealed frontier
+    prompt.sequence_epoch = 7;
+    auto & frontier = checkpoint.computation_frontier;
+    frontier.version = common_computation_frontier::VERSION;
+    frontier.sequence_epoch = 7;
+    frontier.token_count = 4;
+    frontier.next_position = 4;
+    frontier.execution_identity = "execution";
+    frontier.adapter_config_identity = "adapter";
+    CHECK(prompt.tokens.media_content_identity(4, frontier.media_content_identity));
+    CHECK(reusable(4, 5) == 4);
+    frontier.sequence_epoch++;
+    CHECK(reusable(4, 5) == 0);
+    frontier.sequence_epoch--;
+    frontier.adapter_config_identity = "other";
+    CHECK(reusable(4, 5) == 0);
+    frontier.adapter_config_identity = "adapter";
+    frontier.media_content_identity = "other";
+    CHECK(reusable(4, 5) == 0);
+
+    context.frontier_required = false;
+    const server_tokens exact(llama_tokens { 1, 2, 3, 4 }, false);
+    CHECK(server_prompt_cache_reusable_prefix(
+        prompt, exact, 4, 5, context, "adapter") == 0);
+    // Do not fall through to an older checkpoint: execution would choose the
+    // full frontier first, then fail its final-token rollback after import.
+    common_prompt_checkpoint earlier;
+    earlier.n_tokens = 2;
+    earlier.pos_min = earlier.pos_max = 1;
+    fill_checkpoint_bytes(earlier.data_tgt, 8, 1);
+    prompt.checkpoints.insert(prompt.checkpoints.begin(), std::move(earlier));
+    CHECK(server_prompt_cache_reusable_prefix(
+        prompt, exact, 4, 5, context, "adapter") == 0);
+
+    server_prompt_cache cache(0, 0);
+    auto host = make_prompt_entry("adapter", { 1, 2, 3, 4, 5, 6 });
+    host.front().fixed_pos_min = 5;
+    host.front().prompt = prompt.clone();
+    cache.states.splice(cache.states.end(), host);
+    server_prompt live = prompt.clone();
+    live.checkpoints.pop_back();
+    context.live_pos_min = 5;
+    CHECK(server_prompt_cache_reusable_prefix(live, exact, 4, 5, context, "adapter") == 2);
+    CHECK(cache.select(live, exact, "adapter", &context) == cache.states.end());
+
+    // A full token match still requires final-token evaluation; no checkpoint
+    // means this exact hit is not a usable recurrent restore.
+    prompt.checkpoints.clear();
+    CHECK(server_prompt_cache_reusable_prefix(
+        prompt, prompt.tokens, 6, 5, context, "adapter") == 0);
+    const server_tokens append(llama_tokens { 1, 2, 3, 4, 5, 6, 7 }, false);
+    CHECK(server_prompt_cache_reusable_prefix(
+        prompt, append, 6, 5, context, "adapter") == 6);
+}
+
+void test_recurrent_selection_survives_displacement_save(bool accounted) {
+    server_cache_authority authority;
+    configure_host_accounting(authority, accounted);
+    server_prompt_cache cache(0, 0);
+    cache.acct = &authority.ledger;
+    cache.publish_authority = &authority;
+    cache.retention_obs = &authority.retention;
+    cache.destruction_obs = &authority.destruction;
+    auto short_entry = make_prompt_entry("same", { 1, 2 });
+    short_entry.front().fixed_pos_min = 1;
+    server_prompt_cache::iterator source;
+    CHECK(cache.publish(std::move(short_entry), nullptr, -1, &source));
+    if (accounted) {
+        (void) publish_host_retention(authority, source);
+    }
+
+    auto displaced = make_prompt_entry("same", { 1, 2, 3, 4, 5, 6 });
+    displaced.front().fixed_pos_min = 5;
+    const auto live = displaced.front().prompt.clone();
+    const server_tokens incoming(llama_tokens { 1, 2, 3, 4, 99 }, false);
+    server_prompt_cache_reuse_context context;
+    context.live_pos_min = 5;
+    CHECK(cache.select(live, incoming, "same", &context) == source);
+    llama_cache_acct_artifact_id artifact;
+    std::vector<llama_cache_acct_op_id> ops;
+    server_cache_recovery_pin pin;
+    CHECK(cache.acquire_durable_recovery(source, artifact, ops, pin) == accounted);
+    CHECK(cache.publish(std::move(displaced)));
+    if (!accounted) {
+        // No durability proof: the save may deduplicate the selected source.
+        // Reselect from the new inventory rather than retaining its iterator.
+        CHECK(cache.states.size() == 1);
+        CHECK(cache.select(live, incoming, "same", &context) == cache.states.end());
+        return;
+    }
+    CHECK(cache.states.size() == 2);
+    CHECK(cache.select(live, incoming, "same", &context) == source);
+    CHECK(source->recovery_pins == 1);
+    pin = {};
+    CHECK(source->recovery_pins == 0);
+}
+
+void test_host_load_recurrent_selection() {
+    // Exercise the real observed/unobserved selector, stopping at clone
+    // staging before any GPU mutation. A selected host returns false here.
+    CHECK(server_fault("load_clone_fail"));
+    if (!server_fault("load_clone_fail")) {
+        return;
+    }
+    for (const bool observed : { false, true }) {
+        for (const int live_frontier : { 0, 2, 4, 6 }) {
+            server_cache_authority authority;
+            server_prompt_cache cache(0, 0);
+            cache.publish_authority = &authority;
+            auto short_entry = make_prompt_entry("same", { 1, 2, 3, 4 });
+            short_entry.front().fixed_pos_min = 3;
+            auto * useful = &short_entry.front();
+            cache.states.splice(cache.states.end(), short_entry);
+            // Larger LCP, but the recurrent image is after the divergence.
+            auto unusable = make_prompt_entry("same", { 1, 2, 3, 4, 5, 6, 7, 8, 100 });
+            unusable.front().fixed_pos_min = 8;
+            auto * longer = &unusable.front();
+            cache.states.splice(cache.states.end(), unusable);
+            auto wrong_adapter = make_prompt_entry("other", { 1, 2, 3, 4, 5, 6, 7, 8 });
+            wrong_adapter.front().fixed_pos_min = 7;
+            cache.states.splice(cache.states.end(), wrong_adapter);
+            const server_tokens incoming(llama_tokens { 1, 2, 3, 4, 5, 6, 7, 8, 9 }, false);
+            server_prompt live;
+            live.tokens = server_tokens(llama_tokens { 1, 2, 3, 4, 5, 6, 7, 8, 50, 51 }, false);
+            if (live_frontier > 0) {
+                live.checkpoints.emplace_back();
+                auto & checkpoint = live.checkpoints.back();
+                checkpoint.n_tokens = live_frontier;
+                checkpoint.pos_min = checkpoint.pos_max = live_frontier - 1;
+                fill_checkpoint_bytes(checkpoint.data_tgt, 8, 1);
+            }
+            server_prompt_cache_reuse_context context;
+            context.live_pos_min = 9;
+            // Raw LCP ranking misses the useful shorter host in every arm.
+            CHECK(cache.select(live, incoming, "same", nullptr) == cache.states.end());
+            common_cache_plan_record rec;
+            server_prompt_cache_restore_shape shape;
+            const bool selected = live_frontier < 4;
+            CHECK(cache.load(live, incoming, nullptr, nullptr, 0, "same", shape,
+                observed ? &rec : nullptr, nullptr, &context) == !selected);
+            CHECK(shape == server_prompt_cache_restore_shape::none);
+            CHECK(live.n_tokens() == 10);
+            CHECK(cache.states.size() == 3);
+            if (observed) {
+                const auto * row = rec.selected_row(common_cache_plan_provider::host_cache_entry);
+                CHECK((row != nullptr) == selected);
+                if (row) {
+                    CHECK(row->source_id == useful->cache_plan_source_id);
+                    CHECK(row->lcp_tokens.value == 4);
+                    CHECK(!row->delivered);
+                }
+            }
+            if (live_frontier == 0) {
+                longer->prompt.checkpoints.emplace_back();
+                auto & checkpoint = longer->prompt.checkpoints.back();
+                checkpoint.n_tokens = 6;
+                checkpoint.pos_min = checkpoint.pos_max = 5;
+                fill_checkpoint_bytes(checkpoint.data_tgt, 8, 1);
+                CHECK(cache.select(live, incoming, "same", &context) ==
+                      std::next(cache.states.begin()));
+            }
+        }
+    }
+}
+
 void test_host_publication_accounting_fault_is_atomic() {
     server_cache_authority authority;
     configure_host_accounting(authority, true);
@@ -5040,6 +5240,7 @@ int main(int argc, char ** argv) {
     if (argc == 2 && std::string(argv[1]) == "--clone-fault") {
         test_lifecycle_restore_clone_fault();
         test_host_load_short_prefix_clone_fault();
+        test_host_load_recurrent_selection();
         llama_backend_free();
         if (failures == 0) {
             std::puts("test-server-prompt-cache: CLONE_FAULT_PASS");
@@ -5105,6 +5306,9 @@ int main(int argc, char ** argv) {
     test_checkpoint_draft_restore_refuses_without_context();
     test_checkpoint_suffix_trim_rebases_only_preserved_prefixes();
     test_lifecycle_restore_retains_immutable_source();
+    test_recurrent_reusable_prefix();
+    test_recurrent_selection_survives_displacement_save(false);
+    test_recurrent_selection_survives_displacement_save(true);
     test_implicit_soft_append_chain_is_bounded();
     test_durable_recovery_binds_exact_published_peer();
     test_displacement_save_order_preserves_prefix_recovery();
