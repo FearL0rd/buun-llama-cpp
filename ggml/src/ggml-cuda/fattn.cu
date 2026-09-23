@@ -1992,6 +1992,9 @@ static void ggml_cuda_turbo_prefill_attend(ggml_backend_cuda_context & ctx, ggml
         case BEST_FATTN_KERNEL_MMA_F16:
             ggml_cuda_flash_attn_ext_mma_f16(ctx, dst);
             break;
+        case BEST_FATTN_KERNEL_SM70_D256:
+            ggml_cuda_flash_attn_ext_sm70_d256(ctx, dst);
+            break;
         case BEST_FATTN_KERNEL_NONE:
             GGML_ABORT("fatal error");
     }
