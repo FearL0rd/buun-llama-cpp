@@ -155,10 +155,20 @@ if (CUDAToolkit_FOUND)
                              ${GGML_SOURCES_CUDA}
                             )
 
-    # sm70 vendor headers (cute/cutlass/flash) resolve their internal
-    # "cute/..." / "cutlass/..." includes relative to the vendor root.
+    # The sm70 D256 Split-D flash-attention launcher compiles as its own object
+    # library so its vendored cute/cutlass headers stay isolated from the
+    # backend's other vendored versions (bsa_vendor, fp8-cutlass).
     if (EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/sm70-vendor")
-        target_include_directories(ggml-cuda PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/sm70-vendor")
+        add_library(ggml-cuda-sm70-d256 OBJECT fattn-sm70-d256.cu)
+        set_target_properties(ggml-cuda-sm70-d256 PROPERTIES
+            CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}" CUDA_STANDARD 17 POSITION_INDEPENDENT_CODE ON)
+        target_include_directories(ggml-cuda-sm70-d256 PRIVATE
+            "${CMAKE_CURRENT_SOURCE_DIR}/sm70-vendor"
+            "${CMAKE_CURRENT_SOURCE_DIR}/..")
+        target_link_libraries(ggml-cuda-sm70-d256 PRIVATE ggml-base)
+        target_compile_options(ggml-cuda-sm70-d256 PRIVATE
+            -O3 -use_fast_math --expt-relaxed-constexpr -extended-lambda)
+        target_sources(ggml-cuda PRIVATE $<TARGET_OBJECTS:ggml-cuda-sm70-d256>)
     endif()
 
     target_include_directories(ggml-cuda PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/bsa_vendor")
