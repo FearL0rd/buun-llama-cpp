@@ -2998,6 +2998,7 @@ void test_lifecycle_full_cache_rotates() {
 void test_lifecycle_restore_retains_immutable_source() {
     server_cache_authority authority;
     configure_host_accounting(authority, true);
+    CHECK(authority.retention.enable_prefix_tracking());
     const std::string execution = "restore-retained-hard-fallback";
 
     server_prompt_cache cache(/* limit_size_mib */ 0, /* limit_tokens */ 0);
@@ -3537,6 +3538,9 @@ void test_lifecycle_off_restore_consumes() {
 void test_lifecycle_restore_batch_timing() {
     server_cache_authority authority;
     configure_host_accounting(authority, true);
+    // Production host restores have prefix tracking enabled. Checkpoint
+    // metadata must remain outside that index and keep its own frontier.
+    CHECK(authority.retention.enable_prefix_tracking());
     server_prompt_cache cache(0, 0);
     cache.acct = &authority.ledger;
     cache.publish_authority = &authority;
@@ -3552,7 +3556,7 @@ void test_lifecycle_restore_batch_timing() {
     for (int i = 0; i < 8; ++i) {
         entry.front().prompt.checkpoints.emplace_back();
         auto & checkpoint = entry.front().prompt.checkpoints.back();
-        checkpoint.n_tokens = 4096;
+        checkpoint.n_tokens = 512 * (i + 1);
         fill_checkpoint_bytes(
             checkpoint.data_tgt, 64 * 1024, uint8_t(i + 1));
         fill_checkpoint_bytes(
@@ -3573,10 +3577,14 @@ void test_lifecycle_restore_batch_timing() {
         server_retention_instance_key::for_host_entry(&cache.states.front()),
         common_retention_pool::attention, spans, true, 4096, 4096, true));
     for (const auto & checkpoint : cache.states.front().prompt.checkpoints) {
+        server_cache_lease_identity identity;
+        CHECK(server_cache_lease_build_identity(
+            "batch-restore", cache.states.front().adapter_config_key,
+            cache.states.front().prompt.tokens, checkpoint.n_tokens, identity));
         CHECK(authority.retention.publish(
             server_retention_instance_key::for_checkpoint(-1, &checkpoint),
             common_retention_pool::attention, spans, true, 4096,
-            checkpoint.n_tokens, true));
+            checkpoint.n_tokens, true, &identity));
     }
     constexpr size_t checkpoint_plane_bytes =
         64 * 1024 + 8 * 1024 + 4 * 1024 + 1024;
@@ -3649,16 +3657,33 @@ void test_lifecycle_restore_batch_timing() {
         commit_samples.push_back(uint64_t(std::chrono::duration_cast<
             std::chrono::nanoseconds>(commit_end - commit_begin).count()));
         CHECK(live.checkpoints.size() == 8);
+        CHECK(authority.retention.prefix_tracking_available());
         // The host now owns only the marginal full-snapshot allocation. Every
         // checkpoint plane remains resident through the live aliases and is
         // therefore credited with zero host-cache release bytes.
         CHECK(cache.size() == 32);
+        auto source_checkpoint = cache.states.front().prompt.checkpoints.begin();
         for (const auto & checkpoint : live.checkpoints) {
             server_retention_candidate candidate;
+            const auto key = server_retention_instance_key::for_checkpoint(
+                100 + trial, &checkpoint);
+            CHECK(authority.retention.candidate_for_instance(
+                key, candidate));
+            CHECK(candidate.release_ops.size() == 4);
+            CHECK(candidate.record.stamp.coverage_tokens ==
+                  uint64_t(checkpoint.n_tokens));
+            server_retention_checkpoint_inventory inventory;
+            CHECK(authority.retention.checkpoint_inventory(key, inventory));
+            CHECK(inventory.identity_known);
+            CHECK(inventory.release_owned);
+            server_retention_candidate source_candidate;
             CHECK(authority.retention.candidate_for_instance(
                 server_retention_instance_key::for_checkpoint(
-                    100 + trial, &checkpoint), candidate));
-            CHECK(candidate.release_ops.size() == 4);
+                    -1, &*source_checkpoint), source_candidate));
+            CHECK(candidate.artifact_id != source_candidate.artifact_id);
+            CHECK(source_candidate.record.stamp.coverage_tokens ==
+                  candidate.record.stamp.coverage_tokens);
+            ++source_checkpoint;
         }
         authority.retention.retire_slot(100 + trial);
         CHECK(cache.size() == 32 + 8 * checkpoint_plane_bytes);

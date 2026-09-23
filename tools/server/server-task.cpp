@@ -4004,6 +4004,12 @@ static bool server_prompt_cache_mirror_artifact_clone(
                     uint64_t(coverage_tokens), true);
             break;
         case server_prompt_cache_prefix_clone_mode::publish_from_prompt:
+            if (destination_kind == common_retention_artifact_kind::checkpoint) {
+                // Checkpoints retain their own frontier and identity. They
+                // are not full prompt prefixes and must not enter that index.
+                cloned = cache.retention_obs->clone(source_key, destination_key);
+                break;
+            }
             if (coverage_tokens > 0) {
                 std::string scope;
                 cloned = server_prompt_retention_exact_scope(
