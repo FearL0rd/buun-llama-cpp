@@ -18414,8 +18414,9 @@ private:
                                     break;
                                 }
                             }
-                            // Make room for the new checkpoint in legacy order
-                            // among members not protected by the retention floor.
+                            // Make room within the existing count limit. The
+                            // retention floor thins interior coverage first;
+                            // mandatory/leased/pinned members remain protected.
                             const auto & cur = *victim;
 
                             SLT_WRN(slot,

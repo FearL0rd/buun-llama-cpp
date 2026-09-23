@@ -4552,6 +4552,7 @@ bool server_cache_checkpoint_capacity_floor(
              it != context.checkpoints.end(); ++it, ++ordinal) {
             server_cache_checkpoint_floor_input input;
             input.ordinal = ordinal;
+            input.n_tokens = it->empty() ? 0 : it->n_tokens;
             const auto key =
                 server_retention_instance_key::for_checkpoint(context.slot_id, &*it);
             server_retention_checkpoint_inventory catalog;

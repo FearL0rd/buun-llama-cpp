@@ -4817,6 +4817,70 @@ void test_checkpoint_capacity_floor() {
           common_cache_plan_destruction_reason::hard_lease_blocked);
 }
 
+void test_checkpoint_capacity_preserves_history() {
+    const auto geometry = [] (std::initializer_list<int64_t> frontiers) {
+        std::vector<server_cache_checkpoint_floor_input> inputs;
+        for (const auto frontier : frontiers) {
+            server_cache_checkpoint_floor_input input;
+            input.ordinal = uint32_t(inputs.size());
+            input.n_tokens = frontier;
+            inputs.push_back(input);
+        }
+        return inputs;
+    };
+    auto inputs = geometry({ 512, 1020, 4092, 4604 });
+    CHECK(server_cache_plan_checkpoint_capacity_floor(inputs).ordinal == 1);
+    inputs[1].protection = server_cache_checkpoint_protection::hard_lease;
+    CHECK(server_cache_plan_checkpoint_capacity_floor(inputs).ordinal == 2);
+    inputs[2].recovery_pinned = true;
+    CHECK(server_cache_plan_checkpoint_capacity_floor(inputs).ordinal == 3);
+    inputs[3].protection = server_cache_checkpoint_protection::seam_heuristic;
+    // An early anchor is only a preference, weaker than existing protections.
+    CHECK(server_cache_plan_checkpoint_capacity_floor(inputs).ordinal == 0);
+    inputs[0].protection = server_cache_checkpoint_protection::mandatory_anchor;
+    CHECK(server_cache_plan_checkpoint_capacity_floor(inputs).ordinal == 3);
+    inputs[3].recovery_pinned = true;
+    CHECK(!server_cache_plan_checkpoint_capacity_floor(inputs).selected);
+
+    CHECK(server_cache_plan_checkpoint_capacity_floor(geometry({ 512 })).ordinal == 0);
+    CHECK(server_cache_plan_checkpoint_capacity_floor(geometry({ 512, 1024 })).ordinal == 1);
+    CHECK(server_cache_plan_checkpoint_capacity_floor(geometry({ 0, 1024, 2048 })).ordinal == 0);
+    CHECK(server_cache_plan_checkpoint_capacity_floor(geometry({ 512, 512, 2048 })).ordinal == 0);
+    CHECK(server_cache_plan_checkpoint_capacity_floor(geometry({ 1024, 512, 2048 })).ordinal == 0);
+
+    // Repeated append-only turns used to FIFO-delete every early frontier.
+    // Keep the same count limit, an early anchor, and useful interior coverage
+    // under both a small ring and the production default size.
+    for (const size_t limit : { size_t(4), size_t(32) }) {
+        inputs.clear();
+        for (int64_t frontier = 512; frontier <= 65536; frontier += 512) {
+            if (inputs.size() == limit) {
+                const auto plan = server_cache_plan_checkpoint_capacity_floor(inputs);
+                CHECK(plan.selected);
+                CHECK(plan.ordinal > 0 && plan.ordinal < inputs.size());
+                if (!plan.selected || plan.ordinal >= inputs.size()) {
+                    break;
+                }
+                inputs.erase(inputs.begin() + plan.ordinal);
+            }
+            server_cache_checkpoint_floor_input incoming;
+            incoming.n_tokens = frontier;
+            inputs.push_back(incoming);
+            for (size_t i = 0; i < inputs.size(); ++i) {
+                inputs[i].ordinal = uint32_t(i);
+                inputs[i].protection = i + 1 == inputs.size()
+                    ? server_cache_checkpoint_protection::seam_heuristic
+                    : server_cache_checkpoint_protection::none;
+            }
+            CHECK(inputs.size() <= limit);
+            CHECK(inputs.front().n_tokens == 512);
+            CHECK(inputs.back().n_tokens == frontier);
+        }
+        CHECK(inputs.size() == limit);
+        CHECK(inputs[1].n_tokens < inputs.back().n_tokens - 1024);
+    }
+}
+
 void test_checkpoint_attempt_latch_rearms_on_ring_change() {
     server_cache_checkpoint_attempt_latch latch;
     uint64_t full_computations = 0;
@@ -5329,6 +5393,7 @@ int main(int argc, char ** argv) {
     test_host_trade_partial_substrate_is_typed();
     test_checkpoint_capacity_skips_pinned_member();
     test_checkpoint_capacity_floor();
+    test_checkpoint_capacity_preserves_history();
     test_checkpoint_attempt_latch_rearms_on_ring_change();
     test_checkpoint_effect_matrix_consistency();
     test_live_checkpoint_payload_ownership();
