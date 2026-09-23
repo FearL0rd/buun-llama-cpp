@@ -117,6 +117,10 @@ if (CUDAToolkit_FOUND)
 
     file(GLOB   GGML_SOURCES_CUDA "*.cu")
     list(FILTER GGML_SOURCES_CUDA EXCLUDE REGEX "bsa_.*\\.cu$")
+    # fattn-sm70-d256.cu is compiled by the ggml-cuda-sm70-d256 object library
+    # below (it needs the sm70-vendor include root, which must stay isolated
+    # from the backend's other vendored headers).
+    list(FILTER GGML_SOURCES_CUDA EXCLUDE REGEX "fattn-sm70-d256\\.cu$")
     set_source_files_properties(marlin-q4-a32.cu marlin-q8-g128.cu PROPERTIES
         COMPILE_OPTIONS "--expt-relaxed-constexpr")
     set_source_files_properties(int8-channel.cu PROPERTIES
