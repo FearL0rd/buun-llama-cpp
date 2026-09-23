@@ -1824,7 +1824,7 @@ public:
                     return false;
                 }
                 if (shard.stash_bytes != 0 && !allow_clean_stash) {
-                    status = vbr_explicit_capture_status::unsupported_layout;
+                    status = vbr_explicit_capture_status::projected_stash_requires_exact;
                     return false;
                 }
                 total_columns += shard.columns;
@@ -5449,6 +5449,7 @@ const char * vbr_explicit_capture_status_name(
         case vbr_explicit_capture_status::ok: return "ok";
         case vbr_explicit_capture_status::not_armed: return "not_armed";
         case vbr_explicit_capture_status::unsupported_layout: return "unsupported_layout";
+        case vbr_explicit_capture_status::projected_stash_requires_exact: return "projected_stash_requires_exact";
         case vbr_explicit_capture_status::slot_not_idle: return "slot_not_idle";
         case vbr_explicit_capture_status::identity_unavailable: return "identity_unavailable";
         case vbr_explicit_capture_status::generation_unavailable: return "generation_unavailable";

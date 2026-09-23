@@ -752,6 +752,7 @@ server_vbr_artifact_capture_status map_status(
             return server_vbr_artifact_capture_status::ok;
         case vbr_explicit_capture_status::not_armed:
         case vbr_explicit_capture_status::unsupported_layout:
+        case vbr_explicit_capture_status::projected_stash_requires_exact:
             return server_vbr_artifact_capture_status::unsupported;
         case vbr_explicit_capture_status::slot_not_idle:
             return server_vbr_artifact_capture_status::slot_processing;

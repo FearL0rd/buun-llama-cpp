@@ -11805,9 +11805,12 @@ private:
 
     static bool vbr_idle_retry_exact(
             vbr_explicit_capture_phase phase,
-            vbr_capture_stream_status stream_status) noexcept {
-        return phase == vbr_explicit_capture_phase::unit_transfer &&
-            stream_status == vbr_capture_stream_status::projection_invalid;
+            vbr_capture_stream_status stream_status,
+            vbr_explicit_capture_status status) noexcept {
+        return (phase == vbr_explicit_capture_phase::unit_transfer &&
+                stream_status == vbr_capture_stream_status::projection_invalid) ||
+            (phase == vbr_explicit_capture_phase::metadata_and_manifest &&
+             status == vbr_explicit_capture_status::projected_stash_requires_exact);
     }
 
     static bool vbr_idle_release_isolated_retry(
@@ -13342,10 +13345,12 @@ private:
                 continue;
             }
 
-            // A stem retry owns a singleton projection because it changes the
-            // frontier of the complete physical union. Earlier exact rows
-            // finish first; a later quiet tick then isolates this source.
-            if ((stem_retry || checkpoint_stem) && !manifests.empty()) {
+            // Stem and exact-layout retries own a singleton capture. A stem
+            // changes the projected union's frontier; exact capture preserves
+            // physical ownership that cannot be split across that union.
+            const bool exact_retry =
+                idle.vbr_idle_exact_retry_identity == attempt_identity;
+            if ((stem_retry || checkpoint_stem || exact_retry) && !manifests.empty()) {
                 continue;
             }
 
@@ -13447,7 +13452,7 @@ private:
                 // dependency. It cannot be partitioned across the projected
                 // <=8-manifest union, so capture one ranked source per idle
                 // wave through the exact host handoff below.
-                if (stem_retry || checkpoint_stem ||
+                if (stem_retry || checkpoint_stem || exact_retry ||
                     requires_coordinated_tree_clear || ctx_dft ||
                     idle.can_speculate()) {
                     break;
@@ -14179,8 +14184,10 @@ private:
                     witnessable_admission_refusal &&
                     vbr_record_idle_admission_refusal(
                         *candidate.slot, candidate.attempt_identity);
-                if (vbr_idle_retry_exact(
-                        diagnostics.capture_phase, diagnostics.inner_stream_status)) {
+                const bool retry_exact = vbr_idle_retry_exact(
+                    diagnostics.capture_phase, diagnostics.inner_stream_status,
+                    diagnostics.capture_status);
+                if (retry_exact) {
                     candidate.slot->vbr_idle_exact_retry_identity = candidate.attempt_identity;
                 }
                 const bool begin_stem_retry = !candidate.refresh &&
@@ -14207,7 +14214,7 @@ private:
                     terminal ||
                     (candidate.stem_requested &&
                      stem_permanently_unavailable);
-                const bool retry_immediately = vbr_idle_retry_immediately(
+                const bool retry_immediately = retry_exact || vbr_idle_retry_immediately(
                     terminal, aggregate_over_cap,
                     admission_state.capacity_status,
                     candidates.size(),
@@ -20803,16 +20810,37 @@ server_vbr_reclaim_policy_for_test() {
         result.fragmented_projection_retries_exact =
             server_context_impl::vbr_idle_retry_exact(
                 vbr_explicit_capture_phase::unit_transfer,
-                vbr_capture_stream_status::projection_invalid) &&
+                vbr_capture_stream_status::projection_invalid,
+                vbr_explicit_capture_status::transfer_failed) &&
             !server_context_impl::vbr_idle_retry_exact(
                 vbr_explicit_capture_phase::unit_transfer,
-                vbr_capture_stream_status::cancelled) &&
+                vbr_capture_stream_status::cancelled,
+                vbr_explicit_capture_status::cancelled) &&
             !server_context_impl::vbr_idle_retry_exact(
                 vbr_explicit_capture_phase::unit_transfer,
-                vbr_capture_stream_status::transfer_failed) &&
+                vbr_capture_stream_status::transfer_failed,
+                vbr_explicit_capture_status::transfer_failed) &&
             !server_context_impl::vbr_idle_retry_exact(
                 vbr_explicit_capture_phase::companion_capture,
-                vbr_capture_stream_status::projection_invalid);
+                vbr_capture_stream_status::projection_invalid,
+                vbr_explicit_capture_status::transfer_failed);
+        result.stash_projection_retries_exact =
+            server_context_impl::vbr_idle_retry_exact(
+                vbr_explicit_capture_phase::metadata_and_manifest,
+                vbr_capture_stream_status::_count,
+                vbr_explicit_capture_status::projected_stash_requires_exact) &&
+            !server_context_impl::vbr_idle_retry_exact(
+                vbr_explicit_capture_phase::metadata_and_manifest,
+                vbr_capture_stream_status::_count,
+                vbr_explicit_capture_status::unsupported_layout) &&
+            !server_context_impl::vbr_idle_retry_exact(
+                vbr_explicit_capture_phase::metadata_and_manifest,
+                vbr_capture_stream_status::_count,
+                vbr_explicit_capture_status::stash_inconsistent) &&
+            !server_context_impl::vbr_idle_retry_exact(
+                vbr_explicit_capture_phase::companion_capture,
+                vbr_capture_stream_status::_count,
+                vbr_explicit_capture_status::projected_stash_requires_exact);
         result.isolated_capture_drains_without_backoff =
             server_context_impl::vbr_idle_release_isolated_retry(
                 1, 1, true, false, true, false) &&

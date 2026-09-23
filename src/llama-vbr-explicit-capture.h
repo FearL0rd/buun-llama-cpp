@@ -107,6 +107,9 @@ enum class vbr_explicit_capture_status : uint8_t {
     accounting_failed,
     publication_failed,
     internal_error,
+    // Projected rows cannot carry physical sink-stash ownership. The caller
+    // may retry through exact capture, which transfers and accounts for it.
+    projected_stash_requires_exact,
     _count,
 };
 

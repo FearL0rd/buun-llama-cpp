@@ -4325,6 +4325,7 @@ static bool model_backed_adoption(
         uint64_t destination_budget_mib = 0,
         ggml_type expected_destination_type = GGML_TYPE_COUNT) {
     const bool live_matrix = live_token_count != 0;
+    bool live_requires_rebase = false;
     const bool require_destination_degraded =
         expected_destination_type != GGML_TYPE_COUNT;
     vbr_upward_recipe destination_upward_recipe;
@@ -4378,7 +4379,7 @@ static bool model_backed_adoption(
     context_params.vbr_budget_explicit = true;
     context_params.vbr_vram_budget_bytes = live_matrix
         ? live_budget_mib*1024*1024 : 4ull*1024*1024*1024;
-    if (downward_mode) {
+    if (downward_mode || live_matrix) {
         context_params.vbr_min_bits = 1.0;
         context_params.vbr_min_bits_explicit = true;
     }
@@ -4727,6 +4728,40 @@ static bool model_backed_adoption(
     CHECK(catalog.resolve_reference(reference, package) ==
           vbr_artifact_resolve_status::ok);
     CHECK(package && package.validate() == vbr_artifact_status::ok);
+    if (std::any_of(package.units().begin(), package.units().end(),
+            [](const auto & unit) {
+                return unit.descriptor.clean_stash_state ==
+                    vbr_artifact_clean_stash_state::present;
+            })) {
+        CHECK(captured.stash_bytes != 0);
+        // Physical sink ownership is carried by the exact artifact above,
+        // not by a projected row union. Refuse before any projected transfer
+        // with the specific status that selects the server's exact retry.
+        vbr_projected_capture_batch_request projected;
+        projected.idle_decode_thread = true;
+        projected.max_packed_bytes = 4ull*1024*1024*1024;
+        projected.ring = request.ring;
+        projected.topologies = request.topologies;
+        projected.pool_bindings = request.pool_bindings;
+        projected.representation_context = request.representation_context;
+        projected.representation_identity = request.representation_identity;
+        vbr_projected_capture_manifest_request manifest;
+        manifest.manifest_id = 1;
+        manifest.sequence = request.sequence;
+        manifest.identity = request.identity;
+        manifest.token_block = request.token_block;
+        manifest.text_only = true;
+        projected.manifests.push_back(std::move(manifest));
+        const auto refused = vbr_capture_projected_batch(*source_memory, projected);
+        CHECK(refused.status ==
+            vbr_explicit_capture_status::projected_stash_requires_exact);
+        CHECK(refused.phase == vbr_explicit_capture_phase::metadata_and_manifest);
+        CHECK(refused.publications.empty());
+        CHECK(refused.unit_transfer_calls == 0);
+        CHECK(refused.companion_d2h_bytes == 0);
+        CHECK(refused.ring_operation_acquires == 0);
+        std::fprintf(stderr, "VBR projected stash requires exact: zero-transfer refusal verified\n");
+    }
     if (live_matrix) {
         std::set<int32_t> types;
         std::map<uint32_t, int32_t> by_unit;
@@ -4750,6 +4785,10 @@ static bool model_backed_adoption(
                         controller.units.size() &&
                     controller.units[unit.descriptor.logical_unit_id].domain !=
                         vbr_repr_domain::full) {
+                    // A unit first retiered before any rows were written has
+                    // no stash. Validation must rebase that honest absence,
+                    // even when the live K/V pair never straddled two tiers.
+                    live_requires_rebase = true;
                     std::fprintf(stderr,
                         "VBR tapped-without-stash unit=%u type=%d domain=%u\n",
                         unit.descriptor.logical_unit_id,
@@ -4825,6 +4864,8 @@ static bool model_backed_adoption(
                 vbr_artifact_clean_stash_state::omitted_source_present)]);
         std::fprintf(stderr, "VBR manifest_consistency=%u\n",
             unsigned(package.manifest().consistency.kind));
+        CHECK(stash_states[size_t(
+            vbr_artifact_clean_stash_state::omitted_source_present)] == 0);
         CHECK(types.size() > 1);
         CHECK(!require_straddled || straddled);
         if (types.size() <= 1 || (require_straddled && !straddled)) {
@@ -5341,7 +5382,7 @@ static bool model_backed_adoption(
     // at a boundary also proves rollback after the preceding boundary. Composite
     // publication and close deliberately have no post-boundary fault seam.
     if (live_matrix) {
-        CHECK(run_import(false, require_straddled
+        CHECK(run_import(false, require_straddled || live_requires_rebase
             ? vbr_import_decision::live_rebased
             : vbr_import_decision::native_import));
     } else if (!needs_transform) {
