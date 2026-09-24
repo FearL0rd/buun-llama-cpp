@@ -1964,10 +1964,11 @@ struct server_slot {
         common_cache_family_binding restored_family = cache_family;
         server_prompt_cache_restore_shape restore_shape =
             server_prompt_cache_restore_shape::none;
-        return prompt_loaded(prompt_cache.load(prompt, tokens, ctx_tgt, ctx_dft, id,
-                                               adapter_config_key, restore_shape, obs,
-                                               &restored_family, reuse),
-                             restore_shape, restored_family);
+        // a statement of its own: prompt_loaded reads the restore_shape load writes
+        const bool res = prompt_cache.load(prompt, tokens, ctx_tgt, ctx_dft, id,
+                                           adapter_config_key, restore_shape, obs,
+                                           &restored_family, reuse);
+        return prompt_loaded(res, restore_shape, restored_family);
     }
 
     // restores the fixed host state `source` itself
@@ -1975,9 +1976,9 @@ struct server_slot {
         common_cache_family_binding restored_family = cache_family;
         server_prompt_cache_restore_shape restore_shape =
             server_prompt_cache_restore_shape::none;
-        return prompt_loaded(prompt_cache.load_entry(prompt, source, ctx_tgt, ctx_dft, id,
-                                                     restore_shape, &restored_family),
-                             restore_shape, restored_family);
+        const bool res = prompt_cache.load_entry(prompt, source, ctx_tgt, ctx_dft, id,
+                                                 restore_shape, &restored_family);
+        return prompt_loaded(res, restore_shape, restored_family);
     }
 
     bool prompt_loaded(bool res, server_prompt_cache_restore_shape restore_shape,
