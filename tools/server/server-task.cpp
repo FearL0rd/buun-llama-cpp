@@ -2023,6 +2023,14 @@ bool server_prompt_cache::fits_bytes(size_t host_bytes) const noexcept {
         (limit_size == 0 || (reserved <= limit_size && host_bytes <= limit_size-reserved));
 }
 
+size_t server_prompt_cache::byte_deficit(size_t host_bytes) const noexcept {
+    const size_t reserved = active_storage_bytes();
+    if (limit_size == 0 || host_bytes > SIZE_MAX-reserved) {
+        return limit_size == 0 ? 0 : SIZE_MAX;
+    }
+    return host_bytes+reserved > limit_size ? host_bytes+reserved-limit_size : 0;
+}
+
 size_t server_prompt_cache::effective_host_token_limit(size_t host_bytes, size_t host_tokens) const noexcept {
     const size_t bytes = active_storage_bytes(), tokens = active_storage_tokens();
     if (host_bytes > SIZE_MAX-bytes || host_tokens > SIZE_MAX-tokens) { return 0; }
@@ -5447,7 +5455,7 @@ host_trade_retention_capacity_projection project_host_trade_retention_capacity(
         server_prompt_cache_shadow_lineage_slot * lineages,
         llama_cache_acct_artifact_id ignored_artifact = {},
         llama_cache_acct_artifact_id excluded_artifact = {},
-        uint64_t minimum_resource = 1) noexcept {
+        uint64_t minimum_resource = 0) noexcept {
     host_trade_retention_capacity_projection result;
     if (!rows || !artifacts || !lineages || !cache.retention_obs || !cache.acct ||
         candidates.size() > SERVER_PROMPT_CACHE_SHADOW_MAX_CANDIDATES) {
@@ -5609,8 +5617,6 @@ host_trade_retention_capacity_projection project_host_trade_retention_capacity(
         result.candidate_count++;
         if (reason == server_cache_destruction_reason::host_token_limit) {
             row->resource = candidate.victim->prompt.n_tokens();
-        } else if (candidate.vbr) {
-            row->resource = candidate.marginal_resident_bytes;
         } else {
             row->resource = candidate.marginal_resident_bytes;
         }
@@ -5667,12 +5673,20 @@ host_trade_retention_capacity_projection project_host_trade_retention_capacity(
         return static_cast<server_prompt_cache_shadow_lineage_slot *>(nullptr);
     };
 
+    // A row whose own release reaches minimum_resource (when one is given)
+    // outranks every row that does not; value decides within each group.
     bool have_best = false;
+    bool best_covers = false;
     common_retention_shadow_value best;
     const uint64_t competition_epoch =
         cache.retention_obs->competition_epoch_value();
     for (const auto * row = begin; row != end; ++row) {
-        if (!row->releasable || row->resource < std::max<uint64_t>(minimum_resource, 1)) {
+        if (!row->releasable || row->resource == 0) {
+            continue;
+        }
+        const bool covers = minimum_resource != 0 &&
+            row->resource >= minimum_resource;
+        if (have_best && best_covers && !covers) {
             continue;
         }
         auto * lineage = find_lineage(
@@ -5687,7 +5701,7 @@ host_trade_retention_capacity_projection project_host_trade_retention_capacity(
                 row->resource, competition_epoch, {}, quote)) {
             return {};
         }
-        const int comparison = have_best
+        const int comparison = have_best && best_covers == covers
             ? common_retention_shadow_compare(quote.value, best) : -1;
         if (!have_best || comparison < 0 || (comparison == 0 &&
                 std::tie(row->stamp.pool, row->stamp.lineage_id,
@@ -5695,6 +5709,7 @@ host_trade_retention_capacity_projection project_host_trade_retention_capacity(
                 std::tie(result.pool, result.lineage_id,
                          result.artifact.v))) {
             have_best = true;
+            best_covers = covers;
             best = quote.value;
             result.artifact = row->artifact_id;
             result.lineage_id = row->stamp.lineage_id;
@@ -5855,21 +5870,15 @@ static bool server_prompt_cache_plan_vbr_pressure(
         }
         // An entry that shares its backing (one of several conversations
         // captured into one batch image) releases almost nothing alone. Under
-        // byte pressure, rank the victims whose own release covers the deficit
-        // first; only when none does fall back to every victim (and the
+        // byte pressure, the victims whose own release covers the deficit
+        // rank first; only when none does is every victim eligible (and the
         // bounded pair below).
-        const size_t reserved = cache.active_storage_bytes();
-        const uint64_t deficit = byte_pressure && cache.limit_size != 0 &&
-                reserved <= cache.limit_size &&
-                projected_bytes > cache.limit_size - reserved
-            ? projected_bytes - (cache.limit_size - reserved) : 0;
-        const auto project = [&](uint64_t minimum_release) {
-            return project_host_trade_retention_capacity(
-                cache, reason,
-                cache.states.end(), candidates,
-                shadow_rows, shadow_artifacts, shadow_lineages,
-                ignored_artifact, {}, minimum_release);
-        };
+        const uint64_t deficit = byte_pressure
+            ? cache.byte_deficit(projected_bytes) : 0;
+        const auto projection = project_host_trade_retention_capacity(
+            cache, reason, cache.states.end(), candidates,
+            shadow_rows, shadow_artifacts, shadow_lineages,
+            ignored_artifact, {}, deficit);
         // Match the publication terminal's oldest-eligible fallback when
         // optional semantic retention scores are unavailable (e.g. requests
         // without message delimiters). Lease and physical release evidence
@@ -5890,10 +5899,9 @@ static bool server_prompt_cache_plan_vbr_pressure(
                     value.victim->recovery_pins == 0;
             });
         };
-        auto selected = deficit != 0
-            ? select(project(deficit), {}, deficit) : candidates.end();
-        if (selected == candidates.end()) {
-            selected = select(project(1), {});
+        auto selected = select(projection, {}, deficit);
+        if (selected == candidates.end() && deficit != 0) {
+            selected = select(projection, {});
         }
         if (selected == candidates.end()) {
             return false;
@@ -6711,21 +6719,22 @@ bool server_prompt_cache::destroy_retention_host_entry(
     // Without retention scores this floor is what executes, so it applies the
     // planner's sufficiency floor too: the oldest victim whose own release
     // covers the deficit, else the oldest lawful one.
-    const bool sufficiency = minimum_release > 1 &&
-        reason == server_cache_destruction_reason::host_capacity;
-    for (const auto & candidate : candidates) {
-        if (candidate.lease_known && !candidate.hard_leased &&
+    const auto lawful = [](const host_trade_candidate & candidate) {
+        return candidate.lease_known && !candidate.hard_leased &&
             candidate.retirement_ready &&
-            candidate.victim->recovery_pins == 0) {
-            if (legacy_floor == states.end()) {
-                legacy_floor = candidate.victim;
-            }
-            if (!sufficiency || (candidate.marginal_resident_known &&
-                    candidate.marginal_resident_bytes >= minimum_release)) {
-                legacy_floor = candidate.victim;
-                break;
-            }
-        }
+            candidate.victim->recovery_pins == 0;
+    };
+    auto oldest = std::find_if(candidates.begin(), candidates.end(),
+        [&](const host_trade_candidate & candidate) {
+            return lawful(candidate) && (minimum_release == 0 ||
+                (candidate.marginal_resident_known &&
+                 candidate.marginal_resident_bytes >= minimum_release));
+        });
+    if (oldest == candidates.end()) {
+        oldest = std::find_if(candidates.begin(), candidates.end(), lawful);
+    }
+    if (oldest != candidates.end()) {
+        legacy_floor = oldest->victim;
     }
     if (legacy_floor == states.end() && std::any_of(
             candidates.begin(), candidates.end(), [](const auto & candidate) {
@@ -6744,26 +6753,14 @@ bool server_prompt_cache::destroy_retention_host_entry(
         (reason == server_cache_destruction_reason::host_capacity ||
          reason == server_cache_destruction_reason::host_token_limit) &&
         legacy_floor != states.end()) {
-        // The same sufficiency floor the pressure planner ranks under: when
-        // some victim's own release covers the deficit, never pick one that
-        // frees next to nothing (a sharer of a batch image).
-        const auto project = [&](uint64_t floor) {
-            return project_host_trade_retention_capacity(
+        // Ranked under the same sufficiency floor as the pressure planner.
+        const auto projection = competition_wave_valid
+            ? project_host_trade_retention_capacity(
                 *this, reason, incoming, candidates,
                 retention_shadow_rows.get(),
                 retention_shadow_artifacts.get(),
-                retention_shadow_lineages.get(), {}, {}, floor);
-        };
-        auto projection = host_trade_retention_capacity_projection {};
-        if (competition_wave_valid) {
-            if (reason == server_cache_destruction_reason::host_capacity &&
-                minimum_release > 1) {
-                projection = project(minimum_release);
-            }
-            if (!projection.complete) {
-                projection = project(1);
-            }
-        }
+                retention_shadow_lineages.get(), {}, {}, minimum_release)
+            : host_trade_retention_capacity_projection {};
         const auto proposed = projection.artifact;
         if (observe_retention_shadow) {
             const auto increment = [](uint64_t & value) noexcept {
@@ -9448,10 +9445,6 @@ bool server_prompt_cache::update_impl(
                     continue;
                 }
             }
-            const size_t reserved = active_storage_bytes();
-            const uint64_t deficit = reserved <= limit_size &&
-                    cache_bytes > limit_size - reserved
-                ? cache_bytes - (limit_size - reserved) : 0;
             if (!evict_front_under_pressure(
                     server_cache_destruction_reason::host_capacity,
                     incoming, competition_wave_valid, observe_shadow,
@@ -9459,7 +9452,7 @@ bool server_prompt_cache::update_impl(
                     required_victims.count == 1
                         ? required_victims.artifacts[0]
                         : llama_cache_acct_artifact_id {},
-                    deficit)) {
+                    byte_deficit(cache_bytes))) {
                 return false;
             }
             required_victims = {};

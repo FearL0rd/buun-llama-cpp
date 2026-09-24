@@ -5325,7 +5325,7 @@ private:
                 saved.push_back(slot);
             }
         }
-        const size_t n_hosted = (resume_vbr() ? resume_vbr_host_cache() : prompt_cache != nullptr)
+        const size_t n_hosted = resume_host_cache()
             ? resume_capture_hosted(why, order.empty() ? slots.front() : *order.front(), saved) : 0;
         resume_prune(0);
         SRV_INF("RESUME event=capture_done why=%s slots=%zu hosted=%zu t_ms=%.1f\n",
@@ -5416,13 +5416,13 @@ private:
                 solo.members         = &one;
                 solo.hosted_artifact = vbr ? pinned[i].pin.payload()->reference_artifact().v : 0;
                 const auto restore = [&]() {
+                    if (!vbr) {
+                        resume_stage_clear(stage);
+                    }
                     return (vbr ? try_automatic_vbr_restore(stage, task, {}, nullptr, false, &pinned[i].pin)
                                 : stage.prompt_load(*prompt_cache, task.tokens, adapter)) &&
                         stage.prompt.n_tokens() == task.tokens.size();
                 };
-                if (!vbr) {
-                    resume_stage_clear(stage);
-                }
                 bool restored = restore();
                 if (vbr && !restored) {
                     // a cache with no room for two conversations takes one into an empty stage; a

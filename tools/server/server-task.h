@@ -1387,6 +1387,8 @@ struct server_prompt_cache {
     size_t active_storage_bytes() const noexcept;
     size_t active_storage_tokens() const noexcept;
     bool fits_bytes(size_t host_bytes) const noexcept;
+    // bytes past the byte limit (with the reservations) if host_bytes were held; 0 when they fit
+    size_t byte_deficit(size_t host_bytes) const noexcept;
     size_t effective_host_token_limit(size_t host_bytes, size_t host_tokens) const noexcept;
 
 private:
