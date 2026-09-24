@@ -183,12 +183,19 @@ bool server_resume_manifest_validate(const server_resume_manifest & manifest, st
 
     if (manifest.artifact) {
         const auto & artifact = *manifest.artifact;
-        // an artifact holds its partial state itself, a placement has the frontier's beside it
-        const size_t max_tails = manifest.placed() ? 1 : 0;
+        // an artifact holds its partial state itself, a placement has the frontier's beside it;
+        // either may carry the ring's two checkpoints below its end
+        size_t n_frontier = 0;
+        bool   roles_hold = true;
+        for (const auto & tail : manifest.tail_states) {
+            const bool frontier = tail.p0 == manifest.n_tokens;
+            n_frontier += frontier;
+            roles_hold = roles_hold && frontier == (tail.role == "frontier");
+        }
         if ((artifact.kind != server_resume_object_kind::artifact && !manifest.placed()) ||
             artifact.p0 != 0 || artifact.p1 != manifest.n_tokens ||
-            artifact.gen == 0 || artifact.gen > manifest.generation ||
-            manifest.tail_states.size() > max_tails) {
+            artifact.gen == 0 || artifact.gen > manifest.generation || !roles_hold ||
+            n_frontier > (manifest.placed() ? 1u : 0u) || manifest.tail_states.size() - n_frontier > 2) {
             error = "artifact does not hold the token range";
             return false;
         }

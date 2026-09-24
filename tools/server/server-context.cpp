@@ -5146,18 +5146,91 @@ private:
         return n;
     }
 
-    // A slot checkpoint that can be stored as a tail state of the ledger.
+    // A slot checkpoint that can be stored as a tail state of the ledger. A dynamic cache stamps a
+    // checkpoint with the epochs of the rows it was taken over: one still of the live lineage is
+    // over the rows the saved image holds. Only a recurrent state goes with that image, a window
+    // checkpoint carries rows of its own.
     bool resume_checkpoint_storable(
             const server_slot & slot,
             const common_prompt_checkpoint & cp,
             const std::string & adapter,
             int32_t n_tokens) const {
-        return !cp.data_tgt.empty() &&
+        const bool lineage = resume_vbr()
+            ? llama_model_n_swa(model_tgt) == 0 && common_prompt_checkpoint_lineage_matches(
+                  cp, llama_memory_vbr_state(llama_get_memory(ctx_tgt), slot.id, 0))
+            : cp.checkpoint_epoch == 0 && cp.checkpoint_epoch_swa == 0;
+        return lineage && !cp.data_tgt.empty() &&
             cp.n_tokens > 0 && cp.n_tokens < n_tokens &&
             cp.pos_max + 1 == cp.n_tokens &&
-            cp.checkpoint_epoch == 0 && cp.checkpoint_epoch_swa == 0 &&
             !resume_cuts_media(slot.prompt.tokens, size_t(cp.n_tokens)) &&
             checkpoint_frontier_is_current(slot, cp, adapter);
+    }
+
+    // The checkpoints of the slot a save keeps: the oldest, for a rewind to the start of the
+    // conversation, and the newest, for a re-render of the last turn.
+    std::vector<std::pair<const common_prompt_checkpoint *, const char *>> resume_ring_tails(
+            const server_slot & slot, const std::string & adapter, int32_t n_tokens) const {
+        const common_prompt_checkpoint * turn = nullptr;
+        const common_prompt_checkpoint * oldest = nullptr;
+        for (const auto & cp : slot.prompt.checkpoints) {
+            if (!resume_checkpoint_storable(slot, cp, adapter, n_tokens)) {
+                continue;
+            }
+            if (!turn || cp.n_tokens > turn->n_tokens) {
+                turn = &cp;
+            }
+            if (!oldest || cp.n_tokens < oldest->n_tokens) {
+                oldest = &cp;
+            }
+        }
+        std::vector<std::pair<const common_prompt_checkpoint *, const char *>> out;
+        if (oldest && oldest != turn) {
+            out.emplace_back(oldest, "early");
+        }
+        if (turn) {
+            out.emplace_back(turn, "turn");
+        }
+        return out;
+    }
+
+    // The ring's checkpoints of a dynamic save, stored beside its image as tail states of the entry.
+    server_resume_reason resume_write_ring_tails(
+            const server_slot & slot, const std::string & id, server_resume_manifest & next,
+            const std::vector<std::pair<const common_prompt_checkpoint *, const char *>> & ring,
+            uint32_t producer, uint64_t & bytes_written, std::string & error) {
+        server_resume_prefix_hasher hasher(slot.prompt.tokens);
+        for (const auto & [cp, role] : ring) {
+            auto rec = resume_ring_tail_record(*cp, role);
+            rec.gen           = next.generation;
+            rec.producer      = producer;
+            rec.prefix_digest = hasher.at(size_t(rec.pos()));
+            const auto reason = resume_store->write_object(id, rec, cp->data_tgt.data(), cp->data_tgt.size(), error);
+            if (reason != server_resume_reason::ok) {
+                return reason;
+            }
+            bytes_written += rec.bytes;
+            next.tail_states.push_back(std::move(rec));
+        }
+        return server_resume_reason::ok;
+    }
+
+    static uint64_t resume_ring_bytes(const std::vector<std::pair<const common_prompt_checkpoint *, const char *>> & ring) {
+        uint64_t bytes = 0;
+        for (const auto & tail : ring) {
+            bytes += tail.first->data_tgt.size();
+        }
+        return bytes;
+    }
+
+    static server_resume_object_record resume_ring_tail_record(const common_prompt_checkpoint & cp, const char * role) {
+        server_resume_object_record rec;
+        rec.kind     = server_resume_object_kind::tail_state;
+        rec.p0       = int32_t(cp.n_tokens);
+        rec.n_tokens = int32_t(cp.n_tokens);
+        rec.pos_min  = cp.pos_min;
+        rec.pos_max  = cp.pos_max;
+        rec.role     = role;
+        return rec;
     }
 
     // An idle capture in flight reads a live slot and holds the transfer ring: it is cancelled
@@ -5757,39 +5830,15 @@ private:
                 }
                 return nullptr;
             };
-            const common_prompt_checkpoint * turn = nullptr;
-            const common_prompt_checkpoint * oldest = nullptr;
-            for (const auto & cp : slot.prompt.checkpoints) {
-                if (!resume_checkpoint_storable(slot, cp, adapter, n_tokens)) {
-                    continue;
-                }
-                if (!turn || cp.n_tokens > turn->n_tokens) {
-                    turn = &cp;
-                }
-                if (!oldest || cp.n_tokens < oldest->n_tokens) {
-                    oldest = &cp;
-                }
-            }
             server_resume_prefix_hasher hasher(tokens);
-            const auto add_checkpoint =[&](const common_prompt_checkpoint & cp, const char * role) {
-                tail_source src;
-                src.rec.kind = server_resume_object_kind::tail_state;
-                src.rec.p0 = int32_t(cp.n_tokens);
-                src.rec.n_tokens = int32_t(cp.n_tokens);
-                src.rec.pos_min = cp.pos_min;
-                src.rec.pos_max = cp.pos_max;
-                src.rec.role = role;
-                src.checkpoint = &cp;
-                tails.push_back(std::move(src));
-            };
             // A disk-only early tail has no live identity witness. Equal base rows cannot
             // prove it (pure recurrent models have no base rows at all). Use a live checkpoint;
             // the byte comparison below still reuses its stored object when it is unchanged.
-            if (oldest && oldest != turn) {
-                add_checkpoint(*oldest, "early");
-            }
-            if (turn) {
-                add_checkpoint(*turn, "turn");
+            for (const auto & [cp, role] : resume_ring_tails(slot, adapter, n_tokens)) {
+                tail_source src;
+                src.rec = resume_ring_tail_record(*cp, role);
+                src.checkpoint = cp;
+                tails.push_back(std::move(src));
             }
             {
                 tail_source src;
@@ -6055,6 +6104,7 @@ private:
             {"n_tokens", next.n_tokens},
             {"placed", next.placed()},
             {"artifact_kept", bytes_written == 0},
+            {"tail_states", next.tail_states.size()},
             {"bytes_written", bytes_written},
             {"t_ms", (ggml_time_us() - t_start)/1000.0},
         };
@@ -6082,9 +6132,14 @@ private:
         if (have_old && !old.placed() && resume_vbr_unchanged(slot, old) &&
             resume_group_current(slot, group, id, *old.artifact)) {
             next.artifact       = old.artifact;
+            next.tail_states    = old.tail_states;
             next.sequence_epoch = old.sequence_epoch;
             next.ledger         = old.ledger;
-            next.retain_producers({&*next.artifact});
+            std::vector<server_resume_object_record *> reused = {&*next.artifact};
+            for (auto & tail : next.tail_states) {
+                reused.push_back(&tail);
+            }
+            next.retain_producers(reused);
             // the commit on disk holds this artifact whether or not the new one replaces it
             group.pool_entry = id;
             group.pool       = *old.artifact;
@@ -6152,7 +6207,8 @@ private:
         const auto abandon = [&](server_resume_reason reason, const std::string & message) {
             return resume_vbr_abandon(slot, id, reason, message);
         };
-        const uint64_t bytes_needed = captured.payload_bytes + captured.companion_bytes;
+        const auto ring = resume_ring_tails(slot, adapter, n_tokens);
+        const uint64_t bytes_needed = captured.payload_bytes + captured.companion_bytes + resume_ring_bytes(ring);
         if (resume_store->free_bytes() < bytes_needed) {
             return abandon(server_resume_reason::no_space, "need " + std::to_string(bytes_needed) + " bytes");
         }
@@ -6178,12 +6234,17 @@ private:
             return abandon(reason, error + " export=" + vbr_artifact_status_name(exported));
         }
 
+        uint64_t bytes_written = rec.bytes;
+        if (const auto ring_reason = resume_write_ring_tails(
+                slot, id, next, ring, rec.producer, bytes_written, error); ring_reason != server_resume_reason::ok) {
+            return abandon(ring_reason, error);
+        }
         next.artifact       = rec;
         next.sequence_epoch = slot.prompt.sequence_epoch;
         if (!resume_ledger_build(tokens, adapter, next.ledger)) {
             return abandon(server_resume_reason::io_error, "ledger");
         }
-        json out = resume_vbr_publish(slot, id, next, rec.bytes, t_start);
+        json out = resume_vbr_publish(slot, id, next, bytes_written, t_start);
         if (resume_saved(out)) {
             group.pool_entry = id;
             group.pool       = rec;
@@ -6356,7 +6417,8 @@ private:
         const auto abandon = [&](server_resume_reason reason, const std::string & message) {
             return resume_vbr_abandon(slot, id, reason, message);
         };
-        if (resume_store->free_bytes() < payload.size() + frontier.size() + 1024*1024) {
+        const auto ring = resume_ring_tails(slot, adapter, n_tokens);
+        if (resume_store->free_bytes() < payload.size() + frontier.size() + resume_ring_bytes(ring) + 1024*1024) {
             return abandon(server_resume_reason::no_space, "placement");
         }
 
@@ -6393,12 +6455,17 @@ private:
             }
             next.tail_states.push_back(tail);
         }
+        uint64_t bytes_written = rec.bytes + frontier.size();
+        reason = resume_write_ring_tails(slot, id, next, ring, producer, bytes_written, error);
+        if (reason != server_resume_reason::ok) {
+            return abandon(reason, error);
+        }
 
         next.sequence_epoch = ensure_frontier_sequence_epoch(slot.prompt);
         if (!resume_ledger_build(tokens, adapter, next.ledger)) {
             return abandon(server_resume_reason::io_error, "ledger");
         }
-        return resume_vbr_publish(slot, id, next, rec.bytes + frontier.size(), t_start);
+        return resume_vbr_publish(slot, id, next, bytes_written, t_start);
     }
 
     // what the restored slots hold on the host: exact copies serve a continuation, projectable ones
@@ -6962,58 +7029,68 @@ private:
         slot.t_last_used = resume_last_used(manifest);
 
         // the other tail states become checkpoints of the slot
-        size_t n_imported = 0;
-        size_t n_dropped = 0;
-        {
-            auto tails = manifest.tail_states;
-            std::sort(tails.begin(), tails.end(), [](const auto & a, const auto & b) {
-                return a.pos() < b.pos();
-            });
-            tails.erase(std::remove_if(tails.begin(), tails.end(), [p](const auto & rec) {
-                return rec.pos() >= p;
-            }), tails.end());
-            // The recent turn is needed for the client's first re-render/rewind. Reserve the
-            // limited ring for the newest companions, then import them in chronological order.
-            const size_t limit = size_t(std::max(0, params_base.n_ctx_checkpoints));
-            if (tails.size() > limit) {
-                n_dropped += tails.size() - limit;
-                tails.erase(tails.begin(), tails.end() - limit);
-            }
-            for (const auto & rec : tails) {
-                std::vector<uint8_t> data;
-                std::string error;
-                bool ok = false;
-                try {
-                    ok = resume_store->read_object(id, rec, data, error) == server_resume_reason::ok &&
-                        resume_import_checkpoint(slot, rec, data);
-                } catch (const std::exception & e) {
-                    error = e.what();
-                }
-                if (ok) {
-                    n_imported++;
-                    bytes_read += data.size();
-                } else {
-                    n_dropped++;
-                    SLT_WRN(slot, "RESUME checkpoint import dropped pos=%d role=%s %s\n",
-                            rec.pos(), rec.role.c_str(), error.c_str());
-                }
-            }
-        }
+        const auto ring = resume_import_ring(slot, id, manifest, p);
 
         json status = {
             {"outcome", p == n_tokens ? "installed_full" : "installed_prefix"},
             {"entry", id},
             {"p", p},
             {"n_tokens", n_tokens},
-            {"checkpoints", n_imported},
-            {"checkpoints_dropped", n_dropped},
-            {"bytes_read", bytes_read},
+            {"checkpoints", ring.n_imported},
+            {"checkpoints_dropped", ring.n_dropped},
+            {"bytes_read", bytes_read + ring.bytes_read},
             {"t_ms", (ggml_time_us() - t_start)/1000.0},
         };
         if (p < n_tokens) {
             status["why"] = why_prefix.empty() ? "context_smaller" : why_prefix;
         }
         return status;
+    }
+
+    struct resume_ring_import {
+        size_t   n_imported = 0;
+        size_t   n_dropped  = 0;
+        uint64_t bytes_read = 0;
+    };
+
+    // The tail states of an entry below the restored position `p` become checkpoints of the slot.
+    resume_ring_import resume_import_ring(
+            server_slot & slot, const std::string & id, const server_resume_manifest & manifest, int32_t p) {
+        resume_ring_import out;
+        auto tails = manifest.tail_states;
+        std::sort(tails.begin(), tails.end(), [](const auto & a, const auto & b) {
+            return a.pos() < b.pos();
+        });
+        tails.erase(std::remove_if(tails.begin(), tails.end(), [p](const auto & rec) {
+            return rec.pos() >= p;
+        }), tails.end());
+        // The recent turn is needed for the client's first re-render/rewind. Reserve the
+        // limited ring for the newest companions, then import them in chronological order.
+        const size_t limit = size_t(std::max(0, params_base.n_ctx_checkpoints));
+        if (tails.size() > limit) {
+            out.n_dropped += tails.size() - limit;
+            tails.erase(tails.begin(), tails.end() - limit);
+        }
+        for (const auto & rec : tails) {
+            std::vector<uint8_t> data;
+            std::string error;
+            bool ok = false;
+            try {
+                ok = resume_store->read_object(id, rec, data, error) == server_resume_reason::ok &&
+                    resume_import_checkpoint(slot, rec, data);
+            } catch (const std::exception & e) {
+                error = e.what();
+            }
+            if (ok) {
+                out.n_imported++;
+                out.bytes_read += data.size();
+            } else {
+                out.n_dropped++;
+                SLT_WRN(slot, "RESUME checkpoint import dropped pos=%d role=%s %s\n",
+                        rec.pos(), rec.role.c_str(), error.c_str());
+            }
+        }
+        return out;
     }
 
     // establish the slot the way a slot-file restore does, with no logits and no draft state
@@ -7050,8 +7127,10 @@ private:
         if (const char * why = resume_vbr_inadmissible(co.tokens, manifest, slot)) {
             return resume_skipped(why);
         }
-        if (resume_has_partial != !manifest.tail_states.empty() ||
-            (resume_has_partial && manifest.tail_states[0].pos() != manifest.n_tokens)) {
+        // the partial state of its end; the others are checkpoints of the ring
+        const auto frontier = std::find_if(manifest.tail_states.begin(), manifest.tail_states.end(),
+            [&](const server_resume_object_record & rec) { return rec.pos() == manifest.n_tokens; });
+        if (resume_has_partial != (frontier != manifest.tail_states.end())) {
             return resume_skipped("companion_missing");
         }
         if (slot.state != SLOT_STATE_IDLE || slot.prompt.n_tokens() != 0 || !slot.prompt.checkpoints.empty() ||
@@ -7062,7 +7141,7 @@ private:
         std::string error;
         auto reason = resume_store->read_object(co.entry->id, *manifest.artifact, payload, error);
         if (reason == server_resume_reason::ok && resume_has_partial) {
-            reason = resume_store->read_object(co.entry->id, manifest.tail_states[0], co.tail, error);
+            reason = resume_store->read_object(co.entry->id, *frontier, co.tail, error);
         }
         if (reason != server_resume_reason::ok) {
             return resume_failed(reason, error);
@@ -7094,12 +7173,15 @@ private:
         slot.prompt.sequence_epoch = manifest.sequence_epoch;
         resume_note_lineage(slot, co.entry->id);
         slot.t_last_used = resume_last_used(manifest);
+        const auto ring = resume_import_ring(slot, co.entry->id, manifest, manifest.n_tokens);
         return json {
             {"outcome", "installed_full"},
             {"p", manifest.n_tokens},
             {"n_tokens", manifest.n_tokens},
             {"placed", true},
-            {"bytes_read", manifest.artifact->bytes + tail.size()},
+            {"checkpoints", ring.n_imported},
+            {"checkpoints_dropped", ring.n_dropped},
+            {"bytes_read", manifest.artifact->bytes + tail.size() + ring.bytes_read},
         };
     }
 
@@ -7256,6 +7338,8 @@ private:
         slot_restored_tokens_publish(slot);
         resume_note_lineage(slot, id);
         slot.t_last_used = resume_last_used(manifest);
+        // the image restored the rows the ring's checkpoints were taken over
+        const auto ring = resume_import_ring(slot, id, manifest, manifest.n_tokens);
         for (auto * co : ready) {
             co->status = resume_co_establish(*co);
         }
@@ -7269,7 +7353,9 @@ private:
             {"units", imported.units},
             {"companions", imported.companions},
             {"co_residents", ready.size()},
-            {"bytes_read", rec.bytes},
+            {"checkpoints", ring.n_imported},
+            {"checkpoints_dropped", ring.n_dropped},
+            {"bytes_read", rec.bytes + ring.bytes_read},
             {"t_ms", (ggml_time_us() - t_start)/1000.0},
         };
     }

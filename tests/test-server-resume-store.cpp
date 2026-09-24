@@ -657,11 +657,16 @@ static void test_artifact(const std::string & root) {
         [&](const server_resume_store::put_fn & put) { put(payload.data(), 100); return false; }, error) != server_resume_reason::ok);
     CHECK(n_files(store->directory() + "/entries/" + id_failed) == 0);
 
-    // an artifact stands in for the chunks, never beside them, and carries no tail states
+    // an artifact stands in for the chunks, never beside them, and carries no frontier tail state:
+    // only the ring's two checkpoints below its end
     const auto valid = [](const server_resume_manifest & m) { std::string e; return server_resume_manifest_validate(m, e); };
     CHECK(valid(manifest));
     { auto m = manifest; m.chunks.push_back(chunk_of(0, 48, 1)); CHECK(!valid(m)); }
     { auto m = manifest; m.tail_states.push_back(tail_of(48, 1, "frontier")); CHECK(!valid(m)); }
+    { auto m = manifest; m.tail_states.push_back(tail_of(16, 1, "early")); m.tail_states.push_back(tail_of(40, 1, "turn")); CHECK(valid(m)); }
+    { auto m = manifest; m.tail_states.push_back(tail_of(40, 1, "frontier")); CHECK(!valid(m)); }
+    { auto m = manifest; m.tail_states.push_back(tail_of(48, 1, "turn")); CHECK(!valid(m)); }
+    { auto m = manifest; for (int32_t pos : {8, 16, 40}) { m.tail_states.push_back(tail_of(pos, 1, "turn")); } CHECK(!valid(m)); }
     { auto m = manifest; m.artifact->p1 = 47; CHECK(!valid(m)); }
     { auto m = manifest; m.artifact->kind = server_resume_object_kind::base_chunk; CHECK(!valid(m)); }
     { auto m = manifest; m.artifact->gen = 2; CHECK(!valid(m)); }
@@ -697,7 +702,9 @@ static void test_artifact(const std::string & root) {
 
     { auto m = placed; m.sequence_epoch = 0; CHECK(valid(m)); }
     { auto m = placed; m.tail_states.push_back(tail_of(32, 1, "frontier")); CHECK(valid(m)); }
-    { auto m = placed; m.tail_states.push_back(tail_of(32, 1, "frontier")); m.tail_states.push_back(tail_of(16, 1, "turn")); CHECK(!valid(m)); }
+    { auto m = placed; m.tail_states.push_back(tail_of(32, 1, "frontier")); m.tail_states.push_back(tail_of(16, 1, "turn")); CHECK(valid(m)); }
+    { auto m = placed; m.tail_states.push_back(tail_of(32, 1, "frontier")); m.tail_states.push_back(tail_of(32, 1, "frontier")); CHECK(!valid(m)); }
+    { auto m = placed; m.tail_states.push_back(tail_of(16, 1, "frontier")); CHECK(!valid(m)); }
     { auto m = placed; m.pool_entry.clear(); CHECK(!valid(m)); }
     { auto m = placed; m.pool_entry = "../escape"; CHECK(!valid(m)); }
     { auto m = placed; m.pool_generation = 0; CHECK(!valid(m)); }
