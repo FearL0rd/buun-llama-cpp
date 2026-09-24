@@ -3146,7 +3146,10 @@ static bool ggml_cuda_mul_mat_id_needs_sync(const ggml_tensor * dst, const int c
     }
 
     if (dst->ne[2] <= MMVQ_MAX_BATCH_SIZE) {
-        if (ggml_is_quantized(src0->type)) {
+        // must mirror the MMVQ/MMVF selection in ggml_cuda_mul_mat_id, including the
+        // should_use_mmvq batch caps (GA10x/Orin/Ada per-type) — the graph planner relies
+        // on this predicate; a mismatch lets a sync-requiring fallback run mid-capture.
+        if (ggml_cuda_should_use_mmvq(src0->type, cc, dst->ne[2])) {
             if (dst->ne[2] <= get_mmvq_mmid_max_batch(src0->type, cc)) {
                 return false;
             }
