@@ -75,6 +75,9 @@ struct llama_vbr_artifact_catalog::impl {
         vbr_artifact_unit_descriptor descriptor;
         std::vector<std::shared_ptr<const artifact_segment_chain>>
             payload_shards;
+        std::vector<uint64_t> authenticated_revisions;
+        uint32_t authenticated_unit_index = UINT32_MAX;
+        uint32_t authenticated_format_version = 0;
         std::vector<allocation> allocations;
     };
 
@@ -86,6 +89,7 @@ struct llama_vbr_artifact_catalog::impl {
         vbr_artifact_clean_stash descriptor;
         std::vector<std::shared_ptr<const artifact_segment_chain>>
             shards;
+        std::vector<uint64_t> authenticated_revisions;
         std::vector<allocation> allocations;
     };
 
@@ -98,6 +102,7 @@ struct llama_vbr_artifact_catalog::impl {
         vbr_artifact_reference_manifest manifest;
         std::vector<std::shared_ptr<const artifact_segment_chain>>
             companion_payloads;
+        std::vector<uint64_t> authenticated_companion_revisions;
         std::vector<vbr_artifact_projected_range_view> projected_ranges;
         bool projected_sealed = false;
         std::vector<llama_cache_acct_op_id> operations;
@@ -286,6 +291,10 @@ struct vbr_artifact_package_view::storage {
     std::vector<vbr_artifact_projected_range_view> projected_ranges;
     bool projected_sealed = false;
     std::vector<vbr_artifact_allocation_view> reference_allocations;
+    // Only the catalog can construct this evidence. Metadata is immutable;
+    // chains remain pinned by units/companions, including across retained views.
+    std::vector<std::pair<const artifact_segment_chain *, uint64_t>> authenticated_backing;
+    bool authentication_complete = false;
 };
 
 struct vbr_artifact_attention_prefix_projection::impl {
@@ -893,6 +902,35 @@ uint64_t projected_reserve_bytes(
         });
     return reserve == request.reserve_accounting.end()
         ? 0 : reserve->resident_bytes;
+}
+
+// Only use this after binding all sources to catalog-owned immutable chains.
+// Small metadata/test packages stay serial; four workers bound CPU/scratch use
+// while retaining the exact same canonical hashes and full import barrier.
+uint32_t owned_package_hash_workers(const vbr_artifact_package & package) noexcept {
+    uint64_t remaining = 8*1024*1024;
+    const auto large = [&](uint64_t bytes) {
+        remaining -= std::min(remaining, bytes);
+        return remaining == 0;
+    };
+    for (const auto & unit : package.unit_blobs) {
+        for (const auto & shard : unit.descriptor.shards) {
+            if (large(shard.payload_bytes)) {
+                return 4;
+            }
+        }
+        for (const auto & shard : unit.descriptor.clean_stash.shards) {
+            if (large(shard.payload_bytes)) {
+                return 4;
+            }
+        }
+    }
+    for (const auto & companion : package.companions) {
+        if (large(companion.payload_bytes)) {
+            return 4;
+        }
+    }
+    return 1;
 }
 
 bool projected_batch_reserve_accounting_valid(
@@ -1653,6 +1691,19 @@ vbr_artifact_package_view::reference_allocations() const noexcept {
     return storage_ ? storage_->reference_allocations : empty;
 }
 
+vbr_artifact_status vbr_artifact_package_view::validate_authenticated() const noexcept {
+    if (!storage_ || storage_->projected_sealed || !storage_->authentication_complete) {
+        return validate();
+    }
+    for (const auto & backing : storage_->authenticated_backing) {
+        if (!backing.first || backing.second == 0 ||
+            backing.first->content_revision() != backing.second) {
+            return vbr_artifact_status::checksum_mismatch;
+        }
+    }
+    return vbr_artifact_status::ok;
+}
+
 vbr_artifact_status vbr_artifact_package_view::validate() const noexcept {
     if (!storage_) {
         return vbr_artifact_status::invalid_argument;
@@ -1725,7 +1776,8 @@ vbr_artifact_status vbr_artifact_package_view::validate() const noexcept {
         vbr_artifact_package package;
         const auto status = exact_package(package);
         return status == vbr_artifact_status::ok ?
-            vbr_artifact_validate_prepared_package(package) : status;
+            vbr_artifact_validate_prepared_package(
+                package, owned_package_hash_workers(package)) : status;
     } catch (...) {
         return vbr_artifact_status::internal_error;
     }
@@ -1753,14 +1805,14 @@ vbr_artifact_status vbr_artifact_package_view::exact_package(
                 return vbr_artifact_status::malformed;
             }
             for (size_t i = 0; i < view.payload_shards.size(); ++i) {
-                if (!view.payload_shards[i]) {
+                if (!view.payload_shards[i] || view.payload_shards[i]->content_revision() == 0) {
                     return vbr_artifact_status::malformed;
                 }
                 blob.descriptor.shards[i].payload =
                     view.payload_shards[i]->source();
             }
             for (size_t i = 0; i < view.stash_shards.size(); ++i) {
-                if (!view.stash_shards[i]) {
+                if (!view.stash_shards[i] || view.stash_shards[i]->content_revision() == 0) {
                     return vbr_artifact_status::malformed;
                 }
                 blob.descriptor.clean_stash.shards[i].payload =
@@ -1770,7 +1822,7 @@ vbr_artifact_status vbr_artifact_package_view::exact_package(
         }
         package.companions.reserve(storage_->companions.size());
         for (const auto & view : storage_->companions) {
-            if (!view.payload) {
+            if (!view.payload || view.payload->content_revision() == 0) {
                 return vbr_artifact_status::malformed;
             }
             auto companion = view.descriptor;
@@ -3278,6 +3330,9 @@ llama_vbr_artifact_catalog::publish_stream_complete(
 
         std::vector<const vbr_verified_segment *> segment_lookup(
             expected_segments, nullptr);
+        // Bind authentication to the revisions being read, not revisions
+        // observed later at resolve time (which could bless replaced backing).
+        std::vector<uint64_t> segment_revisions(expected_segments, 0);
         for (const auto & segment : segments) {
             if (!sealed_projected && payload_bytes_rehashed) {
                 if (!segment.bytes || segment.bytes->size() >
@@ -3325,6 +3380,9 @@ llama_vbr_artifact_catalog::publish_stream_complete(
                 return result;
             }
             segment_lookup[slot] = &segment;
+            if (!sealed_projected) {
+                segment_revisions[slot] = segment.bytes->content_revision();
+            }
             shards[segment.shard_index].payload = segment.bytes->source();
         }
         if (std::find(segment_lookup.begin(), segment_lookup.end(), nullptr) !=
@@ -3342,6 +3400,7 @@ llama_vbr_artifact_catalog::publish_stream_complete(
             impl_->n_refusals++;
             return result;
         }
+        std::vector<uint64_t> companion_revisions;
         for (const auto & companion :
              stream_state->companions) {
             if (companion.companion_index >=
@@ -3355,9 +3414,58 @@ llama_vbr_artifact_catalog::publish_stream_complete(
             working.companions[
                 companion.companion_index].payload =
                     companion.bytes->source();
+            // Stored companion vectors use submission order. Reuse evidence
+            // only when that order agrees with the authenticated manifest.
+            companion_revisions.push_back(
+                !sealed_projected && companion.companion_index == companion_revisions.size()
+                    ? companion.bytes->content_revision() : 0);
+        }
+        vbr_artifact_preparation_reuse preparation_reuse;
+        if (!sealed_projected) {
+            preparation_reuse.version = working.version;
+            preparation_reuse.units.resize(working.unit_blobs.size());
+            const auto same_backing = [&](const auto & chains, const auto & revisions,
+                                           size_t offset, size_t count) {
+                if (chains.size() != count || revisions.size() != count) {
+                    return false;
+                }
+                for (size_t s = 0; s < count; ++s) {
+                    const auto * segment = segment_lookup[offset + s];
+                    if (chains[s] != segment->bytes || revisions[s] == 0 ||
+                        revisions[s] != segment->bytes->content_revision()) {
+                        return false;
+                    }
+                }
+                return true;
+            };
+            for (size_t u = 0; u < working.unit_blobs.size(); ++u) {
+                const auto & incoming = working.unit_blobs[u].descriptor;
+                for (const auto & entry : impl_->blobs) {
+                    const auto & saved = entry.second;
+                    // Section checksums bind object index and format. Never
+                    // borrow those from another unit order or projected blob.
+                    if (saved.authenticated_unit_index != u ||
+                        saved.authenticated_format_version != working.version ||
+                        saved.descriptor.logical_unit_id != incoming.logical_unit_id ||
+                        !same_backing(saved.payload_shards, saved.authenticated_revisions,
+                            payload_offsets[u], incoming.shards.size())) {
+                        continue;
+                    }
+                    if (incoming.clean_stash_state == vbr_artifact_clean_stash_state::present) {
+                        const auto stash = impl_->stashes.find(saved.stash_id.bytes());
+                        if (stash == impl_->stashes.end() ||
+                            !same_backing(stash->second.shards, stash->second.authenticated_revisions,
+                                stash_offsets[u], incoming.clean_stash.shards.size())) {
+                            continue;
+                        }
+                    }
+                    preparation_reuse.units[u] = { saved.id, saved.payload_digest, saved.descriptor };
+                    break;
+                }
+            }
         }
         if (!sealed_projected &&
-            vbr_artifact_prepare(working) !=
+            vbr_artifact_prepare(working, owned_package_hash_workers(working), &preparation_reuse) !=
                 vbr_artifact_status::ok) {
             result.status =
                 llama_vbr_artifact_publish_status::format_rejected;
@@ -3404,6 +3512,7 @@ llama_vbr_artifact_catalog::publish_stream_complete(
         }
         pending_reference.companion_payloads.reserve(
             stream_state->companions.size());
+        pending_reference.authenticated_companion_revisions = std::move(companion_revisions);
         for (const auto & companion : stream_state->companions) {
             pending_reference.companion_payloads.push_back(
                 companion.bytes);
@@ -3426,6 +3535,14 @@ llama_vbr_artifact_catalog::publish_stream_complete(
                     working.unit_blobs[u].payload_digest;
                 pending.descriptor =
                     working.unit_blobs[u].descriptor;
+                if (!sealed_projected) {
+                    pending.authenticated_unit_index = uint32_t(u);
+                    pending.authenticated_format_version = working.version;
+                }
+                for (const auto & shard : pending.descriptor.shards) {
+                    pending.authenticated_revisions.push_back(
+                        segment_revisions[payload_offsets[u] + shard.shard_index]);
+                }
                 pending.stash_id =
                     pending.descriptor.clean_stash.payload_id;
                 for (auto & shard : pending.descriptor.shards) {
@@ -3493,6 +3610,10 @@ llama_vbr_artifact_catalog::publish_stream_complete(
                         .payload_id;
                 pending.descriptor =
                     working.unit_blobs[u].descriptor.clean_stash;
+                for (const auto & shard : pending.descriptor.shards) {
+                    pending.authenticated_revisions.push_back(
+                        segment_revisions[stash_offsets[u] + shard.shard_index]);
+                }
                 for (auto & shard : pending.descriptor.shards) {
                     shard.payload = {};
                 }
@@ -4332,6 +4453,20 @@ llama_vbr_artifact_catalog::materialize_reference_locked(
     state->manifest = it->second.manifest;
     state->projected_ranges = it->second.projected_ranges;
     state->projected_sealed = it->second.projected_sealed;
+    state->authentication_complete = !state->projected_sealed;
+    const auto bind_authentication = [&](const auto & chains, const auto & revisions) {
+        if (chains.size() != revisions.size()) {
+            state->authentication_complete = false;
+            return;
+        }
+        for (size_t i = 0; i < chains.size(); ++i) {
+            if (!chains[i] || revisions[i] == 0) {
+                state->authentication_complete = false;
+                return;
+            }
+            state->authenticated_backing.emplace_back(chains[i].get(), revisions[i]);
+        }
+    };
     state->units.reserve(it->second.unit_ids.size());
     for (const auto & id : it->second.unit_ids) {
         const auto found = impl_->blobs.find(id.bytes());
@@ -4349,6 +4484,7 @@ llama_vbr_artifact_catalog::materialize_reference_locked(
             shard.payload = {};
         }
         unit.payload_shards = found->second.payload_shards;
+        bind_authentication(unit.payload_shards, found->second.authenticated_revisions);
         for (const auto & allocation : found->second.allocations) {
             unit.payload_allocations.push_back(allocation_view(allocation));
         }
@@ -4358,6 +4494,7 @@ llama_vbr_artifact_catalog::materialize_reference_locked(
                 return vbr_artifact_resolve_status::unavailable;
             }
             unit.stash_shards = stash->second.shards;
+            bind_authentication(unit.stash_shards, stash->second.authenticated_revisions);
             for (const auto & allocation : stash->second.allocations) {
                 unit.stash_allocations.push_back(allocation_view(allocation));
             }
@@ -4369,6 +4506,8 @@ llama_vbr_artifact_catalog::materialize_reference_locked(
         return vbr_artifact_resolve_status::unavailable;
     }
     state->companions.reserve(it->second.companion_payloads.size());
+    bind_authentication(it->second.companion_payloads,
+                        it->second.authenticated_companion_revisions);
     for (size_t i = 0; i < it->second.companion_payloads.size(); ++i) {
         vbr_artifact_companion_view companion;
         companion.descriptor = it->second.manifest.companions[i];
@@ -4378,6 +4517,9 @@ llama_vbr_artifact_catalog::materialize_reference_locked(
     }
     for (const auto & allocation : it->second.allocations) {
         state->reference_allocations.push_back(allocation_view(allocation));
+    }
+    if (!state->authentication_complete) {
+        state->authenticated_backing.clear();
     }
     output = std::move(state);
     return vbr_artifact_resolve_status::ok;

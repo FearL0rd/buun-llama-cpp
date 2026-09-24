@@ -4089,18 +4089,20 @@ uint32_t llama_kv_cache::vbr_watermark_cells(uint32_t extra_tokens) const {
 }
 
 uint32_t llama_kv_cache::vbr_import_watermark_cells(
-        uint32_t incoming_cells, uint32_t prefix_cells, uint32_t source_watermark,
-        llama_seq_id destination) const {
-    if (other) { return other->vbr_import_watermark_cells(incoming_cells, prefix_cells, source_watermark, destination); }
+        uint32_t incoming_cells, uint32_t prefix_cells, uint32_t source_high_water,
+        llama_seq_id destination, uint32_t source_backing) const {
+    if (other) { return other->vbr_import_watermark_cells(incoming_cells, prefix_cells, source_high_water, destination, source_backing); }
     if (destination < 0 || size_t(destination) >= seq_to_stream.size()) { return 0; }
     const auto & cells = v_cells[seq_to_stream[destination]];
     if (cells.get_used() == 0) {
-        if (source_watermark == 0) { return vbr_watermark_cells(incoming_cells); }
+        if (source_high_water == 0) { return vbr_watermark_cells(incoming_cells); }
         // Whole imports preserve source physical placements, including holes
         // left by earlier provisional replacements. Prefix projections pass
-        // their compacted high-water instead. The suffix resumes after it.
+        // their compacted high-water instead. The suffix resumes after the
+        // last installed row, not after the payload's allocation padding.
         const uint64_t suffix = incoming_cells > prefix_cells ? incoming_cells-prefix_cells : 0;
-        return vbr_watermark_cells(uint32_t(std::min(uint64_t(UINT32_MAX), source_watermark+suffix)));
+        return vbr_watermark_cells(uint32_t(std::min(uint64_t(UINT32_MAX),
+            std::max(uint64_t(source_backing), source_high_water+suffix))));
     }
     uint32_t incumbent = 0;
     // Price growth beyond the rows being replaced, retaining foreign rows and
@@ -4113,7 +4115,7 @@ uint32_t llama_kv_cache::vbr_import_watermark_cells(
     // The guard prefers provisional free cells, leaving the incumbent's old
     // physical range behind the resumed head. Credit reuse only when the
     // guard must recycle the incumbent (and the prefix fits those rows).
-    if (source_watermark != 0 &&
+    if (source_high_water != 0 &&
         (prefix_cells <= cells.size()-cells.get_used() || prefix_cells > incumbent)) {
         incumbent = 0;
     }

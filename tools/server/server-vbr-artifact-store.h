@@ -181,6 +181,7 @@ struct server_vbr_artifact_capture_output {
     uint64_t stash_bytes = 0;
     uint64_t companion_bytes = 0;
     uint64_t chunks = 0;
+    uint64_t reused_attention_bytes = 0;
     uint64_t backpressure_waits = 0;
     uint64_t event_completions = 0;
     uint64_t synchronous_fallbacks = 0;
@@ -492,7 +493,8 @@ public:
         server_vbr_explicit_host_capture & operation) noexcept;
     server_vbr_artifact_capture_output publish_host_payload(
         server_vbr_explicit_host_capture & operation,
-        std::shared_ptr<const server_prompt_cache_vbr_payload> & payload)
+        std::shared_ptr<const server_prompt_cache_vbr_payload> & payload,
+        vbr_explicit_attention_reuse * attention_reuse = nullptr)
         noexcept;
 
     // Publish an already sealed projected assembly through this store's

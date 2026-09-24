@@ -373,6 +373,15 @@ struct llama_kv_cache_vbr_epoch_test {
             std::min(capacity, GGML_PAD(1500u, padding)));
         CHECK(cache->vbr_import_watermark_cells(1000, 500, 0, 0) ==
             std::min(capacity, GGML_PAD(1000u, padding)));
+        // Saved padding is a minimum backing extent, not occupied rows to
+        // which a resumed suffix should be added (and padded a second time).
+        CHECK(cache->vbr_import_watermark_cells(1000, 500, 500, 0, 768) ==
+            std::min(capacity, GGML_PAD(1000u, padding)));
+        CHECK(cache->vbr_import_watermark_cells(500, 500, 500, 0, 1024) ==
+            std::min(capacity, GGML_PAD(1024u, padding)));
+        // Real source holes still count toward the resumed high-water.
+        CHECK(cache->vbr_import_watermark_cells(1000, 500, 1000, 0, 1024) ==
+            std::min(capacity, GGML_PAD(1500u, padding)));
         if (capacity >= 1536) {
             std::vector<ggml_type> types;
             for (const auto & layer : cache->layers) {
@@ -4733,6 +4742,7 @@ static bool model_backed_adoption(
         uint64_t destination_budget_mib = 0,
         ggml_type expected_destination_type = GGML_TYPE_COUNT) {
     const bool live_matrix = live_token_count != 0;
+    bool live_requires_rebase = false;
     const bool require_destination_degraded =
         expected_destination_type != GGML_TYPE_COUNT;
     vbr_upward_recipe destination_upward_recipe;
@@ -4786,7 +4796,7 @@ static bool model_backed_adoption(
     context_params.vbr_budget_explicit = true;
     context_params.vbr_vram_budget_bytes = live_matrix
         ? live_budget_mib*1024*1024 : 4ull*1024*1024*1024;
-    if (downward_mode) {
+    if (downward_mode || live_matrix) {
         context_params.vbr_min_bits = 1.0;
         context_params.vbr_min_bits_explicit = true;
     }
@@ -5117,8 +5127,16 @@ static bool model_backed_adoption(
             vbr_artifact_retire_status::retired);
     }
 
-    const auto captured = vbr_capture_explicit_manifest(
-        *source_memory, request, catalog, capture_accounting);
+    vbr_explicit_capture_operation capture_operation;
+    CHECK(vbr_prepare_explicit_manifest(
+        *source_memory, request, catalog, capture_accounting,
+        capture_operation).status == vbr_explicit_capture_status::ok);
+    vbr_explicit_attention_reuse attention_reuse;
+    vbr_artifact_package_view empty_package;
+    CHECK(!capture_operation.retain_attention(empty_package, attention_reuse));
+    CHECK(vbr_transfer_explicit_manifest(capture_operation).status ==
+          vbr_explicit_capture_status::ok);
+    const auto captured = vbr_publish_explicit_manifest(capture_operation);
     CHECK(captured.status == vbr_explicit_capture_status::ok);
     CHECK(captured.sink.reference_artifact.v != 0);
     if (captured.status != vbr_explicit_capture_status::ok ||
@@ -5135,6 +5153,107 @@ static bool model_backed_adoption(
     CHECK(catalog.resolve_reference(reference, package) ==
           vbr_artifact_resolve_status::ok);
     CHECK(package && package.validate() == vbr_artifact_status::ok);
+    CHECK(capture_operation.retain_attention(package, attention_reuse));
+    {
+        // The companion changes; exact attention and clean stash do not.
+        // Reuse skips all ring work, while canonical publication still binds
+        // the new companion and manifest and retains the original backing.
+        auto shared_request = bounded_request;
+        shared_request.attention_reuse = attention_reuse;
+        --shared_request.identity.token_count;
+        --shared_request.identity.next_position;
+        --shared_request.frontier.token_count;
+        --shared_request.frontier.next_position;
+        shared_request.token_block.pop_back();
+        bounded_probe.completed_writes = 0;
+        bounded_probe.bytes[0] = 42;
+        auto limited_request = shared_request;
+        limited_request.max_packed_bytes = 1;
+        const auto limited = vbr_capture_explicit_manifest(
+            *source_memory, limited_request, catalog, capture_accounting);
+        CHECK(limited.status == vbr_explicit_capture_status::admission_refused);
+        CHECK(limited.chunks == 0 && bounded_probe.completed_writes == 0);
+        vbr_explicit_capture_operation shared_operation;
+        CHECK(vbr_prepare_explicit_manifest(
+            *source_memory, shared_request, catalog, capture_accounting,
+            shared_operation).status == vbr_explicit_capture_status::ok);
+        const auto shared_transfer = vbr_transfer_explicit_manifest(shared_operation);
+        CHECK(shared_transfer.status == vbr_explicit_capture_status::ok);
+        CHECK(shared_transfer.chunks == 0 && shared_transfer.event_completions == 0);
+        CHECK(shared_transfer.payload_bytes == captured.payload_bytes);
+        CHECK(shared_transfer.stash_bytes == captured.stash_bytes);
+        CHECK(shared_transfer.reused_attention_bytes == captured.payload_bytes + captured.stash_bytes);
+        CHECK(bounded_probe.completed_writes == 3);
+        const auto shared = vbr_publish_explicit_manifest(shared_operation);
+        CHECK(shared.status == vbr_explicit_capture_status::ok);
+        vbr_artifact_package_view shared_package;
+        CHECK(catalog.resolve_reference(shared.sink.reference_artifact, shared_package) ==
+              vbr_artifact_resolve_status::ok);
+        CHECK(shared_package.validate() == vbr_artifact_status::ok);
+        CHECK(shared_package.manifest().manifest_digest != package.manifest().manifest_digest);
+        for (size_t i = 0; i < package.units().size(); ++i) {
+            CHECK(shared_package.units()[i].unit_version_id == package.units()[i].unit_version_id);
+            CHECK(shared_package.units()[i].payload_shards == package.units()[i].payload_shards);
+            CHECK(shared_package.units()[i].stash_shards == package.units()[i].stash_shards);
+        }
+        vbr_explicit_attention_reuse lease;
+        CHECK(!capture_operation.retain_attention(shared_package, lease));
+        CHECK(shared_package.claim_host_ownership());
+        CHECK(shared_operation.retain_attention(shared_package, lease));
+        shared_operation.reset();
+        const auto held = catalog.snapshot().references;
+        shared_package.reset();
+        CHECK(catalog.snapshot().references == held);
+        lease.reset();
+        CHECK(catalog.snapshot().references + 1 == held);
+
+        // A lease does not bypass cancellation or publish partial companions.
+        bounded_probe.completed_writes = 0;
+        shared_request.continue_context = &bounded_probe;
+        shared_request.continue_transfer = [](void * opaque) noexcept {
+            return static_cast<bounded_companion_probe *>(opaque)->completed_writes == 0;
+        };
+        const auto cancelled = vbr_capture_explicit_manifest(
+            *source_memory, shared_request, catalog, capture_accounting);
+        CHECK(cancelled.status == vbr_explicit_capture_status::cancelled);
+        CHECK(cancelled.chunks == 0 && bounded_probe.completed_writes == 1);
+        CHECK(catalog.snapshot().references + 1 == held);
+    }
+    capture_operation.reset();
+    if (std::any_of(package.units().begin(), package.units().end(),
+            [](const auto & unit) {
+                return unit.descriptor.clean_stash_state ==
+                    vbr_artifact_clean_stash_state::present;
+            })) {
+        CHECK(captured.stash_bytes != 0);
+        // Physical sink ownership is carried by the exact artifact above,
+        // not by a projected row union. Refuse before any projected transfer
+        // with the specific status that selects the server's exact retry.
+        vbr_projected_capture_batch_request projected;
+        projected.idle_decode_thread = true;
+        projected.max_packed_bytes = 4ull*1024*1024*1024;
+        projected.ring = request.ring;
+        projected.topologies = request.topologies;
+        projected.pool_bindings = request.pool_bindings;
+        projected.representation_context = request.representation_context;
+        projected.representation_identity = request.representation_identity;
+        vbr_projected_capture_manifest_request manifest;
+        manifest.manifest_id = 1;
+        manifest.sequence = request.sequence;
+        manifest.identity = request.identity;
+        manifest.token_block = request.token_block;
+        manifest.text_only = true;
+        projected.manifests.push_back(std::move(manifest));
+        const auto refused = vbr_capture_projected_batch(*source_memory, projected);
+        CHECK(refused.status ==
+            vbr_explicit_capture_status::projected_stash_requires_exact);
+        CHECK(refused.phase == vbr_explicit_capture_phase::metadata_and_manifest);
+        CHECK(refused.publications.empty());
+        CHECK(refused.unit_transfer_calls == 0);
+        CHECK(refused.companion_d2h_bytes == 0);
+        CHECK(refused.ring_operation_acquires == 0);
+        std::fprintf(stderr, "VBR projected stash requires exact: zero-transfer refusal verified\n");
+    }
     if (live_matrix) {
         std::set<int32_t> types;
         std::map<uint32_t, int32_t> by_unit;
@@ -5158,6 +5277,10 @@ static bool model_backed_adoption(
                         controller.units.size() &&
                     controller.units[unit.descriptor.logical_unit_id].domain !=
                         vbr_repr_domain::full) {
+                    // A unit first retiered before any rows were written has
+                    // no stash. Validation must rebase that honest absence,
+                    // even when the live K/V pair never straddled two tiers.
+                    live_requires_rebase = true;
                     std::fprintf(stderr,
                         "VBR tapped-without-stash unit=%u type=%d domain=%u\n",
                         unit.descriptor.logical_unit_id,
@@ -5233,6 +5356,8 @@ static bool model_backed_adoption(
                 vbr_artifact_clean_stash_state::omitted_source_present)]);
         std::fprintf(stderr, "VBR manifest_consistency=%u\n",
             unsigned(package.manifest().consistency.kind));
+        CHECK(stash_states[size_t(
+            vbr_artifact_clean_stash_state::omitted_source_present)] == 0);
         CHECK(types.size() > 1);
         CHECK(!require_straddled || straddled);
         if (types.size() <= 1 || (require_straddled && !straddled)) {
@@ -5262,7 +5387,19 @@ static bool model_backed_adoption(
         // Context destruction is a terminal scheduler boundary. Keep the
         // retained hardware harness explicit about the production settle.
         llama_synchronize(source.get());
+        // A decode invalidates the old live-source proof even if the same
+        // allocation still exists. The optional optimization must fall back.
+        auto stale_request = bounded_request;
+        stale_request.attention_reuse = attention_reuse;
+        const auto stale = vbr_capture_explicit_manifest(
+            *source_memory, stale_request, catalog, capture_accounting);
+        CHECK(stale.status == vbr_explicit_capture_status::ok);
+        CHECK(stale.chunks != 0);
+        CHECK(stale.reused_attention_bytes == 0);
+        CHECK(catalog.discard_unowned_reference(stale.sink.reference_artifact) ==
+              vbr_artifact_retire_status::retired);
     }
+    attention_reuse.reset();
     capture_ring.reset();
     if (!live_matrix) {
         source.reset();
@@ -5622,6 +5759,9 @@ static bool model_backed_adoption(
             std::move(*staged.staged), ledger, hooks);
         if (fail_before_phase != vbr_adopt_phase::_count) {
             CHECK(adopted.status != vbr_adopt_status::adopted);
+            // An earlier failure must not masquerade as coverage of a later
+            // boundary (e.g. missing side stream hiding H2D rollback tests).
+            CHECK(adopted.phase == fail_before_phase);
             vbr_target_validation_snapshot rolled_back;
             vbr_downward_policy_projection rolled_back_projection;
             bool rolled_back_downward = false;
@@ -5644,7 +5784,8 @@ static bool model_backed_adoption(
             CHECK(vbr_operation_registry_quiescent_for(&target_instance, 1));
             target_context.reset();
             CHECK(ledger.snapshot().live_ops == baseline_live_ops);
-            return adopted.status != vbr_adopt_status::adopted;
+            return adopted.status != vbr_adopt_status::adopted &&
+                   adopted.phase == fail_before_phase;
         }
         CHECK(adopted.status == vbr_adopt_status::adopted);
         CHECK(adopted.decision == expected_decision);
@@ -5749,7 +5890,7 @@ static bool model_backed_adoption(
     // at a boundary also proves rollback after the preceding boundary. Composite
     // publication and close deliberately have no post-boundary fault seam.
     if (live_matrix) {
-        CHECK(run_import(false, require_straddled
+        CHECK(run_import(false, require_straddled || live_requires_rebase
             ? vbr_import_decision::live_rebased
             : vbr_import_decision::native_import));
     } else if (!needs_transform) {

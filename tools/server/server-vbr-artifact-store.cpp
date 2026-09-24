@@ -775,6 +775,7 @@ server_vbr_artifact_capture_status map_status(
             return server_vbr_artifact_capture_status::ok;
         case vbr_explicit_capture_status::not_armed:
         case vbr_explicit_capture_status::unsupported_layout:
+        case vbr_explicit_capture_status::projected_stash_requires_exact:
             return server_vbr_artifact_capture_status::unsupported;
         case vbr_explicit_capture_status::slot_not_idle:
             return server_vbr_artifact_capture_status::slot_processing;
@@ -831,6 +832,7 @@ void copy_capture_result(
     output.stash_bytes = result.stash_bytes;
     output.companion_bytes = result.companion_bytes;
     output.chunks = result.chunks;
+    output.reused_attention_bytes = result.reused_attention_bytes;
     output.backpressure_waits = result.backpressure_waits;
     output.event_completions = result.event_completions;
     output.synchronous_fallbacks = result.synchronous_fallbacks;
@@ -2426,9 +2428,13 @@ server_vbr_artifact_store::transfer_host_payload(
 server_vbr_artifact_capture_output
 server_vbr_artifact_store::publish_host_payload(
         server_vbr_explicit_host_capture & operation,
-        std::shared_ptr<const server_prompt_cache_vbr_payload> & payload)
+        std::shared_ptr<const server_prompt_cache_vbr_payload> & payload,
+        vbr_explicit_attention_reuse * attention_reuse)
         noexcept {
     payload.reset();
+    if (attention_reuse) {
+        attention_reuse->reset();
+    }
     server_vbr_artifact_capture_output output;
     if (!operation.ready_for_publication()) {
         if (!operation.impl_) {
@@ -2498,6 +2504,12 @@ server_vbr_artifact_store::publish_host_payload(
         }
         impl_->counters.staging_overlap_refusals =
             impl_->catalog.snapshot().staging_overlap_refusals;
+        if (attention_reuse) {
+            // Optional optimization: refusal leaves the next capture on its
+            // normal transfer path, without invalidating this publication.
+            (void) operation.impl_->capture.retain_attention(
+                payload->package(), *attention_reuse);
+        }
         operation.reset();
         return output;
     } catch (...) {

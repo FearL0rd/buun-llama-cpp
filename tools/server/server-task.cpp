@@ -25,6 +25,9 @@
 #include <thread>
 #include <tuple>
 #include <type_traits>
+#if defined(__GLIBC__)
+#include <malloc.h>
+#endif
 
 namespace {
 
@@ -4008,6 +4011,12 @@ static bool server_prompt_cache_mirror_artifact_clone(
                     uint64_t(coverage_tokens), true);
             break;
         case server_prompt_cache_prefix_clone_mode::publish_from_prompt:
+            if (destination_kind == common_retention_artifact_kind::checkpoint) {
+                // Checkpoints retain their own frontier and identity. They
+                // are not full prompt prefixes and must not enter that index.
+                cloned = cache.retention_obs->clone(source_key, destination_key);
+                break;
+            }
             if (coverage_tokens > 0) {
                 std::string scope;
                 cloned = server_prompt_retention_exact_scope(
@@ -4550,6 +4559,7 @@ bool server_cache_checkpoint_capacity_floor(
              it != context.checkpoints.end(); ++it, ++ordinal) {
             server_cache_checkpoint_floor_input input;
             input.ordinal = ordinal;
+            input.n_tokens = it->empty() ? 0 : it->n_tokens;
             const auto key =
                 server_retention_instance_key::for_checkpoint(context.slot_id, &*it);
             server_retention_checkpoint_inventory catalog;
@@ -5758,14 +5768,16 @@ static bool server_prompt_cache_plan_vbr_pressure(
                 if (state_artifact == ignored_artifact) {
                     continue;
                 }
+                // A pinned provider remains retained coverage, not a victim.
+                // Its shared payload must not veto unrelated retirements.
+                if (it->recovery_pins != 0) {
+                    continue;
+                }
                 if (it->payload.kind() !=
                         server_prompt_cache_payload_kind::vbr_artifact ||
                     it->payload.vbr_has_quality_anchor() ||
                     it->payload.vbr_logical_erase_only()) {
                     return false;
-                }
-                if (it->recovery_pins != 0) {
-                    continue;
                 }
                 victims.push_back(it);
                 ordinals.push_back(ordinal);
@@ -5805,18 +5817,25 @@ static bool server_prompt_cache_plan_vbr_pressure(
             cache.states.end(), candidates,
             shadow_rows, shadow_artifacts, shadow_lineages,
             ignored_artifact);
-        if (!projection.complete || !projection.release_evidence_complete ||
-            !projection.artifact.v) {
-            return false;
-        }
-        const auto selected = std::find_if(
-            candidates.begin(), candidates.end(), [&](const auto & value) {
-                return value.ranking.artifact_id == projection.artifact &&
+        // Match the publication terminal's oldest-eligible fallback when
+        // optional semantic retention scores are unavailable (e.g. requests
+        // without message delimiters). Lease and physical release evidence
+        // remain mandatory; missing scores never manufacture reclaim credit.
+        const auto select = [&](const auto & projected,
+                                llama_cache_acct_artifact_id excluded) {
+            const bool ranked = projected.complete &&
+                projected.release_evidence_complete && projected.artifact.v;
+            return std::find_if(candidates.begin(), candidates.end(), [&](const auto & value) {
+                return value.ranking.artifact_id.v &&
+                    value.ranking.artifact_id != excluded &&
+                    (!ranked || value.ranking.artifact_id == projected.artifact) &&
                     (!byte_pressure || value.marginal_resident_known) &&
                     value.retirement_ready && value.lease_known &&
                     !value.hard_leased && !value.mandatory_anchor &&
                     value.victim->recovery_pins == 0;
             });
+        };
+        const auto selected = select(projection, {});
         if (selected == candidates.end()) {
             return false;
         }
@@ -5858,21 +5877,7 @@ static bool server_prompt_cache_plan_vbr_pressure(
             cache, reason, cache.states.end(), candidates,
             shadow_rows, shadow_artifacts, shadow_lineages,
             ignored_artifact, selected->ranking.artifact_id);
-        if (!second_projection.complete ||
-            !second_projection.release_evidence_complete ||
-            !second_projection.artifact.v) {
-            plan = {};
-            return false;
-        }
-        const auto second = std::find_if(
-            candidates.begin(), candidates.end(), [&](const auto & value) {
-                return value.ranking.artifact_id ==
-                        second_projection.artifact &&
-                    value.marginal_resident_known &&
-                    value.retirement_ready && value.lease_known &&
-                    !value.hard_leased && !value.mandatory_anchor &&
-                    value.victim->recovery_pins == 0;
-            });
+        const auto second = select(second_projection, selected->ranking.artifact_id);
         if (second == candidates.end() || second == selected) {
             plan = {};
             return false;
@@ -6732,10 +6737,16 @@ bool server_prompt_cache::destroy_retention_host_entry(
             }
         }
         observe_retention_shadow = false;
-        if (projection.release_evidence_complete && proposed.v != 0) {
+        // A pre-D2H VBR capacity citation may have used the same lawful FIFO
+        // floor when turn scores were unavailable. Revalidate that decision,
+        // rather than refusing every such publication at the terminal.
+        const auto executable = !projection.complete && required_victim.v &&
+                host_entry_artifact_id(*this, *legacy_floor) == required_victim
+            ? required_victim : proposed;
+        if (projection.release_evidence_complete && executable.v != 0) {
             const auto selected = std::find_if(
                 candidates.begin(), candidates.end(), [&](const auto & value) {
-                    return value.ranking.artifact_id == proposed &&
+                    return value.ranking.artifact_id == executable &&
                         value.lease_known && !value.hard_leased &&
                         value.victim != incoming &&
                         value.victim->recovery_pins == 0;
@@ -8503,21 +8514,92 @@ void server_prompt_cache::commit_restore_delivery(
         source, server_cache_destruction_reason::host_consumed_restore);
 }
 
+bool server_prompt_checkpoint_frontier_is_current(
+        const server_prompt & prompt,
+        const common_prompt_checkpoint & checkpoint,
+        const std::string & execution_identity,
+        const std::string & adapter_identity) {
+    const auto & frontier = checkpoint.computation_frontier;
+    if (!frontier.valid() ||
+        frontier.sequence_epoch != prompt.sequence_epoch ||
+        frontier.execution_identity != execution_identity ||
+        frontier.adapter_config_identity != adapter_identity ||
+        frontier.token_count != checkpoint.n_tokens ||
+        checkpoint.pos_max < 0 || frontier.next_position <= 0 ||
+        frontier.next_position - 1 != checkpoint.pos_max) {
+        return false;
+    }
+    std::string media_identity;
+    return prompt.tokens.media_content_identity(frontier.token_count, media_identity) &&
+           media_identity == frontier.media_content_identity;
+}
+
+llama_pos server_prompt_checkpoint_reuse_threshold(llama_pos pos_next, int32_t n_swa, bool has_new_tokens) {
+    return std::max(0, pos_next - n_swa - (has_new_tokens ? 0 : 1));
+}
+
+server_prompt_checkpoint_reuse server_prompt_checkpoint_reuse_geometry(
+        const server_tokens & tokens, const common_prompt_checkpoint & checkpoint, llama_pos pos_next) {
+    pos_next = std::min(pos_next, std::max(checkpoint.pos_min + 1, checkpoint.pos_max));
+    return { pos_next, std::min(tokens.size_up_to_pos(pos_next), size_t(std::max<int64_t>(0, checkpoint.n_tokens))) };
+}
+
+size_t server_prompt_cache_reusable_prefix(
+        const server_prompt & prompt, const server_tokens & incoming,
+        size_t lcp, llama_pos pos_min,
+        const server_prompt_cache_reuse_context & context,
+        const std::string & adapter_identity) {
+    if (lcp == 0 || pos_min < 0) {
+        return 0;
+    }
+    const llama_pos pos_next = prompt.tokens.pos_next(lcp);
+    // Match the executor, including the final-token evaluation on exact hits.
+    const llama_pos threshold = server_prompt_checkpoint_reuse_threshold(
+        pos_next, context.n_swa, lcp < incoming.size());
+    if (pos_min < threshold) {
+        return lcp;
+    }
+    // Fixed KV has zero VBR epochs. Use the same reverse selection and
+    // frontier/lineage guards as execution, without transferring any state.
+    const llama_memory_vbr_state_data fixed_state = {};
+    for (auto it = prompt.checkpoints.rbegin(); it != prompt.checkpoints.rend(); ++it) {
+        const auto & checkpoint = *it;
+        const auto evaluation = server_cache_plan_evaluate_checkpoint(
+            !checkpoint.empty(), true, true,
+            common_prompt_checkpoint_lineage_matches(checkpoint, fixed_state),
+            checkpoint.pos_min, checkpoint.pos_max, pos_next, threshold, 0);
+        if (!server_cache_plan_viable(evaluation.reason)) {
+            continue;
+        }
+        if (context.frontier_required && !server_prompt_checkpoint_frontier_is_current(
+                prompt, checkpoint, context.execution_identity, adapter_identity)) {
+            continue;
+        }
+        const size_t restored = std::min(lcp,
+            server_prompt_checkpoint_reuse_geometry(prompt.tokens, checkpoint, pos_next).n_tokens);
+        // An imported recurrent checkpoint has no rollback history. If it
+        // reaches the whole request, final-token replay would cold-reset it.
+        // Do not quote an older checkpoint: execution selects this one first.
+        return restored < incoming.size() ? restored : 0;
+    }
+    return 0;
+}
+
 // The observed/unobserved split is a compile-time instantiation: with the observer
-// off, load() runs the pre-cache-plan observer candidate loop with zero observer branches. Single source —
+// off, selection runs the same candidate loop with zero observer branches. Single source —
 // every `if constexpr (Observed)` block vanishes from the <false> instantiation.
 template <bool Observed>
-bool server_prompt_cache::load_impl(
-        server_prompt & prompt, const server_tokens & tokens_new,
-        llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot,
+server_prompt_cache::selection server_prompt_cache::select_impl(
+        const server_prompt & prompt, const server_tokens & tokens_new,
         const std::string & adapter_config_key, common_cache_plan_record * rec,
-        common_cache_family_binding * restored_family,
-        server_prompt_cache_restore_shape & restore_shape) {
-    restore_shape = server_prompt_cache_restore_shape::none;
+        const server_prompt_cache_reuse_context * reuse) {
     if constexpr (!Observed) {
         (void) rec;
     }
     const int lcp_best = prompt.tokens.get_common_prefix(tokens_new);
+    size_t reusable_best = reuse ? server_prompt_cache_reusable_prefix(
+        prompt, tokens_new, lcp_best, reuse->live_pos_min, *reuse,
+        adapter_config_key) : 0;
 
     float f_keep_best = prompt.tokens.size() > 0 ? float(lcp_best) / prompt.tokens.size() : -1.0f; // empty slot: any cache entry wins
     float f_sim_best  = float(lcp_best) / tokens_new.size();
@@ -8529,10 +8611,10 @@ bool server_prompt_cache::load_impl(
     // Observer tallies exist only in the observed instantiation and only carry
     // values this selection computes anyway
     [[maybe_unused]] int32_t obs_source_best = -1;
-    [[maybe_unused]] int     obs_lcp_sel  = 0;
-    int reuse_lcp_best = 0;
+    int selected_lcp = 0;
 
-    // find the most similar cached prompt, that would also preserve the most context.
+    // Compare restorable frontiers when supplied; otherwise retain the legacy
+    // token-similarity/retained-fraction heuristic.
     // Observer transport [observer, noexcept]: ONE row per visited entry, keyed by its
     // request-local immutable source id; every evaluated survivor starts unselected and
     // the shipped winner is promoted to accepted after the scan. find_or_add returning
@@ -8592,15 +8674,26 @@ bool server_prompt_cache::load_impl(
 
         SRV_TRC("   - prompt with length %7zu, lcp = %7d, f_keep = %.3f, f_sim = %.3f\n", it->prompt.tokens.size(), lcp_cur, f_keep_cur, f_sim_cur);
 
-        if (f_keep_best < f_keep_cur && f_sim_best < f_sim_cur) {
+        const size_t reusable_cur = reuse ? server_prompt_cache_reusable_prefix(
+            it->prompt, tokens_new, lcp_cur, it->fixed_pos_min, *reuse,
+            adapter_config_key) : 0;
+        if constexpr (Observed) {
+            if (reuse && lcp_cur > 0 && reusable_cur == 0 && row) {
+                row->note_reject(COMMON_CACHE_PLAN_REASON_COVERAGE_INSUFFICIENT);
+            }
+        }
+        // A longer token match can have no usable recurrent frontier. Rank
+        // actual replay savings, retaining live state on ties (no host copy).
+        if (reuse ? reusable_cur > reusable_best
+                  : f_keep_best < f_keep_cur && f_sim_best < f_sim_cur) {
+            reusable_best = reusable_cur;
             f_keep_best = f_keep_cur;
             f_sim_best  = f_sim_cur;
 
             it_best = it;
-            reuse_lcp_best = lcp_cur;
+            selected_lcp = lcp_cur;
             if constexpr (Observed) {
                 obs_source_best = obs_source;
-                obs_lcp_sel  = lcp_cur; // the winner's exact LCP, from the shipped computation
             }
         }
     }
@@ -8617,7 +8710,7 @@ bool server_prompt_cache::load_impl(
                 win->payload_kind =
                     common_cache_plan_payload_kind::fixed_state;
                 win->accept(); // mark the actual scan winner
-                win->lcp_tokens    = llama_cache_acct_value::measured((uint64_t) obs_lcp_sel);
+                win->lcp_tokens    = llama_cache_acct_value::measured((uint64_t) selected_lcp);
                 // bytes the restore actually installs (main+draft state) — NOT entry
                 // size(), which also sums every retained checkpoint.
                 win->payload_bytes = llama_cache_acct_value::measured(
@@ -8627,12 +8720,36 @@ bool server_prompt_cache::load_impl(
         }
     }
 
+    return { it_best, selected_lcp };
+}
+
+server_prompt_cache::iterator server_prompt_cache::select(
+        const server_prompt & prompt, const server_tokens & tokens_new,
+        const std::string & adapter_config_key,
+        const server_prompt_cache_reuse_context * reuse) {
+    return select_impl<false>(prompt, tokens_new, adapter_config_key, nullptr, reuse).source;
+}
+
+template <bool Observed>
+bool server_prompt_cache::load_impl(
+        server_prompt & prompt, const server_tokens & tokens_new,
+        llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot,
+        const std::string & adapter_config_key, common_cache_plan_record * rec,
+        common_cache_family_binding * restored_family,
+        server_prompt_cache_restore_shape & restore_shape,
+        const server_prompt_cache_reuse_context * reuse) {
+    restore_shape = server_prompt_cache_restore_shape::none;
+    const auto selected = select_impl<Observed>(prompt, tokens_new, adapter_config_key, rec, reuse);
+    auto it_best = selected.source;
     if (it_best == states.end()) {
         // nothing better than the slot's current state; leave the slot as-is
         return true;
     }
 
-    SRV_TRC(" - found better prompt with f_keep = %.3f, f_sim = %.3f\n", f_keep_best, f_sim_best);
+    const int reuse_lcp_best = selected.lcp;
+    const int32_t obs_source_best = Observed ? it_best->cache_plan_source_id : -1;
+    SRV_TRC(" - found better prompt with length %zu, lcp = %d\n",
+            it_best->prompt.tokens.size(), reuse_lcp_best);
 
     // immutable host restore stages the immutable source copy before either main or draft
     // context is touched. Allocation failure therefore leaves the source and
@@ -8709,8 +8826,8 @@ bool server_prompt_cache::load_impl(
     return true;
 }
 
-template bool server_prompt_cache::load_impl<false>(server_prompt &, const server_tokens &, llama_context *, llama_context *, int32_t, const std::string &, common_cache_plan_record *, common_cache_family_binding *, server_prompt_cache_restore_shape &);
-template bool server_prompt_cache::load_impl<true>(server_prompt &, const server_tokens &, llama_context *, llama_context *, int32_t, const std::string &, common_cache_plan_record *, common_cache_family_binding *, server_prompt_cache_restore_shape &);
+template bool server_prompt_cache::load_impl<false>(server_prompt &, const server_tokens &, llama_context *, llama_context *, int32_t, const std::string &, common_cache_plan_record *, common_cache_family_binding *, server_prompt_cache_restore_shape &, const server_prompt_cache_reuse_context *);
+template bool server_prompt_cache::load_impl<true>(server_prompt &, const server_tokens &, llama_context *, llama_context *, int32_t, const std::string &, common_cache_plan_record *, common_cache_family_binding *, server_prompt_cache_restore_shape &, const server_prompt_cache_reuse_context *);
 
 bool server_prompt_cache::load(
         server_prompt & prompt, const server_tokens & tokens_new,
@@ -8718,11 +8835,12 @@ bool server_prompt_cache::load(
         const std::string & adapter_config_key,
         server_prompt_cache_restore_shape & restore_shape,
         common_cache_plan_record * rec,
-        common_cache_family_binding * restored_family) {
+        common_cache_family_binding * restored_family,
+        const server_prompt_cache_reuse_context * reuse) {
     // One dispatch outside every loop: the off path is the original loop.
     return rec != nullptr
-        ? load_impl<true>(prompt, tokens_new, ctx_tgt, ctx_dft, id_slot, adapter_config_key, rec, restored_family, restore_shape)
-        : load_impl<false>(prompt, tokens_new, ctx_tgt, ctx_dft, id_slot, adapter_config_key, nullptr, restored_family, restore_shape);
+        ? load_impl<true>(prompt, tokens_new, ctx_tgt, ctx_dft, id_slot, adapter_config_key, rec, restored_family, restore_shape, reuse)
+        : load_impl<false>(prompt, tokens_new, ctx_tgt, ctx_dft, id_slot, adapter_config_key, nullptr, restored_family, restore_shape, reuse);
 }
 
 void server_prompt_cache::update() {
@@ -9016,6 +9134,25 @@ bool server_prompt_cache::update_impl(
         !quality_anchor_budget_enabled) {
         return true;
     }
+    // Capture workers allocate large pageable chunks in separate malloc
+    // arenas. Logical eviction can leave GiBs of free pages resident there
+    // while the next worker grows another arena. Reclaim those free pages
+    // once after a large, proven release, outside the retirement transaction.
+    // Apply the same host-pressure treatment to fixed-state payloads; small,
+    // unknown, or purely logical releases do not request a trim.
+    struct heap_reclaim {
+        bool pending = false;
+        void note(uint64_t released) noexcept {
+            pending |= released != UINT64_MAX && released >= (64ull << 20);
+        }
+        ~heap_reclaim() {
+#if defined(__GLIBC__)
+            if (pending) {
+                malloc_trim(0);
+            }
+#endif
+        }
+    } reclaim;
     bool pressure_wave_started = false;
     bool competition_wave_valid = true;
     bool retention_shadow_observed = false;
@@ -9206,6 +9343,7 @@ bool server_prompt_cache::update_impl(
                     }
                     required_victims = {};
                     retention_shadow_observed |= observe_shadow;
+                    reclaim.note(released_bytes);
                     if (released_bytes == UINT64_MAX ||
                         released_bytes > cache_bytes ||
                         released_tokens > cache_tokens) {
@@ -9228,6 +9366,7 @@ bool server_prompt_cache::update_impl(
             }
             required_victims = {};
             retention_shadow_observed |= observe_shadow;
+            reclaim.note(released_bytes);
             if (released_bytes == UINT64_MAX ||
                 released_bytes > cache_bytes ||
                 released_tokens > cache_tokens) {
@@ -9271,6 +9410,7 @@ bool server_prompt_cache::update_impl(
             }
             required_victims = {};
             retention_shadow_observed |= observe_shadow;
+            reclaim.note(released_bytes);
             if (released_bytes == UINT64_MAX ||
                 released_bytes > cache_bytes ||
                 released_tokens > cache_tokens) {

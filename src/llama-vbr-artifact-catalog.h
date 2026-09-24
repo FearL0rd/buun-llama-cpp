@@ -451,6 +451,10 @@ public:
     const std::vector<vbr_artifact_allocation_view> &
         reference_allocations() const noexcept;
     vbr_artifact_status validate() const noexcept;
+    // Reuse publication authentication only for immutable catalog metadata
+    // whose owned backing still has its verified revisions. Legacy/unproven
+    // packages use validate(); final import barriers must also use validate().
+    vbr_artifact_status validate_authenticated() const noexcept;
     // Rebuild the prepared wire package of an exact (non-projected) reference.
     // Payload sources borrow this view's storage, so the view must outlive
     // every read of `out`.
@@ -462,6 +466,7 @@ public:
 private:
     struct storage;
     friend class llama_vbr_artifact_catalog;
+    friend class vbr_explicit_capture_operation;
     friend class vbr_artifact_attention_prefix_projection;
     llama_vbr_artifact_catalog * owner_ = nullptr;
     std::shared_ptr<const storage> storage_;
