@@ -763,7 +763,9 @@ void llama_kv_cache_iswa::state_write(llama_io_write_i & io, llama_seq_id seq_id
         kv_base->state_write(io, seq_id, flags);
     }
 
-    kv_swa->state_write(io, seq_id, flags);
+    if ((flags & LLAMA_STATE_SEQ_FLAGS_RECURRENT_ONLY) == 0) {
+        kv_swa->state_write(io, seq_id, flags);
+    }
 }
 
 void llama_kv_cache_iswa::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
@@ -771,7 +773,9 @@ void llama_kv_cache_iswa::state_read(llama_io_read_i & io, llama_seq_id seq_id, 
         kv_base->state_read(io, seq_id, flags);
     }
 
-    kv_swa->state_read(io, seq_id, flags);
+    if ((flags & LLAMA_STATE_SEQ_FLAGS_RECURRENT_ONLY) == 0) {
+        kv_swa->state_read(io, seq_id, flags);
+    }
 }
 
 void llama_kv_cache_iswa::state_write_range(llama_io_write_i & io, llama_seq_id seq_id, llama_pos p0, llama_pos p1) const {

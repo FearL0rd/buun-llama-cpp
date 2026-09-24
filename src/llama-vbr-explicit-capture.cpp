@@ -2787,7 +2787,8 @@ vbr_projected_capture_batch_result vbr_capture_projected_batch(
                 recurrent_children.push_back(node.recurrent);
                 continue;
             }
-            if (node.attention == nullptr ||
+            // a projection packs rows from position 0, which a window no longer holds
+            if (node.attention == nullptr || node.window ||
                 !node.attention->vbr_operation_armed() ||
                 node.dependency_mode !=
                     checkpoint_child_dependency_mode::live_guarded) {

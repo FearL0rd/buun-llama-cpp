@@ -1169,6 +1169,10 @@ extern "C" {
 // has behind the window, which is what lets a server reuse it without falling back to a checkpoint.
 #define LLAMA_STATE_SEQ_FLAGS_SWA_HELD_CELLS 4
 
+// With PARTIAL_ONLY: the recurrent state alone. The sliding-window cells are left out, for a caller
+// that restores them from elsewhere.
+#define LLAMA_STATE_SEQ_FLAGS_RECURRENT_ONLY 8
+
     typedef uint32_t llama_state_seq_flags;
 
     LLAMA_API size_t llama_state_seq_get_size_ext(

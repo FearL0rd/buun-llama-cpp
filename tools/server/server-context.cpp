@@ -4992,6 +4992,9 @@ private:
     // its last checkpoint and prefills the turn again. Checkpoint tails stay exact-window.
     static constexpr llama_state_seq_flags RESUME_FRONTIER_FLAGS =
         LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY | LLAMA_STATE_SEQ_FLAGS_SWA_HELD_CELLS;
+    // a placed entry's window rows are in its pool image
+    static constexpr llama_state_seq_flags RESUME_PLACED_TAIL_FLAGS =
+        LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY | LLAMA_STATE_SEQ_FLAGS_RECURRENT_ONLY;
 
     static int64_t resume_unix_ms() {
         return std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -5022,9 +5025,10 @@ private:
         }
         resume_key_hex     = server_resume_hex(resume_key.digest.data(), resume_key.digest.size());
         const auto family_hex = server_resume_hex(family.data(), family.size());
+        // a dynamic cache places its window rows, so only a recurrent state is left to the tail
         resume_has_partial =
             llama_model_is_hybrid(model_tgt) || llama_model_is_recurrent(model_tgt) ||
-            llama_model_n_swa(model_tgt) > 0;
+            (llama_model_n_swa(model_tgt) > 0 && !resume_vbr());
         if (!resume_store || family_hex != resume_family_hex) {
             resume_family_hex = family_hex;
             server_resume_reason reason = server_resume_reason::ok;
@@ -5641,7 +5645,7 @@ private:
         if (pos_max + 1 != n_tokens) {
             return skipped("frontier_inconsistent");
         }
-        if (!resume_has_partial && pos_min != 0) {
+        if (!resume_has_partial && pos_min != 0 && llama_model_n_swa(model_tgt) == 0) {
             return skipped("unsupported_positions");
         }
 
@@ -6259,8 +6263,8 @@ private:
 
     // Whether the placements are the whole of a sequence of `n_tokens`: one for each attention
     // child of the tree, in its order, with its frontier at the end and one row for each position
-    // of [0, n_tokens). The import admits fewer rows, as a checkpoint may hold them; a resumed
-    // conversation with a hole in it would read as whole.
+    // of [0, n_tokens), or of a suffix of it for a window child. The import admits fewer rows, as a
+    // checkpoint may hold them; a resumed conversation with a hole in it would read as whole.
     bool resume_placement_whole(const std::vector<vbr_artifact_stream_placement> & placements, int32_t n_tokens) const {
         std::vector<llama_memory_tree_child> tree;
         if (!llama_memory_tree_collect(llama_get_memory(ctx_tgt), tree)) {
@@ -6276,15 +6280,18 @@ private:
             }
             const auto & placement = placements[i++];
             if (placement.child_id != node.child_id || placement.computation_frontier != n_tokens ||
-                placement.cells.size() != size_t(n_tokens)) {
+                placement.cells.empty() || placement.cells.size() > size_t(n_tokens) ||
+                (!node.window && placement.cells.size() != size_t(n_tokens))) {
                 return false;
             }
-            std::vector<bool> held(size_t(n_tokens), false);
+            const llama_pos first = n_tokens - llama_pos(placement.cells.size());
+            std::vector<bool> held(placement.cells.size(), false);
             for (const auto & cell : placement.cells) {
-                if (cell.logical_position < 0 || cell.logical_position >= n_tokens || held[cell.logical_position]) {
+                if (cell.logical_position < first || cell.logical_position >= n_tokens ||
+                    held[cell.logical_position - first]) {
                     return false;
                 }
-                held[cell.logical_position] = true;
+                held[cell.logical_position - first] = true;
             }
         }
         return i == placements.size();
@@ -6327,9 +6334,9 @@ private:
         const std::vector<uint8_t> payload = resume_placement_encode(placements);
         std::vector<uint8_t> frontier;
         if (resume_has_partial) {
-            frontier.resize(llama_state_seq_get_size_ext(ctx_tgt, slot.id, RESUME_FRONTIER_FLAGS));
+            frontier.resize(llama_state_seq_get_size_ext(ctx_tgt, slot.id, RESUME_PLACED_TAIL_FLAGS));
             if (frontier.empty() || llama_state_seq_get_data_ext(
-                    ctx_tgt, frontier.data(), frontier.size(), slot.id, RESUME_FRONTIER_FLAGS) != frontier.size()) {
+                    ctx_tgt, frontier.data(), frontier.size(), slot.id, RESUME_PLACED_TAIL_FLAGS) != frontier.size()) {
                 return json {{"outcome", "failed"}, {"reason", "state_rejected"}, {"error", "partial read"}};
             }
         }
@@ -6371,7 +6378,7 @@ private:
             tail.p0 = n_tokens;
             tail.n_tokens = n_tokens;
             tail.pos_max = n_tokens - 1;
-            // a windowed child shares no image, so the partial state here is a recurrent one
+            // the window rows are placed, so the partial state here is a recurrent one
             tail.pos_min = tail.pos_max;
             tail.role = "frontier";
             tail.gen = next.generation;
@@ -7070,7 +7077,7 @@ private:
         const auto & tail = co.tail;
         auto & slot = *co.slot;
         if ((resume_has_partial && llama_state_seq_set_data_ext(
-                ctx_tgt, tail.data(), tail.size(), slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) != tail.size()) ||
+                ctx_tgt, tail.data(), tail.size(), slot.id, RESUME_PLACED_TAIL_FLAGS) != tail.size()) ||
             llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id) != manifest.n_tokens - 1) {
             const llama_pos pos_max = llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id);
             slot.mandatory_recovery_reset(server_cache_destruction_reason::restore_failure);
@@ -12776,9 +12783,8 @@ private:
                 if (handoff_eligible &&
                     slot.prompt_clear_after_vbr_publication(
                         server_cache_destruction_reason::live_prefix_replace)) {
-                    // Hybrid/iSWA memory may contain payload-complete children
-                    // which a per-sequence erase cannot empty. With one slot,
-                    // clearing the whole tree cannot affect another request.
+                    // With one slot, clearing the whole hybrid/iSWA tree
+                    // cannot affect another request.
                     llama_memory_clear(memory, false);
                     memory->breathe();
                     cleared_for_empty_handoff = true;
@@ -14752,7 +14758,7 @@ private:
                     accelerator_codec);
             std::vector<llama_memory_tree_child> tree;
             size_t recurrent_children = 0;
-            bool payload_complete_attention = false;
+            bool window_attention = false;
             if (!llama_memory_tree_collect(
                     llama_get_memory(ctx_tgt), tree)) {
                 status = server_vbr_artifact_capture_status::unsupported;
@@ -14767,9 +14773,7 @@ private:
                     vbr_artifact_companion_kind::qsa_index, qsa_codec);
             for (const auto & child : tree) {
                 recurrent_children += child.recurrent != nullptr;
-                payload_complete_attention |= child.attention != nullptr &&
-                    child.dependency_mode ==
-                        checkpoint_child_dependency_mode::payload_complete;
+                window_attention |= child.attention != nullptr && child.window;
             }
             // SWA/iSWA checkpoint bytes contain tier-sensitive attention
             // state.  They remain unavailable until that state has its own
@@ -14777,7 +14781,7 @@ private:
             // or mismatch the VBR attention tree.
             if (!draft_codec_ready || !accelerator_codec_ready ||
                 !qsa_codec_ready ||
-                payload_complete_attention || recurrent_children > 1 ||
+                window_attention || recurrent_children > 1 ||
                 (recurrent_children != 0 &&
                  !add_checkpoint_buffer(
                      recurrent_codec,
@@ -15607,7 +15611,7 @@ private:
                     if (node.recurrent != nullptr) {
                         continue;
                     }
-                    if (node.attention == nullptr ||
+                    if (node.attention == nullptr || node.window ||
                         node.dependency_mode !=
                             checkpoint_child_dependency_mode::live_guarded) {
                         supported = false;
@@ -16243,10 +16247,10 @@ private:
                 if (readiness_only) {
                     break;
                 }
-                // A payload-complete iSWA child is one exact artifact-wide
-                // dependency. It cannot be partitioned across the projected
-                // <=8-manifest union, so capture one ranked source per idle
-                // wave through the exact host handoff below.
+                // A window child cannot be projected, and a recurrent state
+                // is not partitioned across the projected <=8-manifest union,
+                // so capture one ranked source per idle wave through the exact
+                // host handoff below.
                 if (stem_retry || checkpoint_stem || exact_retry ||
                     requires_coordinated_tree_clear || ctx_dft ||
                     idle.can_speculate()) {
@@ -16257,10 +16261,9 @@ private:
             }
         }
         const auto displace_existing_sources = [&]() {
-            // iSWA owns one shared payload-complete child. Removing a single
-            // sequence cannot empty that child, so its live aliases are
-            // reclaimed atomically below only after every resident slot has
-            // a durable host frontier.
+            // Window and recurrent children are captured exactly, one source
+            // per wave, so their live aliases are reclaimed atomically below
+            // only after every resident slot has a durable host frontier.
             if (requires_coordinated_tree_clear ||
                 !may_displace_live_source) {
                 return;
@@ -17370,9 +17373,8 @@ private:
             }
             if (all_durable && !reclaim.empty() &&
                 capture_session.continue_capture()) {
-                // No per-sequence erase can empty the payload-complete SWA
-                // child. The scheduler has authenticated every resident
-                // sequence above, so clear the shared tree once and then
+                // The scheduler has authenticated every resident sequence
+                // above, so clear the shared tree once and then
                 // consume each already-admitted live alias without another
                 // fallible operation in between.
                 llama_memory_clear(memory, false);
