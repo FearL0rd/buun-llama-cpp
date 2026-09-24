@@ -2594,10 +2594,16 @@ static bool server_prompt_retention_exact_scope(
         int64_t coverage_tokens,
         std::string & out) noexcept;
 
+// a host copy a diverging request can be projected onto: no media, no checkpoints
+static bool server_prompt_projectable(const server_prompt & prompt) noexcept {
+    return !prompt.tokens.has_media() && prompt.checkpoints.empty();
+}
+
 bool server_prompt_cache::contains_vbr_frontier(
         const server_prompt & prompt,
         const std::string & execution_identity,
-        const std::string & adapter_config_key) const noexcept {
+        const std::string & adapter_config_key,
+        bool projectable) const noexcept {
     for (const auto & state : states) {
         if (state.payload.kind() ==
                 server_prompt_cache_payload_kind::vbr_artifact &&
@@ -2605,7 +2611,7 @@ bool server_prompt_cache::contains_vbr_frontier(
             server_prompt_cache_vbr_frontier_matches(
                 prompt, state.payload, execution_identity,
                 adapter_config_key)) {
-            return true;
+            return !projectable || server_prompt_projectable(state.prompt);
         }
     }
     return false;
@@ -3156,8 +3162,7 @@ bool server_prompt_cache::prepare_vbr_restore(
                     source_tokens == 0 ||
                     (current.projected
                         ? prefix >= source_tokens ||
-                          state->prompt.tokens.has_media() ||
-                          !state->prompt.checkpoints.empty()
+                          !server_prompt_projectable(state->prompt)
                         : source_tokens != prefix) ||
                     state->recovery_pins == UINT32_MAX) {
                     return true;

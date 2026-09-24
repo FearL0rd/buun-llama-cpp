@@ -5153,15 +5153,37 @@ private:
             checkpoint_frontier_is_current(slot, cp, adapter);
     }
 
+    // An idle capture in flight reads a live slot and holds the transfer ring: it is cancelled
+    // and joined before a slot is torn down or another capture takes the ring. Returns whether
+    // the worker was still transferring.
+    bool drain_idle_capture() {
+        if (!vbr_idle_exact_capture) {
+            return false;
+        }
+        const bool in_flight = !vbr_idle_exact_capture->complete.load(std::memory_order_acquire);
+        vbr_idle_exact_capture->session.cancel();
+        (void) finish_idle_exact_vbr_capture(false);
+        return in_flight;
+    }
+
     // The loop has returned: nothing is decoding. A request it left mid-generation ends as a
     // cancelled one does: the slot is released, its client is stopping, and the conversation it
     // holds is the one saved.
     void resume_shutdown() {
+        if (!resume_active() || ctx_tgt == nullptr) {
+            return;
+        }
+        const size_t n_held = std::count_if(slots.begin(), slots.end(),
+                [](const server_slot & slot) { return slot.state == SLOT_STATE_WAIT_VBR_CAPTURE; });
+        const bool in_flight = drain_idle_capture();
+        size_t n_released = 0;
         for (auto & slot : slots) {
             if (slot.is_processing()) {
                 slot.release();
+                n_released++;
             }
         }
+        SRV_INF("RESUME event=shutdown capture_in_flight=%d held=%zu released=%zu\n", int(in_flight), n_held, n_released);
         resume_capture_all("shutdown");
     }
 
@@ -5171,11 +5193,7 @@ private:
             return;
         }
         const int64_t t_start = ggml_time_us();
-        // an idle capture in flight holds the transfer ring these captures need
-        if (vbr_idle_exact_capture) {
-            vbr_idle_exact_capture->session.cancel();
-            (void) finish_idle_exact_vbr_capture(false);
-        }
+        drain_idle_capture();
         std::vector<server_slot *> order;
         for (auto & slot : slots) {
             if (slot.prompt.n_tokens() > 0) {
@@ -6371,6 +6389,45 @@ private:
         return resume_vbr_publish(slot, id, next, rec.bytes + frontier.size(), t_start);
     }
 
+    // what the restored slots hold on the host: exact copies serve a continuation, projectable ones
+    // a diverging request too
+    struct resume_coverage {
+        size_t live        = 0; // slots holding a conversation
+        size_t exact       = 0;
+        size_t projectable = 0;
+    };
+
+    resume_coverage resume_coverage_now() const {
+        resume_coverage cover;
+        for (const auto & slot : slots) {
+            if (slot.prompt.n_tokens() <= 0) {
+                continue;
+            }
+            cover.live++;
+            if (vbr_idle_source_durable(slot)) {
+                cover.exact++;
+                cover.projectable += vbr_idle_source_durable(slot, /*projectable=*/true);
+            }
+        }
+        return cover;
+    }
+
+    // The idle capture, wave after wave, until every live conversation has a host copy; a wave
+    // covering no further slot (refused, cancelled, displaced) ends the pass, so it takes at most
+    // one per slot.
+    resume_coverage resume_idle_publish_all() {
+        resume_coverage cover = resume_coverage_now();
+        while (cover.exact < cover.live) {
+            const size_t before = cover.exact;
+            (void) resume_idle_publish();
+            cover = resume_coverage_now();
+            if (cover.exact <= before) {
+                break;
+            }
+        }
+        return cover;
+    }
+
     // Contract §7. Entries go to their hinted slot when it is free, else to any free one.
     void resume_install_all() {
         if (!resume_active()) {
@@ -6526,11 +6583,22 @@ private:
             resume_log(status);
         }
         // The slots' conversations get their host copies now, as the idle pass would give them at
-        // the first quiet moment. A slot displaced before that pass is saved by the exact route,
-        // and the owners' restore cannot project a diverging request onto an exact package.
-        const size_t n_copies = resume_vbr() && n_installed > 0 ? resume_idle_publish() : 0;
-        SRV_INF("RESUME event=install_done entries=%zu installed=%zu host=%zu slot_copies=%zu t_ms=%.1f\n",
-                entries.size(), n_installed, n_host, n_copies, (ggml_time_us() - t_start)/1000.0);
+        // the first quiet moment. A slot displaced before that pass is saved by the exact route.
+        resume_coverage cover;
+        if (resume_vbr() && n_installed > 0) {
+            cover = resume_idle_publish_all();
+        }
+        SRV_INF("RESUME event=install_done entries=%zu installed=%zu host=%zu live=%zu exact=%zu projectable=%zu t_ms=%.1f\n",
+                entries.size(), n_installed, n_host, cover.live, cover.exact, cover.projectable,
+                (ggml_time_us() - t_start)/1000.0);
+        if (cover.exact < cover.live) {
+            SRV_WRN("RESUME %zu restored slot(s) have no host copy: displaced, they are saved by the exact route\n",
+                    cover.live - cover.exact);
+        }
+        if (cover.projectable < cover.exact) {
+            SRV_WRN("RESUME %zu restored slot(s) have an exact host copy only: a continuation is warm, "
+                    "a diverging request prefills cold\n", cover.exact - cover.projectable);
+        }
     }
 
     // One entry through an empty slot into the host prompt cache: installed as any other, saved by
@@ -7679,10 +7747,7 @@ private:
     int64_t t_last_load_progress_ms = 0;
 
     void destroy() {
-        if (vbr_idle_exact_capture) {
-            vbr_idle_exact_capture->session.cancel();
-            (void) finish_idle_exact_vbr_capture(false);
-        }
+        drain_idle_capture();
         if (ctx_tgt) {
             llama_get_memory(ctx_tgt)->vbr_hard_seal_guard_set({});
         }
@@ -8042,12 +8107,19 @@ private:
             ? cells[size_t(slot_id)] : 0;
     }
 
+    // projectable: the host copy must also be one a diverging request can be projected onto. The
+    // sources the idle pass cuts only at a sealed checkpoint (the gate of its consider_checkpoint:
+    // hybrid model, drafter, speculative slot) get exact copies, and prepare_vbr_restore projects
+    // onto a copy with no checkpoints and no media only
     bool vbr_idle_source_durable(
-            const server_slot & slot) const noexcept {
+            const server_slot & slot, bool projectable = false) const noexcept {
         if (!params_base.vbr_prompt_cache) {
             return true;
         }
         if (!prompt_cache || slot.prompt.n_tokens() <= 0) {
+            return false;
+        }
+        if (projectable && (llama_model_is_hybrid(model_tgt) || ctx_dft || slot.can_speculate())) {
             return false;
         }
         try {
@@ -8057,7 +8129,7 @@ private:
                     server_vbr_prompt_cache_support_status::supported &&
                 prompt_cache->contains_vbr_frontier(
                     slot.prompt, frontier_execution_identity,
-                    lora_config_identity(slot.lora));
+                    lora_config_identity(slot.lora), projectable);
         } catch (...) {
             return false;
         }
@@ -21902,8 +21974,7 @@ private:
                     // source down. A later idle publication can retry the
                     // same stable frontier if it remains useful.
                     slot.state = SLOT_STATE_WAIT_VBR_CAPTURE;
-                    vbr_idle_exact_capture->session.cancel();
-                    (void) finish_idle_exact_vbr_capture(false);
+                    drain_idle_capture();
                 }
                 // release slot because of stop condition
                 if (params_base.vbr_prompt_cache ||

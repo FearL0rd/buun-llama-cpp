@@ -20,11 +20,14 @@ Decisions agreed with the user:
 - Default persistence includes **live slots and their required companions**.
   Idle slots still holding a prompt are live slots.
 - Revised 2026-09-20 (user requirement: `--resume` gives back the server that
-  was stopped): the host prompt cache is persisted too, by default, on both
-  routes. Entries a slot's conversation leaves behind stay on disk and come
-  back through a slot at load; under dynamic VBR each hosted conversation is a
-  whole-pool image and costs seconds to save and to load (§9, P3 stage 2). The
-  `--resume-host-cache` opt-in first proposed here was never built.
+  was stopped): the host prompt cache is persisted too, by default. Under
+  dynamic VBR every hosted conversation is saved at shutdown as a whole-pool
+  image and comes back through a slot at load, at seconds each way (§9, P3
+  stage 2). On the fixed route the shutdown saves the slots only: an entry a
+  conversation left on disk when it left its slot stays there and comes back,
+  a host-only conversation that was never saved is lost. Saving those is the
+  fixed-route item still open in P4. The `--resume-host-cache` opt-in first
+  proposed here was never built.
 - Select snapshots by **semantic family**, not weight identity. Structurally
   compatible fine-tunes are intentionally eligible for experiments.
 - Measure snapshot size and save/restore costs before choosing additional
@@ -873,7 +876,20 @@ The R1 and R7 findings are recorded with their slices above. The rest:
   saved to its last generated token and continues after the restart (harness
   scenario `busy`: two hosted conversations, one generating when SIGTERM
   lands, a fourth idle in a second slot; all saved and restored, on dense and
-  hybrid).
+  hybrid). An idle capture whose worker is still reading a slot when the loop
+  returns is cancelled and joined first, as the stop-token path does before
+  it releases a slot; cancelling alone does not stop the worker, and a release
+  drops the speculative rows and child cells it may be reading. The shutdown
+  line reports whether a capture was in flight and how many slots it held
+  (harness scenario `drain`: SIGTERM ladders across the idle capture after a
+  response, a cut prompt, a busy second slot and a fresh restart, on dense,
+  hybrid, SWA and speculative models, with a resume-off control). Every stop
+  drained before it released and saved the conversation to its last token;
+  none landed inside an exact-background transfer, because the idle pass
+  captures on the queue thread before the loop can return and the SWA frontier
+  capture that holds a slot lasts tens of milliseconds. The in-flight branch is
+  held by the order of the helper, not by a measurement: a delay seam in the
+  owners' worker would make it measurable.
 - **An unchanged entry was kept by its tokens** (R4). A save skipped the
   artifact write when the slot held the entry's tokens, so a slot refilled with
   the same tokens under another model of the family, or under
@@ -898,15 +914,26 @@ The R1 and R7 findings are recorded with their slices above. The rest:
   on, and a slot displaced before the idle pass has captured it goes to the
   host by the exact route, which the owners' restore cannot project a
   diverging request onto (a cold prefill for the very conversation the client
-  was in the middle of). The install now ends with one run of the idle capture
-  over the restored slots, so each has a projected host copy before the server
-  listens (`install_done` reports `slot_copies`); one device-to-host copy per
-  live slot at startup.
+  was in the middle of). The install now ends with the idle capture run over
+  the restored slots, wave after wave, until each has a host copy; one
+  device-to-host copy per live slot at startup. A wave keeps the owners'
+  bounds (eight manifests, one stateful or speculative candidate), so the pass
+  runs at most one wave per slot and stops at the first wave that covers no
+  further slot (refused, cancelled, displaced). `install_done` reports `live`,
+  `exact` (slots with a durable copy: a continuation is warm) and `projectable`
+  (a diverging request is warm too), and warns about the difference. A
+  stateful conversation (hybrid model, a drafter, a speculative slot: the gate
+  of the idle pass's checkpoint cut) is exact only: its copy is cut at a sealed
+  checkpoint, which a restored slot has none of, and the owners' restore
+  projects onto a copy without checkpoints only — the ring checkpoint
+  persistence of the next slice closes that.
 
 ### P4 — Accelerator integration and remaining host-cache work
 
-- [x] Host-cache persistence, bounded by the entry count, no duplication of live
-  payloads (built by default in P3, both routes; the opt-in was dropped).
+- [x] Host-cache persistence under dynamic VBR, bounded by the entry count, no
+  duplication of live payloads (built by default in P3; the opt-in was dropped).
+- [ ] Host-cache persistence on the fixed route: the shutdown keeps the entries
+  already on disk but does not save the host-only conversations still in RAM.
 - [ ] Host-cache publication on a wake with requests queued (P3 stage 2 limit).
 - [ ] MTP and DFlash/DFlash2 companion save/rebuild policies, then DSpark when a
   representative model/hardware is available.

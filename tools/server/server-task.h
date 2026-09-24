@@ -1428,10 +1428,13 @@ public:
     // Exact immutable VBR-frontier presence query. This alone is not a clear
     // authority: automatic displacement also revalidates the live semantic
     // frontier, scheduler state, pending work, and lease/recovery protection.
+    // projectable: the copy must also be one prepare_vbr_restore can project
+    // a diverging request onto.
     bool contains_vbr_frontier(
         const server_prompt & prompt,
         const std::string & execution_identity,
-        const std::string & adapter_config_key) const noexcept;
+        const std::string & adapter_config_key,
+        bool projectable = false) const noexcept;
     // Read-only suppression check for an already-durable shorter frontier.
     // The host package must be exact for coverage and the current live prompt
     // must still carry that exact prefix under the same source epoch.
