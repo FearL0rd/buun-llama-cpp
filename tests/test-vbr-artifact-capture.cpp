@@ -4759,7 +4759,8 @@ static void test_ring_accounting_once() {
 
 static bool sample_unbounded_host_budget(
         void *,
-        llama_cache_budget_config & output) noexcept {
+        llama_cache_budget_config & output,
+        uint64_t) noexcept {
     output = {};
     output.host.pageable_state =
         llama_cache_budget_capacity_state::unbounded;
@@ -4788,7 +4789,8 @@ struct projected_store_budget_context {
 
 static bool sample_projected_store_budget(
         void * opaque,
-        llama_cache_budget_config & output) noexcept {
+        llama_cache_budget_config & output,
+        uint64_t) noexcept {
     const auto * context =
         static_cast<const projected_store_budget_context *>(opaque);
     if (!context || !context->available) {
@@ -4971,7 +4973,7 @@ static void test_projected_host_batch_store_adapter() {
     };
     llama_cache_budget_config staging_budget;
     CHECK(sample_projected_store_budget(
-        &budget_context, staging_budget));
+        &budget_context, staging_budget, 0));
     staging_budget.devices.front().configured_cache_cap = 32;
     staging_budget.devices.front().cache_cap_state =
         llama_cache_budget_capacity_state::known;
@@ -5360,7 +5362,7 @@ static void test_projected_host_batch_store_adapter() {
         { topology }, foreign_bindings));
     llama_cache_budget_config foreign_budget;
     CHECK(sample_projected_store_budget(
-        &budget_context, foreign_budget));
+        &budget_context, foreign_budget, 0));
     std::vector<vbr_projected_manifest_publish_result> foreign_results;
     CHECK(foreign_catalog.publish_projected_batch(
         ready_assembly, make_publications(ready_assembly), foreign_budget,
@@ -5536,7 +5538,7 @@ static void test_server_store_construction_and_lifetime() {
     config.sample_budget = sample_unbounded_host_budget;
 
     const auto baseline = ledger.snapshot();
-    CHECK(sample_unbounded_host_budget(nullptr, budget));
+    CHECK(sample_unbounded_host_budget(nullptr, budget, 0));
     {
         llama_cache_budget_coordinator coordinator;
         const auto snapshot = ledger.snapshot();

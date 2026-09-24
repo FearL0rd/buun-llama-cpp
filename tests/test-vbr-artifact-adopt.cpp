@@ -682,7 +682,7 @@ struct occupied_budget_source {
 };
 
 static bool occupied_sample_budget(
-        void * opaque, llama_cache_budget_config & output) noexcept {
+        void * opaque, llama_cache_budget_config & output, uint64_t) noexcept {
     try {
         output = static_cast<occupied_budget_source *>(opaque)->budget;
         return true;

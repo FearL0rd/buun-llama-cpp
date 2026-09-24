@@ -2051,10 +2051,12 @@ void test_lifecycle_defaults_and_reuse_thresholds() {
     accepted_handoff.family_matches = true;
     CHECK(server_vbr_empty_handoff_lookup_allowed(accepted_handoff));
     CHECK(server_vbr_empty_handoff_allowed(accepted_handoff));
-    CHECK(server_vbr_live_source_displacement_allowed(false, 8));
-    CHECK(server_vbr_live_source_displacement_allowed(true, 1));
-    CHECK(!server_vbr_live_source_displacement_allowed(true, 2));
-    CHECK(!server_vbr_live_source_displacement_allowed(true, 8));
+    CHECK(server_vbr_live_source_displacement_allowed(false, 8, false));
+    CHECK(server_vbr_live_source_displacement_allowed(true, 1, false));
+    CHECK(!server_vbr_live_source_displacement_allowed(true, 2, false));
+    CHECK(!server_vbr_live_source_displacement_allowed(true, 8, false));
+    CHECK(!server_vbr_live_source_displacement_allowed(false, 8, true));
+    CHECK(!server_vbr_live_source_displacement_allowed(true, 1, true));
     const auto rejects_handoff = [&](auto mutate) {
         auto gate = accepted_handoff;
         mutate(gate);

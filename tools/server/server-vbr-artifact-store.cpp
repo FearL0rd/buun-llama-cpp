@@ -1430,7 +1430,7 @@ public:
             scheduler_checked_ = true;
             try {
                 llama_cache_budget_config budget;
-                if (!sample_budget_(budget_context_, budget)) {
+                if (!sample_budget_(budget_context_, budget, 0)) {
                     status_ = status::budget_failed;
                     return false;
                 }
@@ -1708,7 +1708,7 @@ bool server_vbr_artifact_store_test_door::projected_staging_lifecycle(
             projected_capture_resource_admission admission(
                 ledger, &budget_context,
                 +[](void * opaque,
-                    llama_cache_budget_config & output) noexcept {
+                    llama_cache_budget_config & output, uint64_t) noexcept {
                     const auto * state =
                         static_cast<const fixed_budget_context *>(opaque);
                     if (!state || !state->budget) {
@@ -1792,7 +1792,7 @@ bool server_vbr_artifact_store_test_door::projected_staging_initial(
             projected_capture_resource_admission admission(
                 ledger, &budget_context,
                 +[](void * opaque,
-                    llama_cache_budget_config & output) noexcept {
+                    llama_cache_budget_config & output, uint64_t) noexcept {
                     auto * state =
                         static_cast<fixed_budget_context *>(opaque);
                     if (!state || !state->budget || !state->samples) {
@@ -1862,14 +1862,16 @@ bool server_vbr_artifact_store_test_door::projected_resource_initial(
             projected_capture_resource_admission admission(
                 *state.ledger, &budget_state,
                 +[](void * opaque,
-                    llama_cache_budget_config & output) noexcept {
+                    llama_cache_budget_config & output,
+                    uint64_t pending_host_bytes) noexcept {
                     auto * current = static_cast<budget_context *>(opaque);
                     if (!current || !current->store || !current->samples) {
                         return false;
                     }
                     ++*current->samples;
                     return current->store->sample_budget(
-                        current->store->budget_context, output);
+                        current->store->budget_context, output,
+                        pending_host_bytes);
                 },
                 state.domain_bindings, &scheduler, &state.catalog);
             accepted = admission.admit(quote);
@@ -2249,7 +2251,7 @@ server_vbr_artifact_store::create(
         }
 
         llama_cache_budget_config budget;
-        if (!state->sample_budget(state->budget_context, budget)) {
+        if (!state->sample_budget(state->budget_context, budget, 0)) {
             fail(server_vbr_artifact_store_create_failure::
                 budget_sample_failed);
             return nullptr;
@@ -2354,7 +2356,7 @@ server_vbr_artifact_store::prepare_host_payload(
     impl_->counters.requested++;
     try {
         llama_cache_budget_config budget;
-        if (!impl_->sample_budget(impl_->budget_context, budget)) {
+        if (!impl_->sample_budget(impl_->budget_context, budget, 0)) {
             output.status = server_vbr_artifact_capture_status::unavailable;
             impl_->counters.unavailable++;
             return output;
@@ -2534,7 +2536,7 @@ server_vbr_artifact_capture_output server_vbr_artifact_store::capture_impl(
             return output;
         }
         llama_cache_budget_config budget;
-        if (!impl_->sample_budget(impl_->budget_context, budget)) {
+        if (!impl_->sample_budget(impl_->budget_context, budget, 0)) {
             output.status =
                 server_vbr_artifact_capture_status::unavailable;
             impl_->counters.unavailable++;
@@ -2677,7 +2679,7 @@ bool server_vbr_artifact_store::publish_projected_host_batch_impl(
 
     llama_cache_budget_config budget;
     if (!capacity_admitted &&
-        !impl_->sample_budget(impl_->budget_context, budget)) {
+        !impl_->sample_budget(impl_->budget_context, budget, 0)) {
         return false;
     }
 
@@ -3349,7 +3351,7 @@ server_vbr_artifact_store::import_host_prefix_payload_impl(
         }
 
         llama_cache_budget_config budget;
-        if (!impl_->sample_budget(impl_->budget_context, budget)) {
+        if (!impl_->sample_budget(impl_->budget_context, budget, 0)) {
             return fail(server_vbr_artifact_import_status::unavailable,
                         impl_->counters.imports_unavailable);
         }
@@ -3530,7 +3532,7 @@ server_vbr_artifact_import_output server_vbr_artifact_store::import_package_impl
         }
 
         llama_cache_budget_config budget;
-        if (!impl_->sample_budget(impl_->budget_context, budget)) {
+        if (!impl_->sample_budget(impl_->budget_context, budget, 0)) {
             return fail(server_vbr_artifact_import_status::unavailable,
                         impl_->counters.imports_unavailable);
         }
@@ -3828,6 +3830,15 @@ struct ingest_staging {
     std::map<key, std::shared_ptr<artifact_segment_chain>> chains;
     bool verified = false;
 
+    // host bytes held in the chains so far
+    uint64_t bytes() const {
+        uint64_t n = 0;
+        for (const auto & chain : chains) {
+            n += chain.second->size();
+        }
+        return n;
+    }
+
     static bool consume(
             void * context,
             vbr_artifact_section_kind section,
@@ -3861,6 +3872,31 @@ struct ingest_staging {
         static_cast<ingest_staging *>(context)->verified = verified;
     }
 
+    // Whether `bytes` more of pageable host memory fit the sampled budget. The
+    // object is staged in host memory whole before the catalog can price it,
+    // so the encoded size is priced first, as the catalog prices what it
+    // publishes, and nothing is allocated for an object the budget refuses.
+    static bool admitted(
+            llama_cache_acct_ledger & ledger,
+            const llama_cache_budget_config & budget,
+            uint64_t bytes) noexcept {
+        try {
+            auto snapshot = ledger.snapshot();
+            llama_cache_budget_plan plan;
+            plan.accounting_serial = snapshot.serial;
+            plan.entries.push_back({
+                llama_cache_acct_resource_domain::non_device(
+                    llama_cache_acct_residency::pageable_host),
+                bytes, 0});
+            llama_cache_budget_coordinator coordinator;
+            return coordinator.reset(std::move(snapshot), budget) &&
+                coordinator.fits(plan).state ==
+                    llama_cache_budget_fit_state::fits;
+        } catch (...) {
+            return false;
+        }
+    }
+
     std::shared_ptr<const artifact_segment_chain> take(
             bool companion,
             uint32_t object_index,
@@ -3883,6 +3919,13 @@ server_vbr_artifact_store::ingest_host_payload(
     payload.reset();
     server_vbr_artifact_ingest_output output;
     try {
+        llama_cache_budget_config budget;
+        if (!impl_->sample_budget(impl_->budget_context, budget, 0) ||
+            !ingest_staging::admitted(*impl_->ledger, budget, encoded_bytes)) {
+            output.stream_status =
+                vbr_capture_stream_status::accounting_refused;
+            return output;
+        }
         ingest_staging staging;
         const vbr_artifact_payload_consumer consumer {
             &staging, ingest_staging::consume, ingest_staging::finish,
@@ -3897,10 +3940,11 @@ server_vbr_artifact_store::ingest_host_payload(
             return output;
         }
         // The catalog binds one topology set for its lifetime; an envelope
-        // written under another device layout is not re-homed here.
-        llama_cache_budget_config budget;
+        // written under another device layout is not re-homed here. The
+        // staged bytes are allocated already: they count back into the
+        // headroom the catalog prices the package against.
         if (package.topologies != impl_->topologies ||
-            !impl_->sample_budget(impl_->budget_context, budget) ||
+            !impl_->sample_budget(impl_->budget_context, budget, staging.bytes()) ||
             !impl_->catalog.prepare_capture_package(package)) {
             return output;
         }

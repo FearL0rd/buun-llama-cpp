@@ -116,9 +116,12 @@ struct server_vbr_artifact_store_create_diagnostics {
 };
 
 struct server_vbr_artifact_store_config {
+    // pending_host_bytes: host bytes the caller has already allocated for what
+    // it prices, to be counted back into the sampled headroom.
     using sample_budget_fn = bool (*)(
         void * context,
-        llama_cache_budget_config & output) noexcept;
+        llama_cache_budget_config & output,
+        uint64_t pending_host_bytes) noexcept;
 
     llama_cache_acct_ledger * ledger = nullptr;
     llama_cache_acct_resource_domain pinned_domain;

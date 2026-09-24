@@ -118,7 +118,8 @@ bool server_vbr_empty_handoff_allowed(
 
 bool server_vbr_live_source_displacement_allowed(
     bool kv_unified,
-    size_t slot_count) noexcept;
+    size_t slot_count,
+    bool persistent_resume) noexcept;
 
 bool server_vbr_stem_matches_capture_source(
     bool valid,

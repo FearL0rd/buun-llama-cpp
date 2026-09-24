@@ -17,10 +17,14 @@ Decisions agreed with the user:
 
 - `--resume` is a Boolean flag, off by default. No path argument is required.
 - Use the existing llama.cpp cache directory, including `LLAMA_CACHE` overrides.
-- Default persistence includes **live slots and their required companions**, not
-  the entire host prompt cache. Idle slots still holding a prompt are live slots.
-- `--resume-host-cache` additionally includes retained host prompt-cache entries.
-  Proposed CLI rule: this implies `--resume`; it must not be silently ignored.
+- Default persistence includes **live slots and their required companions**.
+  Idle slots still holding a prompt are live slots.
+- Revised 2026-09-20 (user requirement: `--resume` gives back the server that
+  was stopped): the host prompt cache is persisted too, by default, on both
+  routes. Entries a slot's conversation leaves behind stay on disk and come
+  back through a slot at load; under dynamic VBR each hosted conversation is a
+  whole-pool image and costs seconds to save and to load (§9, P3 stage 2). The
+  `--resume-host-cache` opt-in first proposed here was never built.
 - Select snapshots by **semantic family**, not weight identity. Structurally
   compatible fine-tunes are intentionally eligible for experiments.
 - Measure snapshot size and save/restore costs before choosing additional
@@ -126,13 +130,14 @@ learn model-specific recurrent, VBR, or speculative-decoding semantics.
 | Boundary rollback checkpoint needed to establish a usable frontier | Save as a required companion |
 | Additional historical checkpoints | Select by measured reuse benefit; initially exclude those proven optional |
 | MTP/DFlash target companions and draft state | Save what cannot be cheaply and correctly rebuilt; policy determined by gates |
-| Host prompt-cache history | Excluded unless `--resume-host-cache` is present |
+| Host prompt-cache history | Save (revised 2026-09-20): conversations without a slot go through a slot at save and at load, within the entry bound |
 | Allocator slack, scratch, graphs, streams, pointers, locks, leases | Never serialize as executable process state |
 | HTTP requests, sampler/RNG state, tool invocations | Not resumed; new requests establish their own sampling settings |
 
 Default saved roots are all nonempty slots, active or idle, at the captured
-boundary. Traverse only their dependency closure. The host-cache flag adds host
-entries as roots, not another independent copy of shared live data.
+boundary, then the host cache's conversations that no slot holds a copy of,
+newest first, up to the entry bound (§6). A hosted conversation is saved as a
+slot's is, never as a second copy of shared live data.
 
 Checkpoint count is not a safe proxy for optionality. A hybrid checkpoint or SWA
 window may be necessary to reuse a prefix shorter than the saved frontier. Removing
@@ -666,9 +671,32 @@ of the artifact store. What the gate found:
   about 0.4 s after a turn; the projected package has no wire form, so a stop or
   a sleep after any idle moment saved nothing and released the previous entry.
   The first gate missed it: every scenario stopped right after a turn, and the
-  sleep scenario matched the reference text on a cold prefill. With a persistent
-  resume under VBR the source now stays live (the multi-slot behaviour), and the
-  harness has an `idle` scenario whose oracle is `cache_n`, not the text.
+  sleep scenario matched the reference text on a cold prefill. The first slice
+  kept the source live under a persistent resume (the multi-slot behaviour); that
+  exception was keyed on the VBR configuration, not on an active resume, so it
+  changed every dynamic-VBR server (review of 2026-09-23, R1). It is now keyed
+  on an active resume of a dynamic cache and nothing else: a server without
+  `--resume`, or one whose store did not open, displaces as the owners' code
+  does. Removing it altogether was measured too (stage 2 below saves what the
+  host cache holds, and the owners capture an idle source before displacing
+  it): the hosted conversations then come back cold on half the restarts,
+  because a package captured from displaced rows is refused on the empty door
+  (the owners' offset finding in stage 2). With the exception in place under a
+  resume the hosted round trip is whole (6 of 6) and one further case is lost
+  instead (`idle`, 2 of 3): a conversation installed from the store, extended
+  and then displaced by a stranger's request is refused on its way back
+  (`representation_mismatch` in the occupied replacement, for the owners). The
+  exception stays until both owners' doors take such packages. The harness has
+  an `idle` scenario whose oracle is `cache_n`, not the text, and `idle_ctl`,
+  the same without `--resume`. The same rule covers the second place the owners
+  clear a live source: after an exact capture on a windowed, recurrent or hybrid
+  memory, the finisher clears every live conversation once all are proven
+  durable. The owners' pre-displacement capture (merged from master after
+  stage 2) runs such captures when a request launches, so three live hybrid
+  conversations were saved as one placement and two hosted, and the hosted two
+  came back cold (a hybrid hosted entry carries no checkpoints past its last
+  one, the open item below). Under a resume the finisher keeps the sources in
+  their slots; the captures still publish host copies.
 - **`--cache-ram 0` has no artifact store**: nothing is persisted, warned at start.
 - The envelope carries drafter/accelerator companions (27B with MTP: three
   companions, identical tokens, acceptance unchanged).
@@ -729,6 +757,16 @@ What the gate found:
   slots reuses no prefix on the next turn of any slot (`cache_n` 0 of 3047),
   without `--resume` and without a restart; the same run on fixed-type KV
   reuses 3047.
+- **A placement with rows missing installed as whole** (review of 2026-09-23,
+  R7). The import admits the rows a placement names, as a checkpoint may hold a
+  part of a sequence, and the install checked only the last position. A
+  placement object with a middle row removed, and every checksum recomputed,
+  came back as a conversation with a hole in it. The server now refuses a
+  placement that is not the whole of its sequence: one placement per attention
+  child of the tree in its order, its frontier at the end, one row for each
+  position (harness scenario `mutate`: a hole, a duplicated position, a missing
+  child, a short frontier; each refused, the pool and the other slots restored,
+  the conversation cold).
 
 Gate (RTX 3090, three slots, harness scenario `group`: fill three slots, restart,
 every slot must reuse its held prefix, `cache_n >= n_held - 1`; then an unchanged
@@ -819,9 +857,57 @@ Limits: a wake from sleep with requests already queued refuses the idle session
 the publication needs, and the hosted entries stay on disk until the next start.
 Hosted media conversations are not saved.
 
-### P4 — Optional host-cache persistence and accelerator integration
+#### Stage 2 review round (2026-09-23)
 
-- [ ] Host-cache root opt-in, bounded admission, no duplication of live payloads.
+The R1 and R7 findings are recorded with their slices above. The rest:
+
+- **A hosted candidate could change between the choice and the restore** (R2).
+  The save pass picked the hosted states, then restored each by its tokens, and
+  a state the owners replaced in between was restored in its newer form or not
+  at all. Each candidate is now pinned (`recovery_pins`) when it is chosen and
+  restored by the pin, so the pass saves the states it counted.
+- **A busy slot at shutdown was skipped** (R3). A graceful stop with a request
+  still generating saved the idle slots and left the busy one out. Once the
+  loop has returned, a request it left mid-generation is ended as a cancelled
+  one is (the slot released), then the save pass runs, so the conversation is
+  saved to its last generated token and continues after the restart (harness
+  scenario `busy`: two hosted conversations, one generating when SIGTERM
+  lands, a fourth idle in a second slot; all saved and restored, on dense and
+  hybrid).
+- **An unchanged entry was kept by its tokens** (R4). A save skipped the
+  artifact write when the slot held the entry's tokens, so a slot refilled with
+  the same tokens under another model of the family, or under
+  `cache_prompt: false`, kept an image of state it no longer had. The slot now
+  carries a lineage certificate: the entry's image is the slot's state only
+  while the cache's checkpoint epochs are the ones noted when the two were last
+  the same; a restore or a refill breaks it. The hosted round trip carries the
+  same certificate. (Harness scenario `handoff`: save under one model, restart
+  under a fine-tune of the family, refill the exact ledger with the cache off,
+  save: recaptured, `artifact_kept` false, for a primary and a placed entry;
+  the untouched control is kept.)
+- **An oversized artifact was allocated before it was refused** (R5). The host
+  cache admitted a manifest's artifact after reading it whole. The ingest now
+  prices the manifest's byte count against the cache's budget first, and an
+  artifact above it is refused before any of it is read
+  (`accounting_refused`); the bytes staged so far count back into the headroom
+  the package is priced against. The budget the ingest prices against is the
+  host's physical headroom, as for every other host package; `--cache-ram` is
+  the retention bound, not the admission ceiling.
+- **A restored slot displaced before its first idle pass lost its projection.**
+  The first request after a restart usually diverges from the slot it lands
+  on, and a slot displaced before the idle pass has captured it goes to the
+  host by the exact route, which the owners' restore cannot project a
+  diverging request onto (a cold prefill for the very conversation the client
+  was in the middle of). The install now ends with one run of the idle capture
+  over the restored slots, so each has a projected host copy before the server
+  listens (`install_done` reports `slot_copies`); one device-to-host copy per
+  live slot at startup.
+
+### P4 — Accelerator integration and remaining host-cache work
+
+- [x] Host-cache persistence, bounded by the entry count, no duplication of live
+  payloads (built by default in P3, both routes; the opt-in was dropped).
+- [ ] Host-cache publication on a wake with requests queued (P3 stage 2 limit).
 - [ ] MTP and DFlash/DFlash2 companion save/rebuild policies, then DSpark when a
   representative model/hardware is available.
 - [ ] Media-aware payload identity and replay; compatible LoRA transition tests.

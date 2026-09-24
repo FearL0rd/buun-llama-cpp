@@ -52,7 +52,9 @@ struct server_resume_limits {
     static constexpr int      max_json_depth     = 6;
     static constexpr size_t   max_entries_listed = 1024;
     static constexpr uint64_t max_object_bytes   = 8ull * 1024 * 1024 * 1024;
-    // an artifact is never held in one buffer, so nothing is allocated from this number
+    // The store streams an artifact in chunks and allocates nothing from this number; the host
+    // cache that takes it holds it whole in host memory, admitted against its budget before any
+    // of it is read.
     static constexpr uint64_t max_artifact_bytes = 256ull * 1024 * 1024 * 1024;
 
     static constexpr uint64_t max_bytes(server_resume_object_kind kind) {

@@ -28,6 +28,7 @@
 #include "../../src/llama-context.h"
 #include "../../src/llama-io.h"
 #include "../../src/llama-memory-hybrid-idx.h"
+#include "../../src/llama-memory-tree.h"
 #include "../../src/llama-sha256.h"
 #include "../../src/llama-vbr-qsa-index.h"
 #include "../../src/llama-vbr-swa-window.h"
@@ -1660,6 +1661,15 @@ struct server_slot {
     // and the outcome of the last install into this slot (shown by /slots).
     std::string resume_entry_id;
     json resume_status;
+    // The attention-content lineage of the sequence when the entry's image was taken from it or
+    // put into it: the owners move it on every rewrite of what the cells hold, not on appends or
+    // retiers, so the same tokens under the same lineage are the state the image is of. It
+    // counts within this process only, so it lives with the slot and not on the disk.
+    struct {
+        bool     noted     = false;
+        uint64_t epoch     = 0;
+        uint64_t epoch_swa = 0;
+    } resume_lineage;
 
     llama_context * ctx_tgt = nullptr;
     llama_context * ctx_dft = nullptr;
@@ -3393,11 +3403,18 @@ bool server_vbr_empty_handoff_allowed(
 
 bool server_vbr_live_source_displacement_allowed(
         bool kv_unified,
-        size_t slot_count) noexcept {
+        size_t slot_count,
+        bool persistent_resume) noexcept {
     // Empty import is a whole-child contract. Clearing one sequence out of a
     // multi-slot unified tree leaves foreign rows behind, so retain the live
     // source and let the atomic occupied-replacement route preserve them.
-    return !kv_unified || slot_count <= 1;
+    // A persistent resume saves a hosted conversation by restoring it into a
+    // slot, which reads its package at the physical offset of its rows: one
+    // captured from rows not at cell 0 is refused and comes back cold, and a
+    // hybrid one carries no ring checkpoints past its last checkpoint. The
+    // source stays live there too, including the coordinated whole-tree clear
+    // that follows an exact capture.
+    return !persistent_resume && (!kv_unified || slot_count <= 1);
 }
 
 bool server_vbr_stem_matches_capture_source(
@@ -3700,8 +3717,11 @@ private:
     std::string resume_key_hex;
     std::string resume_family_hex;
     bool resume_has_partial = false;
-    // entries of this key that found no slot at install: the next save keeps them
-    std::set<std::string> resume_unslotted;
+    // Entries of this key no slot holds: the next save keeps them. The value is the host node
+    // whose bytes the entry's image was taken from or put into, by the catalog's artifact id, when
+    // the host cache holds one (0 otherwise): a conversation that comes back from that node is the
+    // state the image is of, as a slot's lineage vouches for its own. Within this process only.
+    std::map<std::string, uint64_t> resume_unslotted;
     uint64_t frontier_next_sequence_epoch = 1;
     uint64_t frontier_ratchet_threshold = 1024;
 
@@ -5035,6 +5055,12 @@ private:
         return server_vbr_dynamic_active(params_base);
     }
 
+    // a persistent resume keeps every published source in its slot: see
+    // server_vbr_live_source_displacement_allowed
+    bool resume_keeps_sources_live() const {
+        return resume_active() && resume_vbr();
+    }
+
     // a conversation that leaves its slot lives on in a host cache, of either kind
     bool resume_host_cache() const {
         return fixed_host_cache_enabled() || resume_vbr_host_cache();
@@ -5125,6 +5151,18 @@ private:
             cp.checkpoint_epoch == 0 && cp.checkpoint_epoch_swa == 0 &&
             !resume_cuts_media(slot.prompt.tokens, size_t(cp.n_tokens)) &&
             checkpoint_frontier_is_current(slot, cp, adapter);
+    }
+
+    // The loop has returned: nothing is decoding. A request it left mid-generation ends as a
+    // cancelled one does: the slot is released, its client is stopping, and the conversation it
+    // holds is the one saved.
+    void resume_shutdown() {
+        for (auto & slot : slots) {
+            if (slot.is_processing()) {
+                slot.release();
+            }
+        }
+        resume_capture_all("shutdown");
     }
 
     // Contract §4. Runs on the inference thread with no task in flight.
@@ -5228,7 +5266,21 @@ private:
         const size_t bound  = resume_entry_bound();
         const size_t n_room = bound - std::min(bound, saved.size());
         hosted.erase(hosted.begin(), hosted.end() - std::min(hosted.size(), n_room));
-        if (hosted.empty()) {
+        // Each restore publishes what it replaces, and that may evict the states still to come. A
+        // pinned state is not evicted, so each is pinned now, exact, and one the restore would
+        // have to complete by prefill is left out: the image saved is of the cache, not of a prefill.
+        struct hosted_t {
+            server_tokens tokens;
+            server_prompt_cache_vbr_restore_candidate pin;
+        };
+        std::vector<hosted_t> pinned;
+        for (auto & tokens : hosted) {
+            server_prompt_cache_vbr_restore_candidate pin;
+            if (resume_pin_exact(tokens, adapter, pin)) {
+                pinned.push_back({std::move(tokens), std::move(pin)});
+            }
+        }
+        if (pinned.empty()) {
             return 0;
         }
         // The entries of the slots are held as the hosted ones are. Those are older than any slot's,
@@ -5246,30 +5298,38 @@ private:
             resume_release_entry(slot);
         }
         std::vector<server_slot *> one { &stage };
+        const std::string adapter_hex = resume_adapter_hex(stage);
         size_t n_saved = 0;
-        for (size_t i = 0; i < hosted.size(); ++i) {
+        for (size_t i = 0; i < pinned.size(); ++i) {
             json status;
             try {
                 server_task task(SERVER_TASK_TYPE_COMPLETION);
-                task.tokens = std::move(hosted[i]);
+                task.tokens = std::move(pinned[i].tokens);
                 task.params.cache_prompt = true;
+                resume_group_t solo;
+                solo.members         = &one;
+                solo.hosted_artifact = pinned[i].pin.payload()->reference_artifact().v;
                 const auto restore = [&]() {
-                    return try_automatic_vbr_restore(stage, task, {}) && stage.prompt.n_tokens() > 0;
+                    return try_automatic_vbr_restore(stage, task, {}, nullptr, false, &pinned[i].pin) &&
+                        stage.prompt.n_tokens() == task.tokens.size();
                 };
                 bool restored = restore();
                 if (!restored) {
-                    // a cache with no room for two conversations takes one into an empty stage
+                    // a cache with no room for two conversations takes one into an empty stage; a
+                    // pin the refused restore consumed is taken again
                     resume_stage_clear(stage);
-                    restored = restore();
+                    restored = (pinned[i].pin.ready() || resume_pin_exact(task.tokens, adapter, pinned[i].pin)) &&
+                        restore();
                 }
                 if (restored) {
                     // the image reaches as far as the cache has been written
                     llama_memory_breathe(llama_get_memory(ctx_tgt));
                     // 10 ms apart, and never a time that reads as unused
-                    stage.t_last_used = std::max<int64_t>(1, t_used - int64_t(hosted.size() - i)*10000);
-                    resume_group_t solo;
-                    solo.members = &one;
+                    stage.t_last_used = std::max<int64_t>(1, t_used - int64_t(pinned.size() - i)*10000);
                     status = resume_capture_slot(stage, solo);
+                    if (resume_saved(status)) {
+                        resume_unslotted[status["entry"]] = solo.hosted_artifact;
+                    }
                 } else {
                     status = resume_skipped("host_restore_refused");
                 }
@@ -5294,6 +5354,8 @@ private:
         // the artifact of this pass and the entry it is in, once a member has one
         std::string pool_entry;
         server_resume_object_record pool;
+        // a hosted save: the host node whose image the member's state is of
+        uint64_t hosted_artifact = 0;
     };
 
     // What pruning keeps. One entry per budgeted slot of this resume key, the ones slots hold
@@ -5314,7 +5376,9 @@ private:
 
     resume_retention_t resume_retention(size_t n_new) const {
         resume_retention_t keep;
-        keep.held = resume_unslotted;
+        for (const auto & unslotted : resume_unslotted) {
+            keep.held.insert(unslotted.first);
+        }
         size_t n_slotted = n_new;
         for (const auto & slot : slots) {
             if (!slot.resume_entry_id.empty()) {
@@ -5335,9 +5399,44 @@ private:
     // cache, if there is one
     void resume_release_entry(server_slot & slot) {
         if (!slot.resume_entry_id.empty() && resume_host_cache()) {
-            resume_unslotted.insert(slot.resume_entry_id);
+            resume_unslotted.emplace(slot.resume_entry_id, 0);
         }
-        slot.resume_entry_id.clear();
+        resume_entry_take(slot, {});
+    }
+
+    // the slot takes an entry whose image is not of its state: no lineage vouches for it
+    static void resume_entry_take(server_slot & slot, const std::string & id) {
+        slot.resume_entry_id = id;
+        slot.resume_lineage  = {};
+    }
+
+    // the slot's state and the entry's image are the same, as of now
+    void resume_note_lineage(server_slot & slot) {
+        const auto now = llama_memory_vbr_state(llama_get_memory(ctx_tgt), slot.id, 0);
+        slot.resume_lineage = {true, now.checkpoint_epoch, now.checkpoint_epoch_swa};
+    }
+
+    // the slot takes the entry whose image its state now is
+    void resume_note_lineage(server_slot & slot, const std::string & id) {
+        resume_entry_take(slot, id);
+        resume_note_lineage(slot);
+    }
+
+    bool resume_lineage_current(const server_slot & slot) const {
+        if (!slot.resume_lineage.noted) {
+            return false;
+        }
+        const auto now = llama_memory_vbr_state(llama_get_memory(ctx_tgt), slot.id, 0);
+        return slot.resume_lineage.epoch == now.checkpoint_epoch &&
+            slot.resume_lineage.epoch_swa == now.checkpoint_epoch_swa;
+    }
+
+    // a host node holding exactly this conversation, pinned: the exact route, no projection
+    bool resume_pin_exact(const server_tokens & tokens, const std::string & adapter,
+                          server_prompt_cache_vbr_restore_candidate & pin) {
+        return prompt_cache->prepare_vbr_restore(tokens, frontier_execution_identity, adapter, pin,
+                                                 /*allow_prefix_projection=*/false) &&
+            pin.prefix_tokens() == tokens.size() && pin.source_tokens() == tokens.size();
     }
 
     // Explicit erase ends the conversation on disk as well. Its entry, which need not be the one
@@ -5357,7 +5456,7 @@ private:
                 }
                 resume_store->remove_entry(slot.resume_entry_id);
                 resume_unslotted.erase(slot.resume_entry_id);
-                slot.resume_entry_id.clear();
+                resume_entry_take(slot, {});
             }
         }
         const std::string entry = slot.prompt.n_tokens() == 0 ? std::string() :
@@ -5365,7 +5464,7 @@ private:
         // Keep the selected conversation's identity if durable retirement needs a retry.
         if (!entry.empty() && slot.resume_entry_id != entry) {
             resume_release_entry(slot);
-            slot.resume_entry_id = entry;
+            resume_entry_take(slot, entry);
             resume_unslotted.erase(entry);
         }
         if (!entry.empty() && resume_store->uncommit(entry, error) != server_resume_reason::ok) {
@@ -5533,7 +5632,13 @@ private:
         const std::string entry     = resume_entry_of(slot, tokens, adapter_hex);
         if (entry != displaced) {
             resume_release_entry(slot);
-            slot.resume_entry_id = entry;
+            resume_entry_take(slot, entry);
+            // the entry's image was taken from, or put into, the host node that came back: the
+            // slot holds what the image is of
+            const auto vouched = group.hosted_artifact ? resume_unslotted.find(entry) : resume_unslotted.end();
+            if (vouched != resume_unslotted.end() && vouched->second == group.hosted_artifact) {
+                resume_note_lineage(slot);
+            }
             if (entry.empty() && !displaced.empty()) {
                 // another conversation, or this one from further back than its last chunk. An
                 // entry that would not outlive this save leaves its leading chunks to the new one
@@ -5541,7 +5646,7 @@ private:
                 const auto due  = resume_store->victims(
                     resume_key_hex, keep.n_keep_key, keep.n_keep_total, keep.held, keep.live);
                 if (due.count(displaced)) {
-                    slot.resume_entry_id = displaced;
+                    resume_entry_take(slot, displaced);
                 }
             }
         }
@@ -5769,7 +5874,7 @@ private:
         if (resume_store->free_bytes() < bytes_needed) {
             if (replaced) {
                 resume_store->remove_entry(id);
-                slot.resume_entry_id.clear();
+                resume_entry_take(slot, {});
             }
             return failed(server_resume_reason::no_space,
                           "need " + std::to_string(bytes_needed) + " bytes");
@@ -5778,7 +5883,7 @@ private:
         const auto abandon = [&](server_resume_reason reason, const std::string & message) {
             if (replaced || !have_old) {
                 resume_store->remove_entry(id);
-                slot.resume_entry_id.clear();
+                resume_entry_take(slot, {});
             }
             return failed(reason, message);
         };
@@ -5831,7 +5936,7 @@ private:
             return abandon(reason, error);
         }
         resume_store->sweep(id, next);
-        slot.resume_entry_id = id;
+        resume_entry_take(slot, id);
         resume_unslotted.erase(id);
 
         return json {
@@ -5854,12 +5959,14 @@ private:
             slot.state == SLOT_STATE_IDLE && !slot.is_processing() && !slot.hard_lease_blocks_live_prefix();
     }
 
-    // An epoch names one sequence of this execution, so the same tokens under the same epoch are
+    // An epoch names one sequence of this execution, and the lineage the rewrites of its cells
+    // since the image was taken or put there: a refill of the same tokens keeps the epoch, under
+    // another model of the family as well, and moves the lineage. The same tokens under both are
     // the state the entry was taken from, at the tiers it had then or lower ones.
-    static bool resume_vbr_unchanged(const server_slot & slot, const server_resume_manifest & old) {
+    bool resume_vbr_unchanged(const server_slot & slot, const server_resume_manifest & old) const {
         const auto & tokens = slot.prompt.tokens;
         return old.artifact && old.sequence_epoch != 0 && old.sequence_epoch == slot.prompt.sequence_epoch &&
-            size_t(old.n_tokens) == tokens.size() &&
+            size_t(old.n_tokens) == tokens.size() && resume_lineage_current(slot) &&
             old.artifact->prefix_digest == server_resume_prefix_hasher(tokens).at(tokens.size());
     }
 
@@ -5893,7 +6000,7 @@ private:
     json resume_vbr_abandon(
             server_slot & slot, const std::string & id, server_resume_reason reason, const std::string & message) {
         resume_store->remove_entry(id);
-        slot.resume_entry_id.clear();
+        resume_entry_take(slot, {});
         return resume_failed(reason, message);
     }
 
@@ -5911,7 +6018,8 @@ private:
             return bytes_written == 0 ? resume_failed(reason, error) : resume_vbr_abandon(slot, id, reason, error);
         }
         resume_store->sweep(id, next);
-        slot.resume_entry_id = id;
+        resume_note_lineage(slot, id);
+        // the image is of the slot's state now, whichever host node it came from
         resume_unslotted.erase(id);
         return json {
             {"outcome", "saved"},
@@ -6000,15 +6108,15 @@ private:
                 resume_store->read_manifest(member->resume_entry_id, held, error) == server_resume_reason::ok &&
                 held.artifact && !held.placed() &&
                 resume_drop_entry(member->resume_entry_id, error) == server_resume_reason::ok) {
-                member->resume_entry_id.clear();
+                resume_entry_take(*member, {});
             }
         }
         // a placed entry no slot holds had its rows in the image that went: it cannot come back
         for (auto it = resume_unslotted.begin(); have_old && it != resume_unslotted.end();) {
             server_resume_manifest held;
-            if (resume_store->read_manifest(*it, held, error) == server_resume_reason::ok &&
+            if (resume_store->read_manifest(it->first, held, error) == server_resume_reason::ok &&
                 held.placed() && held.pool_entry == id &&
-                resume_drop_entry(*it, error) == server_resume_reason::ok) {
+                resume_drop_entry(it->first, error) == server_resume_reason::ok) {
                 it = resume_unslotted.erase(it);
             } else {
                 ++it;
@@ -6127,6 +6235,39 @@ private:
             }
         }
         return at == in.size();
+    }
+
+    // Whether the placements are the whole of a sequence of `n_tokens`: one for each attention
+    // child of the tree, in its order, with its frontier at the end and one row for each position
+    // of [0, n_tokens). The import admits fewer rows, as a checkpoint may hold them; a resumed
+    // conversation with a hole in it would read as whole.
+    bool resume_placement_whole(const std::vector<vbr_artifact_stream_placement> & placements, int32_t n_tokens) const {
+        std::vector<llama_memory_tree_child> tree;
+        if (!llama_memory_tree_collect(llama_get_memory(ctx_tgt), tree)) {
+            return false;
+        }
+        size_t i = 0;
+        for (const auto & node : tree) {
+            if (node.attention == nullptr) {
+                continue;
+            }
+            if (i == placements.size()) {
+                return false;
+            }
+            const auto & placement = placements[i++];
+            if (placement.child_id != node.child_id || placement.computation_frontier != n_tokens ||
+                placement.cells.size() != size_t(n_tokens)) {
+                return false;
+            }
+            std::vector<bool> held(size_t(n_tokens), false);
+            for (const auto & cell : placement.cells) {
+                if (cell.logical_position < 0 || cell.logical_position >= n_tokens || held[cell.logical_position]) {
+                    return false;
+                }
+                held[cell.logical_position] = true;
+            }
+        }
+        return i == placements.size();
     }
 
     // The other conversations of a dynamic cache: where the rows of the sequence lie in the pool
@@ -6269,7 +6410,7 @@ private:
                     n_free--;
                     continue;
                 }
-                resume_unslotted.insert(entry.id);
+                resume_unslotted.emplace(entry.id, 0);
                 if (hosted || !resume_vbr()) {
                     unslotted.push_back(&entry);
                 }
@@ -6384,8 +6525,12 @@ private:
             status["entry"] = entry.id;
             resume_log(status);
         }
-        SRV_INF("RESUME event=install_done entries=%zu installed=%zu host=%zu t_ms=%.1f\n",
-                entries.size(), n_installed, n_host, (ggml_time_us() - t_start)/1000.0);
+        // The slots' conversations get their host copies now, as the idle pass would give them at
+        // the first quiet moment. A slot displaced before that pass is saved by the exact route,
+        // and the owners' restore cannot project a diverging request onto an exact package.
+        const size_t n_copies = resume_vbr() && n_installed > 0 ? resume_idle_publish() : 0;
+        SRV_INF("RESUME event=install_done entries=%zu installed=%zu host=%zu slot_copies=%zu t_ms=%.1f\n",
+                entries.size(), n_installed, n_host, n_copies, (ggml_time_us() - t_start)/1000.0);
     }
 
     // One entry through an empty slot into the host prompt cache: installed as any other, saved by
@@ -6397,13 +6542,19 @@ private:
             if (resume_host_publish(stage)) {
                 status["outcome"] = "installed_host";
                 status["restored"] = outcome;
+                // the host node that now holds what the entry's image is of
+                server_prompt_cache_vbr_restore_candidate pin;
+                if (resume_vbr() && stage.prompt.tokens.size() == size_t(entry.manifest.n_tokens) &&
+                    resume_pin_exact(stage.prompt.tokens, lora_config_identity(stage.lora), pin)) {
+                    resume_unslotted[entry.id] = pin.payload()->reference_artifact().v;
+                }
             } else {
                 status["outcome"] = "skipped";
                 status["reason"]  = "host_cache_rejected";
             }
             resume_stage_clear(stage);
         }
-        stage.resume_entry_id.clear();
+        resume_entry_take(stage, {});
         stage.resume_status = resume_public(status);
         return status;
     }
@@ -6418,6 +6569,11 @@ private:
             }
             return durable;
         }
+        return resume_idle_publish() > 0 || vbr_idle_source_durable(stage);
+    }
+
+    // one run of the owners' idle capture over the idle slots: the host copies it published
+    size_t resume_idle_publish() {
         size_t n_published = 0;
         auto capture = queue_tasks.try_begin_idle_capture();
         if (capture) {
@@ -6426,7 +6582,7 @@ private:
         if (vbr_idle_exact_capture) {
             n_published += finish_idle_exact_vbr_capture(true, true);
         }
-        return n_published > 0 || vbr_idle_source_durable(stage);
+        return n_published;
     }
 
     // a staging slot gives its conversation up, what the draft context has of it as well
@@ -6474,7 +6630,7 @@ private:
                             continue;
                         }
                         co.slot->mandatory_recovery_reset(server_cache_destruction_reason::restore_failure);
-                        co.slot->resume_entry_id.clear();
+                        resume_entry_take(*co.slot, {});
                         if (co.status.is_null() || resume_installed(co.status)) {
                             co.status = status;
                         }
@@ -6722,7 +6878,7 @@ private:
             restored.keep_first(size_t(p));
         }
         resume_establish(slot, std::move(restored));
-        slot.resume_entry_id = id;
+        resume_entry_take(slot, id);
         slot.t_last_used = resume_last_used(manifest);
 
         // the other tail states become checkpoints of the slot
@@ -6831,7 +6987,7 @@ private:
         if (reason != server_resume_reason::ok) {
             return resume_failed(reason, error);
         }
-        if (!resume_placement_decode(payload, placements)) {
+        if (!resume_placement_decode(payload, placements) || !resume_placement_whole(placements, manifest.n_tokens)) {
             return json {{"outcome", "failed"}, {"reason", "state_rejected"}, {"error", "placement"}};
         }
         return nullptr;
@@ -6856,7 +7012,7 @@ private:
         resume_establish(slot, std::move(co.tokens));
         // the epoch of the save, so the next one finds the sequence unchanged
         slot.prompt.sequence_epoch = manifest.sequence_epoch;
-        slot.resume_entry_id = co.entry->id;
+        resume_note_lineage(slot, co.entry->id);
         slot.t_last_used = resume_last_used(manifest);
         return json {
             {"outcome", "installed_full"},
@@ -6923,12 +7079,20 @@ private:
                 return bool(payload);
             }, error);
         if (reason != server_resume_reason::ok || !payload) {
+            // to the store, a payload the ingest refused is one not accepted: the ingest's reason first
+            const char * why = "state_rejected";
+            if (ingested.stream_status != vbr_capture_stream_status::ok) {
+                why = vbr_capture_stream_status_name(ingested.stream_status);
+            } else if (reason != server_resume_reason::ok) {
+                why = server_resume_reason_name(reason);
+            }
             return json {
                 {"outcome", "failed"},
-                {"reason", reason != server_resume_reason::ok ? server_resume_reason_name(reason) : "state_rejected"},
+                {"reason", why},
                 {"error", error},
                 {"decode", vbr_artifact_status_name(ingested.decode_status)},
                 {"stream", vbr_capture_stream_status_name(ingested.stream_status)},
+                {"t_ms", (ggml_time_us() - t_start)/1000.0},
             };
         }
 
@@ -7010,7 +7174,7 @@ private:
         // the import published the prompt alone: without a live retention instance the slot is
         // no source for an idle capture, and its conversation goes with the next one to take it
         slot_restored_tokens_publish(slot);
-        slot.resume_entry_id = id;
+        resume_note_lineage(slot, id);
         slot.t_last_used = resume_last_used(manifest);
         for (auto * co : ready) {
             co->status = resume_co_establish(*co);
@@ -10633,10 +10797,11 @@ private:
                 config.budget_context = cache_authority.get();
                 config.sample_budget = [](
                         void * context,
-                        llama_cache_budget_config & output) noexcept {
+                        llama_cache_budget_config & output,
+                        uint64_t pending_host_bytes) noexcept {
                     auto * authority =
                         static_cast<server_cache_authority *>(context);
-                    return authority->sample_budget(output);
+                    return authority->sample_budget(output, pending_host_bytes);
                 };
                 server_vbr_artifact_capture_status status;
                 server_vbr_artifact_store_create_diagnostics diagnostics;
@@ -12341,12 +12506,15 @@ private:
         state->ready = false;
     }
 
+    // `prepared`, when given, is the candidate to restore from in place of the one the host cache
+    // would select for the task now; it is consumed.
     bool try_automatic_vbr_restore(
             server_slot & slot,
             const server_task & task,
             const common_cache_family_binding & incoming_family,
             size_t * restored_prefix = nullptr,
-            bool recovery_refreshed = false) noexcept {
+            bool recovery_refreshed = false,
+            server_prompt_cache_vbr_restore_candidate * prepared = nullptr) noexcept {
         if (restored_prefix) {
             *restored_prefix = SIZE_MAX;
         }
@@ -12393,7 +12561,10 @@ private:
             }
             server_prompt_cache_vbr_restore_candidate candidate;
             const auto adapter_identity = lora_config_identity(slot.lora);
-            if (!prompt_cache->prepare_vbr_restore(
+            if (prepared) {
+                candidate = std::move(*prepared);
+            }
+            if (!candidate.ready() && !prompt_cache->prepare_vbr_restore(
                     task.tokens, frontier_execution_identity,
                     adapter_identity, candidate,
                     !ctx_dft && !slot.can_speculate())) {
@@ -12850,7 +13021,7 @@ private:
                 SLT_DBG(
                     slot,
                     "automatic VBR host restore refused: status=%s "
-                    "validation=%s schedule=%s destination=%s max_deficit=%" PRIu64 " decision=%s adopt=%s "
+                    "validation=%s schedule=%s destination=%s max_deficit=%" PRIu64 " decision=%s stage=%s adopt=%s "
                     "phase=%s units=%u companions=%u rollback=%llu precision_refused=%d precision_known=%d worst_steps=%u deficit=%" PRIu64 "/%" PRIu64 "\n",
                     server_vbr_artifact_import_status_name(imported.status),
                     vbr_manifest_validation_status_name(
@@ -12859,6 +13030,7 @@ private:
                     vbr_import_destination_status_name(imported.destination_status),
                     imported.destination_max_deficit,
                     vbr_import_decision_name(imported.decision),
+                    vbr_adopt_stage_status_name(imported.stage_status),
                     vbr_adopt_status_name(imported.adopt_status),
                     vbr_adopt_phase_name(imported.phase), imported.units,
                     imported.companions,
@@ -15123,7 +15295,7 @@ private:
             llama_model_is_recurrent(model_tgt) ||
             llama_model_is_hybrid(model_tgt);
         if (coordinated && !pending->candidate.preserve_live_source &&
-            !pending->candidate.stemmed) {
+            !pending->candidate.stemmed && !resume_keeps_sources_live()) {
             std::vector<server_slot *> reclaim;
             bool all_durable = true;
             try {
@@ -15346,11 +15518,9 @@ private:
         const bool requires_coordinated_tree_clear = n_swa > 0 ||
             llama_model_is_recurrent(model_tgt) ||
             llama_model_is_hybrid(model_tgt);
-        // A persistent resume saves live slots: the projected package a displaced conversation
-        // is left in has no wire form, so it stays live, as it does in a multi-slot tree.
-        const bool may_displace_live_source = !resume_vbr() &&
+        const bool may_displace_live_source =
             server_vbr_live_source_displacement_allowed(
-                params_base.kv_unified, slots.size());
+                params_base.kv_unified, slots.size(), resume_keeps_sources_live());
         bool projected_attention_layout_supported = false;
         {
             std::vector<llama_memory_tree_child> tree;
@@ -24005,7 +24175,7 @@ void server_context::start_loop() {
     // the loop has returned on this thread: nothing is decoding, and a sleeping server has
     // already saved its slots
     if (!impl->sleeping) {
-        impl->resume_capture_all("shutdown");
+        impl->resume_shutdown();
     }
 }
 
