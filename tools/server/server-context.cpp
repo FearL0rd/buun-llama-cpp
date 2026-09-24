@@ -3398,7 +3398,8 @@ bool server_vbr_empty_handoff_allowed(
     return server_vbr_empty_handoff_lookup_allowed(gate) &&
         gate.incoming_prefix > gate.incumbent_lcp &&
         gate.durable_incumbent_prefix > gate.incumbent_lcp &&
-        !gate.exact_incumbent_durable && gate.family_matches;
+        (!gate.exact_incumbent_durable || gate.occupied_route_unsupported) &&
+        gate.family_matches;
 }
 
 bool server_vbr_live_source_displacement_allowed(
@@ -3772,6 +3773,8 @@ private:
     uint64_t vbr_automatic_restore_occupied_attempts = 0;
     uint64_t vbr_automatic_restore_occupied_succeeded = 0;
     uint64_t vbr_automatic_restore_occupied_fallbacks = 0;
+    // set once the occupied guard refuses the memory tree's shape
+    bool vbr_occupied_route_unsupported = false;
     int64_t vbr_restore_refusal_log_us = 0;
     static constexpr uint64_t VBR_AUTOMATIC_EXACT_CAPTURE_MAX_BYTES =
         16ull*1024ull*1024ull*1024ull;
@@ -12746,6 +12749,8 @@ private:
                     slot.hard_lease_blocks_live_prefix();
                 handoff_gate.deferred_task =
                     queue_tasks.has_deferred_for_slot(slot.id);
+                handoff_gate.occupied_route_unsupported =
+                    vbr_occupied_route_unsupported;
                 handoff_gate.incumbent_supported =
                     automatic_vbr_cache_support(
                         slot.prompt.tokens, slot.lora,
@@ -12912,12 +12917,22 @@ private:
                         quarantined ? "true" : "false", int(imported.precision_refused),
                         int(imported.precision.known), imported.precision.worst_steps,
                         imported.precision.deficit, imported.precision.weight);
+                    using guard_status = vbr_occupied_replacement_guard_status;
+                    // A tree the guard cannot replace atomically (iSWA) takes
+                    // the empty handoff instead, which it proves durable.
+                    if (!recovery_refreshed && !quarantined &&
+                        imported.occupied_guard_status == guard_status::unsupported_tree &&
+                        !vbr_occupied_route_unsupported) {
+                        vbr_occupied_route_unsupported = true;
+                        ticket = {};
+                        return try_automatic_vbr_restore(
+                            slot, task, incoming_family, restored_prefix, true);
+                    }
                     report_refusal(imported, started);
                     // A semantically identical host frontier can still carry
                     // an old slot/layout after an earlier restore. The guard
                     // has refused before any write; refresh from the live
                     // source and retry once, retaining every validation.
-                    using guard_status = vbr_occupied_replacement_guard_status;
                     if (!recovery_refreshed && !quarantined &&
                         (imported.occupied_guard_status == guard_status::frontier_mismatch ||
                          imported.occupied_guard_status == guard_status::ownership_mismatch ||
