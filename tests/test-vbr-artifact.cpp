@@ -1269,6 +1269,21 @@ static void test_companion_payload() {
           vbr_artifact_companion_kind::frontier_logits);
     CHECK(decoded.companions[1].payload_digest ==
           decoded.manifest.companions[1].payload_digest);
+
+    auto parallel = package;
+    CHECK(vbr_artifact_prepare(parallel, 4) == vbr_artifact_status::ok);
+    CHECK(parallel.manifest.manifest_digest == package.manifest.manifest_digest);
+    CHECK(vbr_artifact_validate_prepared_package(parallel, 4) == vbr_artifact_status::ok);
+    // Parallel validation still reads the bytes, including stash/companions.
+    for (auto * source : { &storage.payload0, &storage.stash0, &storage.recurrent, &frontier_logits }) {
+        source->bytes[0] ^= 1;
+        CHECK(vbr_artifact_validate_prepared_package(parallel, 4) != vbr_artifact_status::ok);
+        source->bytes[0] ^= 1;
+    }
+    CHECK(vbr_artifact_validate_prepared_package(parallel, 4) == vbr_artifact_status::ok);
+    parallel.unit_blobs[0].descriptor.shards[0].payload.read = nullptr;
+    auto serial_failure = parallel;
+    CHECK(vbr_artifact_prepare(parallel, 4) == vbr_artifact_prepare(serial_failure));
 }
 
 struct discard_writer {
@@ -1961,6 +1976,13 @@ static void test_catalog_multi_unit_atomic_publish() {
     package.manifest.manifest_digest = {};
     package.manifest.capture_generation_id = {};
     package.manifest.consistency = {};
+
+    auto serial = package;
+    auto parallel = package;
+    CHECK(vbr_artifact_prepare(serial) == vbr_artifact_status::ok);
+    CHECK(vbr_artifact_prepare(parallel, 4) == vbr_artifact_status::ok);
+    CHECK(parallel.manifest.manifest_digest == serial.manifest.manifest_digest);
+    CHECK(vbr_artifact_validate_prepared_package(parallel, 4) == vbr_artifact_status::ok);
 
     CHECK(f.catalog->configure_accounting(package));
     vbr_capture_stream_status status;
@@ -4033,6 +4055,70 @@ static void test_catalog_authentication_reuse() {
     CHECK(corrupt.append(bytes.data(), bytes.size()));
     *chain = std::move(corrupt);
     CHECK(legacy.view.validate_authenticated() != vbr_artifact_status::ok);
+}
+
+static void test_catalog_preparation_reuse() {
+    // Same immutable chains may reuse preparation. Changing schema, payload,
+    // or stash must instead produce exactly the fresh canonical result.
+    for (int change = 0; change < 4; ++change) {
+        validator_fixture f;
+        auto incoming = f.base.package;
+        if (change == 1) {
+            incoming.unit_blobs[0].descriptor.codebook_digest[0] ^= 1;
+        } else if (change >= 2) {
+            auto chain = std::const_pointer_cast<artifact_segment_chain>(change == 2
+                ? f.view.units()[0].payload_shards[0] : f.view.units()[0].stash_shards[0]);
+            std::vector<uint8_t> bytes(chain->size());
+            CHECK(chain->read(0, bytes.data(), bytes.size()));
+            bytes[0] ^= 1;
+            artifact_segment_chain replacement;
+            CHECK(replacement.append(bytes.data(), bytes.size()));
+            *chain = std::move(replacement);
+        }
+        vbr_capture_stream_status status;
+        auto build = f.base.catalog->begin_capture(incoming, f.base.budget, {}, status);
+        CHECK(build && status == vbr_capture_stream_status::ok);
+        auto unit = build->begin_unit(0, status);
+        CHECK(unit && status == vbr_capture_stream_status::ok);
+        for (bool stash : { false, true }) {
+            const auto & chains = stash ? f.view.units()[0].stash_shards : f.view.units()[0].payload_shards;
+            auto & descriptors = stash ? incoming.unit_blobs[0].descriptor.clean_stash.shards :
+                                         incoming.unit_blobs[0].descriptor.shards;
+            for (size_t i = 0; i < chains.size(); ++i) {
+                vbr_verified_segment segment;
+                segment.unit_index = 0;
+                segment.shard_index = uint32_t(i);
+                segment.clean_stash = stash;
+                segment.bytes = chains[i];
+                segment.streaming_digest = vbr_capture_stream_digest(*chains[i]);
+                CHECK(unit->accept_verified_segment(segment) == vbr_capture_stream_status::ok);
+                descriptors[i].payload = chains[i]->source();
+            }
+        }
+        CHECK(unit->seal_unit() == vbr_capture_stream_status::ok);
+        for (size_t i = 0; i < f.view.companions().size(); ++i) {
+            vbr_verified_companion companion;
+            companion.companion_index = uint32_t(i);
+            companion.bytes = f.view.companions()[i].payload;
+            companion.streaming_digest = vbr_capture_stream_digest(*companion.bytes);
+            CHECK(build->accept_verified_companion(companion) == vbr_capture_stream_status::ok);
+            incoming.companions[i].payload = companion.bytes->source();
+        }
+        CHECK(vbr_artifact_prepare(incoming) == vbr_artifact_status::ok);
+        const auto published = build->publish_reference();
+        CHECK(published.status == vbr_capture_stream_status::ok);
+        vbr_artifact_package_view view;
+        CHECK(f.base.catalog->resolve_reference(published.reference_artifact, view) ==
+              vbr_artifact_resolve_status::ok);
+        CHECK(view.validate() == vbr_artifact_status::ok);
+        CHECK(view.units()[0].unit_version_id == incoming.unit_blobs[0].unit_version_id);
+        CHECK(view.manifest().manifest_digest == incoming.manifest.manifest_digest);
+        CHECK((view.units()[0].unit_version_id == f.view.units()[0].unit_version_id) == (change == 0));
+        build.reset();
+        unit.reset();
+        view.reset();
+        CHECK(f.base.catalog->retire(published.reference_artifact) == vbr_artifact_retire_status::retired);
+    }
 }
 
 static vbr_manifest_validation_result validate(
@@ -7436,6 +7522,100 @@ static vbr_artifact_package prompt_cache_quality_anchor_package(
     return result;
 }
 
+static void test_prompt_cache_vbr_pressure_without_turn_scores(bool compound) {
+    catalog_fixture fixture;
+    server_prompt prompt;
+    prompt.tokens = server_tokens(llama_tokens { 101, 102 }, false);
+    prompt.sequence_epoch = 3;
+    CHECK(prompt.tokens.media_content_identity(prompt.n_tokens(),
+        fixture.package.manifest.identity.media_content_identity));
+    fixture.package.manifest.identity.next_position = prompt.tokens.pos_next();
+    const auto & identity = fixture.package.manifest.identity;
+    server_cache_authority authority;
+    server_retention_sidecar_store retention;
+    retention.configure(&fixture.ledger, fixture.host, &authority.leases);
+    CHECK(retention.enable_prefix_tracking());
+    constexpr int32_t source_slot = 9;
+    const auto source_key = server_retention_instance_key::for_slot(source_slot);
+    CHECK(retention.publish(source_key, common_retention_pool::attention,
+        {}, false, prompt.n_tokens(), prompt.n_tokens(), true));
+    CHECK(server_prompt_retention_publish_exact_prefix(retention, source_key,
+        prompt, identity.adapter_config_identity, prompt.n_tokens()));
+
+    server_prompt_cache cache(0, 0);
+    cache.acct = &fixture.ledger;
+    cache.publish_authority = &authority;
+    cache.destruction_obs = &authority.destruction;
+    cache.retention_obs = &retention;
+    cache.lease_obs = &authority.leases;
+    cache.lease_execution_identity = &identity.execution_identity;
+    cache.retention_capacity_authority = true;
+    CHECK(cache.enable_retention_shadow());
+    const auto make_payload = [&](uint8_t salt) {
+        fixture_storage storage;
+        storage.payload0.bytes[0] ^= salt;
+        storage.payload1.bytes[0] ^= salt;
+        storage.stash0.bytes[0] ^= salt;
+        storage.stash1.bytes[0] ^= salt;
+        auto package = make_package(storage);
+        package.manifest.identity = identity;
+        const auto published = publish_fixture(*fixture.catalog, package, {
+            { 0, 1, true, true, storage.stash1.bytes },
+            { 0, 0, false, true, storage.payload0.bytes },
+            { 0, 0, true, true, storage.stash0.bytes },
+            { 0, 1, false, true, storage.payload1.bytes },
+        }, fixture.budget);
+        CHECK(published.status == llama_vbr_artifact_publish_status::published);
+        vbr_artifact_package_view view;
+        CHECK(fixture.catalog->resolve_reference(published.reference_artifact, view) ==
+            vbr_artifact_resolve_status::ok);
+        return server_prompt_cache_payload::from_vbr(
+            server_prompt_cache_vbr_payload::adopt_owned(std::move(view)));
+    };
+    std::vector<server_prompt_cache::iterator> states;
+    for (uint8_t salt : { 1, 2, 3 }) {
+        auto staged = cache.stage_vbr(prompt, make_payload(salt),
+            identity.execution_identity, identity.adapter_config_identity);
+        server_prompt_cache::iterator state;
+        CHECK(cache.publish(std::move(staged), &prompt, source_slot, &state));
+        states.push_back(state);
+    }
+    auto incoming = make_payload(4);
+    auto pinned_alias = states[1]->payload;
+    CHECK(states[1]->payload.vbr_logical_erase_only());
+    const auto pinned_key = server_retention_instance_key::for_host_entry(&*states[1]);
+    const auto pinned_artifact = retention.artifact_id(pinned_key);
+    std::vector<const server_prompt_cache_payload *> survivors {
+        &states[1]->payload, &incoming,
+    };
+    if (!compound) { survivors.push_back(&states[2]->payload); }
+    server_prompt_cache_vbr_budget_summary budget;
+    CHECK(server_prompt_cache_payload::summarize_vbr_budgets(survivors, budget));
+    cache.limit_size = size_t(budget.compact_resident_bytes);
+    server_prompt_cache_vbr_publication_metadata metadata;
+    CHECK(cache.prepare_vbr_publication_metadata(prompt, identity.execution_identity,
+        identity.adapter_config_identity, source_slot, metadata));
+    server_prompt_cache_vbr_publication_metadata * batch[] = { &metadata };
+    server_prompt_cache_vbr_capacity_claim capacity;
+    for (auto state : states) { state->recovery_pins++; }
+    CHECK(!cache.prepare_vbr_publication_capacity(batch, 1, incoming.size(), capacity));
+    CHECK(cache.states.size() == 3);
+    states[0]->recovery_pins--;
+    states[2]->recovery_pins--;
+    CHECK(cache.prepare_vbr_publication_capacity(batch, 1, incoming.size(), capacity));
+    CHECK(capacity.requires_publication_revalidation());
+    CHECK(cache.publish_vbr(metadata, std::move(incoming), {}, false, nullptr, &capacity));
+    CHECK(cache.states.size() == (compound ? 2u : 3u));
+    CHECK(retention.artifact_id(pinned_key) == pinned_artifact);
+    CHECK(states[1]->recovery_pins == 1);
+    states[1]->recovery_pins--;
+    pinned_alias = {};
+    cache.limit_size = 1;
+    cache.update();
+    CHECK(cache.states.empty());
+    CHECK(fixture.catalog->snapshot().references == 0);
+}
+
 static void test_prompt_cache_vbr_pressure_retires_physical_union() {
     catalog_fixture fixture;
 
@@ -9731,6 +9911,8 @@ int main(int argc, char ** argv) {
     }
 #ifdef VBR_PROMPT_CACHE_PUBLICATION_TEST
     if (argc == 2 && strcmp(argv[1], "--host-pressure-only") == 0) {
+        test_prompt_cache_vbr_pressure_without_turn_scores(false);
+        test_prompt_cache_vbr_pressure_without_turn_scores(true);
         test_prompt_cache_vbr_pressure_retires_physical_union();
         return failures == 0 ? 0 : 1;
     }
@@ -9791,6 +9973,7 @@ int main(int argc, char ** argv) {
     test_prompt_cache_vbr_same_frontier_variants();
     test_sequence_projected_capture_union();
     test_catalog_authentication_reuse();
+    test_catalog_preparation_reuse();
     test_manifest_validator_matrix();
     test_validated_manifest_staging();
 #ifdef VBR_PROMPT_CACHE_PUBLICATION_TEST
@@ -9799,6 +9982,8 @@ int main(int argc, char ** argv) {
     test_server_vbr_occupied_failure_terminal();
     test_prompt_cache_vbr_longest_feasible_restore_selection();
     test_prompt_cache_vbr_atomic_logical_publication();
+    test_prompt_cache_vbr_pressure_without_turn_scores(false);
+    test_prompt_cache_vbr_pressure_without_turn_scores(true);
     test_prompt_cache_vbr_pressure_retires_physical_union();
 #endif
     if (failures != 0) {

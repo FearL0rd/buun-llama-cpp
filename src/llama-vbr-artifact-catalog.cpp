@@ -76,6 +76,8 @@ struct llama_vbr_artifact_catalog::impl {
         std::vector<std::shared_ptr<const artifact_segment_chain>>
             payload_shards;
         std::vector<uint64_t> authenticated_revisions;
+        uint32_t authenticated_unit_index = UINT32_MAX;
+        uint32_t authenticated_format_version = 0;
         std::vector<allocation> allocations;
     };
 
@@ -900,6 +902,35 @@ uint64_t projected_reserve_bytes(
         });
     return reserve == request.reserve_accounting.end()
         ? 0 : reserve->resident_bytes;
+}
+
+// Only use this after binding all sources to catalog-owned immutable chains.
+// Small metadata/test packages stay serial; four workers bound CPU/scratch use
+// while retaining the exact same canonical hashes and full import barrier.
+uint32_t owned_package_hash_workers(const vbr_artifact_package & package) noexcept {
+    uint64_t remaining = 8*1024*1024;
+    const auto large = [&](uint64_t bytes) {
+        remaining -= std::min(remaining, bytes);
+        return remaining == 0;
+    };
+    for (const auto & unit : package.unit_blobs) {
+        for (const auto & shard : unit.descriptor.shards) {
+            if (large(shard.payload_bytes)) {
+                return 4;
+            }
+        }
+        for (const auto & shard : unit.descriptor.clean_stash.shards) {
+            if (large(shard.payload_bytes)) {
+                return 4;
+            }
+        }
+    }
+    for (const auto & companion : package.companions) {
+        if (large(companion.payload_bytes)) {
+            return 4;
+        }
+    }
+    return 1;
 }
 
 bool projected_batch_reserve_accounting_valid(
@@ -1782,7 +1813,8 @@ vbr_artifact_status vbr_artifact_package_view::validate() const noexcept {
             companion.payload = view.payload->source();
             package.companions.push_back(std::move(companion));
         }
-        return vbr_artifact_validate_prepared_package(package);
+        return vbr_artifact_validate_prepared_package(
+            package, owned_package_hash_workers(package));
     } catch (...) {
         return vbr_artifact_status::internal_error;
     }
@@ -3372,8 +3404,52 @@ llama_vbr_artifact_catalog::publish_stream_complete(
                 !sealed_projected && companion.companion_index == companion_revisions.size()
                     ? companion.bytes->content_revision() : 0);
         }
+        vbr_artifact_preparation_reuse preparation_reuse;
+        if (!sealed_projected) {
+            preparation_reuse.version = working.version;
+            preparation_reuse.units.resize(working.unit_blobs.size());
+            const auto same_backing = [&](const auto & chains, const auto & revisions,
+                                           size_t offset, size_t count) {
+                if (chains.size() != count || revisions.size() != count) {
+                    return false;
+                }
+                for (size_t s = 0; s < count; ++s) {
+                    const auto * segment = segment_lookup[offset + s];
+                    if (chains[s] != segment->bytes || revisions[s] == 0 ||
+                        revisions[s] != segment->bytes->content_revision()) {
+                        return false;
+                    }
+                }
+                return true;
+            };
+            for (size_t u = 0; u < working.unit_blobs.size(); ++u) {
+                const auto & incoming = working.unit_blobs[u].descriptor;
+                for (const auto & entry : impl_->blobs) {
+                    const auto & saved = entry.second;
+                    // Section checksums bind object index and format. Never
+                    // borrow those from another unit order or projected blob.
+                    if (saved.authenticated_unit_index != u ||
+                        saved.authenticated_format_version != working.version ||
+                        saved.descriptor.logical_unit_id != incoming.logical_unit_id ||
+                        !same_backing(saved.payload_shards, saved.authenticated_revisions,
+                            payload_offsets[u], incoming.shards.size())) {
+                        continue;
+                    }
+                    if (incoming.clean_stash_state == vbr_artifact_clean_stash_state::present) {
+                        const auto stash = impl_->stashes.find(saved.stash_id.bytes());
+                        if (stash == impl_->stashes.end() ||
+                            !same_backing(stash->second.shards, stash->second.authenticated_revisions,
+                                stash_offsets[u], incoming.clean_stash.shards.size())) {
+                            continue;
+                        }
+                    }
+                    preparation_reuse.units[u] = { saved.id, saved.payload_digest, saved.descriptor };
+                    break;
+                }
+            }
+        }
         if (!sealed_projected &&
-            vbr_artifact_prepare(working) !=
+            vbr_artifact_prepare(working, owned_package_hash_workers(working), &preparation_reuse) !=
                 vbr_artifact_status::ok) {
             result.status =
                 llama_vbr_artifact_publish_status::format_rejected;
@@ -3443,6 +3519,10 @@ llama_vbr_artifact_catalog::publish_stream_complete(
                     working.unit_blobs[u].payload_digest;
                 pending.descriptor =
                     working.unit_blobs[u].descriptor;
+                if (!sealed_projected) {
+                    pending.authenticated_unit_index = uint32_t(u);
+                    pending.authenticated_format_version = working.version;
+                }
                 for (const auto & shard : pending.descriptor.shards) {
                     pending.authenticated_revisions.push_back(
                         segment_revisions[payload_offsets[u] + shard.shard_index]);

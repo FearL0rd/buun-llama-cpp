@@ -144,6 +144,7 @@ private:
     std::unique_ptr<impl> impl_;
     uint64_t revision_ = 1;
     void invalidate_revision() noexcept;
+    friend class vbr_pinned_chunk_ring;
     bool append_storage(
         std::shared_ptr<std::vector<uint8_t>> bytes) noexcept;
     friend bool vbr_capture_range_seal(

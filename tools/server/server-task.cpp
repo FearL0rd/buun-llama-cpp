@@ -25,6 +25,9 @@
 #include <thread>
 #include <tuple>
 #include <type_traits>
+#if defined(__GLIBC__)
+#include <malloc.h>
+#endif
 
 namespace {
 
@@ -5761,14 +5764,16 @@ static bool server_prompt_cache_plan_vbr_pressure(
                 if (state_artifact == ignored_artifact) {
                     continue;
                 }
+                // A pinned provider remains retained coverage, not a victim.
+                // Its shared payload must not veto unrelated retirements.
+                if (it->recovery_pins != 0) {
+                    continue;
+                }
                 if (it->payload.kind() !=
                         server_prompt_cache_payload_kind::vbr_artifact ||
                     it->payload.vbr_has_quality_anchor() ||
                     it->payload.vbr_logical_erase_only()) {
                     return false;
-                }
-                if (it->recovery_pins != 0) {
-                    continue;
                 }
                 victims.push_back(it);
                 ordinals.push_back(ordinal);
@@ -5808,18 +5813,25 @@ static bool server_prompt_cache_plan_vbr_pressure(
             cache.states.end(), candidates,
             shadow_rows, shadow_artifacts, shadow_lineages,
             ignored_artifact);
-        if (!projection.complete || !projection.release_evidence_complete ||
-            !projection.artifact.v) {
-            return false;
-        }
-        const auto selected = std::find_if(
-            candidates.begin(), candidates.end(), [&](const auto & value) {
-                return value.ranking.artifact_id == projection.artifact &&
+        // Match the publication terminal's oldest-eligible fallback when
+        // optional semantic retention scores are unavailable (e.g. requests
+        // without message delimiters). Lease and physical release evidence
+        // remain mandatory; missing scores never manufacture reclaim credit.
+        const auto select = [&](const auto & projected,
+                                llama_cache_acct_artifact_id excluded) {
+            const bool ranked = projected.complete &&
+                projected.release_evidence_complete && projected.artifact.v;
+            return std::find_if(candidates.begin(), candidates.end(), [&](const auto & value) {
+                return value.ranking.artifact_id.v &&
+                    value.ranking.artifact_id != excluded &&
+                    (!ranked || value.ranking.artifact_id == projected.artifact) &&
                     (!byte_pressure || value.marginal_resident_known) &&
                     value.retirement_ready && value.lease_known &&
                     !value.hard_leased && !value.mandatory_anchor &&
                     value.victim->recovery_pins == 0;
             });
+        };
+        const auto selected = select(projection, {});
         if (selected == candidates.end()) {
             return false;
         }
@@ -5861,21 +5873,7 @@ static bool server_prompt_cache_plan_vbr_pressure(
             cache, reason, cache.states.end(), candidates,
             shadow_rows, shadow_artifacts, shadow_lineages,
             ignored_artifact, selected->ranking.artifact_id);
-        if (!second_projection.complete ||
-            !second_projection.release_evidence_complete ||
-            !second_projection.artifact.v) {
-            plan = {};
-            return false;
-        }
-        const auto second = std::find_if(
-            candidates.begin(), candidates.end(), [&](const auto & value) {
-                return value.ranking.artifact_id ==
-                        second_projection.artifact &&
-                    value.marginal_resident_known &&
-                    value.retirement_ready && value.lease_known &&
-                    !value.hard_leased && !value.mandatory_anchor &&
-                    value.victim->recovery_pins == 0;
-            });
+        const auto second = select(second_projection, selected->ranking.artifact_id);
         if (second == candidates.end() || second == selected) {
             plan = {};
             return false;
@@ -6735,10 +6733,16 @@ bool server_prompt_cache::destroy_retention_host_entry(
             }
         }
         observe_retention_shadow = false;
-        if (projection.release_evidence_complete && proposed.v != 0) {
+        // A pre-D2H VBR capacity citation may have used the same lawful FIFO
+        // floor when turn scores were unavailable. Revalidate that decision,
+        // rather than refusing every such publication at the terminal.
+        const auto executable = !projection.complete && required_victim.v &&
+                host_entry_artifact_id(*this, *legacy_floor) == required_victim
+            ? required_victim : proposed;
+        if (projection.release_evidence_complete && executable.v != 0) {
             const auto selected = std::find_if(
                 candidates.begin(), candidates.end(), [&](const auto & value) {
-                    return value.ranking.artifact_id == proposed &&
+                    return value.ranking.artifact_id == executable &&
                         value.lease_known && !value.hard_leased &&
                         value.victim != incoming &&
                         value.victim->recovery_pins == 0;
@@ -9126,6 +9130,25 @@ bool server_prompt_cache::update_impl(
         !quality_anchor_budget_enabled) {
         return true;
     }
+    // Capture workers allocate large pageable chunks in separate malloc
+    // arenas. Logical eviction can leave GiBs of free pages resident there
+    // while the next worker grows another arena. Reclaim those free pages
+    // once after a large, proven release, outside the retirement transaction.
+    // Apply the same host-pressure treatment to fixed-state payloads; small,
+    // unknown, or purely logical releases do not request a trim.
+    struct heap_reclaim {
+        bool pending = false;
+        void note(uint64_t released) noexcept {
+            pending |= released != UINT64_MAX && released >= (64ull << 20);
+        }
+        ~heap_reclaim() {
+#if defined(__GLIBC__)
+            if (pending) {
+                malloc_trim(0);
+            }
+#endif
+        }
+    } reclaim;
     bool pressure_wave_started = false;
     bool competition_wave_valid = true;
     bool retention_shadow_observed = false;
@@ -9316,6 +9339,7 @@ bool server_prompt_cache::update_impl(
                     }
                     required_victims = {};
                     retention_shadow_observed |= observe_shadow;
+                    reclaim.note(released_bytes);
                     if (released_bytes == UINT64_MAX ||
                         released_bytes > cache_bytes ||
                         released_tokens > cache_tokens) {
@@ -9338,6 +9362,7 @@ bool server_prompt_cache::update_impl(
             }
             required_victims = {};
             retention_shadow_observed |= observe_shadow;
+            reclaim.note(released_bytes);
             if (released_bytes == UINT64_MAX ||
                 released_bytes > cache_bytes ||
                 released_tokens > cache_tokens) {
@@ -9381,6 +9406,7 @@ bool server_prompt_cache::update_impl(
             }
             required_victims = {};
             retention_shadow_observed |= observe_shadow;
+            reclaim.note(released_bytes);
             if (released_bytes == UINT64_MAX ||
                 released_bytes > cache_bytes ||
                 released_tokens > cache_tokens) {

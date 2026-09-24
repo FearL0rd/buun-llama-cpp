@@ -133,6 +133,78 @@ void test_idle_capture_session_cancellation() {
     }
 }
 
+void test_displacement_capture_session() {
+    for (int route = 0; route < 3; ++route) {
+        server_queue queue;
+        auto capture = queue.try_begin_displacement_capture();
+        CHECK(capture.continue_capture());
+        server_task cancel;
+        cancel.id = 40;
+        cancel.type = SERVER_TASK_TYPE_CANCEL;
+        cancel.id_target = 39;
+        if (route == 0) {
+            queue.post(std::move(cancel));
+        } else if (route == 1) {
+            std::vector<server_task> tasks;
+            tasks.push_back(std::move(cancel));
+            queue.post(std::move(tasks));
+        } else {
+            queue.defer(std::move(cancel));
+        }
+        CHECK(!capture.continue_capture());
+        capture = {};
+        // A queued cancellation must also prevent a fresh foreground wave.
+        CHECK(!queue.try_begin_displacement_capture());
+    }
+    {
+        server_queue queue;
+        auto idle = queue.try_begin_idle_capture();
+        CHECK(idle);
+        CHECK(queue.post(idle_capture_test_task(30)) == 30);
+        CHECK(!idle.continue_capture());
+        // Cancelled work must drain/release before foreground acquisition.
+        CHECK(!queue.try_begin_displacement_capture());
+        idle = {};
+        auto capture = queue.try_begin_displacement_capture();
+        CHECK(capture.continue_capture());
+        CHECK(!queue.try_begin_displacement_capture());
+        CHECK(queue.post(idle_capture_test_task(31)) == 31);
+        std::vector<server_task> tasks;
+        tasks.push_back(idle_capture_test_task(32));
+        CHECK(queue.post(std::move(tasks)) == 0);
+        queue.defer(idle_capture_test_task(33));
+        CHECK(capture.continue_capture());
+        auto moved = std::move(capture);
+        CHECK(!capture);
+        CHECK(moved.continue_capture());
+        moved.cancel();
+        CHECK(!moved.continue_capture());
+        moved = {};
+        auto second = queue.try_begin_displacement_capture();
+        CHECK(second.continue_capture());
+        queue.terminate();
+        CHECK(!second.continue_capture());
+        CHECK(!queue.try_begin_displacement_capture());
+    }
+    {
+        server_queue queue;
+        auto capture = queue.try_begin_displacement_capture();
+        CHECK(capture.continue_capture());
+        capture = {};
+        auto idle = queue.try_begin_idle_capture();
+        CHECK(idle.continue_capture());
+        CHECK(queue.post(idle_capture_test_task(34)) == 34);
+        CHECK(!idle.continue_capture()); // cancellation policy resets per session
+    }
+    server_queue::idle_capture_session escaped;
+    {
+        server_queue queue;
+        escaped = queue.try_begin_displacement_capture();
+        CHECK(escaped.continue_capture());
+    }
+    CHECK(!escaped.continue_capture());
+}
+
 void test_idle_capture_refuses_active_queue_yield() {
     server_queue queue;
     std::mutex mutex;
@@ -181,6 +253,7 @@ void test_idle_capture_refuses_active_queue_yield() {
     // acquire capture authority concurrently with decode/speculative work.
     CHECK(!queue.try_begin_idle_capture());
     CHECK(!queue.try_begin_prompt_boundary_capture());
+    CHECK(!queue.try_begin_displacement_capture());
 
     CHECK(queue.post(idle_capture_test_task(20)) == 20);
     {
@@ -5334,6 +5407,7 @@ int main(int argc, char ** argv) {
     test_active_storage_budget();
     CHECK(server_active_prefix_retention_for_test());
     test_idle_capture_session_cancellation();
+    test_displacement_capture_session();
     test_idle_capture_refuses_active_queue_yield();
     test_queue_yield_work_exception_precedes_callback_exception();
     test_speculative_decode_terminals();

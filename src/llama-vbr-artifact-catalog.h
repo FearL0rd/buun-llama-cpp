@@ -462,6 +462,7 @@ public:
 private:
     struct storage;
     friend class llama_vbr_artifact_catalog;
+    friend class vbr_explicit_capture_operation;
     friend class vbr_artifact_attention_prefix_projection;
     llama_vbr_artifact_catalog * owner_ = nullptr;
     std::shared_ptr<const storage> storage_;

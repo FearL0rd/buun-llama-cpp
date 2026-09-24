@@ -1417,6 +1417,24 @@ public:
                     frontier > parent_wm || incoming_cells > UINT32_MAX || prefix_cells > UINT32_MAX) {
                     return false;
                 }
+                // Whole imports preserve authenticated physical placements;
+                // prefix projections compact their selected rows. Backing can
+                // extend past the last occupied row and is not an append head.
+                uint64_t source_high_water = selected_frontier;
+                if (selected_frontier == 0) {
+                    for (const auto & placement : package.manifest().stream_placements) {
+                        if (placement.child_id != tree_child.child_id) {
+                            continue;
+                        }
+                        for (const auto & cell : placement.cells) {
+                            source_high_water = std::max(source_high_water,
+                                uint64_t(cell.physical_cell) + 1);
+                        }
+                    }
+                }
+                if (source_high_water == 0 || source_high_water > frontier) {
+                    return false;
+                }
                 // Price the destination for the incoming request, not the
                 // artifact's precision or the maximum context. The copied
                 // prefix remains bounded independently by its saved frontier.
@@ -1427,7 +1445,7 @@ public:
                     0, destination);
                 state.restore_watermark = state.cache->vbr_import_watermark_cells(
                     uint32_t(std::max(prefix_cells, incoming_cells)), uint32_t(prefix_cells),
-                    uint32_t(frontier), destination);
+                    uint32_t(source_high_water), destination, uint32_t(frontier));
                 if (!state.cache->vbr_import_destination_input(
                         uint32_t(wm), state.input) ||
                     !state.cache->vbr_import_destination_pricing_begin(
@@ -2011,6 +2029,37 @@ public:
     static bool stable(const child & value) {
         return value.cache != nullptr &&
                value.cache->vbr_capture_stability_matches(value.stability);
+    }
+
+    static bool same_attention(const child & saved, const child & live) {
+        if (saved.cache != live.cache || saved.child_id != live.child_id ||
+            saved.units.size() != live.units.size() || !stable(saved) || !stable(live)) {
+            return false;
+        }
+        // Stability covers the controller instance, mutation serial, tier,
+        // tensor addresses/offsets and stash ownership. Also require the new
+        // size pass to read exactly the same byte ranges in the same order.
+        for (size_t i = 0; i < saved.units.size(); ++i) {
+            const auto & a = saved.units[i];
+            const auto & b = live.units[i];
+            if (a.logical_unit != b.logical_unit || a.is_v != b.is_v ||
+                a.capture_index != b.capture_index || a.n_stream != b.n_stream ||
+                a.unified != b.unified || a.wm_cells != b.wm_cells ||
+                a.shards.size() != b.shards.size()) {
+                return false;
+            }
+            for (size_t j = 0; j < a.shards.size(); ++j) {
+                const auto & x = a.shards[j];
+                const auto & y = b.shards[j];
+                if (x.pool != y.pool || x.extent != y.extent ||
+                    x.shard_index != y.shard_index || x.payload_bytes != y.payload_bytes ||
+                    x.row_bytes != y.row_bytes || x.columns != y.columns ||
+                    x.stash_bytes != y.stash_bytes) {
+                    return false;
+                }
+            }
+        }
+        return true;
     }
 
     static bool occupied_observation(
@@ -4504,6 +4553,31 @@ bool vbr_explicit_capture_pretransfer_quote_admissible(
            (max_packed_bytes == 0 || packed <= max_packed_bytes);
 }
 
+struct vbr_explicit_attention_reuse::impl {
+    vbr_unit_version_sink * sink = nullptr;
+    std::vector<vbr_live_capture_adapter::child> children;
+    vbr_artifact_package_view package;
+};
+
+struct vbr_explicit_attention_reuse_access {
+    static const vbr_artifact_package_view * match(
+            const vbr_explicit_attention_reuse & reuse,
+            vbr_unit_version_sink * sink,
+            const std::vector<vbr_live_capture_adapter::child> & children) {
+        const auto * saved = reuse.impl_.get();
+        if (!saved || saved->sink != sink || saved->children.size() != children.size() ||
+            saved->package.validate_authenticated() != vbr_artifact_status::ok) {
+            return nullptr;
+        }
+        for (size_t i = 0; i < children.size(); ++i) {
+            if (!vbr_live_capture_adapter::same_attention(saved->children[i], children[i])) {
+                return nullptr;
+            }
+        }
+        return &saved->package;
+    }
+};
+
 struct vbr_explicit_capture_operation::impl {
     struct pending_companion {
         recurrent_companion_plan recurrent;
@@ -4513,6 +4587,7 @@ struct vbr_explicit_capture_operation::impl {
     };
 
     vbr_explicit_capture_request request;
+    vbr_unit_version_sink * sink = nullptr;
     std::vector<vbr_live_capture_adapter::child> children;
     std::vector<vbr_controller_instance_id> instances;
     vbr_artifact_package package;
@@ -4541,6 +4616,32 @@ bool vbr_explicit_capture_operation::ready_for_transfer() const noexcept {
 bool vbr_explicit_capture_operation::ready_for_publication() const noexcept {
     return impl_ && impl_->build && impl_->transferred && !impl_->published &&
         impl_->result.status == vbr_explicit_capture_status::ok;
+}
+
+bool vbr_explicit_capture_operation::retain_attention(
+        const vbr_artifact_package_view & package,
+        vbr_explicit_attention_reuse & output) const noexcept {
+    output.reset();
+    if (!impl_ || !impl_->published ||
+        impl_->result.status != vbr_explicit_capture_status::ok || !package ||
+        static_cast<vbr_unit_version_sink *>(package.owner_) != impl_->sink ||
+        package.reference_artifact().v != impl_->result.sink.reference_artifact.v ||
+        package.units().size() != impl_->package.unit_blobs.size() ||
+        package.validate_authenticated() != vbr_artifact_status::ok) {
+        return false;
+    }
+    try {
+        auto saved = std::make_shared<vbr_explicit_attention_reuse::impl>();
+        saved->sink = impl_->sink;
+        saved->children = impl_->children;
+        if (package.retain(saved->package) != vbr_artifact_resolve_status::ok) {
+            return false;
+        }
+        output.impl_ = std::move(saved);
+        return true;
+    } catch (...) {
+        return false;
+    }
 }
 
 void vbr_explicit_capture_operation::reset() noexcept {
@@ -5024,6 +5125,7 @@ vbr_explicit_capture_result vbr_prepare_explicit_manifest(
         auto prepared = std::make_unique<
             vbr_explicit_capture_operation::impl>();
         prepared->request = std::move(request);
+        prepared->sink = &sink;
         prepared->children = std::move(children);
         prepared->instances = std::move(instances);
         prepared->package = std::move(package);
@@ -5214,6 +5316,8 @@ vbr_explicit_capture_result vbr_transfer_explicit_manifest(
             vbr_artifact_companion_kind::_count;
 
         result.phase = vbr_explicit_capture_phase::unit_transfer;
+        const auto * reused = vbr_explicit_attention_reuse_access::match(
+            request.attention_reuse, state.sink, children);
         uint32_t unit_index = 0;
         for (const auto & child : children) {
             for (const auto & plan : child.units) {
@@ -5230,7 +5334,26 @@ vbr_explicit_capture_result vbr_transfer_explicit_manifest(
                     return result;
                 }
                 vbr_capture_stream_stats stats;
-                if (!vbr_live_capture_adapter::stream(
+                if (reused) {
+                    const auto & saved = reused->units().at(unit_index);
+                    for (bool stash : { false, true }) {
+                        const auto & shards = stash ? saved.stash_shards : saved.payload_shards;
+                        for (size_t shard = 0; shard < shards.size(); ++shard) {
+                            vbr_verified_segment segment;
+                            segment.unit_index = unit_index;
+                            segment.shard_index = uint32_t(shard);
+                            segment.clean_stash = stash;
+                            segment.bytes = shards[shard];
+                            segment.streaming_digest = vbr_capture_stream_digest(*segment.bytes);
+                            const auto accepted = unit->accept_verified_segment(segment);
+                            if (accepted != vbr_capture_stream_status::ok) {
+                                result.inner_stream_status = accepted;
+                                result.status = stream_status(accepted);
+                                return result;
+                            }
+                        }
+                    }
+                } else if (!vbr_live_capture_adapter::stream(
                         child, plan, *unit, *request.ring, stats,
                         request.continue_context,
                         request.continue_transfer)) {
@@ -5264,6 +5387,9 @@ vbr_explicit_capture_result vbr_transfer_explicit_manifest(
                     }
                     result.payload_bytes += shard.payload_bytes;
                     result.stash_bytes += shard.stash_bytes;
+                    if (reused) {
+                        result.reused_attention_bytes += shard.payload_bytes + shard.stash_bytes;
+                    }
                 }
                 ++unit_index;
             }

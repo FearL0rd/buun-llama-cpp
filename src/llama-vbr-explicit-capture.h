@@ -409,6 +409,22 @@ bool vbr_explicit_capture_pretransfer_quote_admissible(
     const vbr_explicit_capture_pretransfer_quote & quote,
     uint64_t max_packed_bytes) noexcept;
 
+// Scoped reuse between exact captures of an unchanged live attention tree.
+// Only a successfully published operation can mint this capability. It owns
+// a catalog lease (not just byte pointers), so eviction cannot unaccount the
+// backing while another capture borrows it. The catalog and memory tree must
+// outlive the capability. Companions are never shared through this door.
+class vbr_explicit_attention_reuse {
+public:
+    void reset() noexcept { impl_.reset(); }
+
+private:
+    struct impl;
+    std::shared_ptr<const impl> impl_;
+    friend class vbr_explicit_capture_operation;
+    friend struct vbr_explicit_attention_reuse_access;
+};
+
 struct vbr_explicit_capture_request {
     using representation_identity_fn =
         vbr_explicit_representation_identity_fn;
@@ -427,6 +443,7 @@ struct vbr_explicit_capture_request {
     std::array<uint8_t, 32> identity_policy_order_digest = {};
     bool idle_decode_thread = false;
     vbr_pinned_chunk_ring * ring = nullptr;
+    vbr_explicit_attention_reuse attention_reuse;
     std::vector<vbr_artifact_portable_topology> topologies;
     std::vector<vbr_explicit_capture_pool_binding> pool_bindings;
     std::vector<vbr_explicit_companion_provider> companions;
@@ -488,6 +505,8 @@ struct vbr_explicit_capture_result {
     uint64_t stash_bytes = 0;
     uint64_t companion_bytes = 0;
     uint64_t chunks = 0;
+    // Published bytes borrowed from a previous capture, not transferred again.
+    uint64_t reused_attention_bytes = 0;
     uint64_t backpressure_waits = 0;
     uint64_t event_completions = 0;
     uint64_t synchronous_fallbacks = 0;
@@ -514,6 +533,9 @@ public:
 
     bool ready_for_transfer() const noexcept;
     bool ready_for_publication() const noexcept;
+    bool retain_attention(
+        const vbr_artifact_package_view & package,
+        vbr_explicit_attention_reuse & output) const noexcept;
     void reset() noexcept;
 
 private:

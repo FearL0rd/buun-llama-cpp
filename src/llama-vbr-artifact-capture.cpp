@@ -686,6 +686,7 @@ struct artifact_segment_chain::impl {
     uint64_t stream_digest_expected = 0;
     llama_sha256_writer stream_digest_hash;
     std::array<uint8_t, 32> stream_digest = {};
+    uint64_t ring_digest_revision = 0;
 
     template<typename Consumer>
     bool for_each_span(
@@ -764,6 +765,9 @@ artifact_segment_chain & artifact_segment_chain::operator=(
 }
 
 void artifact_segment_chain::invalidate_revision() noexcept {
+    if (impl_) {
+        impl_->ring_digest_revision = 0;
+    }
     // Saturate at the permanently invalid value instead of allowing ABA on wrap.
     if (revision_ != 0) {
         revision_ = revision_ == UINT64_MAX ? 0 : revision_ + 1;
@@ -925,6 +929,10 @@ std::array<uint8_t, 32> vbr_capture_stream_digest(
                chain.impl_->total == chain.impl_->stream_digest_expected
             ? chain.impl_->stream_digest
             : std::array<uint8_t, 32> {};
+    }
+    if (chain.content_revision() != 0 &&
+        chain.impl_->ring_digest_revision == chain.content_revision()) {
+        return chain.impl_->stream_digest;
     }
     llama_sha256_writer hash;
     capture_stream_digest_begin(hash, chain.size());
@@ -1952,6 +1960,7 @@ vbr_capture_stream_status vbr_pinned_chunk_ring::stream_ranges_impl(
     } else if (!source.read) {
         return vbr_capture_stream_status::invalid_argument;
     }
+    const uint64_t destination_revision = destination.content_revision();
     const bool legacy_digest = !destination.authenticated();
     llama_sha256_writer hash;
     static constexpr char domain_label[] =
@@ -2076,12 +2085,20 @@ vbr_capture_stream_status vbr_pinned_chunk_ring::stream_ranges_impl(
     if (pumped != vbr_capture_stream_status::ok) {
         return pumped;
     }
-    if (stats.bytes != transfer_bytes) {
+    if (stats.bytes != transfer_bytes || destination.size() != transfer_bytes) {
         return vbr_capture_stream_status::short_read;
     }
     stats.max_segment_size = destination.max_segment_size();
     if (legacy_digest) {
         stats.streaming_digest = hash.finish();
+        // The ring just hashed exactly the bytes appended to this owned chain.
+        // Keep that evidence for sink admission, publication and staging;
+        // append/replacement invalidates it through the backing revision.
+        if (destination_revision != 0 && stats.chunks < UINT64_MAX - destination_revision &&
+            destination.content_revision() == destination_revision + stats.chunks) {
+            destination.impl_->stream_digest = stats.streaming_digest;
+            destination.impl_->ring_digest_revision = destination.content_revision();
+        }
     }
     return vbr_capture_stream_status::ok;
 }
