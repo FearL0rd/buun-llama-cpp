@@ -1746,6 +1746,7 @@ struct server_slot {
                 return prompt_save_result::failed;
             }
             auto & entry = staged.front();
+            entry.fixed_pos_min = llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), id);
             // An idle save has no active task and therefore keeps the
             // historical automatic-main default. Checkpoint pricing below is
             // intentionally the opposite polarity: no request means no
@@ -1788,7 +1789,9 @@ struct server_slot {
         }
     }
 
-    bool prompt_load(server_prompt_cache & prompt_cache, const server_tokens & tokens, const std::string & adapter_config_key, common_cache_plan_record * obs = nullptr) {
+    bool prompt_load(server_prompt_cache & prompt_cache, const server_tokens & tokens, const std::string & adapter_config_key,
+                     common_cache_plan_record * obs = nullptr,
+                     const server_prompt_cache_reuse_context * reuse = nullptr) {
         // No-restore is a successful identity operation. Seed the out-value
         // with the live lineage; a committed host restore overwrites it with
         // delivery.cache_family inside load_impl.
@@ -1797,7 +1800,7 @@ struct server_slot {
             server_prompt_cache_restore_shape::none;
         bool res = prompt_cache.load(prompt, tokens, ctx_tgt, ctx_dft, id,
                                      adapter_config_key, restore_shape, obs,
-                                     &restored_family);
+                                     &restored_family, reuse);
         if (!res) {
             SLT_WRN(*this, "%s", "failed to load prompt from cache\n");
         } else {
@@ -3584,8 +3587,9 @@ private:
     // Prompt-boundary sealing lets first-token sampling and unrelated slots
     // proceed, but the source slot's next KV-mutating decode waits for the
     // exact iSWA rows to seal. Bound that inter-token hold even before the
-    // estimator has a model-specific sample.
-    static constexpr uint64_t VBR_PROMPT_BOUNDARY_CAPTURE_DEADLINE_US =
+    // estimator has a model-specific sample. Displacement capture uses the
+    // same cooperative transfer deadline before committing the host image.
+    static constexpr uint64_t VBR_BLOCKING_CAPTURE_DEADLINE_US =
         5000000;
     struct vbr_idle_capture_candidate {
         int32_t slot_id = -1;
@@ -3597,7 +3601,7 @@ private:
         bool refresh = false;
         bool stem_requested = false;
         bool stemmed = false;
-        bool prepressure = false;
+        bool preserve_live_source = false;
         bool active_prompt_frontier = false;
         uint64_t selected_tokens = 0;
         server_prompt_cache_vbr_publication_metadata publication;
@@ -4710,22 +4714,8 @@ private:
             const server_slot & slot,
             const common_prompt_checkpoint & checkpoint,
             const std::string & adapter_identity) const {
-        const auto & frontier = checkpoint.computation_frontier;
-        if (!frontier.valid() ||
-            frontier.sequence_epoch != slot.prompt.sequence_epoch ||
-            frontier.execution_identity != frontier_execution_identity ||
-            frontier.adapter_config_identity != adapter_identity ||
-            frontier.token_count != checkpoint.n_tokens ||
-            checkpoint.pos_max < 0 ||
-            frontier.next_position <= 0 ||
-            frontier.next_position - 1 != checkpoint.pos_max) {
-            return false;
-        }
-
-        std::string media_identity;
-        return slot.prompt.tokens.media_content_identity(
-                   frontier.token_count, media_identity) &&
-               media_identity == frontier.media_content_identity;
+        return server_prompt_checkpoint_frontier_is_current(
+            slot.prompt, checkpoint, frontier_execution_identity, adapter_identity);
     }
 
     bool active_prefix_enabled() const {
@@ -9402,6 +9392,34 @@ private:
 
             recurrent_shrink_for_prefill("before prompt cache save/load");
 
+            std::optional<server_prompt_cache_reuse_context> reuse;
+            if (!selection_deferred_busy && fixed_host_cache_enabled() &&
+                task.type == SERVER_TASK_TYPE_COMPLETION && task.params.cache_prompt &&
+                (llama_model_is_recurrent(model_tgt) || llama_model_is_hybrid(model_tgt))) {
+                if (!incoming_adapter_ready) {
+                    cache_plan_derive_incoming_adapter(task, *ret, stage1_inventory);
+                }
+                // aLoRA and shifted/chunk reuse have additional replay constraints;
+                // keep their existing selection until those can be quoted here too.
+                if (incoming_adapter_matches && !lora_all_alora(ret->lora) &&
+                    task.params.n_cache_reuse == 0) {
+                    reuse.emplace();
+                    reuse->live_pos_min = llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), ret->id);
+                    reuse->n_swa = n_swa;
+                    reuse->frontier_required = ret->frontier_ratchet_flipped;
+                    if (reuse->frontier_required) {
+                        reuse->execution_identity = frontier_execution_identity;
+                    }
+                    const size_t lcp = ret->prompt.tokens.get_common_prefix(task.tokens);
+                    if (server_prompt_cache_reusable_prefix(ret->prompt, task.tokens,
+                            lcp, reuse->live_pos_min, *reuse, incoming_adapter) < lcp) {
+                        // A large token overlap may still need a cold replay. Allow
+                        // host lookup even when the legacy 50%-loss gate stays shut.
+                        update_cache = true;
+                    }
+                }
+            }
+
             // note: prompt_save() itself is a no-op when the slot's context is empty
 
             // A deferred busy slot retains the directive of its in-flight
@@ -9423,6 +9441,19 @@ private:
                 // complete reuse plan runs; it does not gain destruction
                 // authority to skip this save.
                 if (legacy_update_cache || retention_capacity_transition.preserve_source) {
+                    server_cache_recovery_pin incoming_pin;
+                    if (reuse) {
+                        const auto source = prompt_cache->select(
+                            ret->prompt, task.tokens, incoming_adapter, &*reuse);
+                        llama_cache_acct_artifact_id artifact;
+                        std::vector<llama_cache_acct_op_id> ops;
+                        // Save-time token-prefix dedup is not a recurrent
+                        // rewind proof. If durability can be proved, pin the
+                        // incoming image through this save. Otherwise preserve
+                        // the save and let the subsequent lookup reselect safely.
+                        (void) prompt_cache->acquire_durable_recovery(
+                            source, artifact, ops, incoming_pin);
+                    }
                     ret->prompt_save(*prompt_cache);
                 }
 
@@ -9447,7 +9478,7 @@ private:
                 if (incoming_adapter_matches) {
                     // Per-entry host rows ride the shipped lookup without a separate scan.
                     if (!ret->prompt_load(*prompt_cache, task.tokens, incoming_adapter,
-                                          request_cache_plan)) {
+                                          request_cache_plan, reuse ? &*reuse : nullptr)) {
                         cache_plan_host_restore_failed(
                             *ret, request_cache_plan);
                     }
@@ -10463,6 +10494,7 @@ private:
             ? params_base.lora_adapters
             : construct_lora_list(task.params.lora);
 
+        preserve_vbr_before_displacement(slot, task);
 
         if (!are_lora_equal(task_loras, slot.lora)) {
             // called only after establishing inequality, as lora_should_clear_cache requires
@@ -11775,9 +11807,12 @@ private:
 
     static bool vbr_idle_retry_exact(
             vbr_explicit_capture_phase phase,
-            vbr_capture_stream_status stream_status) noexcept {
-        return phase == vbr_explicit_capture_phase::unit_transfer &&
-            stream_status == vbr_capture_stream_status::projection_invalid;
+            vbr_capture_stream_status stream_status,
+            vbr_explicit_capture_status status) noexcept {
+        return (phase == vbr_explicit_capture_phase::unit_transfer &&
+                stream_status == vbr_capture_stream_status::projection_invalid) ||
+            (phase == vbr_explicit_capture_phase::metadata_and_manifest &&
+             status == vbr_explicit_capture_status::projected_stash_requires_exact);
     }
 
     static bool vbr_idle_release_isolated_retry(
@@ -12358,7 +12393,8 @@ private:
 
     size_t finish_idle_exact_vbr_capture(
             bool allow_publish,
-            bool task_arrival = false) noexcept {
+            bool task_arrival = false,
+            vbr_explicit_attention_reuse * attention_reuse = nullptr) noexcept {
         auto * pending = vbr_idle_exact_capture.get();
         if (!pending || (allow_publish && !task_arrival &&
                 !pending->complete.load(std::memory_order_acquire))) {
@@ -12412,12 +12448,14 @@ private:
             pending->transfer.status ==
                 server_vbr_artifact_capture_status::ok &&
             pending->transfer_started_us > 0 &&
-            pending->transfer.pretransfer.planned_packed_bytes != 0) {
+            pending->transfer.pretransfer.planned_packed_bytes >
+                pending->transfer.reused_attention_bytes) {
             const int64_t elapsed =
                 ggml_time_us()-pending->transfer_started_us;
             if (elapsed > 0) {
                 vbr_capture_readiness_estimator->observe_transfer(
-                    pending->transfer.pretransfer.planned_packed_bytes,
+                    pending->transfer.pretransfer.planned_packed_bytes -
+                        pending->transfer.reused_attention_bytes,
                     uint64_t(elapsed));
             }
         }
@@ -12467,7 +12505,7 @@ private:
 
         std::shared_ptr<const server_prompt_cache_vbr_payload> payload;
         const auto captured = vbr_artifact_store->publish_host_payload(
-            pending->capture, payload);
+            pending->capture, payload, attention_reuse);
         if (captured.status != server_vbr_artifact_capture_status::ok ||
             !payload ||
             (!task_arrival && !pending->session.continue_capture())) {
@@ -12614,7 +12652,7 @@ private:
         const bool coordinated = n_swa > 0 ||
             llama_model_is_recurrent(model_tgt) ||
             llama_model_is_hybrid(model_tgt);
-        if (coordinated && !pending->candidate.prepressure &&
+        if (coordinated && !pending->candidate.preserve_live_source &&
             !pending->candidate.stemmed) {
             std::vector<server_slot *> reclaim;
             bool all_durable = true;
@@ -12707,7 +12745,8 @@ private:
                 " attempt=%02x%02x%02x%02x%02x%02x%02x%02x "
                 "reference=%s planned=%" PRIu64 " payload=%" PRIu64
                 " stash=%" PRIu64 " companion=%" PRIu64
-                " chunks=%" PRIu64 " displaced=%zu duration_ms=%.3f\n",
+                " chunks=%" PRIu64 " reused_attention=%" PRIu64
+                " displaced=%zu duration_ms=%.3f\n",
                 pending->candidate.slot_id,
                 pending->candidate.manifest_id,
                 unsigned(identity[0]), unsigned(identity[1]),
@@ -12717,7 +12756,8 @@ private:
                 captured.reference.c_str(),
                 captured.pretransfer.planned_packed_bytes,
                 captured.payload_bytes, captured.stash_bytes,
-                captured.companion_bytes, captured.chunks, displaced,
+                captured.companion_bytes, captured.chunks,
+                captured.reused_attention_bytes, displaced,
                 (ggml_time_us() - pending->started_us)/1000.0);
         }
         SRV_INF(
@@ -12728,9 +12768,76 @@ private:
         return reset_pending(1);
     }
 
+    // Idle capture remains preemptible. Preserve one idle source before launch
+    // can replace it or expand its shared physical layout. Stateful sources
+    // may need both a reusable checkpoint stem and a complete rollback image;
+    // at most two waves use the existing publication and safe-clear machinery.
+    void preserve_vbr_before_displacement(server_slot & slot, const server_task & task) noexcept {
+        if (!params_base.vbr_prompt_cache || !prompt_cache || !vbr_artifact_store ||
+            vbr_idle_exact_capture || task.type != SERVER_TASK_TYPE_COMPLETION ||
+            task.is_child() || task.is_parent() || !task.params.cache_prompt) {
+            return;
+        }
+        const auto eligible = [&](const server_slot & source) {
+            if (source.state != SLOT_STATE_IDLE || source.is_processing() ||
+                source.hard_lease_blocks_live_prefix() || queue_tasks.has_deferred_for_slot(source.id) ||
+                source.prompt.tokens.size() < SERVER_PROMPT_CACHE_MIN_RETENTION_REUSE_TOKENS) {
+                return false;
+            }
+            const size_t common = source.prompt.tokens.get_common_prefix(task.tokens);
+            return common < source.prompt.tokens.size() - common;
+        };
+        server_slot * source = nullptr;
+        if (!slot.prompt.tokens.empty()) {
+            if (eligible(slot)) {
+                source = &slot;
+            }
+        } else {
+            for (auto & idle : slots) {
+                if (eligible(idle) && (!source || idle.t_last_used < source->t_last_used)) {
+                    source = &idle;
+                }
+            }
+        }
+        if (!source) {
+            return;
+        }
+        llama_synchronize(ctx_tgt);
+        if (ctx_dft) {
+            llama_synchronize(ctx_dft.get());
+        }
+        const int64_t started = ggml_time_us();
+        size_t published = 0;
+        vbr_explicit_attention_reuse attention_reuse;
+        for (unsigned wave = 0; wave < 2 && eligible(*source); ++wave) {
+            auto session = queue_tasks.try_begin_displacement_capture();
+            if (!session) {
+                break;
+            }
+            (void) publish_idle_vbr_batch(session, false, source->id, attention_reuse);
+            if (!vbr_idle_exact_capture) {
+                break;
+            }
+            // No decode or queue yielding while the worker reads live KV.
+            if (vbr_idle_exact_capture->worker.joinable()) {
+                vbr_idle_exact_capture->worker.join();
+            }
+            const size_t completed = finish_idle_exact_vbr_capture(
+                true, false, wave == 0 ? &attention_reuse : nullptr);
+            published += completed;
+            if (completed == 0) {
+                break;
+            }
+        }
+        SLT_DBG(*source, "VBR pre-displacement capture published=%zu duration_ms=%.3f\n",
+                published, (ggml_time_us() - started)/1000.0);
+    }
+
     size_t publish_idle_vbr_batch(
             server_queue::idle_capture_session & capture_session,
-            bool readiness_only = false) noexcept {
+            bool readiness_only = false,
+            int32_t preserve_slot = -1,
+            const vbr_explicit_attention_reuse & attention_reuse = {}) noexcept {
         if (!params_base.vbr_prompt_cache || !prompt_cache ||
             !vbr_artifact_store ||
             !capture_session.continue_capture()) {
@@ -12802,6 +12909,9 @@ private:
                 ? &slots[size_t(id)] : nullptr;
         };
         const auto base_eligible = [&](const server_slot & idle) {
+            if (preserve_slot >= 0 && idle.id != preserve_slot) {
+                return false;
+            }
             const bool prompt_boundary =
                 vbr_prompt_boundary_capture_slot >= 0 &&
                 idle.id == vbr_prompt_boundary_capture_slot;
@@ -13307,15 +13417,17 @@ private:
                 continue;
             }
 
-            if ((stem_retry || checkpoint_stem) &&
+            if (preserve_slot < 0 && (stem_retry || checkpoint_stem) &&
                 ggml_time_ms() < idle.vbr_idle_capture_retry_after_ms) {
                 continue;
             }
 
-            // A stem retry owns a singleton projection because it changes the
-            // frontier of the complete physical union. Earlier exact rows
-            // finish first; a later quiet tick then isolates this source.
-            if ((stem_retry || checkpoint_stem) && !manifests.empty()) {
+            // Stem and exact-layout retries own a singleton capture. A stem
+            // changes the projected union's frontier; exact capture preserves
+            // physical ownership that cannot be split across that union.
+            const bool exact_retry =
+                idle.vbr_idle_exact_retry_identity == attempt_identity;
+            if ((stem_retry || checkpoint_stem || exact_retry) && !manifests.empty()) {
                 continue;
             }
 
@@ -13323,7 +13435,7 @@ private:
                 vbr_idle_capture_attempt_suppressed(
                     idle.vbr_idle_capture_attempt_identity,
                     attempt_identity, idle.vbr_idle_capture_terminal,
-                    idle.vbr_idle_capture_retry_after_ms, ggml_time_ms())) {
+                    preserve_slot >= 0 ? 0 : idle.vbr_idle_capture_retry_after_ms, ggml_time_ms())) {
                 continue;
             }
             server_prompt_cache_vbr_publication_metadata publication;
@@ -13417,7 +13529,7 @@ private:
                 // dependency. It cannot be partitioned across the projected
                 // <=8-manifest union, so capture one ranked source per idle
                 // wave through the exact host handoff below.
-                if (stem_retry || checkpoint_stem ||
+                if (stem_retry || checkpoint_stem || exact_retry ||
                     requires_coordinated_tree_clear || ctx_dft ||
                     idle.can_speculate()) {
                     break;
@@ -13481,7 +13593,7 @@ private:
             }
         };
         if (manifests.empty()) {
-            if (readiness_only) {
+            if (readiness_only || preserve_slot >= 0) {
                 return 0;
             }
             displace_existing_sources();
@@ -13512,16 +13624,18 @@ private:
             candidates.front().slot->vbr_idle_exact_retry_identity ==
                 candidates.front().attempt_identity;
         const bool projected_stateful_capture =
-            !readiness_only && stateful_companion_capture &&
+            preserve_slot < 0 && !readiness_only && stateful_companion_capture &&
             projected_attention_layout_supported && !exact_layout_retry &&
             candidates.size() == 1 && manifests.size() == 1;
-        const bool exact_companion_capture = readiness_only || exact_layout_retry ||
+        const bool exact_companion_capture = preserve_slot >= 0 || readiness_only || exact_layout_retry ||
             (stateful_companion_capture && !projected_stateful_capture);
         // Bound every capture by configured durable host capacity (and the
         // library's 16 GiB per-wave ceiling), not by a small transport-window
         // constant that would silently truncate long reusable prefixes. The
         // transfer probes the queue-owned cancellation token between bounded
         // chunks, so newly posted work interrupts a large idle wave promptly.
+        // Pre-displacement capture instead holds the scheduler until this one
+        // source seals or its cooperative transfer deadline expires.
         const uint64_t runway = vbr_automatic_exact_capture_max_bytes();
         if (runway == 0 || !capture_session.continue_capture()) {
             return 0;
@@ -13602,13 +13716,14 @@ private:
             // slot alone waits before its next KV mutation, so use the explicit
             // inter-token deadline below instead of charging the ordinary
             // decode-growth runway twice.
-            exact_admission.prepressure = readiness_only &&
+            exact_admission.prepressure = preserve_slot < 0 && readiness_only &&
                 vbr_prompt_boundary_capture_slot < 0;
             if (vbr_capture_readiness_generation == 0) {
                 exact_admission.generation =
                     ++vbr_capture_readiness_generation;
             }
             exact_request.max_packed_bytes = runway;
+            exact_request.attention_reuse = attention_reuse;
             exact_request.pretransfer_context = &exact_admission;
             exact_request.pretransfer_admit = [](
                     void * opaque,
@@ -13634,9 +13749,13 @@ private:
                         server_vbr_capture_readiness_status::ready) {
                     return false;
                 }
+                // Foreground displacement uses the actual chunk deadline,
+                // not this cold-start bandwidth estimate: with no successful
+                // idle transfers yet, the estimate can otherwise prevent the
+                // first durable publication indefinitely.
                 if (context->prompt_boundary &&
                     context->readiness->forecast_capture_us >
-                        VBR_PROMPT_BOUNDARY_CAPTURE_DEADLINE_US) {
+                        VBR_BLOCKING_CAPTURE_DEADLINE_US) {
                     context->readiness_status =
                         server_vbr_capture_readiness_status::deadline_missed;
                     context->readiness->reset();
@@ -13749,7 +13868,7 @@ private:
             background->candidate.stem_requested =
                 candidate.stem_requested;
             background->candidate.stemmed = candidate.stemmed;
-            background->candidate.prepressure = readiness_only;
+            background->candidate.preserve_live_source = readiness_only;
             background->candidate.active_prompt_frontier =
                 vbr_prompt_boundary_capture_slot == candidate.slot->id;
             background->candidate.selected_tokens =
@@ -13760,10 +13879,10 @@ private:
             auto * worker = vbr_idle_exact_capture.get();
             try {
                 worker->transfer_started_us = ggml_time_us();
-                if (worker->candidate.active_prompt_frontier) {
+                if (worker->candidate.active_prompt_frontier || preserve_slot >= 0) {
                     worker->transfer_deadline_us =
                         worker->transfer_started_us+
-                        int64_t(VBR_PROMPT_BOUNDARY_CAPTURE_DEADLINE_US);
+                        int64_t(VBR_BLOCKING_CAPTURE_DEADLINE_US);
                 }
                 worker->worker = std::thread([this, worker]() noexcept {
                     worker->transfer =
@@ -14149,8 +14268,10 @@ private:
                     witnessable_admission_refusal &&
                     vbr_record_idle_admission_refusal(
                         *candidate.slot, candidate.attempt_identity);
-                if (vbr_idle_retry_exact(
-                        diagnostics.capture_phase, diagnostics.inner_stream_status)) {
+                const bool retry_exact = vbr_idle_retry_exact(
+                    diagnostics.capture_phase, diagnostics.inner_stream_status,
+                    diagnostics.capture_status);
+                if (retry_exact) {
                     candidate.slot->vbr_idle_exact_retry_identity = candidate.attempt_identity;
                 }
                 const bool begin_stem_retry = !candidate.refresh &&
@@ -14177,7 +14298,7 @@ private:
                     terminal ||
                     (candidate.stem_requested &&
                      stem_permanently_unavailable);
-                const bool retry_immediately = vbr_idle_retry_immediately(
+                const bool retry_immediately = retry_exact || vbr_idle_retry_immediately(
                     terminal, aggregate_over_cap,
                     admission_state.capacity_status,
                     candidates.size(),
@@ -16690,7 +16811,7 @@ private:
                             const bool has_new_tokens = (n_past < slot.task->n_tokens());
 
                             // the largest pos_min required for a checkpoint to be useful
-                            const auto pos_min_thold = std::max(0, pos_next - n_swa - (has_new_tokens ? 0 : 1));
+                            const auto pos_min_thold = server_prompt_checkpoint_reuse_threshold(pos_next, n_swa, has_new_tokens);
 
                             if (n_past > 0 && n_past <= slot.prompt.n_tokens()) {
                                 const auto pos_min = llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), slot.id);
@@ -17129,8 +17250,9 @@ private:
                                                 slot.cache_plan->restore_attempt_failed = true;
                                             }
                                         } else if (!do_reset) {
-                                            pos_next = std::min(pos_next, std::max(it->pos_min + 1, it->pos_max));
-                                            n_past = std::min(slot.prompt.tokens.size_up_to_pos(pos_next), (size_t) it->n_tokens);
+                                            const auto restored = server_prompt_checkpoint_reuse_geometry(slot.prompt.tokens, *it, pos_next);
+                                            pos_next = restored.pos_next;
+                                            n_past = restored.n_tokens;
                                             if (slot.retention_reuse_pending &&
                                                 slot.retention_reuse_tokens != 0) {
                                                 // Credit only the stateful
@@ -18383,8 +18505,9 @@ private:
                                     break;
                                 }
                             }
-                            // Make room for the new checkpoint in legacy order
-                            // among members not protected by the retention floor.
+                            // Make room within the existing count limit. The
+                            // retention floor thins interior coverage first;
+                            // mandatory/leased/pinned members remain protected.
                             const auto & cur = *victim;
 
                             SLT_WRN(slot,
@@ -20771,16 +20894,37 @@ server_vbr_reclaim_policy_for_test() {
         result.fragmented_projection_retries_exact =
             server_context_impl::vbr_idle_retry_exact(
                 vbr_explicit_capture_phase::unit_transfer,
-                vbr_capture_stream_status::projection_invalid) &&
+                vbr_capture_stream_status::projection_invalid,
+                vbr_explicit_capture_status::transfer_failed) &&
             !server_context_impl::vbr_idle_retry_exact(
                 vbr_explicit_capture_phase::unit_transfer,
-                vbr_capture_stream_status::cancelled) &&
+                vbr_capture_stream_status::cancelled,
+                vbr_explicit_capture_status::cancelled) &&
             !server_context_impl::vbr_idle_retry_exact(
                 vbr_explicit_capture_phase::unit_transfer,
-                vbr_capture_stream_status::transfer_failed) &&
+                vbr_capture_stream_status::transfer_failed,
+                vbr_explicit_capture_status::transfer_failed) &&
             !server_context_impl::vbr_idle_retry_exact(
                 vbr_explicit_capture_phase::companion_capture,
-                vbr_capture_stream_status::projection_invalid);
+                vbr_capture_stream_status::projection_invalid,
+                vbr_explicit_capture_status::transfer_failed);
+        result.stash_projection_retries_exact =
+            server_context_impl::vbr_idle_retry_exact(
+                vbr_explicit_capture_phase::metadata_and_manifest,
+                vbr_capture_stream_status::_count,
+                vbr_explicit_capture_status::projected_stash_requires_exact) &&
+            !server_context_impl::vbr_idle_retry_exact(
+                vbr_explicit_capture_phase::metadata_and_manifest,
+                vbr_capture_stream_status::_count,
+                vbr_explicit_capture_status::unsupported_layout) &&
+            !server_context_impl::vbr_idle_retry_exact(
+                vbr_explicit_capture_phase::metadata_and_manifest,
+                vbr_capture_stream_status::_count,
+                vbr_explicit_capture_status::stash_inconsistent) &&
+            !server_context_impl::vbr_idle_retry_exact(
+                vbr_explicit_capture_phase::companion_capture,
+                vbr_capture_stream_status::_count,
+                vbr_explicit_capture_status::projected_stash_requires_exact);
         result.isolated_capture_drains_without_backoff =
             server_context_impl::vbr_idle_release_isolated_retry(
                 1, 1, true, false, true, false) &&

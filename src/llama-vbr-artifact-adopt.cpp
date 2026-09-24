@@ -500,7 +500,7 @@ class vbr_kv_import_session {
                     const auto & unit = units[shard.shard_index];
                     if (unit.first != pool || !unit.second ||
                         unit.second->t == nullptr || pool->vmm == nullptr ||
-                        pool->be == nullptr || pool->backend == nullptr ||
+                        pool->be == nullptr ||
                         uint64_t(ggml_row_size(
                             source_type,
                             unit.second->t->ne[0])) != shard.row_bytes ||
@@ -509,6 +509,19 @@ class vbr_kv_import_session {
                             unit.second->t->ne[0])) !=
                             shard.target_row_bytes) {
                         return false;
+                    }
+                    // Exact import may be the first side-stream consumer of
+                    // a fresh cache: neither capture nor retiering has run.
+                    // Keep this backend pool-owned, just as those paths do;
+                    // creating it changes no KV bytes or representation state.
+                    if (pool->backend == nullptr) {
+                        if (pool->device < 0 || pool->be->backend_init == nullptr) {
+                            return false;
+                        }
+                        pool->backend = pool->be->backend_init(pool->device);
+                        if (pool->backend == nullptr) {
+                            return false;
+                        }
                     }
                     if (plan->transform_kind !=
                             vbr_import_transform_kind::none &&
@@ -2037,6 +2050,7 @@ vbr_adopt_result vbr_adopt_empty_manifest(
         if (fault_after(server_hooks, out.phase)) {
             return fail(vbr_adopt_status::internal_error);
         }
+        out.phase = vbr_adopt_phase::operation_open;
         if (accounting.snapshot().serial !=
                 staged->accounting_serial_after_prepare() ||
             staged->accounting_serial_after_prepare() == 0 ||
@@ -2049,7 +2063,6 @@ vbr_adopt_result vbr_adopt_empty_manifest(
         if (!collect_adopt_tree(target, server_hooks, tree)) {
             return fail(vbr_adopt_status::target_drift);
         }
-        out.phase = vbr_adopt_phase::operation_open;
         const auto open_status = operation.open(*manifest, destination, tree);
         if (open_status != import_operation_scope::open_status::ok) {
             return fail(open_status ==

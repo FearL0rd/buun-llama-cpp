@@ -665,10 +665,11 @@ private:
     bool vbr_import_destination_input(
         uint32_t projected_wm_cells,
         vbr_import_destination_child & output) const noexcept;
-    // source_watermark=0 selects normal incoming occupancy; otherwise price
-    // the actual import placement without changing the desired quality policy.
+    // source_high_water=0 selects normal incoming occupancy; otherwise price
+    // the installed rows plus suffix, retaining source_backing independently.
     uint32_t vbr_import_watermark_cells(uint32_t incoming_cells, uint32_t prefix_cells,
-                                        uint32_t source_watermark, llama_seq_id destination) const;
+                                        uint32_t source_high_water, llama_seq_id destination,
+                                        uint32_t source_backing = 0) const;
     struct vbr_import_destination_pricing {
         struct pool_row {
             const ggml_vbr_backend_iface * be = nullptr;

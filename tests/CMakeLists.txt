@@ -154,6 +154,19 @@ target_include_directories(test-server-recurrent-expansion PRIVATE ${PROJECT_SOU
 llama_build_and_test(test-kv-cells.cpp)
 target_include_directories(test-kv-cells PRIVATE ${PROJECT_SOURCE_DIR}/src)
 
+llama_build_and_test(test-sha256.cpp ${PROJECT_SOURCE_DIR}/vendor/hash/sha256/sha256.c)
+target_include_directories(test-sha256 PRIVATE ${PROJECT_SOURCE_DIR}/src ${PROJECT_SOURCE_DIR}/vendor/hash)
+
+# Compile the same implementation without ISA dispatch for fallback coverage on
+# SHA-capable CI hosts. This override is test-only, not a production build option.
+add_executable(test-sha256-portable test-sha256.cpp
+    ${PROJECT_SOURCE_DIR}/src/llama-sha256.cpp
+    ${PROJECT_SOURCE_DIR}/vendor/hash/sha256/sha256.c)
+target_include_directories(test-sha256-portable PRIVATE ${PROJECT_SOURCE_DIR}/src ${PROJECT_SOURCE_DIR}/vendor/hash)
+target_compile_features(test-sha256-portable PRIVATE cxx_std_17)
+target_compile_definitions(test-sha256-portable PRIVATE LLAMA_SHA256_FORCE_PORTABLE=1)
+llama_test(test-sha256-portable)
+
 llama_build(test-safetensors-registry.cpp)
 target_include_directories(test-safetensors-registry PRIVATE ${PROJECT_SOURCE_DIR}/src)
 llama_test(test-safetensors-registry)

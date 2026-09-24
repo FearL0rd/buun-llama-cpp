@@ -833,7 +833,7 @@ bool vbr_quote_import_schedule(
         vbr_import_schedule_quote & output) noexcept {
     output = {};
     try {
-        if (!package || package.validate() != vbr_artifact_status::ok ||
+        if (!package || package.validate_authenticated() != vbr_artifact_status::ok ||
             !package.manifest().manifest_digest.valid() ||
             target.memory_instance_cookie == 0 ||
             target.target_state_serial == 0 ||

@@ -990,7 +990,7 @@ vbr_adopt_stage_result vbr_stage_validated_manifest(
                 return out;
             }
         } else if (!occupied_replacement &&
-                   out.manifest->source_package().validate() !=
+                   out.manifest->source_package().validate_authenticated() !=
                        vbr_artifact_status::ok) {
             out.status = vbr_adopt_stage_status::source_hash_mismatch;
             return out;

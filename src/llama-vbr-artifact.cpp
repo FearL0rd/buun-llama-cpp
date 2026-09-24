@@ -6,10 +6,12 @@
 
 #include <algorithm>
 #include <cstring>
+#include <future>
 #include <limits>
 #include <map>
 #include <new>
 #include <set>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -844,6 +846,31 @@ bool prepare_unit_id(vbr_artifact_unit_blob & blob, uint32_t format_version) {
     }
     blob.unit_version_id = typed_digest<vbr_unit_version_id>(hash);
     return blob.unit_version_id.valid();
+}
+
+// Compare the canonical schema, excluding only byte-derived evidence. Use
+// the latest wire schema so new representation fields automatically participate,
+// including fields that an older package version is not allowed to carry.
+std::array<uint8_t, 32> unit_schema_digest(
+        vbr_artifact_unit_descriptor descriptor) {
+    for (auto & shard : descriptor.shards) {
+        shard.section_checksum = {};
+    }
+    descriptor.clean_stash.payload_id = {};
+    for (auto & shard : descriptor.clean_stash.shards) {
+        shard.section_checksum = {};
+    }
+    llama_sha256_writer hash;
+    emitter out;
+    out.hash_a = &hash;
+    if (!emit_lineage(out, descriptor.lineage_uuid) ||
+        !out.u32(descriptor.logical_unit_id) || !out.u64(descriptor.repr_gen) ||
+        !emit_unit_descriptor_body(out, descriptor, VBR_UNIT_ARTIFACT_FORMAT_VERSION) ||
+        !out.u32(uint32_t(descriptor.clean_stash_state)) ||
+        !emit_clean_stash_descriptor(out, descriptor.clean_stash)) {
+        return {};
+    }
+    return hash.finish();
 }
 
 bool emit_identity(emitter & out, const vbr_artifact_identity_block & identity) {
@@ -3226,7 +3253,8 @@ std::array<uint8_t, 32> vbr_artifact_logical_unit_digest(
 }
 
 vbr_artifact_status vbr_artifact_prepare(
-        vbr_artifact_package & package) noexcept {
+        vbr_artifact_package & package, uint32_t max_workers,
+        const vbr_artifact_preparation_reuse * reuse) noexcept {
     try {
         if (!artifact_version_supported(package.version) ||
             package.flags != ARTIFACT_FLAGS_V1 ||
@@ -3246,8 +3274,30 @@ vbr_artifact_status vbr_artifact_prepare(
                 return vbr_artifact_status::topology_mismatch;
             }
         }
-        for (uint32_t i = 0; i < package.unit_blobs.size(); ++i) {
+        const auto prepare_unit = [&](uint32_t i) {
             auto & blob = package.unit_blobs[i];
+            if (reuse && reuse->version == package.version && i < reuse->units.size() &&
+                reuse->units[i].unit_version_id.valid()) {
+                const auto schema = unit_schema_digest(blob.descriptor);
+                const auto & saved = reuse->units[i];
+                if (digest_nonzero(schema) &&
+                    schema == unit_schema_digest(saved.descriptor)) {
+                    auto prepared = saved;
+                    for (size_t s = 0; s < prepared.descriptor.shards.size(); ++s) {
+                        prepared.descriptor.shards[s].payload = blob.descriptor.shards[s].payload;
+                    }
+                    for (size_t s = 0; s < prepared.descriptor.clean_stash.shards.size(); ++s) {
+                        prepared.descriptor.clean_stash.shards[s].payload =
+                            blob.descriptor.clean_stash.shards[s].payload;
+                    }
+                    if (!descriptor_metadata_valid(
+                            prepared.descriptor, package.topologies, package.version, true)) {
+                        return vbr_artifact_status::content_id_mismatch;
+                    }
+                    blob = std::move(prepared);
+                    return vbr_artifact_status::ok;
+                }
+            }
             if (blob.descriptor.shards.empty() ||
                 !canonicalize_shards(blob.descriptor.shards) ||
                 !prepare_shard_checksums(i, blob.descriptor.shards)) {
@@ -3271,11 +3321,49 @@ vbr_artifact_status vbr_artifact_prepare(
                 !prepare_unit_id(blob, package.version)) {
                 return vbr_artifact_status::content_id_mismatch;
             }
-        }
-        for (uint32_t i = 0; i < package.companions.size(); ++i) {
-            if (!prepare_companion(
-                    i, package.topologies, package.companions[i])) {
-                return vbr_artifact_status::content_id_mismatch;
+            return vbr_artifact_status::ok;
+        };
+        const size_t count = package.unit_blobs.size() + package.companions.size();
+        const size_t workers = max_workers <= 1 ? 1 : std::max<size_t>(1, std::min<size_t>(
+            count, std::min<uint32_t>(max_workers, std::min<uint32_t>(
+                8, std::thread::hardware_concurrency()))));
+        const auto prepare_one = [&](size_t i) {
+            if (i < package.unit_blobs.size()) {
+                return prepare_unit(uint32_t(i));
+            }
+            const size_t companion = i - package.unit_blobs.size();
+            return prepare_companion(uint32_t(companion), package.topologies,
+                       package.companions[companion])
+                ? vbr_artifact_status::ok : vbr_artifact_status::content_id_mismatch;
+        };
+        if (workers == 1) {
+            for (size_t i = 0; i < count; ++i) {
+                const auto status = prepare_one(i);
+                if (status != vbr_artifact_status::ok) {
+                    return status;
+                }
+            }
+        } else {
+            // Independent units keep canonical ordering and every byte hash.
+            // Futures join even if thread creation or a reader throws; no
+            // worker may outlive this package or publish partial metadata.
+            std::vector<vbr_artifact_status> statuses(count);
+            std::vector<std::future<void>> pending;
+            pending.reserve(workers);
+            for (size_t w = 0; w < workers; ++w) {
+                pending.push_back(std::async(std::launch::async, [&, w] {
+                    for (size_t i = w; i < count; i += workers) {
+                        statuses[i] = prepare_one(i);
+                    }
+                }));
+            }
+            for (auto & worker : pending) {
+                worker.get();
+            }
+            for (const auto status : statuses) {
+                if (status != vbr_artifact_status::ok) {
+                    return status;
+                }
             }
         }
 
@@ -3433,10 +3521,10 @@ vbr_artifact_status vbr_artifact_prepare_projected_metadata(
 }
 
 vbr_artifact_status vbr_artifact_validate_prepared_package(
-        const vbr_artifact_package & package) noexcept {
+        const vbr_artifact_package & package, uint32_t max_workers) noexcept {
     try {
         auto canonical = package;
-        const auto status = vbr_artifact_prepare(canonical);
+        const auto status = vbr_artifact_prepare(canonical, max_workers);
         if (status != vbr_artifact_status::ok) {
             return status;
         }
