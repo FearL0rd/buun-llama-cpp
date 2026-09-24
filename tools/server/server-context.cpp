@@ -16758,6 +16758,9 @@ private:
                             worker->transfer.chunks,
                             (ggml_time_us()-worker->transfer_started_us)/1000.0);
                     }
+                    if (server_fault("idle_capture_slow")) {
+                        std::this_thread::sleep_for(std::chrono::seconds(3)); // in-flight window seam
+                    }
                     worker->complete.store(
                         true, std::memory_order_release);
                     queue_tasks.request_idle_maintenance();
