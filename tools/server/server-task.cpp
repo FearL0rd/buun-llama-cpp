@@ -5446,7 +5446,8 @@ host_trade_retention_capacity_projection project_host_trade_retention_capacity(
         server_prompt_cache_shadow_artifact_slot * artifacts,
         server_prompt_cache_shadow_lineage_slot * lineages,
         llama_cache_acct_artifact_id ignored_artifact = {},
-        llama_cache_acct_artifact_id excluded_artifact = {}) noexcept {
+        llama_cache_acct_artifact_id excluded_artifact = {},
+        uint64_t minimum_resource = 1) noexcept {
     host_trade_retention_capacity_projection result;
     if (!rows || !artifacts || !lineages || !cache.retention_obs || !cache.acct ||
         candidates.size() > SERVER_PROMPT_CACHE_SHADOW_MAX_CANDIDATES) {
@@ -5671,7 +5672,7 @@ host_trade_retention_capacity_projection project_host_trade_retention_capacity(
     const uint64_t competition_epoch =
         cache.retention_obs->competition_epoch_value();
     for (const auto * row = begin; row != end; ++row) {
-        if (!row->releasable || row->resource == 0) {
+        if (!row->releasable || row->resource < std::max<uint64_t>(minimum_resource, 1)) {
             continue;
         }
         auto * lineage = find_lineage(
@@ -5852,30 +5853,48 @@ static bool server_prompt_cache_plan_vbr_pressure(
         } catch (...) {
             return false;
         }
-        const auto projection = project_host_trade_retention_capacity(
-            cache, reason,
-            cache.states.end(), candidates,
-            shadow_rows, shadow_artifacts, shadow_lineages,
-            ignored_artifact);
+        // An entry that shares its backing (one of several conversations
+        // captured into one batch image) releases almost nothing alone. Under
+        // byte pressure, rank the victims whose own release covers the deficit
+        // first; only when none does fall back to every victim (and the
+        // bounded pair below).
+        const size_t reserved = cache.active_storage_bytes();
+        const uint64_t deficit = byte_pressure && cache.limit_size != 0 &&
+                reserved <= cache.limit_size &&
+                projected_bytes > cache.limit_size - reserved
+            ? projected_bytes - (cache.limit_size - reserved) : 0;
+        const auto project = [&](uint64_t minimum_release) {
+            return project_host_trade_retention_capacity(
+                cache, reason,
+                cache.states.end(), candidates,
+                shadow_rows, shadow_artifacts, shadow_lineages,
+                ignored_artifact, {}, minimum_release);
+        };
         // Match the publication terminal's oldest-eligible fallback when
         // optional semantic retention scores are unavailable (e.g. requests
         // without message delimiters). Lease and physical release evidence
         // remain mandatory; missing scores never manufacture reclaim credit.
         const auto select = [&](const auto & projected,
-                                llama_cache_acct_artifact_id excluded) {
+                                llama_cache_acct_artifact_id excluded,
+                                uint64_t minimum_release = 0) {
             const bool ranked = projected.complete &&
                 projected.release_evidence_complete && projected.artifact.v;
             return std::find_if(candidates.begin(), candidates.end(), [&](const auto & value) {
                 return value.ranking.artifact_id.v &&
                     value.ranking.artifact_id != excluded &&
                     (!ranked || value.ranking.artifact_id == projected.artifact) &&
-                    (!byte_pressure || value.marginal_resident_known) &&
+                    (!byte_pressure || (value.marginal_resident_known &&
+                        value.marginal_resident_bytes >= minimum_release)) &&
                     value.retirement_ready && value.lease_known &&
                     !value.hard_leased && !value.mandatory_anchor &&
                     value.victim->recovery_pins == 0;
             });
         };
-        const auto selected = select(projection, {});
+        auto selected = deficit != 0
+            ? select(project(deficit), {}, deficit) : candidates.end();
+        if (selected == candidates.end()) {
+            selected = select(project(1), {});
+        }
         if (selected == candidates.end()) {
             return false;
         }
@@ -6536,7 +6555,8 @@ bool server_prompt_cache::destroy_retention_host_entry(
         bool & observe_retention_shadow,
         uint64_t & released_bytes,
         size_t & released_tokens,
-        llama_cache_acct_artifact_id required_victim) {
+        llama_cache_acct_artifact_id required_victim,
+        uint64_t minimum_release) {
     released_bytes = 0;
     released_tokens = 0;
     legacy_floor = states.end();
@@ -6688,12 +6708,23 @@ bool server_prompt_cache::destroy_retention_host_entry(
             &released_bytes, &released_tokens);
     }
 
+    // Without retention scores this floor is what executes, so it applies the
+    // planner's sufficiency floor too: the oldest victim whose own release
+    // covers the deficit, else the oldest lawful one.
+    const bool sufficiency = minimum_release > 1 &&
+        reason == server_cache_destruction_reason::host_capacity;
     for (const auto & candidate : candidates) {
         if (candidate.lease_known && !candidate.hard_leased &&
             candidate.retirement_ready &&
             candidate.victim->recovery_pins == 0) {
-            legacy_floor = candidate.victim;
-            break;
+            if (legacy_floor == states.end()) {
+                legacy_floor = candidate.victim;
+            }
+            if (!sufficiency || (candidate.marginal_resident_known &&
+                    candidate.marginal_resident_bytes >= minimum_release)) {
+                legacy_floor = candidate.victim;
+                break;
+            }
         }
     }
     if (legacy_floor == states.end() && std::any_of(
@@ -6713,13 +6744,26 @@ bool server_prompt_cache::destroy_retention_host_entry(
         (reason == server_cache_destruction_reason::host_capacity ||
          reason == server_cache_destruction_reason::host_token_limit) &&
         legacy_floor != states.end()) {
-        const auto projection = competition_wave_valid
-            ? project_host_trade_retention_capacity(
-                  *this, reason, incoming, candidates,
-                  retention_shadow_rows.get(),
-                  retention_shadow_artifacts.get(),
-                  retention_shadow_lineages.get())
-            : host_trade_retention_capacity_projection {};
+        // The same sufficiency floor the pressure planner ranks under: when
+        // some victim's own release covers the deficit, never pick one that
+        // frees next to nothing (a sharer of a batch image).
+        const auto project = [&](uint64_t floor) {
+            return project_host_trade_retention_capacity(
+                *this, reason, incoming, candidates,
+                retention_shadow_rows.get(),
+                retention_shadow_artifacts.get(),
+                retention_shadow_lineages.get(), {}, {}, floor);
+        };
+        auto projection = host_trade_retention_capacity_projection {};
+        if (competition_wave_valid) {
+            if (reason == server_cache_destruction_reason::host_capacity &&
+                minimum_release > 1) {
+                projection = project(minimum_release);
+            }
+            if (!projection.complete) {
+                projection = project(1);
+            }
+        }
         const auto proposed = projection.artifact;
         if (observe_retention_shadow) {
             const auto increment = [](uint64_t & value) noexcept {
@@ -6861,7 +6905,8 @@ bool server_prompt_cache::evict_front_under_pressure(
         bool observe_retention_shadow,
         uint64_t & released_bytes,
         size_t & released_tokens,
-        llama_cache_acct_artifact_id required_victim) {
+        llama_cache_acct_artifact_id required_victim,
+        uint64_t minimum_release) {
     released_bytes = 0;
     released_tokens = 0;
     GGML_ASSERT(!states.empty());
@@ -6873,7 +6918,7 @@ bool server_prompt_cache::evict_front_under_pressure(
             reason, incoming, legacy_floor, floor_reason,
             recovery_pin_excluded, competition_wave_valid,
             observe_retention_shadow, released_bytes,
-            released_tokens, required_victim)) {
+            released_tokens, required_victim, minimum_release)) {
         return true;
     }
 
@@ -9403,13 +9448,18 @@ bool server_prompt_cache::update_impl(
                     continue;
                 }
             }
+            const size_t reserved = active_storage_bytes();
+            const uint64_t deficit = reserved <= limit_size &&
+                    cache_bytes > limit_size - reserved
+                ? cache_bytes - (limit_size - reserved) : 0;
             if (!evict_front_under_pressure(
                     server_cache_destruction_reason::host_capacity,
                     incoming, competition_wave_valid, observe_shadow,
                     released_bytes, released_tokens,
                     required_victims.count == 1
                         ? required_victims.artifacts[0]
-                        : llama_cache_acct_artifact_id {})) {
+                        : llama_cache_acct_artifact_id {},
+                    deficit)) {
                 return false;
             }
             required_victims = {};

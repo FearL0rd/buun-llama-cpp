@@ -1819,7 +1819,8 @@ private:
             bool & observe_retention_shadow,
             uint64_t & released_bytes,
             size_t & released_tokens,
-            llama_cache_acct_artifact_id required_victim = {});
+            llama_cache_acct_artifact_id required_victim = {},
+            uint64_t minimum_release = 0);
     bool evict_front_under_pressure(
         server_cache_destruction_reason reason,
         iterator incoming,
@@ -1827,7 +1828,8 @@ private:
             bool observe_retention_shadow,
             uint64_t & released_bytes,
             size_t & released_tokens,
-            llama_cache_acct_artifact_id required_victim = {});
+            llama_cache_acct_artifact_id required_victim = {},
+            uint64_t minimum_release = 0);
     void refuse_incoming_under_pressure(
         iterator incoming,
         server_cache_destruction_reason reason);
