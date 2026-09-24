@@ -6708,41 +6708,54 @@ static bool model_backed_occupied_store(
     if (resumed_results.size() != 1 || !resumed_results.front().payload) {
         return false;
     }
-    llama_memory_clear(memory, true);
-    CHECK(llama_kv_cache_vbr_epoch_test::
-        make_construction_empty_preserve_tiers(occupied_cache));
-    server_vbr_artifact_import_target resumed_request;
-    resumed_request.memory = memory;
-    resumed_request.destination = destination_slot;
-    resumed_request.execution_identity = execution_key;
-    resumed_request.adapter_config_identity = adapter_key;
-    resumed_request.previously_observed = true;
-    resumed_request.prepare_publish = [](
-            void *, const std::vector<llama_token> & tokens,
-            uint64_t sequence_epoch) noexcept {
-        return !tokens.empty() && sequence_epoch == 1;
-    };
-    resumed_request.publish = [](void *) noexcept {};
-    const auto resumed = store->import_host_payload(
-        std::move(resumed_request), resumed_results.front().payload);
-    if (resumed.status != server_vbr_artifact_import_status::ok ||
-        resumed.adopt_status != vbr_adopt_status::adopted) {
-        std::fprintf(stderr,
-            "VBR packed empty import failed: store=%s validation=%s "
-            "stage=%s adopt=%s phase=%s\n",
-            server_vbr_artifact_import_status_name(resumed.status),
-            vbr_manifest_validation_status_name(resumed.validation_status),
-            vbr_adopt_stage_status_name(resumed.stage_status),
-            vbr_adopt_status_name(resumed.adopt_status),
-            vbr_adopt_phase_name(resumed.phase));
+    // The same rows captured exact: an otherwise identical pair, both exact
+    // copies, of which only the projected one is a projection parent.
+    std::shared_ptr<const server_prompt_cache_vbr_payload> resumed_exact;
+    CHECK(capture_owner(resumed_tokens, resumed_exact));
+    if (!resumed_exact) {
+        return false;
     }
-    CHECK(resumed.status == server_vbr_artifact_import_status::ok);
-    CHECK(resumed.adopt_status == vbr_adopt_status::adopted);
-    std::vector<uint8_t> resumed_actual_rows;
-    CHECK(llama_kv_cache_vbr_epoch_test::snapshot_sequence_rows(
-        occupied_cache, destination_slot, uint32_t(resumed_tokens.size()),
-        resumed_actual_rows));
-    CHECK(resumed_actual_rows == resumed_expected_rows);
+    CHECK(store->host_prefix_projection_ready(resumed_results.front().payload));
+    CHECK(!store->host_prefix_projection_ready(resumed_exact));
+    const auto import_resumed = [&](const char * label,
+            const std::shared_ptr<const server_prompt_cache_vbr_payload> & payload) {
+        llama_memory_clear(memory, true);
+        CHECK(llama_kv_cache_vbr_epoch_test::
+            make_construction_empty_preserve_tiers(occupied_cache));
+        server_vbr_artifact_import_target request;
+        request.memory = memory;
+        request.destination = destination_slot;
+        request.execution_identity = execution_key;
+        request.adapter_config_identity = adapter_key;
+        request.previously_observed = true;
+        request.prepare_publish = [](
+                void *, const std::vector<llama_token> & tokens,
+                uint64_t sequence_epoch) noexcept {
+            return !tokens.empty() && sequence_epoch == 1;
+        };
+        request.publish = [](void *) noexcept {};
+        const auto resumed = store->import_host_payload(std::move(request), payload);
+        if (resumed.status != server_vbr_artifact_import_status::ok ||
+            resumed.adopt_status != vbr_adopt_status::adopted) {
+            std::fprintf(stderr,
+                "VBR packed empty import (%s) failed: store=%s validation=%s "
+                "stage=%s adopt=%s phase=%s\n", label,
+                server_vbr_artifact_import_status_name(resumed.status),
+                vbr_manifest_validation_status_name(resumed.validation_status),
+                vbr_adopt_stage_status_name(resumed.stage_status),
+                vbr_adopt_status_name(resumed.adopt_status),
+                vbr_adopt_phase_name(resumed.phase));
+        }
+        CHECK(resumed.status == server_vbr_artifact_import_status::ok);
+        CHECK(resumed.adopt_status == vbr_adopt_status::adopted);
+        std::vector<uint8_t> resumed_actual_rows;
+        CHECK(llama_kv_cache_vbr_epoch_test::snapshot_sequence_rows(
+            occupied_cache, destination_slot, uint32_t(resumed_tokens.size()),
+            resumed_actual_rows));
+        CHECK(resumed_actual_rows == resumed_expected_rows);
+    };
+    import_resumed("exact", resumed_exact);
+    import_resumed("projected", resumed_results.front().payload);
 
     // PT production composition: derive a true shorter/divergent prefix from
     // the same store-owned parent, import it through the real empty-target
