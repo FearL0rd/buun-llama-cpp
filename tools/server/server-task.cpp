@@ -5940,11 +5940,16 @@ static bool server_prompt_cache_plan_vbr_pressure(
             plan = {};
             return false;
         }
+        // The second victim answers what the first leaves of the deficit.
+        const uint64_t second_deficit = cache.byte_deficit(after_bytes);
         const auto second_projection = project_host_trade_retention_capacity(
             cache, reason, cache.states.end(), candidates,
             shadow_rows, shadow_artifacts, shadow_lineages,
-            ignored_artifact, selected->ranking.artifact_id);
-        const auto second = select(second_projection, selected->ranking.artifact_id);
+            ignored_artifact, selected->ranking.artifact_id, second_deficit);
+        auto second = select(second_projection, selected->ranking.artifact_id, second_deficit);
+        if (second == candidates.end() && second_deficit != 0) {
+            second = select(second_projection, selected->ranking.artifact_id);
+        }
         if (second == candidates.end() || second == selected) {
             plan = {};
             return false;
@@ -8830,13 +8835,37 @@ bool server_prompt_cache::load_impl(
         const server_prompt_cache_reuse_context * reuse) {
     restore_shape = server_prompt_cache_restore_shape::none;
     const auto selected = select_impl<Observed>(prompt, tokens_new, adapter_config_key, rec, reuse);
-    auto it_best = selected.source;
-    if (it_best == states.end()) {
+    if (selected.source == states.end()) {
         // nothing better than the slot's current state; leave the slot as-is
         return true;
     }
+    return deliver_impl<Observed>(prompt, selected.source, selected.lcp, ctx_tgt, ctx_dft,
+                                  id_slot, rec, restored_family, restore_shape);
+}
 
-    const int reuse_lcp_best = selected.lcp;
+bool server_prompt_cache::load_entry(
+        server_prompt & prompt, iterator source,
+        llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot,
+        server_prompt_cache_restore_shape & restore_shape,
+        common_cache_family_binding * restored_family) {
+    restore_shape = server_prompt_cache_restore_shape::none;
+    if (source == states.end() || !source->payload.fixed_state_restorable()) {
+        return false;
+    }
+    return deliver_impl<false>(prompt, source, int(source->prompt.tokens.size()), ctx_tgt, ctx_dft,
+                               id_slot, nullptr, restored_family, restore_shape);
+}
+
+template <bool Observed>
+bool server_prompt_cache::deliver_impl(
+        server_prompt & prompt, iterator it_best, int reuse_lcp_best,
+        llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot,
+        common_cache_plan_record * rec,
+        common_cache_family_binding * restored_family,
+        server_prompt_cache_restore_shape & restore_shape) {
+    if constexpr (!Observed) {
+        (void) rec;
+    }
     const int32_t obs_source_best = Observed ? it_best->cache_plan_source_id : -1;
     SRV_TRC(" - found better prompt with length %zu, lcp = %d\n",
             it_best->prompt.tokens.size(), reuse_lcp_best);

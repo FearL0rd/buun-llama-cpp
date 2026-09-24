@@ -1693,6 +1693,19 @@ public:
                    server_prompt_cache_restore_shape & restore_shape,
                    const server_prompt_cache_reuse_context * reuse);
 
+    // restores the fixed state `source` itself, whatever a similarity search would choose
+    bool load_entry(server_prompt & prompt, iterator source,
+                    llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot,
+                    server_prompt_cache_restore_shape & restore_shape,
+                    common_cache_family_binding * restored_family = nullptr);
+
+    template <bool Observed>
+    bool deliver_impl(server_prompt & prompt, iterator source, int lcp,
+                      llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot,
+                      common_cache_plan_record * rec,
+                      common_cache_family_binding * restored_family,
+                      server_prompt_cache_restore_shape & restore_shape);
+
     // Two-phase immutable host restore. prepare() runs before either
     // target is touched; commit() is called only after main+draft restore.
     // Public only so the model-free server cache test can pin the storage

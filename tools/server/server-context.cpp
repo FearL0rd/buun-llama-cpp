@@ -1964,9 +1964,24 @@ struct server_slot {
         common_cache_family_binding restored_family = cache_family;
         server_prompt_cache_restore_shape restore_shape =
             server_prompt_cache_restore_shape::none;
-        bool res = prompt_cache.load(prompt, tokens, ctx_tgt, ctx_dft, id,
-                                     adapter_config_key, restore_shape, obs,
-                                     &restored_family, reuse);
+        return prompt_loaded(prompt_cache.load(prompt, tokens, ctx_tgt, ctx_dft, id,
+                                               adapter_config_key, restore_shape, obs,
+                                               &restored_family, reuse),
+                             restore_shape, restored_family);
+    }
+
+    // restores the fixed host state `source` itself
+    bool prompt_load_entry(server_prompt_cache & prompt_cache, server_prompt_cache::iterator source) {
+        common_cache_family_binding restored_family = cache_family;
+        server_prompt_cache_restore_shape restore_shape =
+            server_prompt_cache_restore_shape::none;
+        return prompt_loaded(prompt_cache.load_entry(prompt, source, ctx_tgt, ctx_dft, id,
+                                                     restore_shape, &restored_family),
+                             restore_shape, restored_family);
+    }
+
+    bool prompt_loaded(bool res, server_prompt_cache_restore_shape restore_shape,
+                       const common_cache_family_binding & restored_family) {
         if (!res) {
             SLT_WRN(*this, "%s", "failed to load prompt from cache\n");
         } else {
@@ -5416,11 +5431,22 @@ private:
                 solo.members         = &one;
                 solo.hosted_artifact = vbr ? pinned[i].pin.payload()->reference_artifact().v : 0;
                 const auto restore = [&]() {
-                    if (!vbr) {
-                        resume_stage_clear(stage);
+                    if (vbr) {
+                        return try_automatic_vbr_restore(stage, task, {}, nullptr, false, &pinned[i].pin) &&
+                            stage.prompt.n_tokens() == task.tokens.size();
                     }
-                    return (vbr ? try_automatic_vbr_restore(stage, task, {}, nullptr, false, &pinned[i].pin)
-                                : stage.prompt_load(*prompt_cache, task.tokens, adapter)) &&
+                    // the state itself: a similarity search may prefer a shorter one it leads
+                    resume_stage_clear(stage);
+                    auto source = prompt_cache->states.end();
+                    for (auto it = prompt_cache->states.begin(); it != prompt_cache->states.end(); ++it) {
+                        if (it->payload.fixed_state_restorable() && it->adapter_config_key == adapter &&
+                            it->prompt.tokens.size() == task.tokens.size() &&
+                            it->prompt.tokens.get_common_prefix(task.tokens) == task.tokens.size()) {
+                            source = it;
+                        }
+                    }
+                    return source != prompt_cache->states.end() &&
+                        stage.prompt_load_entry(*prompt_cache, source) &&
                         stage.prompt.n_tokens() == task.tokens.size();
                 };
                 bool restored = restore();
