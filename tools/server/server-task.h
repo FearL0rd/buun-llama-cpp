@@ -1428,13 +1428,15 @@ public:
     // Exact immutable VBR-frontier presence query. This alone is not a clear
     // authority: automatic displacement also revalidates the live semantic
     // frontier, scheduler state, pending work, and lease/recovery protection.
-    // projectable: the copy must also be one prepare_vbr_restore can project
-    // a diverging request onto.
+    // projector: when given, some matching copy must also be one
+    // prepare_vbr_restore can project a diverging request onto — no media or
+    // checkpoints, and the artifact owner confirms the payload the restore
+    // selector would pick is sealed, current and laid out for projection.
     bool contains_vbr_frontier(
         const server_prompt & prompt,
         const std::string & execution_identity,
         const std::string & adapter_config_key,
-        bool projectable = false) const noexcept;
+        const server_vbr_artifact_store * projector = nullptr) const noexcept;
     // Read-only suppression check for an already-durable shorter frontier.
     // The host package must be exact for coverage and the current live prompt
     // must still carry that exact prefix under the same source epoch.

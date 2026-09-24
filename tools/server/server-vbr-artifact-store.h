@@ -553,6 +553,11 @@ public:
         const std::vector<llama_token> & request_tokens,
         uint64_t lcp_tokens,
         vbr_artifact_attention_prefix_projection & output) noexcept;
+    // Read-only: would prepare_host_prefix_projection accept this payload as
+    // a parent right now (owned, current, sealed and laid out for projection)?
+    bool host_prefix_projection_ready(
+        const std::shared_ptr<const server_prompt_cache_vbr_payload> & payload)
+        const noexcept;
     server_vbr_artifact_import_output import_host_prefix_payload(
         server_vbr_artifact_import_target request,
         std::shared_ptr<const server_prompt_cache_vbr_payload> payload,
@@ -636,6 +641,10 @@ private:
         vbr_artifact_attention_prefix_projection projection,
         const std::shared_ptr<const server_prompt_cache_vbr_payload> * recovery)
         noexcept;
+    // The payload is a cache-owned host package this store's catalog owns.
+    bool host_prefix_projection_parent(
+        const std::shared_ptr<const server_prompt_cache_vbr_payload> & payload)
+        const noexcept;
     struct impl;
     explicit server_vbr_artifact_store(std::unique_ptr<impl> state) noexcept;
     std::unique_ptr<impl> impl_;

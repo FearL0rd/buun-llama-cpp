@@ -2594,7 +2594,8 @@ static bool server_prompt_retention_exact_scope(
         int64_t coverage_tokens,
         std::string & out) noexcept;
 
-// a host copy a diverging request can be projected onto: no media, no checkpoints
+// prerequisites for projecting a diverging request onto a host copy: no media,
+// no checkpoints. The artifact owner has the final say on the payload itself.
 static bool server_prompt_projectable(const server_prompt & prompt) noexcept {
     return !prompt.tokens.has_media() && prompt.checkpoints.empty();
 }
@@ -2603,15 +2604,24 @@ bool server_prompt_cache::contains_vbr_frontier(
         const server_prompt & prompt,
         const std::string & execution_identity,
         const std::string & adapter_config_key,
-        bool projectable) const noexcept {
+        const server_vbr_artifact_store * projector) const noexcept {
     for (const auto & state : states) {
-        if (state.payload.kind() ==
-                server_prompt_cache_payload_kind::vbr_artifact &&
-            state.adapter_config_key == adapter_config_key &&
-            server_prompt_cache_vbr_frontier_matches(
+        if (state.payload.kind() !=
+                server_prompt_cache_payload_kind::vbr_artifact ||
+            state.adapter_config_key != adapter_config_key ||
+            !server_prompt_cache_vbr_frontier_matches(
                 prompt, state.payload, execution_identity,
                 adapter_config_key)) {
-            return !projectable || server_prompt_projectable(state.prompt);
+            continue;
+        }
+        if (!projector) {
+            return true;
+        }
+        // the payload prepare_vbr_restore hands to the projector for this entry
+        const auto * variants = state.payload.vbr_variants();
+        if (variants && server_prompt_projectable(state.prompt) &&
+            projector->host_prefix_projection_ready(variants->preferred())) {
+            return true;
         }
     }
     return false;
@@ -3190,9 +3200,7 @@ bool server_prompt_cache::prepare_vbr_restore(
                 }
                 const auto * variants = state->payload.vbr_variants();
                 const bool quality = variants && variants->quality_anchor();
-                const auto & preferred = quality
-                    ? variants->quality_anchor()
-                    : variants->compact_current();
+                const auto & preferred = variants->preferred();
                 const uint64_t artifact_id = preferred
                     ? preferred->reference_artifact().v : 0;
                 if (artifact_id == 0) {
@@ -3254,8 +3262,7 @@ bool server_prompt_cache::prepare_vbr_restore(
             return false;
         }
         auto compact = variants->compact_current();
-        auto preferred = variants->quality_anchor()
-            ? variants->quality_anchor() : compact;
+        auto preferred = variants->preferred();
         ++selected.best->recovery_pins;
         candidate.cache_ = this;
         candidate.source_ = selected.best;

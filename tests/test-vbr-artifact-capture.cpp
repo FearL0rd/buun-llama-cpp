@@ -3389,6 +3389,19 @@ static void test_dependency_scoped_projected_catalog_publication() {
     CHECK(catalog.resolve_reference(prefix_reference, prefix_parent) ==
           vbr_artifact_resolve_status::ok);
     CHECK(prefix_parent.validate() == vbr_artifact_status::ok);
+    // the read-only answer agrees with project_attention_prefix and borrows nothing
+    CHECK(catalog.projection_parent_status(prefix_parent) ==
+          vbr_artifact_prefix_projection_status::projected);
+    auto parent_cap = vbr_artifact_prefix_projection_limits {};
+    parent_cap.max_proofs = 1;
+    CHECK(catalog.projection_parent_status(prefix_parent, parent_cap) ==
+          vbr_artifact_prefix_projection_status::limit_exceeded);
+    parent_cap = {};
+    parent_cap.max_units = 0;
+    CHECK(catalog.projection_parent_status(prefix_parent, parent_cap) ==
+          vbr_artifact_prefix_projection_status::invalid_argument);
+    CHECK(catalog.projection_parent_status(vbr_artifact_package_view {}) ==
+          vbr_artifact_prefix_projection_status::invalid_argument);
 
     const llama_token divergent[] { 1, 2, 99, 100 };
     vbr_artifact_attention_prefix_request prefix_request;
@@ -5209,6 +5222,8 @@ static void test_projected_host_batch_store_adapter() {
         CHECK(results[0].payload->accounted_by(&ledger));
         CHECK(results[0].payload->reference_artifact().v != 0);
     }
+    // no payload, no projection parent
+    CHECK(!store->host_prefix_projection_ready(nullptr));
     CHECK(results[1].manifest_id == 2);
     CHECK(results[1].status ==
           vbr_projected_manifest_publish_status::dependency_unavailable);

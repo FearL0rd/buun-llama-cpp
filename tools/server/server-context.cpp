@@ -5183,7 +5183,9 @@ private:
                 n_released++;
             }
         }
-        SRV_INF("RESUME event=shutdown capture_in_flight=%d held=%zu released=%zu\n", int(in_flight), n_held, n_released);
+        const resume_coverage cover = resume_coverage_now();
+        SRV_INF("RESUME event=shutdown capture_in_flight=%d held=%zu released=%zu live=%zu exact=%zu projectable=%zu\n",
+                int(in_flight), n_held, n_released, cover.live, cover.exact, cover.projectable);
         resume_capture_all("shutdown");
     }
 
@@ -8108,9 +8110,8 @@ private:
     }
 
     // projectable: the host copy must also be one a diverging request can be projected onto. The
-    // sources the idle pass cuts only at a sealed checkpoint (the gate of its consider_checkpoint:
-    // hybrid model, drafter, speculative slot) get exact copies, and prepare_vbr_restore projects
-    // onto a copy with no checkpoints and no media only
+    // restore projects for a slot without a drafter only; the artifact store answers whether the
+    // copy itself is sealed, current and laid out for projection
     bool vbr_idle_source_durable(
             const server_slot & slot, bool projectable = false) const noexcept {
         if (!params_base.vbr_prompt_cache) {
@@ -8119,7 +8120,7 @@ private:
         if (!prompt_cache || slot.prompt.n_tokens() <= 0) {
             return false;
         }
-        if (projectable && (llama_model_is_hybrid(model_tgt) || ctx_dft || slot.can_speculate())) {
+        if (projectable && (!vbr_artifact_store || ctx_dft || slot.can_speculate())) {
             return false;
         }
         try {
@@ -8129,7 +8130,8 @@ private:
                     server_vbr_prompt_cache_support_status::supported &&
                 prompt_cache->contains_vbr_frontier(
                     slot.prompt, frontier_execution_identity,
-                    lora_config_identity(slot.lora), projectable);
+                    lora_config_identity(slot.lora),
+                    projectable ? vbr_artifact_store.get() : nullptr);
         } catch (...) {
             return false;
         }

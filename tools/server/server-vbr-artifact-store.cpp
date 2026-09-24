@@ -3271,9 +3271,7 @@ server_vbr_artifact_store::prepare_host_prefix_projection(
         uint64_t lcp_tokens,
         vbr_artifact_attention_prefix_projection & output) noexcept {
     output.reset();
-    if (!payload || !payload->retirement_owned() ||
-        !payload->accounted_by(impl_->ledger) || !payload->package() ||
-        !impl_->catalog.owns_host_package(payload->package())) {
+    if (!host_prefix_projection_parent(payload)) {
         return vbr_artifact_prefix_projection_status::parent_stale;
     }
     vbr_artifact_attention_prefix_request request;
@@ -3283,6 +3281,22 @@ server_vbr_artifact_store::prepare_host_prefix_projection(
     request.text_only = true;
     return impl_->catalog.project_attention_prefix(
         payload->package(), request, {}, output);
+}
+
+bool server_vbr_artifact_store::host_prefix_projection_ready(
+        const std::shared_ptr<const server_prompt_cache_vbr_payload> & payload)
+        const noexcept {
+    return host_prefix_projection_parent(payload) &&
+        impl_->catalog.projection_parent_status(payload->package()) ==
+            vbr_artifact_prefix_projection_status::projected;
+}
+
+bool server_vbr_artifact_store::host_prefix_projection_parent(
+        const std::shared_ptr<const server_prompt_cache_vbr_payload> & payload)
+        const noexcept {
+    return payload && payload->retirement_owned() &&
+        payload->accounted_by(impl_->ledger) && payload->package() &&
+        impl_->catalog.owns_host_package(payload->package());
 }
 
 server_vbr_artifact_import_output

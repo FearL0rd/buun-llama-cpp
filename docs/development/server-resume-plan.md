@@ -919,9 +919,18 @@ The R1 and R7 findings are recorded with their slices above. The rest:
   device-to-host copy per live slot at startup. A wave keeps the owners'
   bounds (eight manifests, one stateful or speculative candidate), so the pass
   runs at most one wave per slot and stops at the first wave that covers no
-  further slot (refused, cancelled, displaced). `install_done` reports `live`,
-  `exact` (slots with a durable copy: a continuation is warm) and `projectable`
-  (a diverging request is warm too), and warns about the difference. A
+  further slot (refused, cancelled, displaced). `install_done` and the
+  shutdown line report `live`, `exact` (slots with a durable copy: a
+  continuation is warm) and `projectable` (a diverging request is warm too),
+  and the install warns about the difference. `projectable` is the artifact
+  owner's answer, not the server's inference: the copy must carry no media
+  and no checkpoints, and the catalog must confirm that the payload the
+  restore would pick is current, sealed for projection and laid out as the
+  projection requires. A durable copy taken by the exact route (the
+  background worker, a pre-displacement capture) counts as `exact` only; a
+  hybrid model's checkpoint-cut copy fails the prerequisites (it carries
+  checkpoints), with no server-side model check (harness scenario `cover`: nine dense slots count
+  nine projectable after the install waves, four hybrid slots none). A
   stateful conversation (hybrid model, a drafter, a speculative slot: the gate
   of the idle pass's checkpoint cut) is exact only: its copy is cut at a sealed
   checkpoint, which a restored slot has none of, and the owners' restore

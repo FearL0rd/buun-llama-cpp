@@ -2753,6 +2753,9 @@ static void test_catalog_package_lease_and_reference_placement() {
     CHECK(f.catalog->resolve_reference(second.reference_artifact, second_view) ==
           vbr_artifact_resolve_status::ok);
     CHECK(first_view.reference_artifact() == first.reference_artifact);
+    // an exact package is a durable copy but never a projection parent
+    CHECK(f.catalog->projection_parent_status(first_view) ==
+          vbr_artifact_prefix_projection_status::parent_stale);
     CHECK(first_view.units().size() == 1);
     CHECK(first_view.units()[0].payload_shards.size() == 2);
     CHECK(first_view.manifest().stream_placements[0].cells[1].physical_cell == 1);
