@@ -301,10 +301,73 @@ bool same_geometry(
            target.shards.size() == source.shards.size();
 }
 
+// rows every shard of the target unit backs
+uint64_t unit_capacity(const vbr_target_unit_snapshot & target) {
+    uint64_t rows = target.shards.empty() ? 0 : UINT64_MAX;
+    for (const auto & shard : target.shards) {
+        rows = shard.row_bytes == 0
+            ? 0 : std::min(rows, shard.mapped_bytes / shard.row_bytes);
+    }
+    return rows;
+}
+
+// A pool image wider than the target pool (an iSWA window child restored
+// with fewer slots) lands its reference's rows as a dense prefix, in source
+// physical order: a cell's position, not its index, carries its meaning.
+// When they still overflow, the oldest cells the window already masks are
+// dropped, as a live cache of that size would have pruned them.
+bool pack_placement(
+        std::vector<vbr_artifact_stream_placement> & placements,
+        std::vector<vbr_authorized_cell_run> & runs,
+        uint64_t capacity, llama_pos live_from) {
+    if (placements.size() != 1 || placements.front().cells.empty()) {
+        return false;
+    }
+    auto & cells = placements.front().cells;
+    if (cells.size() > capacity) {
+        std::vector<llama_pos> masked;
+        for (const auto & cell : cells) {
+            if (cell.logical_position < live_from) {
+                masked.push_back(cell.logical_position);
+            }
+        }
+        const size_t excess = cells.size() - capacity;
+        if (masked.size() < excess) {
+            return false;
+        }
+        std::nth_element(masked.begin(), masked.begin() + (excess - 1), masked.end());
+        const llama_pos cutoff = masked[excess - 1];
+        cells.erase(std::remove_if(cells.begin(), cells.end(),
+            [&](const vbr_artifact_cell_placement & cell) {
+                return cell.logical_position <= cutoff;
+            }), cells.end());
+        if (cells.empty() || cells.size() > capacity) {
+            return false;
+        }
+    }
+    std::sort(cells.begin(), cells.end(),
+        [](const vbr_artifact_cell_placement & a,
+           const vbr_artifact_cell_placement & b) {
+            return a.physical_cell < b.physical_cell;
+        });
+    if (std::adjacent_find(cells.begin(), cells.end(),
+            [](const vbr_artifact_cell_placement & a,
+               const vbr_artifact_cell_placement & b) {
+                return a.physical_cell == b.physical_cell;
+            }) != cells.end()) {
+        return false;
+    }
+    runs.clear();
+    for (size_t i = 0; i < cells.size(); ++i) {
+        append_cell_run(runs, uint32_t(i), cells[i].physical_cell);
+        cells[i].physical_cell = uint32_t(i);
+    }
+    return true;
+}
+
 bool shard_domain_matches(
         const vbr_artifact_shard_descriptor & source,
         const vbr_target_shard_snapshot & target,
-        uint64_t source_wm_cells,
         const vbr_artifact_package_view & package,
         const vbr_adopt_policy & policy) {
     llama_cache_acct_resource_domain resolved;
@@ -325,9 +388,7 @@ bool shard_domain_matches(
            target.row_count == source.row_count &&
            target.domain == resolved &&
            target.pool_cookie != nullptr &&
-           target.row_bytes != 0 &&
-           source_wm_cells <= UINT64_MAX / target.row_bytes &&
-           target.mapped_bytes >= source_wm_cells * target.row_bytes;
+           target.row_bytes != 0;
 }
 
 bool digest_nonzero(const std::array<uint8_t, 32> & digest) {
@@ -1520,12 +1581,13 @@ vbr_manifest_validation_result vbr_validate_unit_manifest_snapshot(
                 const auto & target_shard =
                     target_unit->shards[shard_index];
                 if (!shard_domain_matches(
-                        shard, target_shard, descriptor.wm_cells,
-                        package, policy)) {
+                        shard, target_shard, package, policy)) {
                     return terminal_result(
                         vbr_manifest_validation_status::topology_mismatch);
                 }
             }
+            const uint64_t capacity = unit_capacity(*target_unit);
+            const bool pack = capacity < descriptor.wm_cells;
             const auto & controller =
                 manifest.generation.controllers[descriptor.child_id];
             if (descriptor.logical_unit_id >= controller.units.size()) {
@@ -1549,8 +1611,8 @@ vbr_manifest_validation_result vbr_validate_unit_manifest_snapshot(
                 for (size_t i = 0; i < descriptor.shards.size(); ++i) {
                     if (target_unit->shards[i].row_bytes !=
                             descriptor.shards[i].row_bytes ||
-                        target_unit->shards[i].mapped_bytes <
-                            descriptor.shards[i].payload_bytes) {
+                        (!pack && target_unit->shards[i].mapped_bytes <
+                                      descriptor.shards[i].payload_bytes)) {
                         return terminal_result(
                             vbr_manifest_validation_status::geometry_mismatch);
                     }
@@ -1577,6 +1639,20 @@ vbr_manifest_validation_result vbr_validate_unit_manifest_snapshot(
                  !projected_source_runs(package, placements, runs))) {
                 return terminal_result(
                     vbr_manifest_validation_status::geometry_mismatch);
+            }
+            // Packed rows leave their captured cells, so neither the page
+            // generations nor a clean stash keyed by source cell carry over.
+            uint64_t packed_cells = 0;
+            if (pack) {
+                if (occupied_replacement || !unit_co_cells.empty() ||
+                    !package.projected_ranges().empty() ||
+                    !pack_placement(placements, runs, capacity,
+                                    target_child->window_live_from)) {
+                    return terminal_result(
+                        vbr_manifest_validation_status::topology_mismatch);
+                }
+                packed_cells = placements.front().cells.size();
+                needs_live_rebase = true;
             }
             for (const auto & placement : placements) {
                 for (const auto & cell : placement.cells) {
@@ -1661,6 +1737,12 @@ vbr_manifest_validation_result vbr_validate_unit_manifest_snapshot(
             plan.unit_reference = *reference;
             plan.controller_policy =
                 manifest.controller_policy[descriptor.child_id];
+            if (pack) {
+                plan.stash_action =
+                    vbr_validated_stash_action::omit_live_rebased;
+                plan.descriptor.wm_cells = packed_cells;
+                plan.controller_policy.wm_cells = packed_cells;
+            }
             plan.operation_target.instance_id = target_child->instance_id;
             plan.operation_target.operation_class =
                 vbr_operation_class::state_api;

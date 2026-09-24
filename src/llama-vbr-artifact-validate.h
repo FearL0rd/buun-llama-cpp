@@ -281,6 +281,9 @@ struct vbr_target_child_snapshot {
     bool generation_compatible = true;
     bool ownership_compatible = true;
     bool stash_compatible = true;
+    // A window child's cells below this position are masked for the
+    // reference's last position and every later one.
+    llama_pos window_live_from = 0;
     vbr_lineage_uuid lineage_uuid;
     vbr_controller_instance_id instance_id;
     uint64_t state_serial = 0;

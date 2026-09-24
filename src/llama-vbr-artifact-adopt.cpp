@@ -784,8 +784,12 @@ class vbr_kv_import_session {
                 return static_cast<const artifact_segment_chain *>(context)->read(
                     offset, out, size);
             } };
-        if (!read.projection_ranges.empty()) {
-            if (!ring_operation || !*ring_operation ||
+        // While the packed operation holds the ring, a plain read travels
+        // through it as a single range.
+        const vbr_h2d_source_range whole = { read.source_offset, read.size };
+        const bool held = ring_operation && *ring_operation;
+        if (!read.projection_ranges.empty() || held) {
+            if (!held ||
                 (read.kind != vbr_staged_read_kind::unit_payload &&
                  read.kind !=
                      vbr_staged_read_kind::recovery_unit_payload)) {
@@ -794,8 +798,10 @@ class vbr_kv_import_session {
             vbr_h2d_packed_transfer transfer;
             transfer.lane = read.lane;
             transfer.source = source;
-            transfer.ranges = read.projection_ranges.data();
-            transfer.range_count = read.projection_ranges.size();
+            transfer.ranges = read.projection_ranges.empty()
+                ? &whole : read.projection_ranges.data();
+            transfer.range_count = read.projection_ranges.empty()
+                ? 1 : read.projection_ranges.size();
             transfer.size = read.size;
             transfer.backend = pool->backend;
             transfer.device = ggml_backend_get_device(pool->backend);

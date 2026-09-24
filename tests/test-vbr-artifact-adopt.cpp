@@ -4424,6 +4424,72 @@ static void test_co_resident_empty_import_validates_live_rebased() {
     CHECK(f.target.construction_empty());
 }
 
+// A target pool narrower than the image (fewer iSWA slots) takes the
+// reference's rows as a dense prefix, rebased; too narrow still refuses.
+static void test_narrow_target_packs_reference() {
+    const auto narrow = [](fixture & f, uint64_t cells) {
+        for (auto & child : f.snapshot.children) {
+            for (auto & unit : child.units) {
+                for (auto & shard : unit.shards) {
+                    shard.mapped_bytes = cells*shard.row_bytes;
+                }
+            }
+        }
+    };
+    co_resident_fixture f;
+    narrow(f, 3);
+    auto packed = f.validate(nullptr);
+    CHECK(packed.status == vbr_manifest_validation_status::validated);
+    CHECK(packed.decision == vbr_import_decision::live_rebased);
+    CHECK(packed.proof);
+    if (packed.proof) {
+        CHECK(packed.proof->children().size() == 2);
+        for (const auto & plan : packed.proof->children()) {
+            CHECK(runs_equal(plan.authorized_runs, { { 0, 3 } }));
+            CHECK(plan.descriptor.wm_cells == 3);
+            CHECK(plan.controller_policy.wm_cells == 3);
+            CHECK(plan.stash_action ==
+                  vbr_validated_stash_action::omit_live_rebased);
+        }
+        for (const auto & child : packed.proof->tracker_install().children) {
+            CHECK(child.transition ==
+                  vbr_tracker_install_transition::whole_import);
+        }
+    }
+    CHECK(f.validate({ co_resident(1, { 3, 4 }) }).status ==
+          vbr_manifest_validation_status::topology_mismatch);
+    narrow(f, 2);
+    CHECK(f.validate(nullptr).status ==
+          vbr_manifest_validation_status::topology_mismatch);
+    // The window masks position 0 for the reference's last position: that
+    // row is dropped and the rest pack from source row 1.
+    for (auto & child : f.snapshot.children) {
+        child.window_live_from = 1;
+    }
+    auto pruned = f.validate(nullptr);
+    CHECK(pruned.status == vbr_manifest_validation_status::validated);
+    CHECK(pruned.proof);
+    if (pruned.proof) {
+        for (const auto & plan : pruned.proof->children()) {
+            CHECK(runs_equal(plan.authorized_runs, { { 0, 2 } }));
+            CHECK(plan.authorized_runs.size() == 1 &&
+                  plan.authorized_runs[0].first_source_row == 1);
+            CHECK(plan.placements.size() == 1 &&
+                  plan.placements[0].cells.size() == 2 &&
+                  plan.placements[0].cells[0].logical_position == 1);
+        }
+    }
+    narrow(f, 1);
+    CHECK(f.validate(nullptr).status ==
+          vbr_manifest_validation_status::topology_mismatch);
+
+    co_resident_fixture adopted;
+    narrow(adopted, 3);
+    adopted.policy.co_residents = nullptr;
+    CHECK(adopt(adopted).status == vbr_adopt_status::adopted);
+    adopted.target.erase_imported();
+}
+
 static void test_co_resident_refusals() {
     using status = vbr_manifest_validation_status;
     co_resident_fixture f;
@@ -7190,6 +7256,7 @@ int main(int argc, char ** argv) {
     adoption_fixture::test_downward_subphase_matrix();
     adoption_fixture::test_upward_reconstruction();
     adoption_fixture::test_co_resident_empty_import_validates_live_rebased();
+    adoption_fixture::test_narrow_target_packs_reference();
     adoption_fixture::test_co_resident_refusals();
     adoption_fixture::test_co_resident_requires_live_rebased_policy();
     adoption_fixture::test_co_resident_seam_adopt_fails_closed();

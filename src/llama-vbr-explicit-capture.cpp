@@ -1007,6 +1007,22 @@ public:
         output.state_serial = cache->vbr_representation_epoch_;
         output.policy_epoch = policy_epoch;
         output.controller_policy = source_policy;
+        const llama_pos last = package.manifest().identity.next_position - 1;
+        if (tree_child.window && last > 0) {
+            // the mask is monotone in p0 below the query position
+            llama_pos lo = 0;
+            llama_pos hi = last;
+            while (lo < hi) {
+                const llama_pos mid = lo + (hi - lo)/2;
+                if (llama_hparams::is_masked_swa(
+                        cache->n_swa, cache->swa_type, mid, last)) {
+                    lo = mid + 1;
+                } else {
+                    hi = mid;
+                }
+            }
+            output.window_live_from = lo;
+        }
 
         for (const auto & source_unit : package.units()) {
             const auto & descriptor = source_unit.descriptor;
