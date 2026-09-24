@@ -6721,10 +6721,12 @@ private:
         return resume_idle_publish() > 0 || vbr_idle_source_durable(stage);
     }
 
-    // one run of the owners' idle capture over the idle slots: the host copies it published
+    // One run of the owners' idle capture over the idle slots: the host copies it published. The
+    // session is the bounded displacement kind, which a queued request does not refuse or cancel:
+    // a request queued while the server wakes (or starts) waits for this pass instead of stopping it.
     size_t resume_idle_publish() {
         size_t n_published = 0;
-        auto capture = queue_tasks.try_begin_idle_capture();
+        auto capture = queue_tasks.try_begin_displacement_capture();
         if (capture) {
             n_published += publish_idle_vbr_batch(capture);
         }
