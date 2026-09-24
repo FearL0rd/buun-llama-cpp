@@ -104,8 +104,9 @@ struct server_vbr_empty_handoff_gate {
     uint64_t incumbent_lcp = 0;
     uint64_t durable_incumbent_prefix = 0;
     bool exact_incumbent_durable = false;
-    // the memory tree has no atomic occupied route (several attention children)
-    bool occupied_route_unsupported = false;
+    // the occupied route refused the request before any write: no atomic route for the memory
+    // tree (several attention children), or no room for both conversations
+    bool occupied_route_refused = false;
     bool hard_lease = false;
     bool deferred_task = false;
     bool incumbent_supported = false;

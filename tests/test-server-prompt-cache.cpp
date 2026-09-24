@@ -2071,7 +2071,7 @@ void test_lifecycle_defaults_and_reuse_thresholds() {
         [](auto & gate) { gate.exact_incumbent_durable = true; });
     auto unsupported_route = accepted_handoff;
     unsupported_route.exact_incumbent_durable = true;
-    unsupported_route.occupied_route_unsupported = true;
+    unsupported_route.occupied_route_refused = true;
     CHECK(server_vbr_empty_handoff_allowed(unsupported_route));
     rejects_handoff(
         [](auto & gate) { gate.durable_incumbent_prefix = 0; });

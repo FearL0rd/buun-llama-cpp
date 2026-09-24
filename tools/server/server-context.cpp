@@ -3398,7 +3398,7 @@ bool server_vbr_empty_handoff_allowed(
     return server_vbr_empty_handoff_lookup_allowed(gate) &&
         gate.incoming_prefix > gate.incumbent_lcp &&
         gate.durable_incumbent_prefix > gate.incumbent_lcp &&
-        (!gate.exact_incumbent_durable || gate.occupied_route_unsupported) &&
+        (!gate.exact_incumbent_durable || gate.occupied_route_refused) &&
         gate.family_matches;
 }
 
@@ -3775,6 +3775,8 @@ private:
     uint64_t vbr_automatic_restore_occupied_fallbacks = 0;
     // set once the occupied guard refuses the memory tree's shape
     bool vbr_occupied_route_unsupported = false;
+    // set while a restore the guard found no room for retries through the empty handoff
+    bool vbr_occupied_route_full = false;
     int64_t vbr_restore_refusal_log_us = 0;
     static constexpr uint64_t VBR_AUTOMATIC_EXACT_CAPTURE_MAX_BYTES =
         16ull*1024ull*1024ull*1024ull;
@@ -12835,8 +12837,8 @@ private:
                     slot.hard_lease_blocks_live_prefix();
                 handoff_gate.deferred_task =
                     queue_tasks.has_deferred_for_slot(slot.id);
-                handoff_gate.occupied_route_unsupported =
-                    vbr_occupied_route_unsupported;
+                handoff_gate.occupied_route_refused =
+                    vbr_occupied_route_unsupported || vbr_occupied_route_full;
                 handoff_gate.incumbent_supported =
                     automatic_vbr_cache_support(
                         slot.prompt.tokens, slot.lora,
@@ -13004,15 +13006,22 @@ private:
                         int(imported.precision.known), imported.precision.worst_steps,
                         imported.precision.deficit, imported.precision.weight);
                     using guard_status = vbr_occupied_replacement_guard_status;
-                    // A tree the guard cannot replace atomically (iSWA) takes
-                    // the empty handoff instead, which it proves durable.
-                    if (!recovery_refreshed && !quarantined &&
-                        imported.occupied_guard_status == guard_status::unsupported_tree &&
-                        !vbr_occupied_route_unsupported) {
-                        vbr_occupied_route_unsupported = true;
+                    // A tree the guard cannot replace atomically (iSWA), or a
+                    // cache without room for both conversations, takes the
+                    // empty handoff instead, which it proves durable.
+                    const bool no_route =
+                        imported.occupied_guard_status == guard_status::unsupported_tree;
+                    const bool no_room =
+                        imported.occupied_guard_status == guard_status::capacity_unavailable;
+                    if (!recovery_refreshed && !quarantined && (no_route || no_room) &&
+                        !vbr_occupied_route_unsupported && !vbr_occupied_route_full) {
+                        vbr_occupied_route_unsupported = no_route;
+                        vbr_occupied_route_full        = no_room;
                         ticket = {};
-                        return try_automatic_vbr_restore(
+                        const bool restored = try_automatic_vbr_restore(
                             slot, task, incoming_family, restored_prefix, true);
+                        vbr_occupied_route_full = false;
+                        return restored;
                     }
                     report_refusal(imported, started);
                     // A semantically identical host frontier can still carry
