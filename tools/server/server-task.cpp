@@ -2600,6 +2600,19 @@ static bool server_prompt_projectable(const server_prompt & prompt) noexcept {
     return !prompt.tokens.has_media() && prompt.checkpoints.empty();
 }
 
+// the copy of an entry a projection would read: the quality anchor when its owner
+// can project it, else the compact copy when that one can, else none
+static const server_prompt_cache_vbr_owner * server_prompt_projection_payload(
+        const server_prompt_cache_vbr_variant_set & variants,
+        const server_vbr_artifact_store & projector) noexcept {
+    for (const auto * payload : { &variants.quality_anchor(), &variants.compact_current() }) {
+        if (*payload && projector.host_prefix_projection_ready(*payload)) {
+            return payload;
+        }
+    }
+    return nullptr;
+}
+
 bool server_prompt_cache::contains_vbr_frontier(
         const server_prompt & prompt,
         const std::string & execution_identity,
@@ -2620,7 +2633,7 @@ bool server_prompt_cache::contains_vbr_frontier(
         // the payload prepare_vbr_restore hands to the projector for this entry
         const auto * variants = state.payload.vbr_variants();
         if (variants && server_prompt_projectable(state.prompt) &&
-            projector->host_prefix_projection_ready(variants->preferred())) {
+            server_prompt_projection_payload(*variants, *projector)) {
             return true;
         }
     }
@@ -3114,7 +3127,8 @@ bool server_prompt_cache::prepare_vbr_restore(
         const std::string & adapter_config_key,
         server_prompt_cache_vbr_restore_candidate & candidate,
         bool allow_prefix_projection,
-        const common_cache_family_binding * required_family) noexcept {
+        const common_cache_family_binding * required_family,
+        const server_vbr_artifact_store * projector) noexcept {
     candidate = {};
     // The first automatic-import slice is text-only. A later-media suffix has
     // a different exact DF scope from its cached media stem; fail closed until
@@ -3145,10 +3159,11 @@ bool server_prompt_cache::prepare_vbr_restore(
             bool quality;
             uint64_t artifact;
             bool projected;
+            const server_vbr_artifact_store * projector;
         } exact {
             nullptr, &request_tokens, &execution_identity,
             &adapter_config_key, required_family,
-            0, 0, -1, false, 0, false,
+            0, 0, -1, false, 0, false, nullptr,
         };
         const auto select =
             [](void * opaque, const server_retention_instance_key & key,
@@ -3199,10 +3214,22 @@ bool server_prompt_cache::prepare_vbr_restore(
                     return true;
                 }
                 const auto * variants = state->payload.vbr_variants();
-                const bool quality = variants && variants->quality_anchor();
-                const auto & preferred = variants->preferred();
-                const uint64_t artifact_id = preferred
-                    ? preferred->reference_artifact().v : 0;
+                if (!variants) {
+                    return true;
+                }
+                // a projection takes the copy its owner can project, or passes
+                // this entry by for one that can serve it
+                const server_prompt_cache_vbr_owner * payload =
+                    current.projected && current.projector
+                        ? server_prompt_projection_payload(
+                              *variants, *current.projector)
+                        : &variants->preferred();
+                if (!payload) {
+                    return true;
+                }
+                const bool quality = *payload && *payload == variants->quality_anchor();
+                const uint64_t artifact_id = *payload
+                    ? (*payload)->reference_artifact().v : 0;
                 if (artifact_id == 0) {
                     return true;
                 }
@@ -3232,7 +3259,7 @@ bool server_prompt_cache::prepare_vbr_restore(
         selection projected {
             nullptr, &request_tokens, &execution_identity,
             &adapter_config_key, required_family,
-            0, 0, -1, false, 0, true,
+            0, 0, -1, false, 0, true, projector,
         };
         if (allow_prefix_projection) {
             if (!retention_obs->visit_common_prefix_instances(
@@ -3262,13 +3289,14 @@ bool server_prompt_cache::prepare_vbr_restore(
             return false;
         }
         auto compact = variants->compact_current();
-        auto preferred = variants->preferred();
         ++selected.best->recovery_pins;
         candidate.cache_ = this;
         candidate.source_ = selected.best;
-        candidate.payload_ = std::move(preferred);
-        if (variants->quality_anchor()) {
+        if (selected.quality) {
+            candidate.payload_ = variants->quality_anchor();
             candidate.fallback_payload_ = std::move(compact);
+        } else {
+            candidate.payload_ = std::move(compact);
         }
         candidate.cache_family_ = selected.best->cache_family;
         candidate.prefix_tokens_ = selected.prefix;

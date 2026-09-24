@@ -6264,14 +6264,12 @@ static bool model_backed_occupied_store(
     // capture does not need). Capture a short parent from the still-live full
     // sequence so this hardware arm exercises the same production owner used
     // by automatic projected host publication.
-    const size_t projected_parent_count = incoming_tokens.size();
-    const auto make_projected_manifest = [&] (uint64_t manifest_id) {
+    const auto make_projected_manifest = [&] (
+            uint64_t manifest_id, const llama_tokens & tokens) {
         vbr_projected_capture_manifest_request manifest;
         manifest.manifest_id = manifest_id;
         manifest.sequence = 0;
-        manifest.token_block.assign(
-            incoming_tokens.begin(),
-            incoming_tokens.begin() + projected_parent_count);
+        manifest.token_block = tokens;
         manifest.identity =
             make_host_capture_request(manifest.token_block).identity;
         manifest.text_only = true;
@@ -6285,14 +6283,15 @@ static bool model_backed_occupied_store(
     server_vbr_projected_host_capture_diagnostics reversed_diagnostics;
     CHECK(store->capture_projected_host_batch(
         *memory,
-        { make_projected_manifest(2), make_projected_manifest(1) },
+        { make_projected_manifest(2, incoming_tokens),
+          make_projected_manifest(1, incoming_tokens) },
         256ull*1024*1024, reversed_results, nullptr,
         &reversed_diagnostics));
     CHECK(reversed_results.size() == 2);
     reversed_results.clear();
 
     vbr_projected_capture_manifest_request projected_manifest;
-    projected_manifest = make_projected_manifest(1);
+    projected_manifest = make_projected_manifest(1, incoming_tokens);
     std::vector<server_vbr_projected_host_publish_result> projected_results;
     server_vbr_projected_host_capture_diagnostics projected_diagnostics;
     CHECK(store->capture_projected_host_batch(
@@ -6625,6 +6624,60 @@ static bool model_backed_occupied_store(
     // soft lease. Drop the now-stale local handle without a second terminal.
     incumbent_lease = {};
 
+    // The continuation landed past the foreign sequence, so the slot's rows
+    // are no longer packed from cell 0. Its projected host copy packs them;
+    // the empty door must still place each row at its physical cell.
+    llama_tokens resumed_tokens = incoming_tokens;
+    resumed_tokens.push_back(continuation);
+    std::vector<uint8_t> resumed_expected_rows;
+    CHECK(llama_kv_cache_vbr_epoch_test::snapshot_sequence_rows(
+        occupied_cache, destination_slot, uint32_t(resumed_tokens.size()),
+        resumed_expected_rows));
+    std::vector<server_vbr_projected_host_publish_result> resumed_results;
+    server_vbr_projected_host_capture_diagnostics resumed_diagnostics;
+    CHECK(store->capture_projected_host_batch(
+        *memory, { make_projected_manifest(3, resumed_tokens) },
+        256ull*1024*1024, resumed_results, nullptr, &resumed_diagnostics));
+    CHECK(resumed_results.size() == 1 && resumed_results.front().payload);
+    if (resumed_results.size() != 1 || !resumed_results.front().payload) {
+        return false;
+    }
+    llama_memory_clear(memory, true);
+    CHECK(llama_kv_cache_vbr_epoch_test::
+        make_construction_empty_preserve_tiers(occupied_cache));
+    server_vbr_artifact_import_target resumed_request;
+    resumed_request.memory = memory;
+    resumed_request.destination = destination_slot;
+    resumed_request.execution_identity = execution_key;
+    resumed_request.adapter_config_identity = adapter_key;
+    resumed_request.previously_observed = true;
+    resumed_request.prepare_publish = [](
+            void *, const std::vector<llama_token> & tokens,
+            uint64_t sequence_epoch) noexcept {
+        return !tokens.empty() && sequence_epoch == 1;
+    };
+    resumed_request.publish = [](void *) noexcept {};
+    const auto resumed = store->import_host_payload(
+        std::move(resumed_request), resumed_results.front().payload);
+    if (resumed.status != server_vbr_artifact_import_status::ok ||
+        resumed.adopt_status != vbr_adopt_status::adopted) {
+        std::fprintf(stderr,
+            "VBR packed empty import failed: store=%s validation=%s "
+            "stage=%s adopt=%s phase=%s\n",
+            server_vbr_artifact_import_status_name(resumed.status),
+            vbr_manifest_validation_status_name(resumed.validation_status),
+            vbr_adopt_stage_status_name(resumed.stage_status),
+            vbr_adopt_status_name(resumed.adopt_status),
+            vbr_adopt_phase_name(resumed.phase));
+    }
+    CHECK(resumed.status == server_vbr_artifact_import_status::ok);
+    CHECK(resumed.adopt_status == vbr_adopt_status::adopted);
+    std::vector<uint8_t> resumed_actual_rows;
+    CHECK(llama_kv_cache_vbr_epoch_test::snapshot_sequence_rows(
+        occupied_cache, destination_slot, uint32_t(resumed_tokens.size()),
+        resumed_actual_rows));
+    CHECK(resumed_actual_rows == resumed_expected_rows);
+
     // PT production composition: derive a true shorter/divergent prefix from
     // the same store-owned parent, import it through the real empty-target
     // store door, and prove that no suffix row was needed for continuation
@@ -6649,26 +6702,30 @@ static bool model_backed_occupied_store(
         const llama_tokens * expected = nullptr;
         bool published = false;
     } prefix_state { &prefix_tokens, false };
-    server_vbr_artifact_import_target prefix_request;
-    prefix_request.memory = memory;
-    prefix_request.destination = destination_slot;
-    prefix_request.execution_identity = execution_key;
-    prefix_request.adapter_config_identity = adapter_key;
-    prefix_request.previously_observed = true;
-    prefix_request.publish_context = &prefix_state;
-    prefix_request.prepare_publish = [](
-            void * opaque,
-            const std::vector<llama_token> & tokens,
-            uint64_t sequence_epoch) noexcept {
-        const auto * state = static_cast<const prefix_publish_state *>(opaque);
-        return state && state->expected && sequence_epoch == 1 &&
-            tokens == *state->expected;
-    };
-    prefix_request.publish = [](void * opaque) noexcept {
-        static_cast<prefix_publish_state *>(opaque)->published = true;
+    const auto prefix_request = [&] (prefix_publish_state & state) {
+        server_vbr_artifact_import_target request;
+        request.memory = memory;
+        request.destination = destination_slot;
+        request.execution_identity = execution_key;
+        request.adapter_config_identity = adapter_key;
+        request.previously_observed = true;
+        request.publish_context = &state;
+        request.prepare_publish = [](
+                void * opaque,
+                const std::vector<llama_token> & tokens,
+                uint64_t sequence_epoch) noexcept {
+            const auto * current =
+                static_cast<const prefix_publish_state *>(opaque);
+            return current && current->expected && sequence_epoch == 1 &&
+                tokens == *current->expected;
+        };
+        request.publish = [](void * opaque) noexcept {
+            static_cast<prefix_publish_state *>(opaque)->published = true;
+        };
+        return request;
     };
     const auto prefix_import = store->import_host_prefix_payload(
-        std::move(prefix_request), projected_owner,
+        prefix_request(prefix_state), projected_owner,
         std::move(prefix_projection));
     if (prefix_import.status != server_vbr_artifact_import_status::ok ||
         prefix_import.adopt_status != vbr_adopt_status::adopted ||
@@ -6740,6 +6797,134 @@ static bool model_backed_occupied_store(
         }
         CHECK(equal);
     }
+
+    // Occupied prefix projection from a parent whose prefix rows are not its
+    // leading packed rows: the suffix reused cells freed below the prefix, so
+    // relocation reads parent rows past the projected payload size.
+    llama_memory_clear(memory, true);
+    const size_t low_count = 40;
+    const size_t suffix_count = 4;
+    CHECK(incoming_tokens.size() > low_count &&
+          prefix_count + suffix_count <= low_count/2);
+    llama_tokens low_tokens(
+        incoming_tokens.begin(), incoming_tokens.begin()+low_count);
+    llama_tokens parent_tokens(
+        incoming_tokens.begin(),
+        incoming_tokens.begin()+prefix_count+suffix_count);
+    CHECK(model_adoption_decode(context.get(), low_tokens, 0, 1));
+    CHECK(model_adoption_decode(context.get(), prefix_tokens, 0));
+    CHECK(llama_memory_seq_rm(memory, 1, -1, -1));
+    CHECK(model_adoption_decode(
+        context.get(),
+        llama_tokens(parent_tokens.begin()+prefix_count, parent_tokens.end()),
+        llama_pos(prefix_count)));
+    llama_synchronize(context.get());
+    std::vector<server_vbr_projected_host_publish_result> reordered_results;
+    CHECK(store->capture_projected_host_batch(
+        *memory, { make_projected_manifest(4, parent_tokens) }, 256ull*1024*1024,
+        reordered_results, nullptr, nullptr));
+    CHECK(reordered_results.size() == 1 && reordered_results.front().payload);
+    if (reordered_results.size() != 1 || !reordered_results.front().payload) {
+        return false;
+    }
+    const auto reordered_parent = reordered_results.front().payload;
+    CHECK(llama_memory_seq_rm(memory, 0, llama_pos(prefix_count), -1));
+    std::vector<uint8_t> reordered_expected_rows;
+    CHECK(llama_kv_cache_vbr_epoch_test::snapshot_sequence_rows(
+        occupied_cache, 0, uint32_t(prefix_count), reordered_expected_rows));
+    llama_memory_clear(memory, true);
+    llama_tokens occupant_tokens(
+        incumbent_tokens.end()-20, incumbent_tokens.end());
+    CHECK(model_adoption_decode(context.get(), occupant_tokens, 0));
+    llama_synchronize(context.get());
+    std::shared_ptr<const server_prompt_cache_vbr_payload> occupant_owner;
+    CHECK(capture_owner(occupant_tokens, occupant_owner));
+    if (!occupant_owner) {
+        return false;
+    }
+    vbr_artifact_attention_prefix_projection occupied_projection;
+    CHECK(store->prepare_host_prefix_projection(
+        reordered_parent, divergent_request, prefix_count,
+        occupied_projection) ==
+        vbr_artifact_prefix_projection_status::projected);
+    prefix_publish_state occupied_state { &prefix_tokens, false };
+    const auto occupied_import = store->import_host_occupied_prefix_replacement(
+        prefix_request(occupied_state), reordered_parent, occupant_owner,
+        std::move(occupied_projection));
+    if (occupied_import.status != server_vbr_artifact_import_status::ok ||
+        occupied_import.adopt_status != vbr_adopt_status::adopted) {
+        std::fprintf(stderr,
+            "VBR occupied prefix import failed: store=%s guard=%s "
+            "validation=%s stage=%s adopt=%s phase=%s\n",
+            server_vbr_artifact_import_status_name(occupied_import.status),
+            vbr_occupied_replacement_guard_status_name(
+                occupied_import.occupied_guard_status),
+            vbr_manifest_validation_status_name(
+                occupied_import.validation_status),
+            vbr_adopt_stage_status_name(occupied_import.stage_status),
+            vbr_adopt_status_name(occupied_import.adopt_status),
+            vbr_adopt_phase_name(occupied_import.phase));
+    }
+    CHECK(occupied_import.status == server_vbr_artifact_import_status::ok);
+    CHECK(occupied_import.adopt_status == vbr_adopt_status::adopted);
+    CHECK(occupied_state.published);
+    CHECK(memory->seq_pos_max(0) == llama_pos(prefix_count-1));
+    std::vector<uint8_t> reordered_actual_rows;
+    CHECK(llama_kv_cache_vbr_epoch_test::snapshot_sequence_rows(
+        occupied_cache, 0, uint32_t(prefix_count), reordered_actual_rows));
+    CHECK(reordered_actual_rows == reordered_expected_rows);
+
+    // A longer exact-only host match must not mask a shorter copy the owner can
+    // project: with the projector the selector passes the exact entry by.
+    llama_memory_clear(memory, true);
+    llama_tokens branch_tokens(
+        incoming_tokens.begin(), incoming_tokens.begin()+prefix_count);
+    for (size_t i = 0; i < suffix_count; ++i) {
+        branch_tokens.push_back(llama_token(
+            (uint32_t(incoming_tokens[prefix_count+i])+2u)%uint32_t(vocab_size)));
+    }
+    CHECK(model_adoption_decode(context.get(), branch_tokens, 0));
+    llama_synchronize(context.get());
+    std::vector<server_vbr_projected_host_publish_result> branch_results;
+    CHECK(store->capture_projected_host_batch(
+        *memory, { make_projected_manifest(5, branch_tokens) }, 256ull*1024*1024,
+        branch_results, nullptr, nullptr));
+    CHECK(branch_results.size() == 1 && branch_results.front().payload);
+    if (branch_results.size() != 1 || !branch_results.front().payload) {
+        return false;
+    }
+    const auto branch_owner = branch_results.front().payload;
+    CHECK(store->host_prefix_projection_ready(branch_owner));
+    CHECK(!store->host_prefix_projection_ready(incoming_owner));
+    server_prompt branch_prompt;
+    branch_prompt.tokens = server_tokens(branch_tokens, false);
+    branch_prompt.sequence_epoch = 1;
+    constexpr int32_t branch_source_slot = 5;
+    CHECK(publish_live_source(branch_source_slot, branch_prompt));
+    CHECK(publish_host(
+        branch_source_slot, branch_prompt, branch_owner, incoming_family));
+    const size_t exact_lcp = low_count/2;
+    llama_tokens selector_request(
+        incoming_tokens.begin(), incoming_tokens.begin()+exact_lcp);
+    selector_request.push_back(llama_token(
+        (uint32_t(incoming_tokens[exact_lcp])+1u)%uint32_t(vocab_size)));
+    {
+        server_prompt_cache_vbr_restore_candidate blind;
+        CHECK(cache.prepare_vbr_restore(
+            server_tokens(selector_request, false), execution_key,
+            adapter_key, blind, true));
+        CHECK(blind.prefix_tokens() == exact_lcp);
+        CHECK(blind.payload() != branch_owner);
+    }
+    server_prompt_cache_vbr_restore_candidate selected;
+    CHECK(cache.prepare_vbr_restore(
+        server_tokens(selector_request, false), execution_key,
+        adapter_key, selected, true, nullptr, store.get()));
+    CHECK(selected.requires_prefix_projection());
+    CHECK(selected.prefix_tokens() == prefix_count);
+    CHECK(selected.payload() == branch_owner);
+    CHECK(cache.contains_vbr_frontier(
+        branch_prompt, execution_key, adapter_key, store.get()));
     return failures == 0;
 }
 

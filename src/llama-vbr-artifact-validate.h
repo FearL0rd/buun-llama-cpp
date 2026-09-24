@@ -456,9 +456,12 @@ enum class vbr_validated_stash_action : uint8_t {
     _count,
 };
 
+// A dense image holds each row at its physical cell; a projected package
+// packs its rows, so the run's source row differs from its destination cell.
 struct vbr_authorized_cell_run {
     uint32_t first_physical_cell = 0;
     uint32_t cell_count = 0;
+    uint64_t first_source_row = 0;
 };
 
 // Prefix projections deliberately separate packed host rows from freshly

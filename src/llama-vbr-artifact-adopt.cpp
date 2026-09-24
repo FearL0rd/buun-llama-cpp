@@ -574,6 +574,11 @@ class vbr_kv_import_session {
                             final_watermarks_[pool_index->second],
                             descriptor_watermark);
                     }
+                    // Relocation runs address rows of the staged source: a
+                    // prefix projection reads them out of its parent image,
+                    // which is larger than the projected payload.
+                    const uint64_t source_bytes = shard.source
+                        ? shard.source->size() : shard.payload_bytes;
                     const auto validate_run = [&](uint64_t source_first,
                                                   uint32_t destination_first,
                                                   uint32_t cell_count) {
@@ -586,8 +591,8 @@ class vbr_kv_import_session {
                         const uint64_t relative =
                             uint64_t(source_first)*shard.row_bytes;
                         const uint64_t bytes = uint64_t(cell_count)*shard.row_bytes;
-                        if (relative > shard.payload_bytes ||
-                            bytes > shard.payload_bytes-relative ||
+                        if (relative > source_bytes ||
+                            bytes > source_bytes-relative ||
                             unit.second->byte_off > pool->size ||
                             uint64_t(destination_first)*shard.target_row_bytes >
                                 pool->size-unit.second->byte_off ||
@@ -614,17 +619,20 @@ class vbr_kv_import_session {
                         if (run.cell_count == 0 ||
                             run.first_physical_cell >
                                 UINT32_MAX-run.cell_count ||
+                            run.first_source_row > UINT64_MAX/shard.row_bytes ||
                             uint64_t(run.first_physical_cell) >
                                 UINT64_MAX/shard.row_bytes ||
                             uint64_t(run.cell_count) > UINT64_MAX/shard.row_bytes) {
                             return false;
                         }
+                        const uint64_t source =
+                            run.first_source_row*shard.row_bytes;
                         const uint64_t relative =
                             uint64_t(run.first_physical_cell)*shard.row_bytes;
                         const uint64_t bytes =
                             uint64_t(run.cell_count)*shard.row_bytes;
-                        if (relative > shard.payload_bytes ||
-                            bytes > shard.payload_bytes-relative ||
+                        if (source > shard.payload_bytes ||
+                            bytes > shard.payload_bytes-source ||
                             unit.second->byte_off > pool->size ||
                             relative > pool->size-unit.second->byte_off ||
                             bytes > pool->size-unit.second->byte_off-relative) {
@@ -2261,7 +2269,12 @@ vbr_adopt_result vbr_adopt_empty_manifest(
         }
         const bool prefix_projection = manifest->is_prefix_projection();
         const bool packed_transfer =
-            prefix_projection || occupied_replacement;
+            prefix_projection || occupied_replacement ||
+            std::any_of(
+                staged->reads().begin(), staged->reads().end(),
+                [](const vbr_staged_read_descriptor & read) {
+                    return !read.projection_ranges.empty();
+                });
         if (prefix_projection && !manifest->projection_transfer_ready()) {
             return fail(vbr_adopt_status::source_changed);
         }
@@ -2359,11 +2372,9 @@ vbr_adopt_result vbr_adopt_empty_manifest(
             return fail(vbr_adopt_status::transfer_failed);
         }
         for (const auto & plan : manifest->children()) {
-            const uint64_t expected = packed_transfer
-                ? uint64_t(plan.shards.size())*
-                    (occupied_replacement
-                        ? manifest->relocation_runs().size() : 1)
-                : uint64_t(plan.shards.size())*plan.authorized_runs.size();
+            const uint64_t expected = uint64_t(plan.shards.size())*
+                (occupied_replacement ? manifest->relocation_runs().size()
+                 : prefix_projection ? 1 : plan.authorized_runs.size());
             if (expected == 0 || expected > UINT32_MAX ||
                 transferred_units[{ plan.child_id, plan.logical_unit_id }] !=
                     expected) {

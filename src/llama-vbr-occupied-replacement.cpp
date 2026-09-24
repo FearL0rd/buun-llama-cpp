@@ -21,9 +21,7 @@ struct vbr_occupied_replacement_guard::map {
     std::vector<vbr_occupied_replacement_cell> preserved_cells;
 };
 
-namespace {
-
-bool occupied_projected_packed_rows(
+bool vbr_projected_packed_rows(
         const vbr_artifact_package_view & incoming,
         const vbr_artifact_stream_placement & placement,
         std::vector<uint64_t> & packed_rows) {
@@ -143,6 +141,8 @@ bool occupied_projected_packed_rows(
         std::none_of(packed_rows.begin(), packed_rows.end(),
                      [](uint64_t value) { return value == UINT64_MAX; });
 }
+
+namespace {
 
 bool occupied_unit_schedule_equal(
         const vbr_artifact_unit_descriptor & incoming,
@@ -665,12 +665,12 @@ vbr_occupied_replacement_guard_status occupied_guard_validate(
         return logical == incoming_tokens;
     };
     if (build && (!(prefix_incoming ? prefix_packed_rows()
-                                    : occupied_projected_packed_rows(
+                                    : vbr_projected_packed_rows(
                                           incoming, incoming_placement,
                                           packed_rows)) ||
                   (strategy ==
                        vbr_occupied_replacement_strategy::recycle_incumbent_cells &&
-                   !occupied_projected_packed_rows(
+                   !vbr_projected_packed_rows(
                        recovery, recovery_placement,
                        recovery_packed_rows)))) {
         return vbr_occupied_replacement_guard_status::unsupported_layout;

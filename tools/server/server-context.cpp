@@ -7239,7 +7239,7 @@ private:
             slot.mandatory_recovery_reset(server_cache_destruction_reason::restore_failure);
             return refusal(imported);
         }
-        common_speculative_sequence_transition(slot.get_spec(), slot.id, vbr_restore_event_for(payload));
+        common_speculative_sequence_transition(slot.get_spec(), slot.id, vbr_restore_event_for(slot.id, payload));
         slot.bind_frontier_logits_to_prompt();
         // the import published the prompt alone: without a live retention instance the slot is
         // no source for an idle capture, and its conversation goes with the next one to take it
@@ -12497,9 +12497,10 @@ private:
         return ready;
     }
 
-    // what the drafter learns of a restored sequence follows from the companions that came with it
-    static common_speculative_sequence_event vbr_restore_event_for(
-            const server_prompt_cache_vbr_owner & payload) noexcept {
+    // what the drafter learns of a restored sequence follows from the companions that came with it;
+    // call after adoption: a draft image captured while the draft was empty restores no draft
+    common_speculative_sequence_event vbr_restore_event_for(
+            llama_seq_id seq, const server_prompt_cache_vbr_owner & payload) const noexcept {
         bool draft_image = false;
         bool accelerator_image = false;
         if (payload) {
@@ -12511,7 +12512,8 @@ private:
                     vbr_artifact_companion_kind::typed_accelerator;
             }
         }
-        if (!draft_image) {
+        if (!draft_image || !ctx_dft ||
+            llama_memory_seq_pos_max(llama_get_memory(ctx_dft.get()), seq) < 0) {
             return common_speculative_sequence_event::
                 target_restored_without_draft;
         }
@@ -12641,7 +12643,8 @@ private:
             if (!candidate.ready() && !prompt_cache->prepare_vbr_restore(
                     task.tokens, frontier_execution_identity,
                     adapter_identity, candidate,
-                    !ctx_dft && !slot.can_speculate())) {
+                    !ctx_dft && !slot.can_speculate(), nullptr,
+                    vbr_artifact_store.get())) {
                 if (occupied_candidate) {
                     SLT_INF(slot, "%s",
                             "automatic occupied VBR restore refused: no exact host candidate\n");
@@ -12851,8 +12854,6 @@ private:
                 const int64_t started = ggml_time_us();
                 const uint64_t prefix_tokens = ticket.incoming_prefix_tokens();
                 const uint64_t incumbent_lcp = ticket.incumbent_live_lcp();
-                const auto restore_event =
-                    vbr_restore_event_for(ticket.incoming_payload());
                 const bool incoming_frontier_logits = std::any_of(
                     ticket.incoming_payload()->package().companions().begin(),
                     ticket.incoming_payload()->package().companions().end(),
@@ -12926,6 +12927,8 @@ private:
                     return false;
                 }
                 GGML_ASSERT(state.published);
+                const auto restore_event =
+                    vbr_restore_event_for(slot.id, ticket.incoming_payload());
                 prompt_cache->commit_vbr_occupied_replacement(
                     ticket, slot.prompt, slot.cache_family, slot.id);
                 if (!occupied_prefix_projection &&
@@ -13123,7 +13126,7 @@ private:
                 (imported.decision == vbr_import_decision::native_import ||
                  imported.decision == vbr_import_decision::live_rebased);
             const auto restore_event =
-                vbr_restore_event_for(candidate.payload());
+                vbr_restore_event_for(slot.id, candidate.payload());
             if (candidate.requires_prefix_projection()) {
                 slot.cache_family = incoming_family;
             }

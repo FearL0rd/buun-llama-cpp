@@ -170,6 +170,18 @@ bool co_resident_cells(
     return true;
 }
 
+// extend the last run while both the destination cell and the source row follow on
+void append_cell_run(
+        std::vector<vbr_authorized_cell_run> & runs, uint32_t cell, uint64_t row) {
+    if (runs.empty() ||
+        uint64_t(runs.back().first_physical_cell) + runs.back().cell_count != cell ||
+        runs.back().first_source_row + runs.back().cell_count != row) {
+        runs.push_back({ cell, 1, row });
+    } else {
+        ++runs.back().cell_count;
+    }
+}
+
 bool authorized_placement_plan(
         const vbr_artifact_reference_manifest & manifest,
         uint32_t child_id,
@@ -209,13 +221,32 @@ bool authorized_placement_plan(
         }
     }
     for (uint32_t cell : cells) {
-        if (runs.empty() ||
-            uint64_t(runs.back().first_physical_cell) +
-                    runs.back().cell_count != cell) {
-            runs.push_back({ cell, 1 });
-        } else {
-            ++runs.back().cell_count;
-        }
+        append_cell_run(runs, cell, cell);
+    }
+    return !runs.empty();
+}
+
+// A projected package packs its rows: re-split the physical runs wherever the
+// source rows stop being contiguous with them.
+bool projected_source_runs(
+        const vbr_artifact_package_view & package,
+        const std::vector<vbr_artifact_stream_placement> & placements,
+        std::vector<vbr_authorized_cell_run> & runs) {
+    std::vector<uint64_t> packed_rows;
+    if (placements.size() != 1 ||
+        !vbr_projected_packed_rows(package, placements.front(), packed_rows)) {
+        return false;
+    }
+    std::vector<std::pair<uint32_t, uint64_t>> rows;
+    rows.reserve(placements.front().cells.size());
+    for (const auto & cell : placements.front().cells) {
+        rows.push_back({
+            cell.physical_cell, packed_rows[size_t(cell.logical_position)] });
+    }
+    std::sort(rows.begin(), rows.end());
+    runs.clear();
+    for (const auto & [cell, row] : rows) {
+        append_cell_run(runs, cell, row);
     }
     return !runs.empty();
 }
@@ -1541,6 +1572,12 @@ vbr_manifest_validation_result vbr_validate_unit_manifest_snapshot(
                 return terminal_result(
                     vbr_manifest_validation_status::ownership_mismatch);
             }
+            if (!package.projected_ranges().empty() &&
+                (!unit_co_cells.empty() ||
+                 !projected_source_runs(package, placements, runs))) {
+                return terminal_result(
+                    vbr_manifest_validation_status::geometry_mismatch);
+            }
             for (const auto & placement : placements) {
                 for (const auto & cell : placement.cells) {
                     if (cell.physical_cell >= descriptor.wm_cells) {
@@ -2444,7 +2481,7 @@ vbr_manifest_validation_result vbr_validate_attention_prefix_projection(
             plan.target_pool_cookie = target_unit.shards.front().pool_cookie;
             plan.descriptor = descriptor;
             plan.descriptor.wm_cells = prefix_tokens;
-            plan.authorized_runs.push_back({ 0, uint32_t(prefix_tokens) });
+            plan.authorized_runs.push_back({ 0, uint32_t(prefix_tokens), 0 });
             if (unit_index == 0) {
                 plan.placements.push_back(std::move(dense_placement));
             }

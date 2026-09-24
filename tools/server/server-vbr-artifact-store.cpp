@@ -288,6 +288,15 @@ public:
             llama_memory_seq_pos_min(memory, target->destination) < 0 &&
             llama_memory_seq_pos_max(memory, target->destination) < 0;
     }
+    // A target-only restore empties the draft sequence until the drafter
+    // rebuilds it, so a captured draft image may hold no cells at all.
+    static bool at_terminal(
+            const server_vbr_draft_target & target, llama_pos terminal) {
+        auto * memory = llama_get_memory(target.ctx);
+        const llama_pos live = llama_memory_seq_pos_max(memory, target.destination);
+        return live == terminal ||
+            (live < 0 && llama_memory_seq_pos_min(memory, target.destination) < 0);
+    }
     static bool prepare(
             const void * opaque,
             std::unique_ptr<vbr_parsed_companion_image> parsed_base,
@@ -317,8 +326,7 @@ public:
             }
             auto * memory = llama_get_memory(target->ctx);
             if (!memory || target->expected_terminal < 0 ||
-                llama_memory_seq_pos_max(memory, destination) !=
-                    target->expected_terminal) {
+                !at_terminal(*target, target->expected_terminal)) {
                 if (memory) {
                     llama_memory_seq_rm(memory, destination, -1, -1);
                 }
@@ -341,7 +349,7 @@ public:
             reader, target.destination, LLAMA_STATE_SEQ_FLAGS_NONE);
         auto * memory = llama_get_memory(target.ctx);
         return written == bytes && reader.n_bytes() == bytes && memory &&
-            llama_memory_seq_pos_max(memory, target.destination) == terminal;
+            at_terminal(target, terminal);
     }
     static bool prepare_replacement(
             const void * opaque,
@@ -377,9 +385,11 @@ public:
                 llama_memory_seq_pos_min(memory, destination);
             const size_t live_bytes = llama_state_seq_get_size_ext(
                 target->ctx, destination, LLAMA_STATE_SEQ_FLAGS_NONE);
-            if (image->recovery_live_terminal != target->recovery_terminal ||
-                recovery_live_min < 0 ||
-                recovery_live_min > target->recovery_terminal ||
+            // an empty draft sequence is its own recovery: nothing to restore
+            if (((recovery_live_min >= 0 || image->recovery_live_terminal >= 0) &&
+                 (image->recovery_live_terminal != target->recovery_terminal ||
+                  recovery_live_min < 0 ||
+                  recovery_live_min > target->recovery_terminal)) ||
                 live_bytes == 0 ||
                 live_bytes != recovery->bytes ||
                 recovery->source->size() != recovery->bytes) {
@@ -419,9 +429,7 @@ public:
             target->destination == image.target.destination &&
             target->expected_terminal == image.target.expected_terminal &&
             target->recovery_terminal == image.target.recovery_terminal &&
-            llama_memory_seq_pos_max(
-                llama_get_memory(target->ctx), target->destination) ==
-                    target->expected_terminal &&
+            at_terminal(*target, target->expected_terminal) &&
             llama_state_seq_get_size_ext(
                 target->ctx, target->destination,
                 LLAMA_STATE_SEQ_FLAGS_NONE) == image.expected_bytes;
