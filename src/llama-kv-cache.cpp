@@ -6819,10 +6819,10 @@ bool llama_kv_cache::vbr_capture_policy_snapshot(
     output.floor_type = floor_index < vbr_degrade_order_.size()
         ? int32_t(vbr_tier_type(vbr_params_.codec, vbr_degrade_order_[floor_index].tier))
         : int32_t(llama_vbr_ladder(vbr_params_.codec).default_floor);
+    // the budget, explicit or not, is the pressure an artifact moves across
     output.pressure_independent_settings =
         (uint64_t(vbr_params_.dynamic) << 0) |
         (uint64_t(vbr_params_.min_bits_explicit) << 1) |
-        (uint64_t(vbr_params_.budget_explicit) << 2) |
         (uint64_t(vbr_params_.pin_k) << 3) |
         (uint64_t(vbr_params_.pin_v) << 4) |
         (uint64_t(vbr_params_.codec) << 8);
