@@ -5325,20 +5325,21 @@ private:
                 saved.push_back(slot);
             }
         }
-        const size_t n_hosted = resume_vbr_host_cache()
+        const size_t n_hosted = (resume_vbr() ? resume_vbr_host_cache() : prompt_cache != nullptr)
             ? resume_capture_hosted(why, order.empty() ? slots.front() : *order.front(), saved) : 0;
         resume_prune(0);
         SRV_INF("RESUME event=capture_done why=%s slots=%zu hosted=%zu t_ms=%.1f\n",
                 why, order.size(), n_hosted, (ggml_time_us() - t_start)/1000.0);
     }
 
-    // The conversations a dynamic cache holds in the host cache alone. An artifact there has no
-    // form a file can take, so each comes back into a slot by the owners' restore, is saved as a
-    // slot's conversation is and gives way to the next. The cache goes away after this pass and
-    // the slots are saved by now: one of them is the stage, each restore replacing what it holds,
-    // and the others leave so that the image saved is of one conversation.
+    // The conversations the host cache alone holds. A state there has no form a file can take, so
+    // each comes back into a slot (the owners' restore of a dynamic cache, the host restore of a
+    // fixed one), is saved as a slot's conversation is and gives way to the next. The cache goes
+    // away after this pass and the slots are saved by now: one of them is the stage, each restore
+    // replacing what it holds, and the others leave so that the image saved is of one conversation.
     size_t resume_capture_hosted(const char * why, server_slot & stage,
                                  const std::vector<const server_slot *> & saved) {
+        const bool vbr = resume_vbr();
         const std::string adapter = lora_config_identity(stage.lora);
         const auto leads = [](const server_tokens & a, const server_tokens & b) {
             return a.size() <= b.size() && a.get_common_prefix(b) == a.size();
@@ -5347,9 +5348,11 @@ private:
         std::vector<server_tokens> hosted;
         for (const auto & state : prompt_cache->states) {
             const auto & tokens = state.prompt.tokens;
-            if (state.payload.kind() != server_prompt_cache_payload_kind::vbr_artifact ||
-                tokens.empty() || tokens.has_media() || state.adapter_config_key != adapter ||
-                state.vbr_execution_identity != frontier_execution_identity) {
+            const bool of_route = vbr
+                ? state.payload.kind() == server_prompt_cache_payload_kind::vbr_artifact &&
+                    state.vbr_execution_identity == frontier_execution_identity
+                : state.payload.fixed_state() != nullptr;
+            if (!of_route || tokens.empty() || tokens.has_media() || state.adapter_config_key != adapter) {
                 continue;
             }
             // the copy of a saved slot, or an earlier state of a conversation that is saved later on
@@ -5368,9 +5371,10 @@ private:
         const size_t bound  = resume_entry_bound();
         const size_t n_room = bound - std::min(bound, saved.size());
         hosted.erase(hosted.begin(), hosted.end() - std::min(hosted.size(), n_room));
-        // Each restore publishes what it replaces, and that may evict the states still to come. A
-        // pinned state is not evicted, so each is pinned now, exact, and one the restore would
-        // have to complete by prefill is left out: the image saved is of the cache, not of a prefill.
+        // A dynamic restore publishes what it replaces, and that may evict the states still to
+        // come. A pinned state is not evicted, so each is pinned now, exact, and one the restore
+        // would have to complete by prefill is left out: the image saved is of the cache, not of a
+        // prefill. A fixed restore replaces an empty stage and publishes nothing.
         struct hosted_t {
             server_tokens tokens;
             server_prompt_cache_vbr_restore_candidate pin;
@@ -5378,7 +5382,7 @@ private:
         std::vector<hosted_t> pinned;
         for (auto & tokens : hosted) {
             server_prompt_cache_vbr_restore_candidate pin;
-            if (resume_pin_exact(tokens, adapter, pin)) {
+            if (!vbr || resume_pin_exact(tokens, adapter, pin)) {
                 pinned.push_back({std::move(tokens), std::move(pin)});
             }
         }
@@ -5393,7 +5397,7 @@ private:
                 t_used = std::min(t_used, slot.t_last_used);
                 // A replacement wants what it replaces held by the host cache, and a stage that
                 // is not gives way as the others do.
-                if (&slot != &stage || !ensure_vbr_replacement_recovery(slot)) {
+                if (!vbr || &slot != &stage || !ensure_vbr_replacement_recovery(slot)) {
                     resume_stage_clear(slot);
                 }
             }
@@ -5410,13 +5414,17 @@ private:
                 task.params.cache_prompt = true;
                 resume_group_t solo;
                 solo.members         = &one;
-                solo.hosted_artifact = pinned[i].pin.payload()->reference_artifact().v;
+                solo.hosted_artifact = vbr ? pinned[i].pin.payload()->reference_artifact().v : 0;
                 const auto restore = [&]() {
-                    return try_automatic_vbr_restore(stage, task, {}, nullptr, false, &pinned[i].pin) &&
+                    return (vbr ? try_automatic_vbr_restore(stage, task, {}, nullptr, false, &pinned[i].pin)
+                                : stage.prompt_load(*prompt_cache, task.tokens, adapter)) &&
                         stage.prompt.n_tokens() == task.tokens.size();
                 };
+                if (!vbr) {
+                    resume_stage_clear(stage);
+                }
                 bool restored = restore();
-                if (!restored) {
+                if (vbr && !restored) {
                     // a cache with no room for two conversations takes one into an empty stage; a
                     // pin the refused restore consumed is taken again
                     resume_stage_clear(stage);
@@ -5429,7 +5437,7 @@ private:
                     // 10 ms apart, and never a time that reads as unused
                     stage.t_last_used = std::max<int64_t>(1, t_used - int64_t(pinned.size() - i)*10000);
                     status = resume_capture_slot(stage, solo);
-                    if (resume_saved(status)) {
+                    if (vbr && resume_saved(status)) {
                         resume_unslotted[status["entry"]] = solo.hosted_artifact;
                     }
                 } else {
