@@ -11418,8 +11418,7 @@ private:
             const llama_pos pos_next = task.tokens.pos_next(slot_lcps[i]);
             const bool has_new_tokens = slot_lcps[i] < task.tokens.size();
             const llama_pos pos_min_threshold =
-                std::max<llama_pos>(
-                    0, pos_next - n_swa - (has_new_tokens ? 0 : 1));
+                server_prompt_checkpoint_reuse_threshold(pos_next, n_swa, has_new_tokens);
             const auto vbr_now = llama_memory_vbr_state(
                 llama_get_memory(ctx_tgt), candidate_target.id, 0);
             std::string adapter_identity;
@@ -19490,6 +19489,8 @@ private:
                                     slot.vbr_imported_complete_frontier >=
                                         uint64_t(n_past);
                                 slot.vbr_imported_complete_frontier = 0;
+                                SLT_DBG(slot, "prefix reuse check: n_past = %d, pos_next = %d, pos_min = %d, thold = %d, complete_vbr_import = %d\n",
+                                        n_past, pos_next, pos_min, pos_min_thold, complete_vbr_import);
                                 if (pos_min == -1) {
                                     // Fail-closed coordinated restore. The token ledger claims a
                                     // prefix (n_past > 0) but this sequence's KV is empty (pos_min == -1) --
@@ -21070,9 +21071,9 @@ private:
                                 slot.prompt.tokens.pos_next();
                             const bool has_new_tokens =
                                 slot.prompt.n_tokens() < slot.task->n_tokens();
-                            const llama_pos seam_min = std::max(
-                                0, seam_next - n_swa -
-                                    (has_new_tokens ? 0 : 1));
+                            const llama_pos seam_min =
+                                server_prompt_checkpoint_reuse_threshold(
+                                    seam_next, n_swa, has_new_tokens);
                             const bool recurrent =
                                 llama_model_is_recurrent(model_tgt) ||
                                 llama_model_is_hybrid(model_tgt);

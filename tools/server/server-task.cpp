@@ -8575,7 +8575,15 @@ bool server_prompt_checkpoint_frontier_is_current(
 }
 
 llama_pos server_prompt_checkpoint_reuse_threshold(llama_pos pos_next, int32_t n_swa, bool has_new_tokens) {
-    return std::max(0, pos_next - n_swa - (has_new_tokens ? 0 : 1));
+    // the first evaluated position: the next one, or the final token again on an exact hit
+    const llama_pos first = pos_next - (has_new_tokens ? 0 : 1);
+    if (n_swa <= 0) {
+        return std::max(0, first);
+    }
+    // a window keeps key k for query p while p - k < n_swa (is_masked_swa), so the window of
+    // `first` begins at first - n_swa + 1; a pos_min past it lacks a key. The cache prunes to
+    // exactly that window, and an exact capture of it is complete.
+    return std::max(0, first - n_swa + 2);
 }
 
 server_prompt_checkpoint_reuse server_prompt_checkpoint_reuse_geometry(
