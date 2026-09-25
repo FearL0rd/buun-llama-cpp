@@ -3836,11 +3836,7 @@ vbr_artifact_status server_vbr_artifact_store::export_host_payload(
         !impl_->catalog.owns_host_package(payload.package())) {
         return vbr_artifact_status::invalid_argument;
     }
-    vbr_artifact_package package;
-    const auto status = payload.package().exact_package(package);
-    return status == vbr_artifact_status::ok
-        ? vbr_artifact_encode(package, writer, max_encoded_bytes)
-        : status;
+    return payload.package().encode_exact(writer, max_encoded_bytes);
 }
 
 namespace {

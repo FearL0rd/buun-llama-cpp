@@ -459,6 +459,10 @@ public:
     // Payload sources borrow this view's storage, so the view must outlive
     // every read of `out`.
     vbr_artifact_status exact_package(vbr_artifact_package & out) const noexcept;
+    // Encode that package, reusing the unit ids published with it.
+    vbr_artifact_status encode_exact(
+        const vbr_artifact_stream_writer & output,
+        uint64_t max_total_bytes) const noexcept;
     vbr_artifact_resolve_status retain(
         vbr_artifact_package_view & output) const noexcept;
     void reset() noexcept;

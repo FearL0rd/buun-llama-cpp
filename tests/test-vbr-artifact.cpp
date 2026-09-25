@@ -1299,6 +1299,33 @@ struct discard_writer {
     }
 };
 
+struct vector_sink {
+    std::vector<uint8_t> bytes;
+
+    static bool write(
+            void * context,
+            const uint8_t * data,
+            size_t size) noexcept {
+        auto & out = static_cast<vector_sink *>(context)->bytes;
+        out.insert(out.end(), data, data + size);
+        return true;
+    }
+};
+
+// Several hash workers (immutable sources) must write the same bytes.
+static void test_parallel_encode_matches_serial() {
+    fixture_storage storage;
+    auto package = make_package(storage);
+    std::vector<uint8_t> serial;
+    CHECK(vbr_artifact_encode_vector(package, serial, 1024*1024) ==
+          vbr_artifact_status::ok);
+    vector_sink parallel;
+    const vbr_artifact_stream_writer sink { &parallel, vector_sink::write };
+    CHECK(vbr_artifact_encode(package, sink, 1024*1024, nullptr, 4) ==
+          vbr_artifact_status::ok);
+    CHECK(!serial.empty() && parallel.bytes == serial);
+}
+
 static void test_stream_larger_than_capture_ring() {
     constexpr uint64_t ring_bytes = 256ull*1024*1024;
     generated_source generated { ring_bytes + 1, 0x39 };
@@ -1815,6 +1842,15 @@ static void test_catalog_streaming_protocol() {
         CHECK(original.validate_authenticated() == vbr_artifact_status::ok);
         CHECK(deduplicated.validate_authenticated() == vbr_artifact_status::ok);
         CHECK(retained.validate_authenticated() == vbr_artifact_status::ok);
+        // Reusing the published ids writes the same bytes as a full encode.
+        vbr_artifact_package exact;
+        std::vector<uint8_t> full;
+        CHECK(original.exact_package(exact) == vbr_artifact_status::ok);
+        CHECK(vbr_artifact_encode_vector(exact, full, 1024*1024) == vbr_artifact_status::ok);
+        vector_sink reused;
+        CHECK(original.encode_exact({ &reused, vector_sink::write }, 1024*1024) ==
+              vbr_artifact_status::ok);
+        CHECK(!full.empty() && reused.bytes == full);
         CHECK(original.units()[0].payload_shards[0] ==
               deduplicated.units()[0].payload_shards[0]);
         auto chain = std::const_pointer_cast<artifact_segment_chain>(
@@ -4041,6 +4077,15 @@ static void test_catalog_authentication_reuse() {
         *chain = std::move(corrupt);
         CHECK(f.view.validate() != vbr_artifact_status::ok);
         CHECK(f.view.validate_authenticated() == vbr_artifact_status::checksum_mismatch);
+        // Stale evidence is not reused: export hashes the changed bytes.
+        vbr_artifact_package exact;
+        std::vector<uint8_t> full;
+        CHECK(f.view.exact_package(exact) == vbr_artifact_status::ok);
+        CHECK(vbr_artifact_encode_vector(exact, full, 1024*1024) == vbr_artifact_status::ok);
+        vector_sink exported;
+        CHECK(f.view.encode_exact({ &exported, vector_sink::write }, 1024*1024) ==
+              vbr_artifact_status::ok);
+        CHECK(!full.empty() && exported.bytes == full);
     }
 
     // Legacy publication has no reusable evidence and must still hash bytes.
@@ -9959,6 +10004,7 @@ int main(int argc, char ** argv) {
     test_encoder_rejects_source_mutation();
     test_validation_and_ordering();
     test_companion_payload();
+    test_parallel_encode_matches_serial();
     test_stream_larger_than_capture_ring();
     test_catalog_streaming_protocol();
     test_catalog_accounting_setup_preserves_shared_gauges();

@@ -1844,6 +1844,32 @@ vbr_artifact_status vbr_artifact_package_view::exact_package(
     }
 }
 
+vbr_artifact_status vbr_artifact_package_view::encode_exact(
+        const vbr_artifact_stream_writer & output,
+        uint64_t max_total_bytes) const noexcept {
+    try {
+        vbr_artifact_package package;
+        const auto status = exact_package(package);
+        if (status != vbr_artifact_status::ok) {
+            return status;
+        }
+        // Publication authenticated these units in this order and version.
+        // While their backing is unchanged, their ids are not rehashed.
+        const bool authenticated = storage_->authentication_complete &&
+            validate_authenticated() == vbr_artifact_status::ok;
+        vbr_artifact_preparation_reuse reuse;
+        if (authenticated) {
+            reuse.version = package.version;
+            reuse.units = package.unit_blobs;
+        }
+        return vbr_artifact_encode(package, output, max_total_bytes, nullptr,
+                                   owned_package_hash_workers(package),
+                                   authenticated ? &reuse : nullptr);
+    } catch (...) {
+        return vbr_artifact_status::internal_error;
+    }
+}
+
 vbr_artifact_resolve_status vbr_artifact_package_view::retain(
         vbr_artifact_package_view & output) const noexcept {
     if (owner_ == nullptr || !storage_) {
