@@ -172,6 +172,11 @@ static bool server_diffusion_denoise(
             for (auto & th : pool) { th.join(); }
         }
 
+        if (step_idx == 0) {
+            LOG_INF("%s: step 0 canvas[0] argmax=%d entropy=%.4f (decode rows=%d)\n",
+                    __func__, argmax_canvas[0], entropy[0], C);
+        }
+
         // accept the lowest-entropy positions within the MI bound (sum of strictly-earlier entropies <= bound)
         std::iota(order.begin(), order.end(), 0);
         std::sort(order.begin(), order.end(), [&](int32_t a, int32_t b) { return entropy[a] < entropy[b]; });
