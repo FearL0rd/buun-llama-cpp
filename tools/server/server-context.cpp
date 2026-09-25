@@ -6771,6 +6771,29 @@ private:
                     params_base.fit_params_target[0] / (1024.0 * 1024.0));
         }
 
+        // canvas diffusion (diffusion-gemma) emits logits for the whole canvas in one pass, so the
+        // output caps must cover canvas_length. The key lives in the GGUF header and is absent for
+        // every other architecture, so this is a no-op unless the model is a canvas model.
+        {
+            const gguf_init_params gparams = { /*.no_alloc =*/ true, /*.ctx =*/ nullptr };
+            gguf_context * gctx = gguf_init_from_file(params_base.model.path.c_str(), gparams);
+            if (gctx) {
+                const int64_t kid = gguf_find_key(gctx, "diffusion-gemma.diffusion.canvas_length");
+                if (kid >= 0 && gguf_get_kv_type(gctx, kid) == GGUF_TYPE_UINT32) {
+                    const int32_t canvas = (int32_t) gguf_get_val_u32(gctx, kid);
+                    if (canvas > params_base.n_outputs_max) {
+                        SRV_INF("diffusion canvas model: raising n_outputs_max %d -> %d (canvas_length)\n",
+                                params_base.n_outputs_max, canvas);
+                        params_base.n_outputs_max = canvas;
+                    }
+                    if (canvas > params_base.n_outputs_max_per_seq) {
+                        params_base.n_outputs_max_per_seq = canvas;
+                    }
+                }
+                gguf_free(gctx);
+            }
+        }
+
         // attach a progress callback
         {
             params_base.load_progress_callback = load_progress_callback;
