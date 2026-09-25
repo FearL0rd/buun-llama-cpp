@@ -7844,7 +7844,9 @@ private:
                     cache_authority->retention, nullptr,
                     retention_owner_plan);
             }
-            if (params_base.cache_lifecycle) {
+            // memoryless models (canvas diffusion) have no llama_memory: the seal guard has
+            // nothing to protect, skip it instead of dereferencing a null memory
+            if (params_base.cache_lifecycle && llama_get_memory(ctx_tgt)) {
                 llama_get_memory(ctx_tgt)->vbr_hard_seal_guard_set(
                     vbr_hard_seal_guard {
                         [this]() {
@@ -19770,7 +19772,10 @@ private:
                     eb, diff_canvas_length, slot.task->params.n_predict);
             // every row this turn wrote is transient: the runner decodes [prompt | canvas]
             // non-causally, so the K/V rows beyond the prompt are not reusable state
-            server_cache_transient_seq_rm_impl(llama_get_memory(ctx_tgt), slot.id, n_prompt, -1);
+            // (memoryless model: nothing to clear)
+            if (llama_memory_t mem = llama_get_memory(ctx_tgt)) {
+                server_cache_transient_seq_rm_impl(mem, slot.id, n_prompt, -1);
+            }
             SLT_INF(slot, "diff canvas: %d tokens in %.1f ms\n",
                     (int) tokens.size(), (ggml_time_us() - t_start) / 1e3);
 
