@@ -16715,6 +16715,14 @@ private:
 
                         // TODO: support memory-less logits computation
                         if (slot.task->need_logits() && !llama_get_memory(ctx_tgt)) {
+                            if (diff_canvas_length > 0) {
+                                // canvas diffusion is memoryless: the entropy-bound runner in
+                                // post_cycle() decodes the prompt itself, so there is no prefill
+                                slot.prompt.tokens = server_tokens(input_tokens.get_tokens(), input_tokens.has_mtmd);
+                                slot.state = SLOT_STATE_GENERATING;
+                                slot.stats.update_prompt_last();
+                                return;
+                            }
                             send_error(slot, "the current context does not logits computation. skipping", ERROR_TYPE_SERVER);
                             slot.release();
                             return;
