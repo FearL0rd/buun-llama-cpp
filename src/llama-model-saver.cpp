@@ -33,6 +33,7 @@ bool llama_model_saver_supports_arch(llm_arch arch) {
         case LLM_ARCH_APERTUS:
         case LLM_ARCH_MIMO2:
         case LLM_ARCH_STEP35:
+        case LLM_ARCH_DIFFUSION_GEMMA: // add_kv_from_model does not write diffusion.canvas_length
         case LLM_ARCH_SPARK2_5:
         case LLM_ARCH_MUSE_GLIMMER:
         case LLM_ARCH_MELLUM:
