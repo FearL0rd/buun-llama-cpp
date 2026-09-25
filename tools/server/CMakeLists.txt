@@ -39,6 +39,8 @@ add_library(${TARGET} STATIC
     server-vbr-prompt-cache-support.h
     server-retention-sidecar.cpp
     server-retention-sidecar.h
+    server-resume-store.cpp
+    server-resume-store.h
     server-queue.cpp
     server-queue.h
     server-common.cpp
@@ -64,6 +66,7 @@ endif()
 target_include_directories(${TARGET} PRIVATE ../mtmd)
 target_include_directories(${TARGET} PRIVATE ${CMAKE_SOURCE_DIR})
 target_link_libraries(${TARGET} PUBLIC llama-common mtmd ${CMAKE_THREAD_LIBS_INIT})
+target_link_libraries(${TARGET} PRIVATE vendor::hash)
 
 # llama-server-impl: server logic, reusable by app
 

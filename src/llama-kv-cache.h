@@ -244,6 +244,9 @@ public:
     void state_write(llama_io_write_i & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) const override;
     void state_read (llama_io_read_i  & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) override;
 
+    void state_write_range (llama_io_write_i & io, llama_seq_id seq_id, llama_pos p0, llama_pos p1) const override;
+    void state_append_range(llama_io_read_i  & io, llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_pos p_limit) override;
+
     //
     // llama_kv_cache specific API
     //
@@ -288,6 +291,12 @@ public:
             vbr_checkpoint_generation_controller & output,
             vbr_artifact_stream_placement * placement = nullptr,
             vbr_explicit_generation_failure * failure = nullptr) const;
+    // Rows one sequence solely owns, for a co-resident record beside another
+    // sequence's exact capture. False on a shared or shifted row, or no rows.
+    bool vbr_sequence_placement(
+            uint32_t child_id,
+            llama_seq_id seq_id,
+            vbr_artifact_stream_placement & output) const;
     // effective bits/value of this cache at the CURRENT tensor types (llama_memory_i)
     double kv_bpv() const override;
 
@@ -882,6 +891,7 @@ private:
             const vbr_shared_scratch_binding & binding);
     void vbr_vmm_ensure_mapped(); // grow physical backing to the current cell watermark
     bool vbr_vmm_try_map(uint32_t wm); // same, recoverable: false on physical exhaustion
+    bool vbr_vmm_try_map_import();     // try_map to the cells a state import just positioned
 
     // Decode-time degrade controller (VMM mode only). The price order and its cursor stay
     // GLOBAL (layer-global price order); each step resolves the pool that owns its tensor.
@@ -1295,6 +1305,7 @@ private:
     void     seq_cp_impl(
             llama_seq_id seq_id_src, llama_seq_id seq_id_dst,
             llama_pos p0, llama_pos p1, bool publish_lineage);
+    void     vbr_recovery_settle(); // the boundary quarantine drain + re-arm
     vbr_generation_tracker *       vbr_generation_tracker_mut();
     const vbr_generation_tracker * vbr_generation_tracker_get() const;
     static bool vbr_generation_cell_has_seq_cb(
@@ -1673,6 +1684,7 @@ private:
 
     friend class llama_kv_cache_iswa;
     friend struct llama_kv_cache_vbr_epoch_test;
+    friend struct llama_kv_cache_state_test;
 
     // TurboQuant rotation matrices (128x128, row-major stored)
     ggml_tensor * turbo_rotation = nullptr;      // R (forward rotation)
@@ -1721,14 +1733,25 @@ private:
     bool state_write_includes_cell(
             const llama_kv_cells & cells,
             uint32_t cell,
-            llama_seq_id seq_id) const;
+            llama_seq_id seq_id,
+            bool held_cells = false) const; // LLAMA_STATE_SEQ_FLAGS_SWA_HELD_CELLS
 
     void state_write_meta(llama_io_write_i & io, const cell_ranges_t & cr, llama_seq_id seq_id = -1) const;
     void state_write_data(llama_io_write_i & io, const cell_ranges_t & cr) const;
 
+    // an append keeps the sequence, takes only the first n_keep of the blob's cells and requires pos == p0 + i
+    struct state_append_t {
+        llama_pos p0;
+        uint32_t  n_keep;
+    };
+
+    // settle and refuse what a dynamic-VBR cache cannot serialize. shared by both writers
+    void state_write_prepare() const;
+
     // sinfo_in, when set, replaces the find_slot call: the cells are given by the caller
-    bool state_read_meta(llama_io_read_i & io, uint32_t strm, uint32_t cell_count,       slot_info & sinfo, llama_seq_id dest_seq_id = -1, const slot_info * sinfo_in = nullptr);
-    bool state_read_data(llama_io_read_i & io, uint32_t strm, uint32_t cell_count, const slot_info & sinfo);
+    bool state_read_meta(llama_io_read_i & io, uint32_t strm, uint32_t cell_count,       slot_info & sinfo, llama_seq_id dest_seq_id = -1, const slot_info * sinfo_in = nullptr, const state_append_t * append = nullptr);
+    // sinfo holds the first n_place cells of the blob, the rows of the others are read and dropped
+    bool state_read_data(llama_io_read_i & io, uint32_t strm, uint32_t cell_count, const slot_info & sinfo, uint32_t n_place);
 };
 
 class llama_kv_cache_context : public llama_memory_context_i {

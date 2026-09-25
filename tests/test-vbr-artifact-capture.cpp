@@ -2580,6 +2580,70 @@ static void test_dependency_scoped_projected_catalog_publication() {
               shared_alias.observation, shared_alias_guard) ==
           vbr_occupied_replacement_guard_status::ownership_mismatch);
     shared_guard.reset();
+
+    // Absent insertion: the destination holds nothing, another sequence owns
+    // half the pool, and the incoming rows take the free half with the live
+    // controller as the only witness.
+    occupied_guard_fixture absent_pool = occupied;
+    absent_pool.target.destination_sequence_absent = true;
+    for (auto & cell : absent_pool.cells) {
+        cell.owner_sequence = 93;
+        cell.owns_destination = false;
+        cell.token = llama_token(2000+cell.physical_cell);
+    }
+    absent_pool.bind();
+    vbr_occupied_replacement_guard absent_guard;
+    CHECK(vbr_prepare_absent_insertion_guard(
+              absent_pool.target, occupied_view,
+              absent_pool.observation, absent_guard) ==
+          vbr_occupied_replacement_guard_status::ready);
+    CHECK(absent_guard.ready());
+    CHECK(absent_guard.absent_destination());
+    CHECK(absent_guard.strategy() ==
+          vbr_occupied_replacement_strategy::provisional_free_cells);
+    CHECK(absent_guard.recovery_runs().empty());
+    CHECK(absent_guard.cell_mapping().size() == 8);
+    CHECK(absent_guard.cell_mapping().front()
+              .destination_physical_cell == 8);
+    CHECK(absent_guard.preserved_cells().size() == 8);
+    CHECK(absent_guard.preserved_cells().front().owner_sequence == 93);
+    CHECK(absent_guard.preserved_cells().front().token == 2000);
+    CHECK(vbr_recheck_occupied_replacement_guard(
+              absent_guard, absent_pool.target, absent_pool.observation) ==
+          vbr_occupied_replacement_guard_status::ready);
+    auto absent_mutant = absent_pool;
+    ++absent_mutant.cells.back().token;
+    absent_mutant.bind();
+    CHECK(vbr_recheck_occupied_replacement_guard(
+              absent_guard, absent_mutant.target,
+              absent_mutant.observation) ==
+          vbr_occupied_replacement_guard_status::currency_changed);
+    CHECK(!absent_guard.ready());
+
+    auto absent_present = absent_pool;
+    absent_present.target.destination_sequence_absent = false;
+    absent_present.bind();
+    CHECK(vbr_prepare_absent_insertion_guard(
+              absent_present.target, occupied_view,
+              absent_present.observation, absent_guard) ==
+          vbr_occupied_replacement_guard_status::destination_present);
+    absent_present = absent_pool;
+    absent_present.cells.front().owner_sequence = 92;
+    absent_present.cells.front().owns_destination = true;
+    absent_present.bind();
+    CHECK(vbr_prepare_absent_insertion_guard(
+              absent_present.target, occupied_view,
+              absent_present.observation, absent_guard) ==
+          vbr_occupied_replacement_guard_status::destination_present);
+    // The other sequences sit at a later degrade cursor than the file.
+    auto absent_tiered = absent_pool;
+    absent_tiered.target.children.front().controller_policy.cursor++;
+    absent_tiered.bind();
+    CHECK(vbr_prepare_absent_insertion_guard(
+              absent_tiered.target, occupied_view,
+              absent_tiered.observation, absent_guard) ==
+          vbr_occupied_replacement_guard_status::tier_mismatch);
+    CHECK(!absent_guard.ready());
     auto full_pool_mutant = full_pool;
     full_pool_mutant.cells.back().physical_cell = 6;
     full_pool_mutant.bind();
@@ -3389,6 +3453,19 @@ static void test_dependency_scoped_projected_catalog_publication() {
     CHECK(catalog.resolve_reference(prefix_reference, prefix_parent) ==
           vbr_artifact_resolve_status::ok);
     CHECK(prefix_parent.validate() == vbr_artifact_status::ok);
+    // the read-only answer agrees with project_attention_prefix and borrows nothing
+    CHECK(catalog.projection_parent_status(prefix_parent) ==
+          vbr_artifact_prefix_projection_status::projected);
+    auto parent_cap = vbr_artifact_prefix_projection_limits {};
+    parent_cap.max_proofs = 1;
+    CHECK(catalog.projection_parent_status(prefix_parent, parent_cap) ==
+          vbr_artifact_prefix_projection_status::limit_exceeded);
+    parent_cap = {};
+    parent_cap.max_units = 0;
+    CHECK(catalog.projection_parent_status(prefix_parent, parent_cap) ==
+          vbr_artifact_prefix_projection_status::invalid_argument);
+    CHECK(catalog.projection_parent_status(vbr_artifact_package_view {}) ==
+          vbr_artifact_prefix_projection_status::invalid_argument);
 
     const llama_token divergent[] { 1, 2, 99, 100 };
     vbr_artifact_attention_prefix_request prefix_request;
@@ -3926,6 +4003,28 @@ static void test_dependency_scoped_projected_catalog_publication() {
     CHECK(refused_validation.status ==
           vbr_manifest_validation_status::topology_mismatch);
     CHECK(!refused_validation.proof);
+
+    // A prefix owns only part of the captured image, so it cannot vouch for
+    // co-resident rows.
+    vbr_artifact_attention_prefix_projection co_resident_projection;
+    CHECK(catalog.project_attention_prefix(
+              prefix_parent, prefix_request, {}, co_resident_projection) ==
+          vbr_artifact_prefix_projection_status::projected);
+    vbr_import_co_resident prefix_co_resident;
+    prefix_co_resident.destination = 13;
+    prefix_co_resident.placements.push_back({ 0, 0, 13, 1, { { 2, 0, 0, 0 } } });
+    const std::vector<vbr_import_co_resident> prefix_co_residents {
+        prefix_co_resident,
+    };
+    auto co_resident_policy = validation_policy;
+    co_resident_policy.co_residents = &prefix_co_residents;
+    auto co_resident_validation = vbr_validate_attention_prefix_projection(
+        validation_target, std::move(co_resident_projection),
+        co_resident_policy);
+    CHECK(co_resident_validation.status ==
+          vbr_manifest_validation_status::ownership_mismatch);
+    CHECK(co_resident_validation.decision == vbr_import_decision::reject);
+    CHECK(!co_resident_validation.proof);
 
     // Dropping the caller's package lease cannot retire storage while either
     // independently borrowed projection remains alive.
@@ -4737,7 +4836,8 @@ static void test_ring_accounting_once() {
 
 static bool sample_unbounded_host_budget(
         void *,
-        llama_cache_budget_config & output) noexcept {
+        llama_cache_budget_config & output,
+        uint64_t) noexcept {
     output = {};
     output.host.pageable_state =
         llama_cache_budget_capacity_state::unbounded;
@@ -4766,7 +4866,8 @@ struct projected_store_budget_context {
 
 static bool sample_projected_store_budget(
         void * opaque,
-        llama_cache_budget_config & output) noexcept {
+        llama_cache_budget_config & output,
+        uint64_t) noexcept {
     const auto * context =
         static_cast<const projected_store_budget_context *>(opaque);
     if (!context || !context->available) {
@@ -4949,7 +5050,7 @@ static void test_projected_host_batch_store_adapter() {
     };
     llama_cache_budget_config staging_budget;
     CHECK(sample_projected_store_budget(
-        &budget_context, staging_budget));
+        &budget_context, staging_budget, 0));
     staging_budget.devices.front().configured_cache_cap = 32;
     staging_budget.devices.front().cache_cap_state =
         llama_cache_budget_capacity_state::known;
@@ -5185,6 +5286,8 @@ static void test_projected_host_batch_store_adapter() {
         CHECK(results[0].payload->accounted_by(&ledger));
         CHECK(results[0].payload->reference_artifact().v != 0);
     }
+    // no payload, no projection parent
+    CHECK(!store->host_prefix_projection_ready(nullptr));
     CHECK(results[1].manifest_id == 2);
     CHECK(results[1].status ==
           vbr_projected_manifest_publish_status::dependency_unavailable);
@@ -5338,7 +5441,7 @@ static void test_projected_host_batch_store_adapter() {
         { topology }, foreign_bindings));
     llama_cache_budget_config foreign_budget;
     CHECK(sample_projected_store_budget(
-        &budget_context, foreign_budget));
+        &budget_context, foreign_budget, 0));
     std::vector<vbr_projected_manifest_publish_result> foreign_results;
     CHECK(foreign_catalog.publish_projected_batch(
         ready_assembly, make_publications(ready_assembly), foreign_budget,
@@ -5514,7 +5617,7 @@ static void test_server_store_construction_and_lifetime() {
     config.sample_budget = sample_unbounded_host_budget;
 
     const auto baseline = ledger.snapshot();
-    CHECK(sample_unbounded_host_budget(nullptr, budget));
+    CHECK(sample_unbounded_host_budget(nullptr, budget, 0));
     {
         llama_cache_budget_coordinator coordinator;
         const auto snapshot = ledger.snapshot();

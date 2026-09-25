@@ -2039,11 +2039,36 @@ bool emit_section_body_verified(
     return false;
 }
 
+size_t hash_worker_count(size_t count, uint32_t max_workers) {
+    return std::max<size_t>(1, std::min<size_t>(
+        { count, max_workers, 8, std::thread::hardware_concurrency() }));
+}
+
+// Worker w takes every workers-th index from w. Futures join even if thread
+// creation or fn throws; no worker may outlive the caller's data.
+template <typename F>
+void for_each_index_parallel(size_t count, size_t workers, const F & fn) {
+    std::vector<std::future<void>> pending;
+    pending.reserve(workers);
+    for (size_t w = 0; w < workers; ++w) {
+        pending.push_back(std::async(std::launch::async, [&, w] {
+            for (size_t i = w; i < count; i += workers) {
+                fn(i);
+            }
+        }));
+    }
+    for (auto & worker : pending) {
+        worker.get();
+    }
+}
+
 bool prepare_sections(
         const vbr_artifact_package & package,
-        std::vector<section_descriptor> & sections) {
+        std::vector<section_descriptor> & sections,
+        uint32_t max_workers) {
     sections = section_inventory(package);
-    for (auto & section : sections) {
+    const auto prepare_one = [&](size_t i) {
+        auto & section = sections[i];
         llama_sha256_writer hash;
         hash.string(DOMAIN_SECTION, sizeof(DOMAIN_SECTION) - 1);
         hash.u32(uint32_t(section.kind));
@@ -2055,11 +2080,22 @@ bool prepare_sections(
         }
         section.size = body.count;
         section.checksum = hash.finish();
-        if (!digest_nonzero(section.checksum)) {
-            return false;
+        return digest_nonzero(section.checksum);
+    };
+    const size_t workers = hash_worker_count(sections.size(), max_workers);
+    if (workers == 1) {
+        for (size_t i = 0; i < sections.size(); ++i) {
+            if (!prepare_one(i)) {
+                return false;
+            }
         }
+        return true;
     }
-    return true;
+    std::vector<uint8_t> ok(sections.size());
+    for_each_index_parallel(sections.size(), workers, [&](size_t i) {
+        ok[i] = prepare_one(i);
+    });
+    return std::find(ok.begin(), ok.end(), 0) == ok.end();
 }
 
 std::array<uint8_t, 32> ordering_digest(
@@ -3324,9 +3360,7 @@ vbr_artifact_status vbr_artifact_prepare(
             return vbr_artifact_status::ok;
         };
         const size_t count = package.unit_blobs.size() + package.companions.size();
-        const size_t workers = max_workers <= 1 ? 1 : std::max<size_t>(1, std::min<size_t>(
-            count, std::min<uint32_t>(max_workers, std::min<uint32_t>(
-                8, std::thread::hardware_concurrency()))));
+        const size_t workers = hash_worker_count(count, max_workers);
         const auto prepare_one = [&](size_t i) {
             if (i < package.unit_blobs.size()) {
                 return prepare_unit(uint32_t(i));
@@ -3344,22 +3378,12 @@ vbr_artifact_status vbr_artifact_prepare(
                 }
             }
         } else {
-            // Independent units keep canonical ordering and every byte hash.
-            // Futures join even if thread creation or a reader throws; no
-            // worker may outlive this package or publish partial metadata.
+            // Independent units keep canonical ordering and every byte hash;
+            // no partial metadata is published.
             std::vector<vbr_artifact_status> statuses(count);
-            std::vector<std::future<void>> pending;
-            pending.reserve(workers);
-            for (size_t w = 0; w < workers; ++w) {
-                pending.push_back(std::async(std::launch::async, [&, w] {
-                    for (size_t i = w; i < count; i += workers) {
-                        statuses[i] = prepare_one(i);
-                    }
-                }));
-            }
-            for (auto & worker : pending) {
-                worker.get();
-            }
+            for_each_index_parallel(count, workers, [&](size_t i) {
+                statuses[i] = prepare_one(i);
+            });
             for (const auto status : statuses) {
                 if (status != vbr_artifact_status::ok) {
                     return status;
@@ -3540,7 +3564,9 @@ vbr_artifact_status vbr_artifact_encode(
         vbr_artifact_package & package,
         const vbr_artifact_stream_writer & output,
         uint64_t max_total_bytes,
-        uint64_t * encoded_size) noexcept {
+        uint64_t * encoded_size,
+        uint32_t max_workers,
+        const vbr_artifact_preparation_reuse * reuse) noexcept {
     if (encoded_size) {
         *encoded_size = 0;
     }
@@ -3548,13 +3574,13 @@ vbr_artifact_status vbr_artifact_encode(
         if (!output.write || max_total_bytes == 0) {
             return vbr_artifact_status::invalid_argument;
         }
-        const auto prepared = vbr_artifact_prepare(package);
+        const auto prepared = vbr_artifact_prepare(package, max_workers, reuse);
         if (prepared != vbr_artifact_status::ok) {
             return prepared;
         }
 
         std::vector<section_descriptor> sections;
-        if (!prepare_sections(package, sections)) {
+        if (!prepare_sections(package, sections, max_workers)) {
             return vbr_artifact_status::internal_error;
         }
         uint64_t total_size;
@@ -3607,7 +3633,11 @@ vbr_artifact_status vbr_artifact_encode(
             emitter body;
             body.output = &output;
             body.hash_b = &verify_section;
-            if (!emit_section_body_verified(body, package, section) ||
+            // Reused (catalog-owned) sources do not change: the section digest
+            // alone checks what is written. Others may change between the
+            // passes, so each id is derived again from the bytes written.
+            if (!(reuse ? emit_section_body(body, package, section)
+                        : emit_section_body_verified(body, package, section)) ||
                 !body.ok ||
                 body.count != section.size ||
                 verify_section.finish() != section.checksum) {

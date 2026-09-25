@@ -15,15 +15,14 @@ struct vbr_occupied_replacement_guard::map {
     vbr_occupied_replacement_strategy strategy =
         vbr_occupied_replacement_strategy::_count;
     bool incoming_transformed = false;
+    bool absent_destination = false;
     uint64_t packed_rows_expanded = 0;
     uint64_t incoming_prefix_tokens = 0;
     std::vector<vbr_artifact_prefix_cell_run> incoming_prefix_runs;
     std::vector<vbr_occupied_replacement_cell> preserved_cells;
 };
 
-namespace {
-
-bool occupied_projected_packed_rows(
+bool vbr_projected_packed_rows(
         const vbr_artifact_package_view & incoming,
         const vbr_artifact_stream_placement & placement,
         std::vector<uint64_t> & packed_rows) {
@@ -144,42 +143,98 @@ bool occupied_projected_packed_rows(
                      [](uint64_t value) { return value == UINT64_MAX; });
 }
 
+namespace {
+
+// A unit an occupied replacement or insertion can place: one unified
+// row-major stream, no clean stash, and dense shard indices.
+bool occupied_unit_admissible(
+        const vbr_artifact_unit_descriptor & unit) noexcept {
+    if (unit.child_id != 0 || unit.layout != vbr_artifact_layout::row_major ||
+        unit.n_stream != 1 || !unit.unified ||
+        unit.clean_stash_state !=
+            vbr_artifact_clean_stash_state::absent_at_source ||
+        unit.clean_stash.valid_rows != 0 || !unit.clean_stash.shards.empty() ||
+        unit.shards.empty()) {
+        return false;
+    }
+    for (size_t i = 0; i < unit.shards.size(); ++i) {
+        if (unit.shards[i].shard_index != i) {
+            return false;
+        }
+    }
+    return true;
+}
+
 bool occupied_unit_schedule_equal(
         const vbr_artifact_unit_descriptor & incoming,
         const vbr_artifact_unit_descriptor & recovery) noexcept {
-    if (incoming.child_id != 0 || recovery.child_id != 0 ||
+    if (!occupied_unit_admissible(incoming) ||
+        !occupied_unit_admissible(recovery) ||
         incoming.logical_unit_id != recovery.logical_unit_id ||
         incoming.recoverability != recovery.recoverability ||
         incoming.side != recovery.side ||
-        incoming.layout != vbr_artifact_layout::row_major ||
-        recovery.layout != vbr_artifact_layout::row_major ||
-        incoming.n_stream != 1 || recovery.n_stream != 1 ||
-        !incoming.unified || !recovery.unified ||
         incoming.rank != recovery.rank ||
         incoming.dimensions[1] != recovery.dimensions[1] ||
         incoming.dimensions[2] != recovery.dimensions[2] ||
         incoming.dimensions[3] != recovery.dimensions[3] ||
         incoming.row_alignment != recovery.row_alignment ||
         incoming.row_codec_version != recovery.row_codec_version ||
-        incoming.clean_stash_state !=
-            vbr_artifact_clean_stash_state::absent_at_source ||
-        recovery.clean_stash_state !=
-            vbr_artifact_clean_stash_state::absent_at_source ||
-        incoming.clean_stash.valid_rows != 0 ||
-        recovery.clean_stash.valid_rows != 0 ||
-        !incoming.clean_stash.shards.empty() ||
-        !recovery.clean_stash.shards.empty() ||
-        incoming.shards.size() != recovery.shards.size() ||
-        incoming.shards.empty()) {
+        incoming.shards.size() != recovery.shards.size()) {
         return false;
     }
     for (size_t i = 0; i < incoming.shards.size(); ++i) {
         const auto & a = incoming.shards[i];
         const auto & b = recovery.shards[i];
-        if (a.shard_index != i || b.shard_index != i ||
-            a.topology_index != b.topology_index ||
+        if (a.topology_index != b.topology_index ||
             a.device_ordinal != b.device_ordinal ||
             a.column_count != b.column_count) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// The live unit holds rows of the descriptor's codec and geometry, apart from
+// the row count, which an occupied replacement matches and an insertion does
+// not.
+bool occupied_target_unit_representation_matches(
+        const vbr_target_unit_snapshot & target,
+        const vbr_artifact_unit_descriptor & descriptor,
+        const vbr_occupied_replacement_unit_currency & live) noexcept {
+    if (target.child_id != 0 || live.child_id != 0 ||
+        target.logical_unit_id != descriptor.logical_unit_id ||
+        live.logical_unit_id != descriptor.logical_unit_id ||
+        target.representation_kind != descriptor.representation.kind ||
+        target.codec_id != descriptor.representation.codec_id ||
+        target.codec_version != descriptor.representation.codec_version ||
+        target.representation_reference_digest !=
+            descriptor.representation.reference_digest ||
+        target.recoverability != descriptor.recoverability ||
+        target.side != descriptor.side || target.layout != descriptor.layout ||
+        target.row_codec_version != descriptor.row_codec_version ||
+        target.codebook_digest != descriptor.codebook_digest ||
+        target.rotation_digest != descriptor.rotation_digest ||
+        target.meansub_digest != descriptor.meansub_digest ||
+        target.meansub_model_id != descriptor.meansub_model_id ||
+        target.meansub_layer != descriptor.meansub_layer ||
+        target.meansub_baked != descriptor.meansub_baked ||
+        target.n_stream != 1 || !target.unified || target.v_trans ||
+        target.rank != descriptor.rank ||
+        target.dimensions[1] != descriptor.dimensions[1] ||
+        target.dimensions[2] != descriptor.dimensions[2] ||
+        target.dimensions[3] != descriptor.dimensions[3] ||
+        target.row_alignment != descriptor.row_alignment ||
+        target.shards.size() != descriptor.shards.size()) {
+        return false;
+    }
+    for (size_t i = 0; i < target.shards.size(); ++i) {
+        const auto & a = target.shards[i];
+        const auto & b = descriptor.shards[i];
+        if (a.shard_index != i || a.pool_cookie == nullptr ||
+            a.topology_index != b.topology_index ||
+            a.device_ordinal != b.device_ordinal ||
+            a.logical_offset != b.logical_offset ||
+            a.row_bytes != b.row_bytes) {
             return false;
         }
     }
@@ -191,9 +246,7 @@ bool occupied_target_unit_matches(
         const vbr_artifact_unit_descriptor & descriptor,
         const vbr_checkpoint_unit_generation & captured,
         const vbr_occupied_replacement_unit_currency & live) noexcept {
-    if (target.child_id != 0 || live.child_id != 0 ||
-        target.logical_unit_id != descriptor.logical_unit_id ||
-        live.logical_unit_id != descriptor.logical_unit_id ||
+    if (!occupied_target_unit_representation_matches(target, descriptor, live) ||
         descriptor.repr_gen != captured.repr_gen ||
         live.generation.repr_gen != captured.repr_gen ||
         target.current_type != descriptor.current_type ||
@@ -213,41 +266,18 @@ bool occupied_target_unit_matches(
         live.generation.last_transition != descriptor.last_transition ||
         target.current_domain != captured.domain ||
         live.generation.domain != captured.domain ||
-        target.representation_kind != descriptor.representation.kind ||
-        target.codec_id != descriptor.representation.codec_id ||
-        target.codec_version != descriptor.representation.codec_version ||
-        target.representation_reference_digest !=
-            descriptor.representation.reference_digest ||
         target.source_loss_history !=
             descriptor.representation.source_loss_history ||
         target.checkpoint_codec_hops !=
             descriptor.representation.checkpoint_codec_hops ||
-        target.recoverability != descriptor.recoverability ||
-        target.side != descriptor.side || target.layout != descriptor.layout ||
-        target.row_codec_version != descriptor.row_codec_version ||
-        target.codebook_digest != descriptor.codebook_digest ||
-        target.rotation_digest != descriptor.rotation_digest ||
-        target.meansub_digest != descriptor.meansub_digest ||
-        target.meansub_model_id != descriptor.meansub_model_id ||
-        target.meansub_layer != descriptor.meansub_layer ||
-        target.meansub_baked != descriptor.meansub_baked ||
-        target.n_stream != 1 || !target.unified || target.v_trans ||
         target.wm_cells != descriptor.wm_cells ||
-        target.rank != descriptor.rank ||
-        target.dimensions != descriptor.dimensions ||
-        target.row_alignment != descriptor.row_alignment ||
-        target.shards.size() != descriptor.shards.size()) {
+        target.dimensions[0] != descriptor.dimensions[0]) {
         return false;
     }
     for (size_t i = 0; i < target.shards.size(); ++i) {
         const auto & a = target.shards[i];
         const auto & b = descriptor.shards[i];
-        if (a.shard_index != i || a.pool_cookie == nullptr ||
-            a.topology_index != b.topology_index ||
-            a.device_ordinal != b.device_ordinal ||
-            a.logical_offset != b.logical_offset ||
-            a.row_count != b.row_count || a.row_bytes != b.row_bytes ||
-            a.mapped_bytes < b.payload_bytes) {
+        if (a.row_count != b.row_count || a.mapped_bytes < b.payload_bytes) {
             return false;
         }
     }
@@ -344,10 +374,41 @@ std::array<uint8_t, 32> occupied_currency_digest(
     return writer.finish();
 }
 
+// The unit of an absent destination against the live controller it joins:
+// the same tier and history, else tier_mismatch, and the same codec and
+// geometry. Watermarks and generations are the live ones and stay.
+vbr_occupied_replacement_guard_status absent_unit_status(
+        const vbr_target_unit_snapshot & target,
+        const vbr_artifact_unit_descriptor & descriptor,
+        const vbr_checkpoint_unit_generation & captured,
+        const vbr_occupied_replacement_unit_currency & live) noexcept {
+    if (target.child_id != 0 || live.child_id != 0 ||
+        target.logical_unit_id != descriptor.logical_unit_id ||
+        live.logical_unit_id != descriptor.logical_unit_id ||
+        !occupied_unit_admissible(descriptor)) {
+        return vbr_occupied_replacement_guard_status::representation_mismatch;
+    }
+    if (target.current_type != descriptor.current_type ||
+        captured.current_type != descriptor.current_type ||
+        live.generation.current_type != descriptor.current_type ||
+        captured.effective_type != descriptor.representation.effective_type ||
+        live.generation.effective_type != descriptor.representation.effective_type ||
+        captured.promote_hops != descriptor.promote_hops ||
+        live.generation.promote_hops != descriptor.promote_hops ||
+        target.current_domain != live.generation.domain ||
+        captured.domain != live.generation.domain) {
+        return vbr_occupied_replacement_guard_status::tier_mismatch;
+    }
+    return occupied_target_unit_representation_matches(target, descriptor, live)
+        ? vbr_occupied_replacement_guard_status::ready
+        : vbr_occupied_replacement_guard_status::representation_mismatch;
+}
+
+// `recovery` is null for an absent destination: nothing to roll back to.
 bool occupied_companions_compatible(
         const vbr_target_validation_snapshot & target,
         const vbr_artifact_package_view & incoming,
-        const vbr_artifact_package_view & recovery) noexcept {
+        const vbr_artifact_package_view * recovery) noexcept {
     if (target.companions.size() != incoming.companions().size()) {
         return false;
     }
@@ -363,13 +424,13 @@ bool occupied_companions_compatible(
             next.payload->size() != next.descriptor.payload_bytes) {
             return false;
         }
-        if (live.kind != vbr_artifact_companion_kind::frontier_logits) {
+        if (recovery && live.kind != vbr_artifact_companion_kind::frontier_logits) {
             const auto old = std::find_if(
-                recovery.companions().begin(), recovery.companions().end(),
+                recovery->companions().begin(), recovery->companions().end(),
                 [&](const auto & value) {
                     return value.descriptor.kind == live.kind;
                 });
-            if (old == recovery.companions().end() || !old->payload ||
+            if (old == recovery->companions().end() || !old->payload ||
                 old->descriptor.format_version != live.format_version ||
                 old->descriptor.build_identity_digest !=
                     live.build_identity_digest ||
@@ -388,7 +449,10 @@ bool occupied_companions_compatible(
                 return false;
         }
     }
-    for (const auto & old : recovery.companions()) {
+    if (!recovery) {
+        return true;
+    }
+    for (const auto & old : recovery->companions()) {
         if (old.descriptor.kind ==
                 vbr_artifact_companion_kind::frontier_logits) {
             continue;
@@ -412,110 +476,167 @@ vbr_occupied_replacement_guard_status occupied_guard_validate(
         vbr_occupied_replacement_guard::map * build,
         const vbr_occupied_replacement_guard::map * expected,
         bool incoming_transformed) {
-    if (!incoming || !recovery || observation.destination < 0 ||
+    // An absent destination has no recovery: the live controller is the only
+    // witness, and `recovery` is an empty view that is never read.
+    const auto * map_authority = build ? build : expected;
+    const bool absent = map_authority && map_authority->absent_destination;
+    if (!incoming || (!absent && !recovery) || observation.destination < 0 ||
         observation.cell_capacity == 0 ||
         (observation.cell_count != 0 && observation.cells == nullptr) ||
         (observation.unit_count != 0 && observation.units == nullptr)) {
         return vbr_occupied_replacement_guard_status::invalid_argument;
     }
+    if (absent && !target.destination_sequence_absent) {
+        return vbr_occupied_replacement_guard_status::destination_present;
+    }
     if (target.memory_instance_cookie == 0 || target.tree_shape_digest == 0 ||
         target.accounting_serial == 0 || target.policy_epoch == 0 ||
-        target.destination_sequence_absent || target.children.size() != 1 ||
+        (!absent && target.destination_sequence_absent) ||
+        target.children.size() != 1 ||
         incoming.manifest().generation.controllers.size() != 1 ||
-        recovery.manifest().generation.controllers.size() != 1 ||
         incoming.manifest().controller_policy.size() != 1 ||
-        recovery.manifest().controller_policy.size() != 1 ||
         incoming.manifest().stream_placements.size() != 1 ||
-        recovery.manifest().stream_placements.size() != 1) {
+        (!absent && (recovery.manifest().generation.controllers.size() != 1 ||
+                     recovery.manifest().controller_policy.size() != 1 ||
+                     recovery.manifest().stream_placements.size() != 1))) {
         return vbr_occupied_replacement_guard_status::unsupported_tree;
     }
-    if (!occupied_companions_compatible(target, incoming, recovery)) {
+    // The QSA index is rebuilt per pool, not per sequence.
+    if (absent &&
+        (std::any_of(target.companions.begin(), target.companions.end(),
+                     [](const auto & companion) {
+                         return companion.kind ==
+                             vbr_artifact_companion_kind::qsa_index;
+                     }) ||
+         std::any_of(incoming.companions().begin(), incoming.companions().end(),
+                     [](const auto & companion) {
+                         return companion.descriptor.kind ==
+                             vbr_artifact_companion_kind::qsa_index;
+                     }))) {
+        return vbr_occupied_replacement_guard_status::unsupported_tree;
+    }
+    if (!occupied_companions_compatible(target, incoming,
+                                        absent ? nullptr : &recovery)) {
         return vbr_occupied_replacement_guard_status::companion_unavailable;
     }
     if (observation.cell_capacity > VBR_OCCUPIED_REPLACEMENT_MAX_CELLS) {
         return vbr_occupied_replacement_guard_status::cell_limit_exceeded;
     }
     const auto & child = target.children.front();
-    const auto & recovery_controller =
-        recovery.manifest().generation.controllers.front();
     const auto & incoming_controller =
         incoming.manifest().generation.controllers.front();
-    const auto & recovery_policy = recovery.manifest().controller_policy.front();
     const auto & incoming_policy = incoming.manifest().controller_policy.front();
     if (child.child_id != 0 || child.empty || !child.dedicated || !child.armed ||
         !child.generation_compatible || !child.ownership_compatible ||
         !child.stash_compatible || child.policy_epoch != target.policy_epoch ||
-        recovery_controller.child_id != 0 || incoming_controller.child_id != 0 ||
-        recovery_controller.dependency_mode !=
-            checkpoint_child_dependency_mode::live_guarded ||
+        incoming_controller.child_id != 0 ||
         incoming_controller.dependency_mode !=
             checkpoint_child_dependency_mode::live_guarded ||
-        child.dependency_mode != recovery_controller.dependency_mode ||
-        child.lineage_uuid != recovery_controller.lineage_uuid ||
-        observation.controller_generation !=
-            recovery_controller.global_generation ||
-        observation.representation_epoch != child.state_serial ||
-        !vbr_artifact_controller_policy_equal(child.controller_policy,
-                                               recovery_policy)) {
+        child.dependency_mode != incoming_controller.dependency_mode ||
+        observation.representation_epoch != child.state_serial) {
         return vbr_occupied_replacement_guard_status::generation_mismatch;
     }
+    const auto & recovery_policy = absent
+        ? child.controller_policy
+        : recovery.manifest().controller_policy.front();
+    if (absent &&
+        (incoming_policy.cursor != child.controller_policy.cursor ||
+         incoming_policy.current_type_vector_digest !=
+             child.controller_policy.current_type_vector_digest)) {
+        return vbr_occupied_replacement_guard_status::tier_mismatch;
+    }
+    if (!absent) {
+        const auto & recovery_controller =
+            recovery.manifest().generation.controllers.front();
+        if (recovery_controller.child_id != 0 ||
+            recovery_controller.dependency_mode !=
+                checkpoint_child_dependency_mode::live_guarded ||
+            child.lineage_uuid != recovery_controller.lineage_uuid ||
+            observation.controller_generation !=
+                recovery_controller.global_generation ||
+            !vbr_artifact_controller_policy_equal(child.controller_policy,
+                                                   recovery_policy)) {
+            return vbr_occupied_replacement_guard_status::generation_mismatch;
+        }
+    }
+    const size_t n_units = incoming.units().size();
     if (incoming_policy.degrade_order_digest != recovery_policy.degrade_order_digest ||
         incoming_policy.floor_type != recovery_policy.floor_type ||
         incoming_policy.pressure_independent_settings !=
             recovery_policy.pressure_independent_settings ||
         incoming_policy.n_stream != 1 || recovery_policy.n_stream != 1 ||
         !incoming_policy.unified || !recovery_policy.unified ||
-        incoming.units().size() != recovery.units().size() ||
-        incoming.units().empty() || child.units.size() != recovery.units().size() ||
-        observation.unit_count != recovery.units().size() ||
-        recovery_controller.units.size() != recovery.units().size() ||
-        incoming_controller.units.size() != incoming.units().size()) {
+        n_units == 0 || child.units.size() != n_units ||
+        observation.unit_count != n_units ||
+        incoming_controller.units.size() != n_units ||
+        (!absent && (recovery.units().size() != n_units ||
+                     recovery.manifest().generation.controllers.front()
+                         .units.size() != n_units))) {
         return vbr_occupied_replacement_guard_status::representation_mismatch;
     }
-    for (size_t i = 0; i < recovery.units().size(); ++i) {
-        const auto & rd = recovery.units()[i].descriptor;
+    for (size_t i = 0; i < n_units; ++i) {
         const auto & id = incoming.units()[i].descriptor;
-        if (rd.logical_unit_id != i || id.logical_unit_id != i ||
+        if (id.logical_unit_id != i) {
+            return vbr_occupied_replacement_guard_status::representation_mismatch;
+        }
+        if (absent) {
+            const auto status = absent_unit_status(
+                child.units[i], id, incoming_controller.units[i],
+                observation.units[i]);
+            if (status != vbr_occupied_replacement_guard_status::ready) {
+                return status;
+            }
+            continue;
+        }
+        const auto & rd = recovery.units()[i].descriptor;
+        if (rd.logical_unit_id != i ||
             !occupied_unit_schedule_equal(id, rd) ||
             !occupied_target_unit_matches(
-                child.units[i], rd, recovery_controller.units[i],
+                child.units[i], rd,
+                recovery.manifest().generation.controllers.front().units[i],
                 observation.units[i])) {
             return vbr_occupied_replacement_guard_status::representation_mismatch;
         }
     }
-    const auto & recovery_placement =
-        recovery.manifest().stream_placements.front();
     const auto & incoming_placement =
         incoming.manifest().stream_placements.front();
-    const auto recovery_tokens = recovery.manifest().token_block.tokens.size();
+    const auto recovery_tokens = absent
+        ? size_t(0) : recovery.manifest().token_block.tokens.size();
     const auto parent_incoming_tokens =
         incoming.manifest().token_block.tokens.size();
-    const auto * map_authority = build ? build : expected;
     const bool prefix_incoming = map_authority &&
         map_authority->incoming_prefix_tokens != 0;
     const auto incoming_tokens = prefix_incoming
         ? size_t(map_authority->incoming_prefix_tokens)
         : parent_incoming_tokens;
-    if (recovery.manifest().identity.token_count <= 0 ||
-        incoming.manifest().identity.token_count <= 0 ||
-        uint64_t(recovery.manifest().identity.token_count) != recovery_tokens ||
+    if (incoming.manifest().identity.token_count <= 0 ||
         uint64_t(incoming.manifest().identity.token_count) !=
             parent_incoming_tokens ||
-        recovery.manifest().identity.next_position != llama_pos(recovery_tokens) ||
         incoming.manifest().identity.next_position !=
             llama_pos(parent_incoming_tokens) ||
-        observation.sequence_epoch != recovery.manifest().identity.sequence_epoch ||
-        recovery_placement.child_id != 0 || incoming_placement.child_id != 0 ||
-        recovery_placement.stream_index != 0 ||
+        incoming_placement.child_id != 0 ||
         incoming_placement.stream_index != 0 ||
-        recovery_placement.source_sequence != observation.destination ||
-        recovery_placement.computation_frontier != llama_pos(recovery_tokens) ||
         incoming_placement.computation_frontier !=
             llama_pos(parent_incoming_tokens) ||
-        recovery_placement.cells.size() != recovery_tokens ||
         incoming_placement.cells.size() != parent_incoming_tokens ||
         incoming_tokens == 0 || incoming_tokens > parent_incoming_tokens) {
         return vbr_occupied_replacement_guard_status::frontier_mismatch;
+    }
+    std::vector<const vbr_artifact_cell_placement *> recovery_logical, incoming_logical;
+    const vbr_artifact_stream_placement * recovery_placement = nullptr;
+    if (!absent) {
+        recovery_placement = &recovery.manifest().stream_placements.front();
+        if (recovery.manifest().identity.token_count <= 0 ||
+            uint64_t(recovery.manifest().identity.token_count) != recovery_tokens ||
+            recovery.manifest().identity.next_position != llama_pos(recovery_tokens) ||
+            observation.sequence_epoch != recovery.manifest().identity.sequence_epoch ||
+            recovery_placement->child_id != 0 ||
+            recovery_placement->stream_index != 0 ||
+            recovery_placement->source_sequence != observation.destination ||
+            recovery_placement->computation_frontier != llama_pos(recovery_tokens) ||
+            recovery_placement->cells.size() != recovery_tokens) {
+            return vbr_occupied_replacement_guard_status::frontier_mismatch;
+        }
     }
     // Artifacts are sealed in physical-row order. After a slot is restored
     // into free cells and then extended, that order need not be token order.
@@ -533,8 +654,7 @@ vbr_occupied_replacement_guard_status occupied_guard_validate(
         }
         return true;
     };
-    std::vector<const vbr_artifact_cell_placement *> recovery_logical, incoming_logical;
-    if (!index_logical(recovery_placement, recovery_logical) ||
+    if ((!absent && !index_logical(*recovery_placement, recovery_logical)) ||
         !index_logical(incoming_placement, incoming_logical)) {
         return vbr_occupied_replacement_guard_status::unsupported_layout;
     }
@@ -586,6 +706,9 @@ vbr_occupied_replacement_guard_status occupied_guard_validate(
                 }
             }
             continue;
+        }
+        if (absent) {
+            return vbr_occupied_replacement_guard_status::destination_present;
         }
         if (live.reference_count != 1 ||
             live.owner_sequence != observation.destination ||
@@ -665,13 +788,13 @@ vbr_occupied_replacement_guard_status occupied_guard_validate(
         return logical == incoming_tokens;
     };
     if (build && (!(prefix_incoming ? prefix_packed_rows()
-                                    : occupied_projected_packed_rows(
+                                    : vbr_projected_packed_rows(
                                           incoming, incoming_placement,
                                           packed_rows)) ||
                   (strategy ==
                        vbr_occupied_replacement_strategy::recycle_incumbent_cells &&
-                   !occupied_projected_packed_rows(
-                       recovery, recovery_placement,
+                   !vbr_projected_packed_rows(
+                       recovery, *recovery_placement,
                        recovery_packed_rows)))) {
         return vbr_occupied_replacement_guard_status::unsupported_layout;
     }
@@ -828,7 +951,8 @@ vbr_occupied_replacement_guard::operator=(
         vbr_occupied_replacement_guard &&) noexcept = default;
 
 bool vbr_occupied_replacement_guard::ready() const noexcept {
-    return map_ && incoming_ && recovery_ && destination_ >= 0 &&
+    return map_ && incoming_ && (recovery_ || map_->absent_destination) &&
+        destination_ >= 0 &&
         map_->strategy != vbr_occupied_replacement_strategy::_count &&
         !map_->mappings.empty() && !map_->relocation_runs.empty() &&
         (map_->strategy !=
@@ -889,6 +1013,10 @@ vbr_occupied_replacement_guard::preserved_cells() const noexcept {
 const vbr_artifact_package_view &
 vbr_occupied_replacement_guard::recovery_package() const noexcept {
     return recovery_;
+}
+
+bool vbr_occupied_replacement_guard::absent_destination() const noexcept {
+    return map_ && map_->absent_destination;
 }
 
 uint64_t vbr_occupied_replacement_guard::packed_rows_expanded() const noexcept {
@@ -1098,6 +1226,66 @@ vbr_prepare_occupied_prefix_replacement_guard(
 }
 
 vbr_occupied_replacement_guard_status
+vbr_prepare_absent_insertion_guard(
+        const vbr_target_validation_snapshot & live_target,
+        const vbr_artifact_package_view & incoming,
+        const vbr_occupied_replacement_observation & observation,
+        vbr_occupied_replacement_guard & output,
+        const vbr_import_schedule_quote * authenticated_incoming) noexcept {
+    output.reset();
+    try {
+        if (!incoming || live_target.children.size() != 1) {
+            return vbr_occupied_replacement_guard_status::invalid_argument;
+        }
+        vbr_import_schedule_quote incoming_quote;
+        const auto * incoming_authority = authenticated_incoming;
+        if (!incoming_authority) {
+            if (!vbr_quote_import_schedule(live_target, incoming, incoming_quote)) {
+                return vbr_occupied_replacement_guard_status::representation_mismatch;
+            }
+            incoming_authority = &incoming_quote;
+        }
+        if (incoming_authority->status() != vbr_import_schedule_status::exact) {
+            return vbr_occupied_replacement_guard_status::tier_mismatch;
+        }
+        if (!vbr_import_schedule_quote_matches(
+                *incoming_authority, live_target, incoming)) {
+            return vbr_occupied_replacement_guard_status::representation_mismatch;
+        }
+        auto shared = std::make_shared<vbr_occupied_replacement_guard::map>();
+        shared->absent_destination = true;
+        shared->mappings.reserve(
+            incoming.manifest().stream_placements.empty()
+                ? 0 : incoming.manifest().stream_placements.front().cells.size());
+        const auto status = occupied_guard_validate(
+            live_target, incoming, vbr_artifact_package_view {}, observation,
+            shared.get(), nullptr, false);
+        if (status != vbr_occupied_replacement_guard_status::ready) {
+            return status;
+        }
+        shared->packed_rows_expanded = incoming.projected_ranges().empty()
+            ? 0 : shared->mappings.size();
+        vbr_artifact_package_view incoming_lease;
+        if (incoming.retain(incoming_lease) != vbr_artifact_resolve_status::ok) {
+            return vbr_occupied_replacement_guard_status::currency_changed;
+        }
+        const auto digest = occupied_currency_digest(live_target, observation);
+        if (!vbr_digest_nonzero(digest)) {
+            return vbr_occupied_replacement_guard_status::internal_error;
+        }
+        output.map_ = std::move(shared);
+        output.incoming_ = std::move(incoming_lease);
+        output.currency_digest_ = digest;
+        output.destination_ = observation.destination;
+        output.accounting_serial_ = live_target.accounting_serial;
+        return vbr_occupied_replacement_guard_status::ready;
+    } catch (...) {
+        output.reset();
+        return vbr_occupied_replacement_guard_status::internal_error;
+    }
+}
+
+vbr_occupied_replacement_guard_status
 vbr_recheck_occupied_replacement_guard(
         vbr_occupied_replacement_guard & guard,
         const vbr_target_validation_snapshot & target,
@@ -1142,6 +1330,8 @@ const char * vbr_occupied_replacement_guard_status_name(
         case vbr_occupied_replacement_guard_status::run_limit_exceeded: return "run_limit_exceeded";
         case vbr_occupied_replacement_guard_status::capacity_unavailable: return "capacity_unavailable";
         case vbr_occupied_replacement_guard_status::currency_changed: return "currency_changed";
+        case vbr_occupied_replacement_guard_status::tier_mismatch: return "tier_mismatch";
+        case vbr_occupied_replacement_guard_status::destination_present: return "destination_present";
         case vbr_occupied_replacement_guard_status::internal_error: return "internal_error";
         case vbr_occupied_replacement_guard_status::_count: return "_count";
     }

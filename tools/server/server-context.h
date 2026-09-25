@@ -64,6 +64,10 @@ struct server_slot_frontier_logits_test_result {
     bool nonfinite_logits_refused = false;
     bool torn_companion_refused = false;
     bool missing_companion_is_cold = false;
+    bool resume_ledger_round_trip = false;
+    bool resume_ledger_refuses_logits = false;
+    bool resume_routes_do_not_cross = false;
+    bool resume_key_mutation_refused = false;
     bool destination_slot_rebound = false;
     bool destination_epoch_rebound = false;
     bool source_process_epoch_not_reused = false;
@@ -100,6 +104,9 @@ struct server_vbr_empty_handoff_gate {
     uint64_t incumbent_lcp = 0;
     uint64_t durable_incumbent_prefix = 0;
     bool exact_incumbent_durable = false;
+    // the occupied route refused the request before any write: no atomic route for the memory
+    // tree (several attention children), or no room for both conversations
+    bool occupied_route_refused = false;
     bool hard_lease = false;
     bool deferred_task = false;
     bool incumbent_supported = false;
@@ -114,7 +121,8 @@ bool server_vbr_empty_handoff_allowed(
 
 bool server_vbr_live_source_displacement_allowed(
     bool kv_unified,
-    size_t slot_count) noexcept;
+    size_t slot_count,
+    bool persistent_resume) noexcept;
 
 bool server_vbr_stem_matches_capture_source(
     bool valid,

@@ -371,6 +371,10 @@ void test_slot_frontier_logits_companion() {
     CHECK(result.nonfinite_logits_refused);
     CHECK(result.torn_companion_refused);
     CHECK(result.missing_companion_is_cold);
+    CHECK(result.resume_ledger_round_trip);
+    CHECK(result.resume_ledger_refuses_logits);
+    CHECK(result.resume_routes_do_not_cross);
+    CHECK(result.resume_key_mutation_refused);
     CHECK(result.destination_slot_rebound);
     CHECK(result.destination_epoch_rebound);
     CHECK(result.source_process_epoch_not_reused);
@@ -2047,10 +2051,12 @@ void test_lifecycle_defaults_and_reuse_thresholds() {
     accepted_handoff.family_matches = true;
     CHECK(server_vbr_empty_handoff_lookup_allowed(accepted_handoff));
     CHECK(server_vbr_empty_handoff_allowed(accepted_handoff));
-    CHECK(server_vbr_live_source_displacement_allowed(false, 8));
-    CHECK(server_vbr_live_source_displacement_allowed(true, 1));
-    CHECK(!server_vbr_live_source_displacement_allowed(true, 2));
-    CHECK(!server_vbr_live_source_displacement_allowed(true, 8));
+    CHECK(server_vbr_live_source_displacement_allowed(false, 8, false));
+    CHECK(server_vbr_live_source_displacement_allowed(true, 1, false));
+    CHECK(!server_vbr_live_source_displacement_allowed(true, 2, false));
+    CHECK(!server_vbr_live_source_displacement_allowed(true, 8, false));
+    CHECK(!server_vbr_live_source_displacement_allowed(false, 8, true));
+    CHECK(!server_vbr_live_source_displacement_allowed(true, 1, true));
     const auto rejects_handoff = [&](auto mutate) {
         auto gate = accepted_handoff;
         mutate(gate);
@@ -2063,6 +2069,10 @@ void test_lifecycle_defaults_and_reuse_thresholds() {
         [](auto & gate) { gate.incoming_prefix = gate.incumbent_lcp; });
     rejects_handoff(
         [](auto & gate) { gate.exact_incumbent_durable = true; });
+    auto unsupported_route = accepted_handoff;
+    unsupported_route.exact_incumbent_durable = true;
+    unsupported_route.occupied_route_refused = true;
+    CHECK(server_vbr_empty_handoff_allowed(unsupported_route));
     rejects_handoff(
         [](auto & gate) { gate.durable_incumbent_prefix = 0; });
     rejects_handoff([](auto & gate) {
@@ -4020,8 +4030,11 @@ void test_host_load_short_prefix_clone_fault() {
 void test_recurrent_reusable_prefix() {
     CHECK(server_prompt_checkpoint_reuse_threshold(4, 0, true) == 4);
     CHECK(server_prompt_checkpoint_reuse_threshold(4, 0, false) == 3);
-    CHECK(server_prompt_checkpoint_reuse_threshold(4, 2, false) == 1);
+    // a window of 2 at the final token 3 holds keys 2 and 3
+    CHECK(server_prompt_checkpoint_reuse_threshold(4, 2, false) == 3);
     CHECK(server_prompt_checkpoint_reuse_threshold(4, 8, true) == 0);
+    // the window a live cache prunes to: query 3047 keeps keys 2536..3046
+    CHECK(server_prompt_checkpoint_reuse_threshold(3047, 512, true) == 2537);
     server_prompt prompt;
     prompt.tokens = server_tokens(llama_tokens { 1, 2, 3, 4, 5, 6 }, false);
     const server_tokens incoming(llama_tokens { 1, 2, 3, 4, 9 }, false);

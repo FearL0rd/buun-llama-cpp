@@ -473,6 +473,7 @@ private:
     uint32_t version = 0;
     std::vector<vbr_artifact_unit_blob> units;
     friend class llama_vbr_artifact_catalog;
+    friend class vbr_artifact_package_view;
     friend vbr_artifact_status vbr_artifact_prepare(
         vbr_artifact_package &, uint32_t, const vbr_artifact_preparation_reuse *) noexcept;
 };
@@ -497,11 +498,15 @@ vbr_artifact_status vbr_artifact_prepare_projected_metadata(
 vbr_artifact_status vbr_artifact_validate_prepared_package(
     const vbr_artifact_package & package, uint32_t max_workers = 1) noexcept;
 
+// max_workers and reuse as for vbr_artifact_prepare. Reuse evidence also
+// means the sources cannot change while encoding, so ids are not derived twice.
 vbr_artifact_status vbr_artifact_encode(
     vbr_artifact_package & package,
     const vbr_artifact_stream_writer & output,
     uint64_t max_total_bytes,
-    uint64_t * encoded_size = nullptr) noexcept;
+    uint64_t * encoded_size = nullptr,
+    uint32_t max_workers = 1,
+    const vbr_artifact_preparation_reuse * reuse = nullptr) noexcept;
 
 vbr_artifact_status vbr_artifact_decode(
     const vbr_artifact_stream_reader & input,

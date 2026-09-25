@@ -455,6 +455,14 @@ public:
     // whose owned backing still has its verified revisions. Legacy/unproven
     // packages use validate(); final import barriers must also use validate().
     vbr_artifact_status validate_authenticated() const noexcept;
+    // Rebuild the prepared wire package of an exact (non-projected) reference.
+    // Payload sources borrow this view's storage, so the view must outlive
+    // every read of `out`.
+    vbr_artifact_status exact_package(vbr_artifact_package & out) const noexcept;
+    // Encode that package, reusing the unit ids published with it.
+    vbr_artifact_status encode_exact(
+        const vbr_artifact_stream_writer & output,
+        uint64_t max_total_bytes) const noexcept;
     vbr_artifact_resolve_status retain(
         vbr_artifact_package_view & output) const noexcept;
     void reset() noexcept;
@@ -587,6 +595,12 @@ public:
     // its originating catalog without reopening ownership.
     bool owns_host_package(
         const vbr_artifact_package_view & package) const noexcept;
+    // Read-only answer to whether project_attention_prefix would accept parent
+    // for some shorter prefix: the same currency and layout checks, no borrow.
+    // `projected` here is a capability at the moment asked, not a reservation.
+    vbr_artifact_prefix_projection_status projection_parent_status(
+        const vbr_artifact_package_view & parent,
+        const vbr_artifact_prefix_projection_limits & limits = {}) const noexcept;
     // Derive an immutable, least-authority prefix capability without creating
     // a catalog reference or reading payload bytes. The result owns an
     // independent borrow of parent and therefore delays its physical retire.

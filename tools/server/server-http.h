@@ -64,7 +64,8 @@ struct server_http_req {
     std::string query_string; // query parameters string (e.g. "action=save")
     std::string body;
     std::map<std::string, uploaded_file> files; // used for file uploads (form data)
-    const std::function<bool()> & should_stop;
+    // true once the client is gone or the server is shutting down
+    std::function<bool()> should_stop;
 
     std::string get_param(const std::string & key, const std::string & def = "") const {
         auto it = params.find(key);
@@ -122,6 +123,10 @@ struct server_http_context {
     bool init(const common_params & params);
     bool start();
     void stop() const;
+
+    // make should_stop() true for every request so parked handlers return within one poll.
+    // only stores an atomic: safe from a signal handler, and does not close the listener
+    void notify_stopping() const;
 
     void get(const std::string & path, const handler_t & handler) const;
     void post(const std::string & path, const handler_t & handler) const;

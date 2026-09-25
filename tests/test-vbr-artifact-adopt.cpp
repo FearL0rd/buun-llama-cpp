@@ -682,7 +682,7 @@ struct occupied_budget_source {
 };
 
 static bool occupied_sample_budget(
-        void * opaque, llama_cache_budget_config & output) noexcept {
+        void * opaque, llama_cache_budget_config & output, uint64_t) noexcept {
     try {
         output = static_cast<occupied_budget_source *>(opaque)->budget;
         return true;
@@ -945,6 +945,149 @@ static void test_native_tracker_rejects_uncovered_cell_and_tuple_splice() {
     CHECK(target.extent_store().live_entries() == 0);
 }
 
+static vbr_tracker_install_child whole_import_plan(
+        const vbr_generation_tracker & target) {
+    vbr_tracker_install_child plan;
+    plan.child_id = 0;
+    plan.transition = vbr_tracker_install_transition::whole_import;
+    plan.lineage_uuid = target.lineage_identity();
+    plan.target_instance = target.runtime_instance();
+    plan.global_generation = 1;
+    plan.units.push_back({
+        1, GGML_TYPE_F16, GGML_TYPE_F16,
+        vbr_repr_domain::full, 0, vbr_repr_transition::whole_import,
+    });
+    return plan;
+}
+
+static vbr_import_co_resident tracker_co_resident(
+        llama_seq_id destination,
+        std::vector<vbr_artifact_cell_placement> cells,
+        uint32_t child_id = 0, uint32_t stream_index = 0) {
+    vbr_import_co_resident co;
+    co.destination = destination;
+    vbr_artifact_stream_placement placement;
+    placement.child_id = child_id;
+    placement.stream_index = stream_index;
+    placement.source_sequence = destination;
+    placement.cells = std::move(cells);
+    co.placements.push_back(std::move(placement));
+    return co;
+}
+
+static void check_tracker_cell(
+        const vbr_generation_tracker & target, uint32_t cell,
+        llama_seq_id sequence, llama_pos p0, llama_pos p1) {
+    CHECK(target.dependency_generation(0, cell) == 1);
+    CHECK(target.membership_generation(0, cell) == 1);
+    CHECK(target.last_membership_seq(0, cell) == sequence);
+    const uint16_t import_provenance =
+        uint16_t(vbr_mutation_family::import) |
+        (uint16_t(vbr_operation_class::state_api) << 8);
+    CHECK(target.dependency_provenance(0, cell) == import_provenance);
+    CHECK(target.membership_provenance(0, cell) == import_provenance);
+    for (const auto ref : { target.dependency_extent(0, cell),
+                            target.membership_extent(0, cell) }) {
+        const auto * extent = target.extent_store().lookup_committed(ref);
+        CHECK(extent != nullptr);
+        if (extent) {
+            CHECK(extent->family == vbr_mutation_family::import);
+            CHECK(extent->operation_class == vbr_operation_class::state_api);
+            CHECK(extent->stream == 0);
+            CHECK(extent->seq_id == sequence);
+            CHECK(extent->p0 == p0);
+            CHECK(extent->p1 == p1);
+        }
+    }
+}
+
+static void test_tracker_image_stamps_co_resident_cells() {
+    const auto source = source_controller(vbr_lineage_uuid { 0x1234, 0x5678 });
+    const std::vector<vbr_import_co_resident> none;
+    // A foreign child's placement is another tracker's business.
+    const std::vector<vbr_import_co_resident> co_residents {
+        tracker_co_resident(2, { { 7, 3, 0, 0 }, { 8, 4, 0, 0 } }),
+        tracker_co_resident(3, { { 9, 0, 0, 0 } }),
+        tracker_co_resident(4, { { 5, 0, 0, 0 } }, 1),
+    };
+    for (const auto * co : { (const std::vector<vbr_import_co_resident> *) nullptr,
+                             &none, &co_residents }) {
+        vbr_generation_tracker target(1, 256, 1, vbr_lineage_uuid { 0xc3, 0xd4 });
+        CHECK(target.initialize_unit(0, GGML_TYPE_F16, vbr_repr_domain::full));
+        const auto plan = whole_import_plan(target);
+        vbr_tracker_import_image image;
+        CHECK(target.prepare_import_image(
+            plan, source, 1, { one_cell_placement() }, image, co));
+        CHECK(image.ready());
+        auto binding = import_binding(target.runtime_instance());
+        vbr_scoped_operation operation(binding);
+        CHECK(bool(operation));
+        CHECK(target.import_image_installable(image, operation.id()));
+        target.install_import_image_swap(image);
+        CHECK(target.stable());
+        CHECK(target.page_generation(0, 0) == 1);
+        check_tracker_cell(target, 5, 1, 0, 11);
+        const bool stamped = co != nullptr && !co->empty();
+        if (stamped) {
+            check_tracker_cell(target, 7, 2, 3, 5);
+            check_tracker_cell(target, 8, 2, 3, 5);
+            check_tracker_cell(target, 9, 3, 0, 1);
+        } else {
+            for (const uint32_t cell : { 7u, 8u, 9u }) {
+                CHECK(target.dependency_generation(0, cell) == 0);
+                CHECK(target.membership_generation(0, cell) == 0);
+                CHECK(!target.dependency_extent(0, cell));
+                CHECK(!target.membership_extent(0, cell));
+            }
+        }
+        CHECK(target.dependency_generation(0, 6) == 0);
+        CHECK(target.extent_store().live_entries() == (stamped ? 3u : 1u));
+        operation.close(vbr_operation_outcome::committed);
+    }
+}
+
+static void test_tracker_image_refuses_malformed_co_residents() {
+    const vbr_lineage_uuid source_lineage { 0x1234, 0x5678 };
+    const auto source = source_controller(source_lineage);
+    vbr_generation_tracker target(1, 256, 1, vbr_lineage_uuid { 0xc5, 0xd6 });
+    CHECK(target.initialize_unit(0, GGML_TYPE_F16, vbr_repr_domain::full));
+    const auto plan = whole_import_plan(target);
+    const auto refused = [&](const vbr_tracker_install_child & install,
+                             std::vector<vbr_import_co_resident> co) {
+        vbr_tracker_import_image image;
+        const bool prepared = target.prepare_import_image(
+            install, source, 1, { one_cell_placement() }, image, &co);
+        return !prepared && !image.ready() &&
+            target.extent_store().live_entries() == 0;
+    };
+
+    auto native = plan;
+    native.transition = vbr_tracker_install_transition::native_clone;
+    native.lineage_uuid = source_lineage;
+    native.global_generation = source.global_generation;
+    native.units = source.units;
+    CHECK(refused(native, { tracker_co_resident(2, { { 7, 0, 0, 0 } }) }));
+    CHECK(refused(plan, { tracker_co_resident(1, { { 7, 0, 0, 0 } }) }));
+    CHECK(refused(plan, { tracker_co_resident(2, { { 5, 0, 0, 0 } }) }));
+    CHECK(refused(plan, { tracker_co_resident(2, { { 256, 0, 0, 0 } }) }));
+    CHECK(refused(plan, { tracker_co_resident(2, { { 7, -1, 0, 0 } }) }));
+    CHECK(refused(plan, { tracker_co_resident(2, { { 7, 0, 0, 0 } }, 0, 1) }));
+    CHECK(refused(plan, { tracker_co_resident(2, {}) }));
+    CHECK(refused(plan, { tracker_co_resident(2, { { 7, 0, 0, 0 } }),
+                          tracker_co_resident(3, { { 7, 0, 0, 0 } }) }));
+    CHECK(refused(plan, { tracker_co_resident(
+        2, { { 7, 0, 0, 0 }, { 7, 1, 0, 0 } }) }));
+
+    // Every refusal left the tracker able to take the well-formed image.
+    const std::vector<vbr_import_co_resident> good {
+        tracker_co_resident(2, { { 7, 0, 0, 0 } }),
+    };
+    vbr_tracker_import_image image;
+    CHECK(target.prepare_import_image(
+        plan, source, 1, { one_cell_placement() }, image, &good));
+    CHECK(image.ready());
+}
+
 static void test_closed_vocabularies() {
     for (uint8_t i = 0; i < uint8_t(vbr_adopt_phase::_count); ++i) {
         CHECK(std::string(vbr_adopt_phase_name(vbr_adopt_phase(i))) !=
@@ -1011,6 +1154,36 @@ static void test_complete_tree_barrier_fail_closed() {
     CHECK(vbr_adopt_check_complete_tree(
               expected, live, { provider, provider }) ==
           vbr_adopt_status::required_companion_unavailable);
+
+    // A shared recurrent target is non-empty at the barrier only when it
+    // implements the prepare the manifest selects.
+    empty = false;
+    provider.prepare_replacement = [](
+            const void *, std::unique_ptr<vbr_parsed_companion_image>,
+            std::unique_ptr<vbr_parsed_companion_image>, llama_seq_id,
+            std::unique_ptr<vbr_prepared_companion_image> &) noexcept {
+        return false;
+    };
+    CHECK(vbr_adopt_check_complete_tree(
+              expected, live, { provider }, true, false) ==
+          vbr_adopt_status::adopted);
+    CHECK(vbr_adopt_check_complete_tree(
+              expected, live, { provider }, true, true) ==
+          vbr_adopt_status::target_drift);
+    provider.prepare_insertion = [](
+            const void *, std::unique_ptr<vbr_parsed_companion_image>,
+            llama_seq_id,
+            std::unique_ptr<vbr_prepared_companion_image> &) noexcept {
+        return false;
+    };
+    CHECK(vbr_adopt_check_complete_tree(
+              expected, live, { provider }, true, true) ==
+          vbr_adopt_status::adopted);
+    CHECK(vbr_adopt_check_complete_tree(expected, live, { provider }) ==
+          vbr_adopt_status::target_drift);
+    provider.prepare_replacement = nullptr;
+    provider.prepare_insertion = nullptr;
+    empty = true;
 
     auto * qsa = reinterpret_cast<llama_memory_hybrid_idx *>(
         uintptr_t(0x4040));
@@ -2266,7 +2439,8 @@ struct fixture {
                      bool recycle_import = false,
                      bool transformed_recycle_import = false,
                      bool occupied_spec_companion_import = false,
-                     bool permuted_placement = false)
+                     bool permuted_placement = false,
+                     uint32_t reference_cells = 5)
         : source(package(
               bytes, companion,
               upward_import ? upward_source : GGML_TYPE_TURBO8_0,
@@ -2319,6 +2493,24 @@ struct fixture {
             }
         };
         permute(source);
+        if (reference_cells < 5) {
+            // The image keeps five rows; those past the reference stay free
+            // for co-resident sequences.
+            auto & manifest = source.manifest;
+            manifest.identity.token_count = reference_cells;
+            manifest.identity.next_position = reference_cells;
+            manifest.token_block.tokens.resize(reference_cells);
+            for (auto & controller : manifest.generation.controllers) {
+                auto & stream = controller.streams[0];
+                stream.computation_frontier = llama_pos(reference_cells);
+                stream.captured_dependency_count = reference_cells;
+                stream.pages[0] = page((uint64_t(1) << reference_cells) - 1);
+            }
+            for (auto & placement : manifest.stream_placements) {
+                placement.computation_frontier = llama_pos(reference_cells);
+                placement.cells.resize(reference_cells);
+            }
+        }
         const auto prepared = vbr_artifact_prepare(source);
         if (prepared != vbr_artifact_status::ok) {
             std::fprintf(stderr, "VBR adoption prepare status=%s source=%s hops=%u stash=%u\n",
@@ -4113,6 +4305,318 @@ static void test_upward_reconstruction() {
     }
 }
 
+static vbr_import_co_resident co_resident(
+        llama_seq_id destination, const std::vector<uint32_t> & cells) {
+    vbr_import_co_resident co;
+    co.destination = destination;
+    for (uint32_t child = 0; child < 2; ++child) {
+        vbr_artifact_stream_placement placement;
+        placement.child_id = child;
+        placement.stream_index = 0;
+        placement.source_sequence = destination;
+        placement.computation_frontier = llama_pos(cells.size());
+        for (size_t i = 0; i < cells.size(); ++i) {
+            placement.cells.push_back({ cells[i], llama_pos(i), 0, 0 });
+        }
+        co.placements.push_back(std::move(placement));
+    }
+    return co;
+}
+
+// The reference owns rows 0..2 of each five-row image; rows 3 and 4 are free.
+struct co_resident_fixture : fixture {
+    std::vector<vbr_import_co_resident> co_residents;
+
+    explicit co_resident_fixture(bool occupied_import = false)
+        : fixture(false, false, false, GGML_TYPE_TURBO8_0, GGML_TYPE_F16, 0,
+                  vbr_artifact_clean_stash_state::absent_at_source,
+                  false, false, occupied_import, false, false, false, false,
+                  occupied_import ? 5 : 3) {}
+
+    vbr_manifest_validation_result validate(
+            const std::vector<vbr_import_co_resident> * value) {
+        if (value) {
+            co_residents = *value;
+        }
+        policy.co_residents = value ? &co_residents : nullptr;
+        policy.adoption_nonce++;
+        refresh();
+        return vbr_validate_unit_manifest_snapshot(snapshot, view, policy);
+    }
+
+    vbr_manifest_validation_result validate(
+            std::vector<vbr_import_co_resident> value) {
+        return validate(&value);
+    }
+};
+
+static bool runs_equal(
+        const std::vector<vbr_authorized_cell_run> & runs,
+        const std::vector<std::pair<uint32_t, uint32_t>> & expected) {
+    return runs.size() == expected.size() && std::equal(
+        runs.begin(), runs.end(), expected.begin(),
+        [](const vbr_authorized_cell_run & run,
+           const std::pair<uint32_t, uint32_t> & value) {
+            return run.first_physical_cell == value.first &&
+                run.cell_count == value.second;
+        });
+}
+
+static void test_co_resident_empty_import_validates_live_rebased() {
+    co_resident_fixture f;
+    const std::vector<vbr_import_co_resident> none;
+    auto baseline = f.validate(nullptr);
+    CHECK(baseline.status == vbr_manifest_validation_status::validated);
+    CHECK(baseline.decision == vbr_import_decision::native_import);
+    CHECK(baseline.proof);
+    auto empty = f.validate(&none);
+    CHECK(empty.status == vbr_manifest_validation_status::validated);
+    CHECK(empty.decision == baseline.decision);
+    CHECK(empty.proof);
+    for (const auto * proof : { baseline.proof.get(), empty.proof.get() }) {
+        if (!proof) {
+            continue;
+        }
+        CHECK(proof->co_residents().empty());
+        CHECK(proof->children().size() == 2);
+        for (const auto & plan : proof->children()) {
+            CHECK(runs_equal(plan.authorized_runs, { { 0, 3 } }));
+        }
+    }
+    if (baseline.proof && empty.proof) {
+        const auto & a = baseline.proof->tracker_install().children;
+        const auto & b = empty.proof->tracker_install().children;
+        CHECK(a.size() == b.size());
+        for (size_t i = 0; i < a.size() && i < b.size(); ++i) {
+            CHECK(a[i].transition == b[i].transition);
+            CHECK(a[i].global_generation == b[i].global_generation);
+        }
+    }
+
+    auto whole = f.validate({ co_resident(1, { 3, 4 }) });
+    CHECK(whole.status == vbr_manifest_validation_status::validated);
+    CHECK(whole.decision == vbr_import_decision::live_rebased);
+    CHECK(whole.proof);
+    if (whole.proof) {
+        CHECK(whole.proof->decision() == vbr_import_decision::live_rebased);
+        const auto & co = whole.proof->co_residents();
+        CHECK(co.size() == 1);
+        if (co.size() == 1) {
+            CHECK(co[0].destination == 1);
+            CHECK(co[0].placements.size() == 2);
+            for (const auto & placement : co[0].placements) {
+                CHECK(placement.cells.size() == 2);
+                if (placement.cells.size() == 2) {
+                    CHECK(placement.cells[0].physical_cell == 3);
+                    CHECK(placement.cells[1].physical_cell == 4);
+                    CHECK(placement.cells[1].logical_position == 1);
+                }
+            }
+        }
+        CHECK(whole.proof->children().size() == 2);
+        for (const auto & plan : whole.proof->children()) {
+            CHECK(runs_equal(plan.authorized_runs, { { 0, 5 } }));
+            CHECK(plan.placements.size() == 1);
+            if (plan.placements.size() == 1) {
+                CHECK(plan.placements[0].cells.size() == 3);
+            }
+        }
+        CHECK(whole.proof->tracker_install().children.size() == 2);
+        for (const auto & child : whole.proof->tracker_install().children) {
+            CHECK(child.transition ==
+                  vbr_tracker_install_transition::whole_import);
+        }
+        // Adoption takes the proof by move.
+        vbr_validated_manifest moved(std::move(*whole.proof));
+        CHECK(moved.co_residents().size() == 1);
+        CHECK(moved.children().size() == 2);
+    }
+
+    // A gap between the reference and the co-resident stays unauthorized, and
+    // two sequences may split the free rows.
+    auto gapped = f.validate({ co_resident(1, { 4 }) });
+    CHECK(gapped.decision == vbr_import_decision::live_rebased);
+    CHECK(gapped.proof);
+    if (gapped.proof) {
+        for (const auto & plan : gapped.proof->children()) {
+            CHECK(runs_equal(plan.authorized_runs, { { 0, 3 }, { 4, 1 } }));
+        }
+    }
+    auto split = f.validate({ co_resident(2, { 4 }), co_resident(1, { 3 }) });
+    CHECK(split.decision == vbr_import_decision::live_rebased);
+    CHECK(split.proof);
+    if (split.proof) {
+        CHECK(split.proof->co_residents().size() == 2);
+        for (const auto & plan : split.proof->children()) {
+            CHECK(runs_equal(plan.authorized_runs, { { 0, 5 } }));
+        }
+    }
+    CHECK(f.target.construction_empty());
+}
+
+// A target pool narrower than the image (fewer iSWA slots) takes the
+// reference's rows as a dense prefix, rebased; too narrow still refuses.
+static void test_narrow_target_packs_reference() {
+    const auto narrow = [](fixture & f, uint64_t cells) {
+        for (auto & child : f.snapshot.children) {
+            for (auto & unit : child.units) {
+                for (auto & shard : unit.shards) {
+                    shard.mapped_bytes = cells*shard.row_bytes;
+                }
+            }
+        }
+    };
+    co_resident_fixture f;
+    narrow(f, 3);
+    auto packed = f.validate(nullptr);
+    CHECK(packed.status == vbr_manifest_validation_status::validated);
+    CHECK(packed.decision == vbr_import_decision::live_rebased);
+    CHECK(packed.proof);
+    if (packed.proof) {
+        CHECK(packed.proof->children().size() == 2);
+        for (const auto & plan : packed.proof->children()) {
+            CHECK(runs_equal(plan.authorized_runs, { { 0, 3 } }));
+            CHECK(plan.descriptor.wm_cells == 3);
+            CHECK(plan.controller_policy.wm_cells == 3);
+            CHECK(plan.stash_action ==
+                  vbr_validated_stash_action::omit_live_rebased);
+        }
+        for (const auto & child : packed.proof->tracker_install().children) {
+            CHECK(child.transition ==
+                  vbr_tracker_install_transition::whole_import);
+        }
+    }
+    CHECK(f.validate({ co_resident(1, { 3, 4 }) }).status ==
+          vbr_manifest_validation_status::topology_mismatch);
+    narrow(f, 2);
+    CHECK(f.validate(nullptr).status ==
+          vbr_manifest_validation_status::topology_mismatch);
+    // The window masks position 0 for the reference's last position: that
+    // row is dropped and the rest pack from source row 1.
+    for (auto & child : f.snapshot.children) {
+        child.window_live_from = 1;
+    }
+    auto pruned = f.validate(nullptr);
+    CHECK(pruned.status == vbr_manifest_validation_status::validated);
+    CHECK(pruned.proof);
+    if (pruned.proof) {
+        for (const auto & plan : pruned.proof->children()) {
+            CHECK(runs_equal(plan.authorized_runs, { { 0, 2 } }));
+            CHECK(plan.authorized_runs.size() == 1 &&
+                  plan.authorized_runs[0].first_source_row == 1);
+            CHECK(plan.placements.size() == 1 &&
+                  plan.placements[0].cells.size() == 2 &&
+                  plan.placements[0].cells[0].logical_position == 1);
+        }
+    }
+    narrow(f, 1);
+    CHECK(f.validate(nullptr).status ==
+          vbr_manifest_validation_status::topology_mismatch);
+
+    co_resident_fixture adopted;
+    narrow(adopted, 3);
+    adopted.policy.co_residents = nullptr;
+    CHECK(adopt(adopted).status == vbr_adopt_status::adopted);
+    adopted.target.erase_imported();
+}
+
+static void test_co_resident_refusals() {
+    using status = vbr_manifest_validation_status;
+    co_resident_fixture f;
+    const auto edited = [](auto && edit) {
+        auto co = co_resident(1, { 3, 4 });
+        edit(co);
+        return std::vector<vbr_import_co_resident> { std::move(co) };
+    };
+    CHECK(f.validate({ co_resident(-1, { 3 }) }).status ==
+          status::ownership_mismatch);
+    CHECK(f.validate({ co_resident(LLAMA_MAX_SEQ, { 3 }) }).status ==
+          status::ownership_mismatch);
+    CHECK(f.validate({ co_resident(f.policy.destination_sequence, { 3 }) })
+              .status == status::ownership_mismatch);
+    CHECK(f.validate({ co_resident(1, { 3 }), co_resident(1, { 4 }) }).status ==
+          status::ownership_mismatch);
+    CHECK(f.validate(edited([](auto & co) { co.placements.clear(); })).status ==
+          status::ownership_mismatch);
+    CHECK(f.validate(edited([](auto & co) {
+              co.placements[1].child_id = 2;
+          })).status == status::ownership_mismatch);
+    CHECK(f.validate(edited([](auto & co) {
+              co.placements[0].cells.clear();
+          })).status == status::ownership_mismatch);
+    CHECK(f.validate(edited([](auto & co) {
+              co.placements[0].stream_index = 1;
+          })).status == status::ownership_mismatch);
+    CHECK(f.validate(edited([](auto & co) {
+              co.placements[1].cells[0].logical_position = -1;
+          })).status == status::ownership_mismatch);
+    // Row 5 is past the image, row 2 belongs to the reference.
+    CHECK(f.validate({ co_resident(1, { 4, 5 }) }).status ==
+          status::ownership_mismatch);
+    CHECK(f.validate({ co_resident(1, { 2, 3 }) }).status ==
+          status::ownership_mismatch);
+    CHECK(f.validate({ co_resident(1, { 3, 4 }), co_resident(2, { 4 }) })
+              .status == status::ownership_mismatch);
+    CHECK(f.validate({ co_resident(1, { 3, 3 }) }).status ==
+          status::ownership_mismatch);
+
+    auto refused = f.validate({ co_resident(1, { 2, 3 }) });
+    CHECK(refused.decision == vbr_import_decision::reject);
+    CHECK(!refused.proof);
+    CHECK(f.target.construction_empty());
+    // None of the refusals poisoned the destination.
+    CHECK(f.validate({ co_resident(1, { 3, 4 }) }).decision ==
+          vbr_import_decision::live_rebased);
+
+    // A validation consumes the replacement guard, hence one fixture each.
+    co_resident_fixture control(true);
+    CHECK(control.validate(nullptr).status == status::validated);
+    co_resident_fixture occupied(true);
+    auto replaced = occupied.validate({ co_resident(1, { 3 }) });
+    CHECK(replaced.status == status::target_not_empty);
+    CHECK(!replaced.proof);
+    // The refusal left the guard, and its package leases, with the caller.
+    CHECK(occupied.occupied_guard.ready());
+    occupied.occupied_guard.reset();
+}
+
+static void test_co_resident_requires_live_rebased_policy() {
+    co_resident_fixture f;
+    f.policy.allow_live_rebased = false;
+    auto rebuilt = f.validate({ co_resident(1, { 3, 4 }) });
+    CHECK(rebuilt.status == vbr_manifest_validation_status::validated);
+    CHECK(rebuilt.decision == vbr_import_decision::rebuild);
+    CHECK(!rebuilt.proof);
+    f.policy.allow_rebuild = false;
+    auto cold = f.validate({ co_resident(1, { 3, 4 }) });
+    CHECK(cold.decision == vbr_import_decision::cold);
+    CHECK(!cold.proof);
+    f.policy.allow_cold = false;
+    auto rejected = f.validate({ co_resident(1, { 3, 4 }) });
+    CHECK(rejected.status == vbr_manifest_validation_status::validated);
+    CHECK(rejected.decision == vbr_import_decision::reject);
+    CHECK(!rejected.proof);
+}
+
+// The seam has no cells to install co-residents into, so adoption must fail
+// closed rather than publish the reference alone.
+static void test_co_resident_seam_adopt_fails_closed() {
+    co_resident_fixture f;
+    const auto plain = adopt(f);
+    CHECK(plain.status == vbr_adopt_status::adopted);
+    CHECK(plain.units == 2);
+    f.target.erase_imported();
+    CHECK(f.ledger.snapshot().live_ops == f.catalog_live_ops);
+
+    co_resident_fixture g;
+    g.co_residents = { co_resident(1, { 3, 4 }) };
+    g.policy.co_residents = &g.co_residents;
+    const auto result = adopt(g);
+    CHECK(result.status == vbr_adopt_status::tracker_failed);
+    CHECK(g.target.publish_calls == 0);
+    check_failed_transaction(g, result);
+}
+
 } // namespace adoption_fixture
 
 namespace {
@@ -5856,14 +6360,12 @@ static bool model_backed_occupied_store(
     // capture does not need). Capture a short parent from the still-live full
     // sequence so this hardware arm exercises the same production owner used
     // by automatic projected host publication.
-    const size_t projected_parent_count = incoming_tokens.size();
-    const auto make_projected_manifest = [&] (uint64_t manifest_id) {
+    const auto make_projected_manifest = [&] (
+            uint64_t manifest_id, const llama_tokens & tokens) {
         vbr_projected_capture_manifest_request manifest;
         manifest.manifest_id = manifest_id;
         manifest.sequence = 0;
-        manifest.token_block.assign(
-            incoming_tokens.begin(),
-            incoming_tokens.begin() + projected_parent_count);
+        manifest.token_block = tokens;
         manifest.identity =
             make_host_capture_request(manifest.token_block).identity;
         manifest.text_only = true;
@@ -5877,14 +6379,15 @@ static bool model_backed_occupied_store(
     server_vbr_projected_host_capture_diagnostics reversed_diagnostics;
     CHECK(store->capture_projected_host_batch(
         *memory,
-        { make_projected_manifest(2), make_projected_manifest(1) },
+        { make_projected_manifest(2, incoming_tokens),
+          make_projected_manifest(1, incoming_tokens) },
         256ull*1024*1024, reversed_results, nullptr,
         &reversed_diagnostics));
     CHECK(reversed_results.size() == 2);
     reversed_results.clear();
 
     vbr_projected_capture_manifest_request projected_manifest;
-    projected_manifest = make_projected_manifest(1);
+    projected_manifest = make_projected_manifest(1, incoming_tokens);
     std::vector<server_vbr_projected_host_publish_result> projected_results;
     server_vbr_projected_host_capture_diagnostics projected_diagnostics;
     CHECK(store->capture_projected_host_batch(
@@ -6217,6 +6720,73 @@ static bool model_backed_occupied_store(
     // soft lease. Drop the now-stale local handle without a second terminal.
     incumbent_lease = {};
 
+    // The continuation landed past the foreign sequence, so the slot's rows
+    // are no longer packed from cell 0. Its projected host copy packs them;
+    // the empty door must still place each row at its physical cell.
+    llama_tokens resumed_tokens = incoming_tokens;
+    resumed_tokens.push_back(continuation);
+    std::vector<uint8_t> resumed_expected_rows;
+    CHECK(llama_kv_cache_vbr_epoch_test::snapshot_sequence_rows(
+        occupied_cache, destination_slot, uint32_t(resumed_tokens.size()),
+        resumed_expected_rows));
+    std::vector<server_vbr_projected_host_publish_result> resumed_results;
+    server_vbr_projected_host_capture_diagnostics resumed_diagnostics;
+    CHECK(store->capture_projected_host_batch(
+        *memory, { make_projected_manifest(3, resumed_tokens) },
+        256ull*1024*1024, resumed_results, nullptr, &resumed_diagnostics));
+    CHECK(resumed_results.size() == 1 && resumed_results.front().payload);
+    if (resumed_results.size() != 1 || !resumed_results.front().payload) {
+        return false;
+    }
+    // The same rows captured exact: an otherwise identical pair, both exact
+    // copies, of which only the projected one is a projection parent.
+    std::shared_ptr<const server_prompt_cache_vbr_payload> resumed_exact;
+    CHECK(capture_owner(resumed_tokens, resumed_exact));
+    if (!resumed_exact) {
+        return false;
+    }
+    CHECK(store->host_prefix_projection_ready(resumed_results.front().payload));
+    CHECK(!store->host_prefix_projection_ready(resumed_exact));
+    const auto import_resumed = [&](const char * label,
+            const std::shared_ptr<const server_prompt_cache_vbr_payload> & payload) {
+        llama_memory_clear(memory, true);
+        CHECK(llama_kv_cache_vbr_epoch_test::
+            make_construction_empty_preserve_tiers(occupied_cache));
+        server_vbr_artifact_import_target request;
+        request.memory = memory;
+        request.destination = destination_slot;
+        request.execution_identity = execution_key;
+        request.adapter_config_identity = adapter_key;
+        request.previously_observed = true;
+        request.prepare_publish = [](
+                void *, const std::vector<llama_token> & tokens,
+                uint64_t sequence_epoch) noexcept {
+            return !tokens.empty() && sequence_epoch == 1;
+        };
+        request.publish = [](void *) noexcept {};
+        const auto resumed = store->import_host_payload(std::move(request), payload);
+        if (resumed.status != server_vbr_artifact_import_status::ok ||
+            resumed.adopt_status != vbr_adopt_status::adopted) {
+            std::fprintf(stderr,
+                "VBR packed empty import (%s) failed: store=%s validation=%s "
+                "stage=%s adopt=%s phase=%s\n", label,
+                server_vbr_artifact_import_status_name(resumed.status),
+                vbr_manifest_validation_status_name(resumed.validation_status),
+                vbr_adopt_stage_status_name(resumed.stage_status),
+                vbr_adopt_status_name(resumed.adopt_status),
+                vbr_adopt_phase_name(resumed.phase));
+        }
+        CHECK(resumed.status == server_vbr_artifact_import_status::ok);
+        CHECK(resumed.adopt_status == vbr_adopt_status::adopted);
+        std::vector<uint8_t> resumed_actual_rows;
+        CHECK(llama_kv_cache_vbr_epoch_test::snapshot_sequence_rows(
+            occupied_cache, destination_slot, uint32_t(resumed_tokens.size()),
+            resumed_actual_rows));
+        CHECK(resumed_actual_rows == resumed_expected_rows);
+    };
+    import_resumed("exact", resumed_exact);
+    import_resumed("projected", resumed_results.front().payload);
+
     // PT production composition: derive a true shorter/divergent prefix from
     // the same store-owned parent, import it through the real empty-target
     // store door, and prove that no suffix row was needed for continuation
@@ -6241,26 +6811,30 @@ static bool model_backed_occupied_store(
         const llama_tokens * expected = nullptr;
         bool published = false;
     } prefix_state { &prefix_tokens, false };
-    server_vbr_artifact_import_target prefix_request;
-    prefix_request.memory = memory;
-    prefix_request.destination = destination_slot;
-    prefix_request.execution_identity = execution_key;
-    prefix_request.adapter_config_identity = adapter_key;
-    prefix_request.previously_observed = true;
-    prefix_request.publish_context = &prefix_state;
-    prefix_request.prepare_publish = [](
-            void * opaque,
-            const std::vector<llama_token> & tokens,
-            uint64_t sequence_epoch) noexcept {
-        const auto * state = static_cast<const prefix_publish_state *>(opaque);
-        return state && state->expected && sequence_epoch == 1 &&
-            tokens == *state->expected;
-    };
-    prefix_request.publish = [](void * opaque) noexcept {
-        static_cast<prefix_publish_state *>(opaque)->published = true;
+    const auto prefix_request = [&] (prefix_publish_state & state) {
+        server_vbr_artifact_import_target request;
+        request.memory = memory;
+        request.destination = destination_slot;
+        request.execution_identity = execution_key;
+        request.adapter_config_identity = adapter_key;
+        request.previously_observed = true;
+        request.publish_context = &state;
+        request.prepare_publish = [](
+                void * opaque,
+                const std::vector<llama_token> & tokens,
+                uint64_t sequence_epoch) noexcept {
+            const auto * current =
+                static_cast<const prefix_publish_state *>(opaque);
+            return current && current->expected && sequence_epoch == 1 &&
+                tokens == *current->expected;
+        };
+        request.publish = [](void * opaque) noexcept {
+            static_cast<prefix_publish_state *>(opaque)->published = true;
+        };
+        return request;
     };
     const auto prefix_import = store->import_host_prefix_payload(
-        std::move(prefix_request), projected_owner,
+        prefix_request(prefix_state), projected_owner,
         std::move(prefix_projection));
     if (prefix_import.status != server_vbr_artifact_import_status::ok ||
         prefix_import.adopt_status != vbr_adopt_status::adopted ||
@@ -6332,6 +6906,134 @@ static bool model_backed_occupied_store(
         }
         CHECK(equal);
     }
+
+    // Occupied prefix projection from a parent whose prefix rows are not its
+    // leading packed rows: the suffix reused cells freed below the prefix, so
+    // relocation reads parent rows past the projected payload size.
+    llama_memory_clear(memory, true);
+    const size_t low_count = 40;
+    const size_t suffix_count = 4;
+    CHECK(incoming_tokens.size() > low_count &&
+          prefix_count + suffix_count <= low_count/2);
+    llama_tokens low_tokens(
+        incoming_tokens.begin(), incoming_tokens.begin()+low_count);
+    llama_tokens parent_tokens(
+        incoming_tokens.begin(),
+        incoming_tokens.begin()+prefix_count+suffix_count);
+    CHECK(model_adoption_decode(context.get(), low_tokens, 0, 1));
+    CHECK(model_adoption_decode(context.get(), prefix_tokens, 0));
+    CHECK(llama_memory_seq_rm(memory, 1, -1, -1));
+    CHECK(model_adoption_decode(
+        context.get(),
+        llama_tokens(parent_tokens.begin()+prefix_count, parent_tokens.end()),
+        llama_pos(prefix_count)));
+    llama_synchronize(context.get());
+    std::vector<server_vbr_projected_host_publish_result> reordered_results;
+    CHECK(store->capture_projected_host_batch(
+        *memory, { make_projected_manifest(4, parent_tokens) }, 256ull*1024*1024,
+        reordered_results, nullptr, nullptr));
+    CHECK(reordered_results.size() == 1 && reordered_results.front().payload);
+    if (reordered_results.size() != 1 || !reordered_results.front().payload) {
+        return false;
+    }
+    const auto reordered_parent = reordered_results.front().payload;
+    CHECK(llama_memory_seq_rm(memory, 0, llama_pos(prefix_count), -1));
+    std::vector<uint8_t> reordered_expected_rows;
+    CHECK(llama_kv_cache_vbr_epoch_test::snapshot_sequence_rows(
+        occupied_cache, 0, uint32_t(prefix_count), reordered_expected_rows));
+    llama_memory_clear(memory, true);
+    llama_tokens occupant_tokens(
+        incumbent_tokens.end()-20, incumbent_tokens.end());
+    CHECK(model_adoption_decode(context.get(), occupant_tokens, 0));
+    llama_synchronize(context.get());
+    std::shared_ptr<const server_prompt_cache_vbr_payload> occupant_owner;
+    CHECK(capture_owner(occupant_tokens, occupant_owner));
+    if (!occupant_owner) {
+        return false;
+    }
+    vbr_artifact_attention_prefix_projection occupied_projection;
+    CHECK(store->prepare_host_prefix_projection(
+        reordered_parent, divergent_request, prefix_count,
+        occupied_projection) ==
+        vbr_artifact_prefix_projection_status::projected);
+    prefix_publish_state occupied_state { &prefix_tokens, false };
+    const auto occupied_import = store->import_host_occupied_prefix_replacement(
+        prefix_request(occupied_state), reordered_parent, occupant_owner,
+        std::move(occupied_projection));
+    if (occupied_import.status != server_vbr_artifact_import_status::ok ||
+        occupied_import.adopt_status != vbr_adopt_status::adopted) {
+        std::fprintf(stderr,
+            "VBR occupied prefix import failed: store=%s guard=%s "
+            "validation=%s stage=%s adopt=%s phase=%s\n",
+            server_vbr_artifact_import_status_name(occupied_import.status),
+            vbr_occupied_replacement_guard_status_name(
+                occupied_import.occupied_guard_status),
+            vbr_manifest_validation_status_name(
+                occupied_import.validation_status),
+            vbr_adopt_stage_status_name(occupied_import.stage_status),
+            vbr_adopt_status_name(occupied_import.adopt_status),
+            vbr_adopt_phase_name(occupied_import.phase));
+    }
+    CHECK(occupied_import.status == server_vbr_artifact_import_status::ok);
+    CHECK(occupied_import.adopt_status == vbr_adopt_status::adopted);
+    CHECK(occupied_state.published);
+    CHECK(memory->seq_pos_max(0) == llama_pos(prefix_count-1));
+    std::vector<uint8_t> reordered_actual_rows;
+    CHECK(llama_kv_cache_vbr_epoch_test::snapshot_sequence_rows(
+        occupied_cache, 0, uint32_t(prefix_count), reordered_actual_rows));
+    CHECK(reordered_actual_rows == reordered_expected_rows);
+
+    // A longer exact-only host match must not mask a shorter copy the owner can
+    // project: with the projector the selector passes the exact entry by.
+    llama_memory_clear(memory, true);
+    llama_tokens branch_tokens(
+        incoming_tokens.begin(), incoming_tokens.begin()+prefix_count);
+    for (size_t i = 0; i < suffix_count; ++i) {
+        branch_tokens.push_back(llama_token(
+            (uint32_t(incoming_tokens[prefix_count+i])+2u)%uint32_t(vocab_size)));
+    }
+    CHECK(model_adoption_decode(context.get(), branch_tokens, 0));
+    llama_synchronize(context.get());
+    std::vector<server_vbr_projected_host_publish_result> branch_results;
+    CHECK(store->capture_projected_host_batch(
+        *memory, { make_projected_manifest(5, branch_tokens) }, 256ull*1024*1024,
+        branch_results, nullptr, nullptr));
+    CHECK(branch_results.size() == 1 && branch_results.front().payload);
+    if (branch_results.size() != 1 || !branch_results.front().payload) {
+        return false;
+    }
+    const auto branch_owner = branch_results.front().payload;
+    CHECK(store->host_prefix_projection_ready(branch_owner));
+    CHECK(!store->host_prefix_projection_ready(incoming_owner));
+    server_prompt branch_prompt;
+    branch_prompt.tokens = server_tokens(branch_tokens, false);
+    branch_prompt.sequence_epoch = 1;
+    constexpr int32_t branch_source_slot = 5;
+    CHECK(publish_live_source(branch_source_slot, branch_prompt));
+    CHECK(publish_host(
+        branch_source_slot, branch_prompt, branch_owner, incoming_family));
+    const size_t exact_lcp = low_count/2;
+    llama_tokens selector_request(
+        incoming_tokens.begin(), incoming_tokens.begin()+exact_lcp);
+    selector_request.push_back(llama_token(
+        (uint32_t(incoming_tokens[exact_lcp])+1u)%uint32_t(vocab_size)));
+    {
+        server_prompt_cache_vbr_restore_candidate blind;
+        CHECK(cache.prepare_vbr_restore(
+            server_tokens(selector_request, false), execution_key,
+            adapter_key, blind, true));
+        CHECK(blind.prefix_tokens() == exact_lcp);
+        CHECK(blind.payload() != branch_owner);
+    }
+    server_prompt_cache_vbr_restore_candidate selected;
+    CHECK(cache.prepare_vbr_restore(
+        server_tokens(selector_request, false), execution_key,
+        adapter_key, selected, true, nullptr, store.get()));
+    CHECK(selected.requires_prefix_projection());
+    CHECK(selected.prefix_tokens() == prefix_count);
+    CHECK(selected.payload() == branch_owner);
+    CHECK(cache.contains_vbr_frontier(
+        branch_prompt, execution_key, adapter_key, store.get()));
     return failures == 0;
 }
 
@@ -6596,11 +7298,18 @@ int main(int argc, char ** argv) {
     adoption_fixture::test_serial_and_admission_faults();
     adoption_fixture::test_downward_subphase_matrix();
     adoption_fixture::test_upward_reconstruction();
+    adoption_fixture::test_co_resident_empty_import_validates_live_rebased();
+    adoption_fixture::test_narrow_target_packs_reference();
+    adoption_fixture::test_co_resident_refusals();
+    adoption_fixture::test_co_resident_requires_live_rebased_policy();
+    adoption_fixture::test_co_resident_seam_adopt_fails_closed();
     test_final_recheck_excludes_only_own_reservation();
     test_native_tracker_image_preserves_lineage_and_runtime();
     test_real_tracker_import_settle_and_teardown();
     test_live_rebased_tracker_image_is_fresh();
     test_native_tracker_rejects_uncovered_cell_and_tuple_splice();
+    test_tracker_image_stamps_co_resident_cells();
+    test_tracker_image_refuses_malformed_co_residents();
     if (argc >= 2 &&
         (std::string(argv[1]) == "--vbr-adopt-cuda" ||
          std::string(argv[1]) == "--vbr-transform-cuda" ||

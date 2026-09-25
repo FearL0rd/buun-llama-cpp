@@ -116,9 +116,12 @@ struct server_vbr_artifact_store_create_diagnostics {
 };
 
 struct server_vbr_artifact_store_config {
+    // pending_host_bytes: host bytes the caller has already allocated for what
+    // it prices, to be counted back into the sampled headroom.
     using sample_budget_fn = bool (*)(
         void * context,
-        llama_cache_budget_config & output) noexcept;
+        llama_cache_budget_config & output,
+        uint64_t pending_host_bytes) noexcept;
 
     llama_cache_acct_ledger * ledger = nullptr;
     llama_cache_acct_resource_domain pinned_domain;
@@ -360,6 +363,17 @@ struct server_vbr_artifact_import_target {
     llama_seq_id destination = -1;
     // Full incoming prompt occupancy; zero retains explicit-import behavior.
     uint64_t incoming_cells = 0;
+    // Other sequences restored from the same image. Whole empty imports only.
+    std::vector<vbr_import_co_resident> co_residents;
+    // Rows of the image no sequence of this import takes. They are under the
+    // watermark the image publishes, so the destination is priced with them.
+    uint64_t unowned_cells = 0;
+    // see vbr_adopt_policy::pack_rows
+    bool pack_rows = false;
+    // Insert into a live pool whose other sequences stay resident. The
+    // destination must hold no cells and the schedule must match the live
+    // degrade cursor exactly.
+    bool absent_insertion = false;
     std::string execution_identity;
     std::string adapter_config_identity;
     bool previously_observed = false;
@@ -421,6 +435,13 @@ struct server_vbr_artifact_import_output {
     uint32_t companions = 0;
     uint64_t payload_bytes = 0;
     uint64_t companion_bytes = 0;
+};
+
+// why an ingest returned no payload
+struct server_vbr_artifact_ingest_output {
+    vbr_artifact_status decode_status = vbr_artifact_status::internal_error;
+    vbr_capture_stream_status stream_status =
+        vbr_capture_stream_status::_count;
 };
 
 // A lower-precision variant may be useful only while negotiation is still
@@ -538,6 +559,11 @@ public:
         const std::vector<llama_token> & request_tokens,
         uint64_t lcp_tokens,
         vbr_artifact_attention_prefix_projection & output) noexcept;
+    // Read-only: would prepare_host_prefix_projection accept this payload as
+    // a parent right now (owned, current, sealed and laid out for projection)?
+    bool host_prefix_projection_ready(
+        const std::shared_ptr<const server_prompt_cache_vbr_payload> & payload)
+        const noexcept;
     server_vbr_artifact_import_output import_host_prefix_payload(
         server_vbr_artifact_import_target request,
         std::shared_ptr<const server_prompt_cache_vbr_payload> payload,
@@ -563,6 +589,21 @@ public:
     bool retain_host_payload(
         const std::string & reference,
         const std::string & tenant_key,
+        std::shared_ptr<const server_prompt_cache_vbr_payload> & payload)
+        noexcept;
+
+    // Persistence seam. Export streams one exact cache-owned package through
+    // the wire codec. Ingest is its inverse: the decoded envelope re-enters
+    // the catalog through the verified-segment door a live capture uses, so
+    // the result is an ordinary retirement-owned payload for
+    // import_host_payload. Same build and device layout only.
+    vbr_artifact_status export_host_payload(
+        const server_prompt_cache_vbr_payload & payload,
+        const vbr_artifact_stream_writer & writer,
+        uint64_t max_encoded_bytes) noexcept;
+    server_vbr_artifact_ingest_output ingest_host_payload(
+        const vbr_artifact_stream_reader & reader,
+        uint64_t encoded_bytes,
         std::shared_ptr<const server_prompt_cache_vbr_payload> & payload)
         noexcept;
 
@@ -606,6 +647,10 @@ private:
         vbr_artifact_attention_prefix_projection projection,
         const std::shared_ptr<const server_prompt_cache_vbr_payload> * recovery)
         noexcept;
+    // The payload is a cache-owned host package this store's catalog owns.
+    bool host_prefix_projection_parent(
+        const std::shared_ptr<const server_prompt_cache_vbr_payload> & payload)
+        const noexcept;
     struct impl;
     explicit server_vbr_artifact_store(std::unique_ptr<impl> state) noexcept;
     std::unique_ptr<impl> impl_;

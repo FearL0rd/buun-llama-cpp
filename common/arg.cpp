@@ -4771,6 +4771,20 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
+        {"--resume"},
+        "keep the slots' conversations across restarts and sleep: their KV state is saved at shutdown and restored at startup (default: disabled)",
+        [](common_params & params) {
+            params.resume = true;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_RESUME"));
+    add_opt(common_arg(
+        {"--resume-path"}, "PATH",
+        "directory of the --resume store (default: the llama.cpp cache directory)",
+        [](common_params & params, const std::string & value) {
+            params.resume_path = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_RESUME_PATH"));
+    add_opt(common_arg(
         {"--cache-receipt"},
         "attach a cache receipt (keyed chained block-hash divergence hint) to responses (default: disabled)",
         [](common_params & params) {

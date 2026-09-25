@@ -151,6 +151,14 @@ endif ()
 llama_build_and_test(test-server-recurrent-expansion.cpp)
 target_include_directories(test-server-recurrent-expansion PRIVATE ${PROJECT_SOURCE_DIR}/tools/server)
 
+if (NOT WIN32)
+    llama_build_and_test(
+        test-server-resume-store.cpp
+        ${PROJECT_SOURCE_DIR}/tools/server/server-resume-store.cpp)
+    target_include_directories(test-server-resume-store PRIVATE ${PROJECT_SOURCE_DIR}/tools/server)
+    target_link_libraries(test-server-resume-store PRIVATE vendor::hash)
+endif()
+
 llama_build_and_test(test-kv-cells.cpp)
 target_include_directories(test-kv-cells PRIVATE ${PROJECT_SOURCE_DIR}/src)
 
@@ -201,6 +209,9 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     target_include_directories(test-recurrent-state-rollback PRIVATE ${PROJECT_SOURCE_DIR}/src)
     llama_build(test-vbr-swa-window.cpp)
     target_include_directories(test-vbr-swa-window PRIVATE ${PROJECT_SOURCE_DIR}/src)
+    # run by hand with a sliding-window model
+    llama_build(test-state-restore-swa-exact.cpp)
+    target_include_directories(test-state-restore-swa-exact PRIVATE ${PROJECT_SOURCE_DIR}/src)
 
     llama_build(test-vbr-representation-epoch.cpp)
     target_include_directories(test-vbr-representation-epoch PRIVATE ${PROJECT_SOURCE_DIR}/src)
@@ -900,6 +911,9 @@ if ((TARGET ggml-cuda OR TARGET ggml-hip) AND NOT GGML_BACKEND_DL)
         target_link_libraries(test-vbr-vmm PRIVATE ggml-hip)
     endif()
     llama_test(test-vbr-vmm LABEL "backend")
+
+    # exhausts the device on purpose, so it is run by hand with a model dynamic VBR can manage
+    llama_build(test-vbr-import-exhausted.cpp)
 endif()
 
 # the tensor API kernels come from a separate metallib - check they produce correct results
@@ -975,6 +989,8 @@ if (NOT LLAMA_USE_SYSTEM_GGML)
     llama_build_and_test(test-alloc.cpp)
     llama_build_and_test(test-backend-meta-replay.cpp)
     set_tests_properties(test-backend-meta-replay PROPERTIES SKIP_RETURN_CODE 77)
+    llama_build_and_test(test-backend-meta-partial-io.cpp)
+    set_tests_properties(test-backend-meta-partial-io PROPERTIES SKIP_RETURN_CODE 77)
 endif()
 
 llama_build(test-export-graph-ops.cpp)

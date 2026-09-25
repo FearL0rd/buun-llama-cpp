@@ -518,6 +518,8 @@ int llama_server(common_params & params, int argc, char ** argv) {
         SRV_INF("%s", "model loaded\n");
 
         shutdown_handler = [&](int) {
+            // release handlers parked on a result, otherwise a streaming one holds exit until its next SSE ping
+            ctx_http.notify_stopping();
             mcp_mgr.shutdown();
             // this will unblock start_loop()
             ctx_server.terminate();

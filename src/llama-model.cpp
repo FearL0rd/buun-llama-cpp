@@ -4297,9 +4297,16 @@ bool llama_model_semantic_family_digest(
         return false;
     }
     llama_sha256_writer writer;
-    static constexpr char domain[] = "llama.model.semantic-family/v3";
+    static constexpr char domain[] = "llama.model.semantic-family/v4";
     writer.string(domain, sizeof(domain) - 1);
     const auto & hp = model->hparams;
+    // Appended MTP layers are a drafter head: the target context never
+    // allocates or serializes them, so a checkpoint shipped with and without
+    // its MTP head (stock vs. a fine-tune that stripped it) is one family.
+    // Granite Switch router layers and all-NextN sidecars are trunk state and
+    // stay bound.
+    const bool     mtp_excluded   = hp.has_mtp() && hp.n_layer() > 0;
+    const uint32_t n_layer_family = mtp_excluded ? hp.n_layer() : hp.n_layer_all;
     const auto write_f32 = [&](float value) {
         uint32_t bits = 0;
         static_assert(sizeof(bits) == sizeof(value));
@@ -4315,8 +4322,8 @@ bool llama_model_semantic_family_digest(
     writer.u32(hp.n_embd);
     writer.u32(hp.n_embd_inp());
     writer.u32(hp.n_embd_out());
-    writer.u32(hp.n_layer_all);
-    writer.u32(hp.n_layer_nextn);
+    writer.u32(n_layer_family);
+    writer.u32(mtp_excluded ? 0u : hp.n_layer_nextn);
     writer.u32(uint32_t(hp.n_layer_kv_from_start));
     writer.u32(uint32_t(hp.router_layer));
     writer.u32(hp.n_expert);
@@ -4492,13 +4499,12 @@ bool llama_model_semantic_family_digest(
     writer.u32(hp.dec_n_layer);
     writer.u32(uint32_t(hp.pooling_type));
     writer.u32(uint32_t(hp.llm_ffn_op));
-    for (uint32_t il = 0; il < hp.n_layer_all; ++il) {
+    for (uint32_t il = 0; il < n_layer_family; ++il) {
         writer.u32(hp.is_recr(il) ? 1u : 0u);
         writer.u32(hp.is_swa(il) ? 1u : 0u);
-        // The indexer role is defined only for target layers. Integrated MTP
-        // artifacts append next-token layers to n_layer_all; those layers are
-        // already bound by n_layer_nextn and their remaining per-layer fields,
-        // but must not be passed to the target-only indexer accessor.
+        // The indexer role is defined only for target layers; router and
+        // all-NextN layers beyond n_layer() must not be passed to the
+        // target-only indexer accessor.
         writer.u32(il < hp.n_layer() && hp.is_indexer_full(il) ? 1u : 0u);
         writer.u32(hp.rope_pattern[il]);
         writer.u32(hp.n_head(il));
@@ -4541,10 +4547,12 @@ bool llama_model_semantic_family_digest(
         writer.u32(score_bits);
         writer.u32(uint32_t(token.attr));
     }
+    // The pad token id is absent: it never enters a sequence or its KV, and
+    // fine-tune exports routinely reassign it.
     for (const llama_token token : {
             vocab.token_bos(), vocab.token_eos(), vocab.token_eot(),
             vocab.token_eom(), vocab.token_unk(), vocab.token_sep(),
-            vocab.token_nl(), vocab.token_pad(), vocab.token_mask() }) {
+            vocab.token_nl(), vocab.token_mask() }) {
         writer.u32(uint32_t(token));
     }
     writer.u32(vocab.get_add_space_prefix() ? 1u : 0u);
