@@ -1,4 +1,5 @@
 #include "llama-vbr-generation.h"
+#include "llama-vbr-precision.h"
 
 #include "llama-vbr-explicit-capture.h"
 #include "llama-vbr-artifact-validate.h"
@@ -90,7 +91,8 @@ void mask_set(std::array<uint64_t, VBR_GENERATION_MASK_WORDS> & mask, uint32_t o
 bool unit_equal(const vbr_checkpoint_unit_generation & captured, const vbr_unit_generation & current) {
     return captured.repr_gen == current.repr_gen && captured.current_type == current.current_type &&
            captured.last_source_type == current.last_source_type && captured.domain == current.domain &&
-           captured.promote_hops == current.promote_hops && captured.last_transition == current.last_transition;
+           captured.promote_hops == current.promote_hops && captured.last_transition == current.last_transition &&
+           captured.effective_type == current.effective_type;
 }
 
 }  // namespace
@@ -820,6 +822,16 @@ bool vbr_generation_tracker::global_transition(vbr_mutation_registrant registran
     }
     ++mutation_serial_;
     ++global_generation_;
+    if (registrant == vbr_mutation_registrant::state_read_install ||
+        registrant == vbr_mutation_registrant::whole_import) {
+        // Raw state streams have no authenticated precision provenance. They
+        // must not inherit a fresh destination's apparent quality. Artifact
+        // import installs its own validated tracker image separately.
+        std::lock_guard<std::mutex> lock(units_mutex_);
+        for (auto & unit : units_) {
+            unit.effective_type = -1;
+        }
+    }
     ++mutation_serial_;
     // The unavailable state does not auto-clear here: the cause (registry or
     // slab exhaustion) may persist. try_clear_shadow_unavailable() probes the cause.
@@ -835,6 +847,7 @@ bool vbr_generation_tracker::initialize_unit(uint32_t unit, int32_t type, vbr_re
     state.repr_gen         = 1;
     state.current_type     = type;
     state.last_source_type = type;
+    state.effective_type   = type;
     state.domain           = domain;
     state.last_transition  = vbr_repr_transition::initial;
     return true;
@@ -874,6 +887,8 @@ bool vbr_generation_tracker::publish_unit(uint32_t                unit,
     ++state.repr_gen;
     state.last_source_type = source_type;
     state.current_type     = target_type;
+    state.effective_type = transition == vbr_repr_transition::full_reset
+        ? target_type : vbr_precision_merge(state.effective_type, target_type);
     state.domain           = domain;
     state.promote_hops     = promote_hops;
     state.last_transition  = transition;
@@ -890,9 +905,10 @@ bool vbr_generation_tracker::prepare_import_image(
         const vbr_checkpoint_generation_controller & source,
         llama_seq_id destination,
         const std::vector<vbr_artifact_stream_placement> & placements,
-        vbr_tracker_import_image & output) noexcept {
+        vbr_tracker_import_image & output,
+        const std::vector<vbr_import_co_resident> * co_residents) noexcept {
     return prepare_import_image_impl(
-        plan, source, destination, &placements, nullptr, output);
+        plan, source, destination, &placements, nullptr, co_residents, output);
 }
 
 bool vbr_generation_tracker::prepare_relocated_import_image(
@@ -902,7 +918,7 @@ bool vbr_generation_tracker::prepare_relocated_import_image(
         const vbr_occupied_replacement_guard & replacement,
         vbr_tracker_import_image & output) noexcept {
     return prepare_import_image_impl(
-        plan, source, destination, nullptr, &replacement, output);
+        plan, source, destination, nullptr, &replacement, nullptr, output);
 }
 
 bool vbr_generation_tracker::prepare_import_image_impl(
@@ -911,10 +927,14 @@ bool vbr_generation_tracker::prepare_import_image_impl(
         llama_seq_id destination,
         const std::vector<vbr_artifact_stream_placement> * placements,
         const vbr_occupied_replacement_guard * replacement,
+        const std::vector<vbr_import_co_resident> * co_residents,
         vbr_tracker_import_image & output) noexcept {
     try {
         if (!active() || !stable() || !output.impl_ ||
             ((placements == nullptr) == (replacement == nullptr)) ||
+            (co_residents != nullptr && !co_residents->empty() &&
+             (replacement != nullptr ||
+              plan.transition != vbr_tracker_install_transition::whole_import)) ||
             plan.child_id != source.child_id ||
             plan.target_instance != instance_id_ ||
             destination < 0 || destination >= LLAMA_MAX_SEQ ||
@@ -1001,6 +1021,73 @@ bool vbr_generation_tracker::prepare_import_image_impl(
             next->extent_handles.push_back(handle);
         }
 
+        // A committed import extent for a sequence other than the destination
+        // that keeps rows in the published stream.
+        const auto reserve_owner_extent = [&](uint16_t stream_index,
+                                              llama_seq_id owner,
+                                              llama_pos first, llama_pos last) {
+            if (last == std::numeric_limits<llama_pos>::max()) {
+                return vbr_extent_handle{};
+            }
+            const auto handle = extents_.reserve(
+                vbr_mutation_family::import,
+                vbr_operation_class::state_api,
+                stream_index, owner, first, last + 1);
+            if (!handle) {
+                return vbr_extent_handle{};
+            }
+            const auto guard = extents_.add_ref(handle);
+            if (!guard) {
+                extents_.fail(handle);
+                return vbr_extent_handle{};
+            }
+            next->extent_guard_refs.push_back(guard);
+            if (!extents_.commit(handle)) {
+                return vbr_extent_handle{};
+            }
+            next->extent_handles.push_back(handle);
+            return handle;
+        };
+        // Generation-1 import stamp for one not yet stamped cell.
+        const auto stamp = [&](vbr_generation_stream_state & stream,
+                               uint32_t physical, llama_seq_id seq,
+                               vbr_extent_handle handle) {
+            if (physical >= n_cells_ || seq < 0 || !handle ||
+                stream.cell_last_dependency_gen[physical] != 0 ||
+                stream.cell_last_membership_gen[physical] != 0) {
+                return false;
+            }
+            const uint32_t page =
+                physical / VBR_GENERATION_PAGE_CELLS;
+            constexpr uint32_t generation = 1;
+            stream.page_event_gen[page] = std::max(
+                stream.page_event_gen[page], generation);
+            stream.page_last_import_gen[page] = std::max(
+                stream.page_last_import_gen[page], generation);
+            stream.cell_last_dependency_gen[physical] = generation;
+            stream.cell_last_membership_gen[physical] = generation;
+            const uint16_t provenance = pack_provenance(
+                vbr_mutation_family::import,
+                vbr_operation_class::state_api);
+            stream.cell_dependency_provenance[physical] = provenance;
+            stream.cell_membership_provenance[physical] = provenance;
+            stream.cell_last_membership_seq[physical] =
+                static_cast<int16_t>(seq);
+            stream.cell_dependency_extent[physical] =
+                extents_.add_ref(handle);
+            stream.cell_membership_extent[physical] =
+                extents_.add_ref(handle);
+            if (!stream.cell_dependency_extent[physical] ||
+                !stream.cell_membership_extent[physical]) {
+                return false;
+            }
+            set_range_bit(
+                stream.cell_dependency_in_range, physical, true);
+            set_range_bit(
+                stream.cell_membership_in_range, physical, true);
+            return true;
+        };
+
         if (replacement) {
             // Rebuild one coherent tracker image for the shared physical
             // stream. The guard authenticates the destination mapping and all
@@ -1030,72 +1117,18 @@ bool vbr_generation_tracker::prepare_import_image_impl(
             }
             std::map<llama_seq_id, vbr_extent_handle> retained_extents;
             for (const auto & entry : ranges) {
-                if (entry.second.second ==
-                        std::numeric_limits<llama_pos>::max()) {
-                    return false;
-                }
-                const auto handle = extents_.reserve(
-                    vbr_mutation_family::import,
-                    vbr_operation_class::state_api,
-                    0, entry.first, entry.second.first,
-                    entry.second.second + 1);
+                const auto handle = reserve_owner_extent(
+                    0, entry.first, entry.second.first, entry.second.second);
                 if (!handle) {
                     return false;
                 }
-                const auto guard = extents_.add_ref(handle);
-                if (!guard) {
-                    extents_.fail(handle);
-                    return false;
-                }
-                next->extent_guard_refs.push_back(guard);
-                if (!extents_.commit(handle)) {
-                    return false;
-                }
-                next->extent_handles.push_back(handle);
                 retained_extents.emplace(entry.first, handle);
             }
-            const auto stamp = [&](uint32_t physical, llama_seq_id seq,
-                                   vbr_extent_handle handle) {
-                if (physical >= n_cells_ || seq < 0 || !handle ||
-                    stream.cell_last_dependency_gen[physical] != 0 ||
-                    stream.cell_last_membership_gen[physical] != 0) {
-                    return false;
-                }
-                const uint32_t page =
-                    physical / VBR_GENERATION_PAGE_CELLS;
-                constexpr uint32_t generation = 1;
-                stream.page_event_gen[page] = std::max(
-                    stream.page_event_gen[page], generation);
-                stream.page_last_import_gen[page] = std::max(
-                    stream.page_last_import_gen[page], generation);
-                stream.cell_last_dependency_gen[physical] = generation;
-                stream.cell_last_membership_gen[physical] = generation;
-                const uint16_t provenance = pack_provenance(
-                    vbr_mutation_family::import,
-                    vbr_operation_class::state_api);
-                stream.cell_dependency_provenance[physical] = provenance;
-                stream.cell_membership_provenance[physical] = provenance;
-                stream.cell_last_membership_seq[physical] =
-                    static_cast<int16_t>(seq);
-                stream.cell_dependency_extent[physical] =
-                    extents_.add_ref(handle);
-                stream.cell_membership_extent[physical] =
-                    extents_.add_ref(handle);
-                if (!stream.cell_dependency_extent[physical] ||
-                    !stream.cell_membership_extent[physical]) {
-                    return false;
-                }
-                set_range_bit(
-                    stream.cell_dependency_in_range, physical, true);
-                set_range_bit(
-                    stream.cell_membership_in_range, physical, true);
-                return true;
-            };
             for (const auto & cell : replacement->preserved_cells()) {
                 const auto handle = retained_extents.find(
                     cell.owner_sequence);
                 if (handle == retained_extents.end() ||
-                    !stamp(cell.physical_cell, cell.owner_sequence,
+                    !stamp(stream, cell.physical_cell, cell.owner_sequence,
                            handle->second)) {
                     return false;
                 }
@@ -1111,7 +1144,7 @@ bool vbr_generation_tracker::prepare_import_image_impl(
                 first = false;
                 previous_physical = cell.destination_physical_cell;
                 const uint32_t physical = cell.destination_physical_cell;
-                if (!stamp(physical, destination, destination_handle)) {
+                if (!stamp(stream, physical, destination, destination_handle)) {
                     return false;
                 }
             }
@@ -1194,6 +1227,43 @@ bool vbr_generation_tracker::prepare_import_image_impl(
                                   cell.physical_cell, true);
                 }
             }
+            if (co_residents != nullptr) {
+                for (const auto & co : *co_residents) {
+                    if (co.destination == destination) {
+                        return false;
+                    }
+                    for (const auto & placement : co.placements) {
+                        if (placement.child_id != plan.child_id) {
+                            continue;
+                        }
+                        if (placement.stream_index >= next->streams.size() ||
+                            placement.cells.empty()) {
+                            return false;
+                        }
+                        const auto range = std::minmax_element(
+                            placement.cells.begin(), placement.cells.end(),
+                            [](const auto & a, const auto & b) {
+                                return a.logical_position < b.logical_position;
+                            });
+                        if (range.first->logical_position < 0) {
+                            return false;
+                        }
+                        const auto handle = reserve_owner_extent(
+                            uint16_t(placement.stream_index), co.destination,
+                            range.first->logical_position,
+                            range.second->logical_position);
+                        // stamp() refuses a row the destination or another
+                        // co-resident already holds.
+                        for (const auto & cell : placement.cells) {
+                            if (!stamp(next->streams[placement.stream_index],
+                                       cell.physical_cell, co.destination,
+                                       handle)) {
+                                return false;
+                            }
+                        }
+                    }
+                }
+            }
         }
 
         for (const auto guard : next->extent_guard_refs) {
@@ -1211,6 +1281,43 @@ bool vbr_generation_tracker::prepare_import_image_impl(
                 return false;
             }
             next->units = units_;
+            for (size_t i = 0; i < next->units.size(); ++i) {
+                auto & unit = next->units[i];
+                const auto & incoming = plan.units[i];
+                if (!replacement->preserved_cells().empty()) {
+                    // Foreign rows share this representation and history. Do
+                    // not publish incoming extent metadata inconsistent with
+                    // their tracker; incompatible histories safely miss.
+                    if (unit.current_type != incoming.current_type ||
+                        unit.domain != incoming.domain ||
+                        unit.promote_hops != incoming.promote_hops) {
+                        return false;
+                    }
+                    unit.effective_type = vbr_precision_merge(
+                        unit.effective_type, incoming.effective_type);
+                } else {
+                    // Keep the guarded controller lineage, but publish the
+                    // same final representation/history as the live extents.
+                    unit.current_type = incoming.current_type;
+                    unit.last_source_type = incoming.last_source_type;
+                    unit.effective_type = incoming.effective_type;
+                    unit.domain = incoming.domain;
+                    unit.promote_hops = incoming.promote_hops;
+                    unit.last_transition = incoming.last_transition;
+                }
+                const auto & prior = units_[i];
+                if (unit.current_type != prior.current_type ||
+                    unit.last_source_type != prior.last_source_type ||
+                    unit.effective_type != prior.effective_type ||
+                    unit.domain != prior.domain || unit.promote_hops != prior.promote_hops ||
+                    unit.last_transition != prior.last_transition) {
+                    if (unit.repr_gen == UINT64_MAX || unit.publish_seq > UINT64_MAX-2) {
+                        return false;
+                    }
+                    ++unit.repr_gen;
+                    unit.publish_seq += 2;
+                }
+            }
         } else {
             next->units.reserve(plan.units.size());
             for (const auto & unit : plan.units) {
@@ -1222,6 +1329,7 @@ bool vbr_generation_tracker::prepare_import_image_impl(
                 installed.publish_seq = 0;
                 installed.current_type = unit.current_type;
                 installed.last_source_type = unit.last_source_type;
+                installed.effective_type = unit.effective_type;
                 installed.domain = unit.domain;
                 installed.promote_hops = unit.promote_hops;
                 installed.last_transition = unit.last_transition;
@@ -1424,6 +1532,7 @@ bool vbr_generation_capture_controller(const vbr_generation_tracker &           
             live_unit.domain,
             live_unit.promote_hops,
             live_unit.last_transition,
+            live_unit.effective_type,
         });
     }
 

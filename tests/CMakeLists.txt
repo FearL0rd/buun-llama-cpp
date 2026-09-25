@@ -151,8 +151,29 @@ endif ()
 llama_build_and_test(test-server-recurrent-expansion.cpp)
 target_include_directories(test-server-recurrent-expansion PRIVATE ${PROJECT_SOURCE_DIR}/tools/server)
 
+if (NOT WIN32)
+    llama_build_and_test(
+        test-server-resume-store.cpp
+        ${PROJECT_SOURCE_DIR}/tools/server/server-resume-store.cpp)
+    target_include_directories(test-server-resume-store PRIVATE ${PROJECT_SOURCE_DIR}/tools/server)
+    target_link_libraries(test-server-resume-store PRIVATE vendor::hash)
+endif()
+
 llama_build_and_test(test-kv-cells.cpp)
 target_include_directories(test-kv-cells PRIVATE ${PROJECT_SOURCE_DIR}/src)
+
+llama_build_and_test(test-sha256.cpp ${PROJECT_SOURCE_DIR}/vendor/hash/sha256/sha256.c)
+target_include_directories(test-sha256 PRIVATE ${PROJECT_SOURCE_DIR}/src ${PROJECT_SOURCE_DIR}/vendor/hash)
+
+# Compile the same implementation without ISA dispatch for fallback coverage on
+# SHA-capable CI hosts. This override is test-only, not a production build option.
+add_executable(test-sha256-portable test-sha256.cpp
+    ${PROJECT_SOURCE_DIR}/src/llama-sha256.cpp
+    ${PROJECT_SOURCE_DIR}/vendor/hash/sha256/sha256.c)
+target_include_directories(test-sha256-portable PRIVATE ${PROJECT_SOURCE_DIR}/src ${PROJECT_SOURCE_DIR}/vendor/hash)
+target_compile_features(test-sha256-portable PRIVATE cxx_std_17)
+target_compile_definitions(test-sha256-portable PRIVATE LLAMA_SHA256_FORCE_PORTABLE=1)
+llama_test(test-sha256-portable)
 
 llama_build(test-safetensors-registry.cpp)
 target_include_directories(test-safetensors-registry PRIVATE ${PROJECT_SOURCE_DIR}/src)
@@ -188,11 +209,16 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     target_include_directories(test-recurrent-state-rollback PRIVATE ${PROJECT_SOURCE_DIR}/src)
     llama_build(test-vbr-swa-window.cpp)
     target_include_directories(test-vbr-swa-window PRIVATE ${PROJECT_SOURCE_DIR}/src)
+    # run by hand with a sliding-window model
+    llama_build(test-state-restore-swa-exact.cpp)
+    target_include_directories(test-state-restore-swa-exact PRIVATE ${PROJECT_SOURCE_DIR}/src)
 
     llama_build(test-vbr-representation-epoch.cpp)
     target_include_directories(test-vbr-representation-epoch PRIVATE ${PROJECT_SOURCE_DIR}/src)
     llama_build_and_test(test-vbr-representation-identity.cpp)
     target_include_directories(test-vbr-representation-identity PRIVATE ${PROJECT_SOURCE_DIR}/src)
+    llama_build_and_test(test-vbr-cross-domain.cpp)
+    set_tests_properties(test-vbr-cross-domain PROPERTIES SKIP_RETURN_CODE 77)
     add_test(
         NAME test-vbr-controller-identity-cpu
         COMMAND $<TARGET_FILE:test-vbr-representation-epoch> --identity-cpu)
@@ -592,6 +618,16 @@ target_include_directories(test-backend-expert-transfer PRIVATE ../ggml/src)
 llama_build_and_test(test-exl3-cpu.cpp)
 llama_build_and_test(test-cuda-graph-key.cpp)
 llama_build_and_test(test-cuda-rdna2-vmm-policy.cpp)
+if (TARGET ggml-cuda)
+    enable_language(CUDA)
+    get_target_property(PARAM_TEST_CUDA_ARCHITECTURES ggml-cuda CUDA_ARCHITECTURES)
+    add_executable(test-cuda-kernel-params test-cuda-kernel-params.cu)
+    target_link_libraries(test-cuda-kernel-params PRIVATE CUDA::cudart)
+    set_target_properties(test-cuda-kernel-params PROPERTIES
+        CUDA_STANDARD 17 CUDA_ARCHITECTURES "${PARAM_TEST_CUDA_ARCHITECTURES}")
+    llama_test(test-cuda-kernel-params LABEL "main;backend")
+    set_tests_properties(test-cuda-kernel-params PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120)
+endif()
 # Calls private Marlin symbols, which are not exported from Windows DLLs.
 if (TARGET ggml-cuda AND NOT GGML_BACKEND_DL AND (NOT WIN32 OR NOT BUILD_SHARED_LIBS))
     enable_language(CUDA)
@@ -875,6 +911,9 @@ if ((TARGET ggml-cuda OR TARGET ggml-hip) AND NOT GGML_BACKEND_DL)
         target_link_libraries(test-vbr-vmm PRIVATE ggml-hip)
     endif()
     llama_test(test-vbr-vmm LABEL "backend")
+
+    # exhausts the device on purpose, so it is run by hand with a model dynamic VBR can manage
+    llama_build(test-vbr-import-exhausted.cpp)
 endif()
 
 # the tensor API kernels come from a separate metallib - check they produce correct results
@@ -950,6 +989,8 @@ if (NOT LLAMA_USE_SYSTEM_GGML)
     llama_build_and_test(test-alloc.cpp)
     llama_build_and_test(test-backend-meta-replay.cpp)
     set_tests_properties(test-backend-meta-replay PROPERTIES SKIP_RETURN_CODE 77)
+    llama_build_and_test(test-backend-meta-partial-io.cpp)
+    set_tests_properties(test-backend-meta-partial-io PROPERTIES SKIP_RETURN_CODE 77)
 endif()
 
 llama_build(test-export-graph-ops.cpp)

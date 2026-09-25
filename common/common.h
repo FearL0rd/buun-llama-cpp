@@ -948,6 +948,8 @@ struct common_params {
     bool log_json = false;
 
     std::string slot_save_path;
+    bool        resume = false; // save the slots' conversations at shutdown and sleep, restore them at startup and wake
+    std::string resume_path;    // root of the resume store, empty: the cache directory
     std::string media_path; // path to directory for loading media files
 
     // Cache receipt: untrusted divergence-location hint

@@ -6430,6 +6430,75 @@ size_t llama_context::state_seq_set_data(llama_seq_id seq_id, const uint8_t * sr
     }
 }
 
+// range blob: io_magic_range, LLAMA_STATE_SEQ_RANGE_VERSION, p0, p1, then what the memory writes for the range
+static constexpr uint32_t io_magic_range = 0x72737167; // "gqsr"
+
+size_t llama_context::state_seq_get_data_range(llama_seq_id seq_id, uint8_t * dst, size_t size, llama_pos p0, llama_pos p1) {
+    std::unique_ptr<llama_io_write_i> io;
+    if (dst == nullptr) {
+        io = std::make_unique<llama_io_write_dummy>(false);
+    } else {
+        io = std::make_unique<llama_io_write_host>(dst, size);
+    }
+
+    try {
+        if (!memory) {
+            throw std::runtime_error("the context has no memory");
+        }
+
+        const uint32_t version = LLAMA_STATE_SEQ_RANGE_VERSION;
+
+        io->write(&io_magic_range, sizeof(io_magic_range));
+        io->write(&version, sizeof(version));
+        io->write(&p0, sizeof(p0));
+        io->write(&p1, sizeof(p1));
+
+        memory->state_write_range(*io, seq_id, p0, p1);
+
+        return io->n_bytes();
+    } catch (const std::exception & err) {
+        LLAMA_LOG_ERROR("%s: error saving state range [%d, %d): %s\n", __func__, p0, p1, err.what());
+        return 0;
+    }
+}
+
+size_t llama_context::state_seq_append_data(llama_seq_id seq_id, const uint8_t * src, size_t size, llama_pos p0, llama_pos p1, llama_pos p_limit) {
+    llama_io_read_host io(src, size);
+
+    try {
+        if (!memory) {
+            throw std::runtime_error("the context has no memory");
+        }
+
+        uint32_t  magic;
+        uint32_t  version;
+        llama_pos p0_read;
+        llama_pos p1_read;
+
+        io.read(&magic, sizeof(magic));
+        io.read(&version, sizeof(version));
+        io.read(&p0_read, sizeof(p0_read));
+        io.read(&p1_read, sizeof(p1_read));
+
+        if (magic != io_magic_range) {
+            throw std::runtime_error("wrong state range magic");
+        }
+        if (version != LLAMA_STATE_SEQ_RANGE_VERSION) {
+            throw std::runtime_error("unsupported state range version");
+        }
+        if (p0_read != p0 || p1_read != p1) {
+            throw std::runtime_error("the blob was written for another range");
+        }
+
+        memory->state_append_range(io, seq_id, p0, p1, p_limit);
+
+        return io.n_bytes();
+    } catch (const std::exception & err) {
+        LLAMA_LOG_ERROR("%s: error appending state range [%d, %d): %s\n", __func__, p0, p1, err.what());
+        return 0;
+    }
+}
+
 bool llama_context::state_load_file(const char * filepath, llama_token * tokens_out, size_t n_token_capacity, size_t * n_token_count_out) {
     llama_file file(filepath, "rb");
 
@@ -8737,6 +8806,26 @@ size_t llama_state_seq_set_data_ext(llama_context * ctx, const uint8_t * src, si
     ctx->synchronize();
 
     return ctx->state_seq_set_data(seq_id, src, size, flags);
+}
+
+size_t llama_state_seq_get_size_range(llama_context * ctx, llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
+    return ctx->state_seq_get_data_range(seq_id, nullptr, 0, p0, p1);
+}
+
+size_t llama_state_seq_get_data_range(llama_context * ctx, uint8_t * dst, size_t size, llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
+    if (dst == nullptr) {
+        return 0;
+    }
+
+    ctx->synchronize();
+
+    return ctx->state_seq_get_data_range(seq_id, dst, size, p0, p1);
+}
+
+size_t llama_state_seq_append_data(llama_context * ctx, const uint8_t * src, size_t size, llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_pos p_limit) {
+    ctx->synchronize();
+
+    return ctx->state_seq_append_data(seq_id, src, size, p0, p1, p_limit);
 }
 
 size_t llama_state_seq_save_file(llama_context * ctx, const char * filepath, llama_seq_id seq_id, const llama_token * tokens, size_t n_token_count) {

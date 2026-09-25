@@ -150,6 +150,8 @@ std::string lora_config_identity(const std::vector<common_adapter_lora_info> & l
 //                             batch before any logical payload mutation
 //   frontier_disagree_after_flip - make the frontier selector disagree only after
 //                                  it owns reads (exercises fail-closed legacy fallback)
+//   idle_capture_slow - hold a background exact capture 3 s after its transfer, before it
+//                       completes (a shutdown can land inside it)
 bool server_fault(const char * tag);
 
 //

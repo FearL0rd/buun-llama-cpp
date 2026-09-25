@@ -626,6 +626,12 @@ bool digest_nonzero(const std::array<uint8_t, 32> & digest) noexcept {
     });
 }
 
+// the digest sealed at capture, else one streamed over the source now
+std::array<uint8_t, 32> source_digest(const artifact_segment_chain & source) noexcept {
+    auto digest = source.sealed_digest();
+    return digest_nonzero(digest) ? digest : vbr_capture_stream_digest(source);
+}
+
 template<class AppendRead>
 bool stage_child(
         const vbr_validated_child_plan & child,
@@ -633,14 +639,25 @@ bool stage_child(
         const std::vector<vbr_h2d_lane_binding> & lanes,
         AppendRead && append_read,
         vbr_adopt_stage_status & failure) {
+    // Packed rows land at their physical cells through the packed
+    // transfer, which carries its source digest on the read.
+    const bool packed = std::any_of(
+        child.authorized_runs.begin(), child.authorized_runs.end(),
+        [](const vbr_authorized_cell_run & run) {
+            return run.first_source_row != run.first_physical_cell;
+        });
     for (const auto & shard : child.shards) {
         const uint32_t lane = find_lane(lanes, shard.domain);
         if (lane >= lanes.size()) {
             failure = vbr_adopt_stage_status::source_unavailable;
             return false;
         }
+        const auto digest = packed && shard.source
+            ? source_digest(*shard.source) : std::array<uint8_t, 32> {};
         for (const auto & run : child.authorized_runs) {
             if (run.cell_count == 0 ||
+                run.first_source_row >
+                    std::numeric_limits<uint64_t>::max()/shard.row_bytes ||
                 uint64_t(run.first_physical_cell) >
                     std::numeric_limits<uint64_t>::max()/shard.row_bytes ||
                 uint64_t(run.cell_count) >
@@ -648,17 +665,23 @@ bool stage_child(
                 failure = vbr_adopt_stage_status::source_unavailable;
                 return false;
             }
-            const uint64_t offset =
-                uint64_t(run.first_physical_cell)*shard.row_bytes;
+            const uint64_t offset = run.first_source_row*shard.row_bytes;
             const uint64_t size = uint64_t(run.cell_count)*shard.row_bytes;
+            vbr_staged_read_descriptor read = {
+                vbr_staged_read_kind::unit_payload,
+                child.child_id, child.logical_unit_id,
+                shard.shard_index, lane, offset, size,
+                shard.source, {}, 0, {},
+            };
+            if (packed) {
+                read.verified_digest = digest;
+                read.destination_offset =
+                    uint64_t(run.first_physical_cell)*shard.row_bytes;
+                read.projection_ranges.push_back({ offset, size });
+            }
             if (offset > shard.payload_bytes ||
                 size > shard.payload_bytes - offset ||
-                !append_read({
-                    vbr_staged_read_kind::unit_payload,
-                    child.child_id, child.logical_unit_id,
-                    shard.shard_index, lane, offset, size,
-                    shard.source, {}, 0, {},
-                })) {
+                !append_read(std::move(read))) {
                 failure = vbr_adopt_stage_status::source_hash_mismatch;
                 return false;
             }
@@ -877,10 +900,7 @@ bool stage_relocated_child(
             failure = vbr_adopt_stage_status::source_unavailable;
             return false;
         }
-        auto digest = source->sealed_digest();
-        if (!digest_nonzero(digest)) {
-            digest = vbr_capture_stream_digest(*source);
-        }
+        const auto digest = source_digest(*source);
         if (!digest_nonzero(digest)) {
             failure = vbr_adopt_stage_status::source_hash_mismatch;
             return false;
@@ -990,7 +1010,7 @@ vbr_adopt_stage_result vbr_stage_validated_manifest(
                 return out;
             }
         } else if (!occupied_replacement &&
-                   out.manifest->source_package().validate() !=
+                   out.manifest->source_package().validate_authenticated() !=
                        vbr_artifact_status::ok) {
             out.status = vbr_adopt_stage_status::source_hash_mismatch;
             return out;
@@ -1048,11 +1068,7 @@ vbr_adopt_stage_result vbr_stage_validated_manifest(
                 return false;
             }
             if (!projected) {
-                read.verified_digest = read.source->sealed_digest();
-                if (!digest_nonzero(read.verified_digest)) {
-                    read.verified_digest =
-                        vbr_capture_stream_digest(*read.source);
-                }
+                read.verified_digest = source_digest(*read.source);
             }
             if (!digest_nonzero(read.verified_digest)) {
                 return false;

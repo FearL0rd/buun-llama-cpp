@@ -21,7 +21,15 @@
 class server_http_context::Impl {
 public:
     std::unique_ptr<httplib::Server> srv;
+    // shared with every request's should_stop closure, which can outlive a route lambda
+    std::shared_ptr<std::atomic<bool>> stopping = std::make_shared<std::atomic<bool>>(false);
 };
+
+static std::function<bool()> make_should_stop(const httplib::Request & req, std::shared_ptr<std::atomic<bool>> stopping) {
+    return [&req, stopping = std::move(stopping)]() {
+        return stopping->load(std::memory_order_relaxed) || req.is_connection_closed();
+    };
+}
 
 // Route-local body policy. Keep this separate from log level: even if the
 // generic httplib logger is enabled in a future build, cache-plan prompts and
@@ -531,7 +539,12 @@ bool server_http_context::start() {
     return true;
 }
 
+void server_http_context::notify_stopping() const {
+    pimpl->stopping->store(true, std::memory_order_relaxed);
+}
+
 void server_http_context::stop() const {
+    notify_stopping();
     if (pimpl->srv) {
         pimpl->srv->stop();
     }
@@ -645,7 +658,7 @@ static void process_handler_response(server_http_req_ptr && request, server_http
 
 void server_http_context::get(const std::string & path, const server_http_context::handler_t & handler) const {
     handlers.emplace(path, handler);
-    pimpl->srv->Get(path_prefix + path, [handler](const httplib::Request & req, httplib::Response & res) {
+    pimpl->srv->Get(path_prefix + path, [handler, stopping = pimpl->stopping](const httplib::Request & req, httplib::Response & res) {
         server_http_req_ptr request = std::make_unique<server_http_req>(server_http_req{
             get_params(req),
             get_headers(req),
@@ -653,7 +666,7 @@ void server_http_context::get(const std::string & path, const server_http_contex
             build_query_string(req),
             req.body,
             {},
-            req.is_connection_closed
+            make_should_stop(req, stopping)
         });
         server_http_res_ptr response = handler(*request);
         process_handler_response(std::move(request), response, res);
@@ -662,7 +675,7 @@ void server_http_context::get(const std::string & path, const server_http_contex
 
 void server_http_context::post(const std::string & path, const server_http_context::handler_t & handler) const {
     handlers.emplace(path, handler);
-    pimpl->srv->Post(path_prefix + path, [handler](const httplib::Request & req, httplib::Response & res) {
+    pimpl->srv->Post(path_prefix + path, [handler, stopping = pimpl->stopping](const httplib::Request & req, httplib::Response & res) {
         std::string body = req.body;
         std::map<std::string, uploaded_file> files;
 
@@ -700,7 +713,7 @@ void server_http_context::post(const std::string & path, const server_http_conte
             build_query_string(req),
             body,
             std::move(files),
-            req.is_connection_closed
+            make_should_stop(req, stopping)
         });
         server_http_res_ptr response = handler(*request);
         process_handler_response(std::move(request), response, res);
@@ -709,7 +722,7 @@ void server_http_context::post(const std::string & path, const server_http_conte
 
 void server_http_context::del(const std::string & path, const server_http_context::handler_t & handler) const {
     handlers.emplace(path, handler);
-    pimpl->srv->Delete(path_prefix + path, [handler](const httplib::Request & req, httplib::Response & res) {
+    pimpl->srv->Delete(path_prefix + path, [handler, stopping = pimpl->stopping](const httplib::Request & req, httplib::Response & res) {
         server_http_req_ptr request = std::make_unique<server_http_req>(server_http_req{
             get_params(req),
             get_headers(req),
@@ -717,7 +730,7 @@ void server_http_context::del(const std::string & path, const server_http_contex
             build_query_string(req),
             req.body,
             {},
-            req.is_connection_closed
+            make_should_stop(req, stopping)
         });
         server_http_res_ptr response = handler(*request);
         process_handler_response(std::move(request), response, res);

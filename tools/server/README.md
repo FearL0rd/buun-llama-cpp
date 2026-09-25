@@ -246,6 +246,8 @@ full matrix is in
 | `--cache-plan-preflight` | expose trusted-local `POST /cache/plan` point-in-time previews (default: disabled)<br/>(env: LLAMA_ARG_CACHE_PLAN_PREFLIGHT) |
 | `--cache-control-api` | expose the trusted-local holder/family/lease control routes and enable their required cache-lifecycle authority (default: disabled)<br/>(env: LLAMA_ARG_CACHE_CONTROL_API) |
 | `--slot-save-path PATH` | path to save slot kv cache (default: disabled) |
+| `--resume` | keep the slots' conversations across restarts and sleep: their KV state is saved at shutdown and restored at startup (default: disabled)<br/>(env: LLAMA_ARG_RESUME) |
+| `--resume-path PATH` | directory of the --resume store (default: the llama.cpp cache directory)<br/>(env: LLAMA_ARG_RESUME_PATH) |
 | `--media-path PATH` | directory for loading local media files; files can be accessed via file:// URLs using relative paths (default: disabled) |
 | `--models-dir PATH` | directory containing models for the router server (default: disabled)<br/>(env: LLAMA_ARG_MODELS_DIR) |
 | `--models-preset PATH` | path to INI file containing model presets for the router server (default: disabled)<br/>(env: LLAMA_ARG_MODELS_PRESET) |
@@ -1263,6 +1265,8 @@ In *router mode* the query param `?model={model_id}` has to be set. This endpoin
 
 `filename`: Name of the file to save the slot's prompt cache. The file will be saved in the directory specified by the `--slot-save-path` server parameter.
 
+The file is one entry in the `--resume` format: the slot's KV state with its context checkpoints (hybrid and SWA models continue without reprocessing), checksummed per object. It works with the dynamic VBR cache (`-ctk vbr`) as well. The host prompt cache is not included; use `--resume` for that.
+
 **Response format**
 
 ```json
@@ -1282,6 +1286,8 @@ In *router mode* the query param `?model={model_id}` has to be set. This endpoin
 *Options:*
 
 `filename`: Name of the file to restore the slot's prompt cache from. The file should be located in the directory specified by the `--slot-save-path` server parameter.
+
+Files written by earlier versions still restore on fixed cache types. Under the dynamic VBR cache only resume-format files restore. Beside other slots the restore needs the file's tiers to match the cache's and free cells to hold it, and the cache must not have sliding-window or indexed attention (otherwise `400`, the other slots untouched).
 
 **Response format**
 

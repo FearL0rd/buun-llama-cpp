@@ -213,6 +213,8 @@ struct server_task {
         int id_slot;
         std::string filename;
         std::string filepath;
+        std::string resume_entry; // restore from the resume store instead of a file
+        bool legacy = false;      // save the one-state file of upstream, not an entry
     };
     slot_action slot_action;
 
@@ -626,6 +628,8 @@ struct server_task_result_slot_save_load : server_task_result {
     size_t n_bytes;
     double t_ms;
 
+    json resume; // outcome of a restore from the resume store
+
     virtual json to_json() override;
 };
 
@@ -795,6 +799,9 @@ struct server_prompt {
 struct server_prompt_cache_state {
     server_prompt prompt;
     server_prompt_cache_payload payload;
+
+    // Physical rewind bound captured with a fixed-state image, not its token LCP.
+    llama_pos fixed_pos_min = -1;
 
     // Canonical identity of the adapter configuration this state was computed under; a load is
     // only served from an entry whose key matches the requesting slot's current adapter config
@@ -1332,6 +1339,37 @@ server_prompt_cache_retention_capacity_live_transition_for(
     };
 }
 
+bool server_prompt_checkpoint_frontier_is_current(
+    const server_prompt & prompt,
+    const common_prompt_checkpoint & checkpoint,
+    const std::string & execution_identity,
+    const std::string & adapter_identity);
+
+llama_pos server_prompt_checkpoint_reuse_threshold(llama_pos pos_next, int32_t n_swa, bool has_new_tokens);
+
+struct server_prompt_checkpoint_reuse {
+    llama_pos pos_next;
+    size_t n_tokens;
+};
+
+server_prompt_checkpoint_reuse server_prompt_checkpoint_reuse_geometry(
+    const server_tokens & tokens, const common_prompt_checkpoint & checkpoint, llama_pos pos_next);
+
+// Read-only geometry for fixed-state recurrent/hybrid host selection. Dynamic
+// VBR artifacts have their own restore feasibility/representation negotiation.
+struct server_prompt_cache_reuse_context {
+    llama_pos live_pos_min = -1;
+    int32_t n_swa = 0;
+    bool frontier_required = false;
+    std::string execution_identity;
+};
+
+size_t server_prompt_cache_reusable_prefix(
+    const server_prompt & prompt, const server_tokens & incoming,
+    size_t lcp, llama_pos pos_min,
+    const server_prompt_cache_reuse_context & context,
+    const std::string & adapter_identity);
+
 bool server_prompt_retention_publish_exact_prefix(
     server_retention_sidecar_store & retention,
     const server_retention_instance_key & key,
@@ -1350,6 +1388,8 @@ struct server_prompt_cache {
     size_t active_storage_bytes() const noexcept;
     size_t active_storage_tokens() const noexcept;
     bool fits_bytes(size_t host_bytes) const noexcept;
+    // bytes past the byte limit (with the reservations) if host_bytes were held; 0 when they fit
+    size_t byte_deficit(size_t host_bytes) const noexcept;
     size_t effective_host_token_limit(size_t host_bytes, size_t host_tokens) const noexcept;
 
 private:
@@ -1391,10 +1431,15 @@ public:
     // Exact immutable VBR-frontier presence query. This alone is not a clear
     // authority: automatic displacement also revalidates the live semantic
     // frontier, scheduler state, pending work, and lease/recovery protection.
+    // projector: when given, some matching copy must also be one
+    // prepare_vbr_restore can project a diverging request onto — no media or
+    // checkpoints, and the artifact owner confirms the payload the restore
+    // selector would pick is sealed, current and laid out for projection.
     bool contains_vbr_frontier(
         const server_prompt & prompt,
         const std::string & execution_identity,
-        const std::string & adapter_config_key) const noexcept;
+        const std::string & adapter_config_key,
+        const server_vbr_artifact_store * projector = nullptr) const noexcept;
     // Read-only suppression check for an already-durable shorter frontier.
     // The host package must be exact for coverage and the current live prompt
     // must still carry that exact prefix under the same source epoch.
@@ -1417,12 +1462,17 @@ public:
     // lower-quality recapture preserves the prior best owner as an optional
     // anchor when its independent budget fits. No unrelated cache victim is
     // selected by this bounded refresh transaction.
+    // replace_live_recovery is for a fresh capture of the current live
+    // frontier, not a catalog-selected quality variant. It retires stale
+    // placement/companion evidence (and any anchor) under the same budget
+    // and recovery-pin checks.
     server_prompt_cache_vbr_refresh_status refresh_vbr_compact(
         const server_prompt & source_prompt,
         server_prompt_cache_vbr_owner incoming,
         const std::string & execution_identity,
         const std::string & adapter_config_key,
-        int32_t source_slot) noexcept;
+        int32_t source_slot,
+        bool replace_live_recovery = false) noexcept;
     // Conservative pre-D2H replacement check for refresh.  The final refresh
     // transaction remeasures exact shared accounting; this preview only
     // authorizes transfer when the quoted compact cannot exceed the hard cap.
@@ -1484,6 +1534,8 @@ public:
     // owns a frontier-media authority.
     // A non-null required_family constrains selection at the index owner so a
     // higher-ranked foreign-family row cannot mask a compatible candidate.
+    // A non-null projector limits projected candidates to copies it can
+    // project, so an unprojectable longer match cannot mask a usable one.
     // This is deliberately separate
     // from fixed-state load()/contains(): VBR restoration is an adopt
     // transaction, not a serialized state-image restore.
@@ -1493,7 +1545,8 @@ public:
         const std::string & adapter_config_key,
         server_prompt_cache_vbr_restore_candidate & candidate,
         bool allow_prefix_projection = true,
-        const common_cache_family_binding * required_family = nullptr) noexcept;
+        const common_cache_family_binding * required_family = nullptr,
+        const server_vbr_artifact_store * projector = nullptr) noexcept;
     // Fallible retention/lease preparation for a construction-empty live
     // destination. Cancellation rolls this provisional association back;
     // commit consumes it only after successful artifact adoption.
@@ -1606,13 +1659,31 @@ public:
     // `obs` is the cache-plan observer row for the host_cache_entry candidate (nullptr = observer
     // off). It only receives values this selection already computes and never triggers a rescan.
     // Dispatches ONCE to an unobserved or observed instantiation, so the disabled path's
-    // candidate loop is the original loop with zero observer branches.
+    // candidate loop has zero observer branches.
     bool load(server_prompt & prompt, const server_tokens & tokens_new,
               llama_context * ctx_tgt, llama_context * ctx_dft,
               int32_t id_slot, const std::string & adapter_config_key,
               server_prompt_cache_restore_shape & restore_shape,
               common_cache_plan_record * rec = nullptr,
-              common_cache_family_binding * restored_family = nullptr);
+              common_cache_family_binding * restored_family = nullptr,
+              const server_prompt_cache_reuse_context * reuse = nullptr);
+
+    // Read-only selection also lets the caller pin the incoming reuse source
+    // while saving the displaced live prompt (whose dedup may otherwise erase it).
+    iterator select(const server_prompt & prompt, const server_tokens & tokens_new,
+                    const std::string & adapter_config_key,
+                    const server_prompt_cache_reuse_context * reuse);
+
+    struct selection {
+        iterator source;
+        int lcp;
+    };
+
+    template <bool Observed>
+    selection select_impl(const server_prompt & prompt, const server_tokens & tokens_new,
+                         const std::string & adapter_config_key,
+                         common_cache_plan_record * rec,
+                         const server_prompt_cache_reuse_context * reuse);
 
     template <bool Observed>
     bool load_impl(server_prompt & prompt, const server_tokens & tokens_new,
@@ -1620,7 +1691,21 @@ public:
                    int32_t id_slot, const std::string & adapter_config_key,
                    common_cache_plan_record * rec,
                    common_cache_family_binding * restored_family,
-                   server_prompt_cache_restore_shape & restore_shape);
+                   server_prompt_cache_restore_shape & restore_shape,
+                   const server_prompt_cache_reuse_context * reuse);
+
+    // restores the fixed state `source` itself, whatever a similarity search would choose
+    bool load_entry(server_prompt & prompt, iterator source,
+                    llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot,
+                    server_prompt_cache_restore_shape & restore_shape,
+                    common_cache_family_binding * restored_family = nullptr);
+
+    template <bool Observed>
+    bool deliver_impl(server_prompt & prompt, iterator source, int lcp,
+                      llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot,
+                      common_cache_plan_record * rec,
+                      common_cache_family_binding * restored_family,
+                      server_prompt_cache_restore_shape & restore_shape);
 
     // Two-phase immutable host restore. prepare() runs before either
     // target is touched; commit() is called only after main+draft restore.
@@ -1750,7 +1835,8 @@ private:
             bool & observe_retention_shadow,
             uint64_t & released_bytes,
             size_t & released_tokens,
-            llama_cache_acct_artifact_id required_victim = {});
+            llama_cache_acct_artifact_id required_victim = {},
+            uint64_t minimum_release = 0);
     bool evict_front_under_pressure(
         server_cache_destruction_reason reason,
         iterator incoming,
@@ -1758,7 +1844,8 @@ private:
             bool observe_retention_shadow,
             uint64_t & released_bytes,
             size_t & released_tokens,
-            llama_cache_acct_artifact_id required_victim = {});
+            llama_cache_acct_artifact_id required_victim = {},
+            uint64_t minimum_release = 0);
     void refuse_incoming_under_pressure(
         iterator incoming,
         server_cache_destruction_reason reason);
