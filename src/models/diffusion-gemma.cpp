@@ -457,6 +457,9 @@ llama_model_diffusion_gemma::graph::graph(const llama_model & model, const llm_g
         auto uptr = std::make_unique<llm_graph_input_attn_diffusion_decode>(hparams, cparams, P, C);
         uptr->self_kq_mask = ggml_new_tensor_4d(ctx0, type_mask, n_kv, C, 1, 1);
         ggml_set_input(uptr->self_kq_mask);
+        // named so the CUDA fattn dispatch can tell this is a region-aware diffusion mask:
+        // the sm70 D256 plugin hard-applies a causal mask and must not run for these graphs
+        ggml_set_name(uptr->self_kq_mask, "self_kq_mask_dg");
         uptr->self_kq_mask_cnv = uptr->self_kq_mask;
         if (hparams.swa_type != LLAMA_SWA_TYPE_NONE) {
             uptr->self_kq_mask_swa = ggml_new_tensor_4d(ctx0, type_mask, n_kv, C, 1, 1);
@@ -469,6 +472,7 @@ llama_model_diffusion_gemma::graph::graph(const llama_model & model, const llm_g
         auto uptr = std::make_unique<llm_graph_input_attn_diffusion_prefill>(hparams, cparams, prefill_off, n_tokens);
         uptr->self_kq_mask = ggml_new_tensor_4d(ctx0, type_mask, n_kv, n_tokens, 1, 1);
         ggml_set_input(uptr->self_kq_mask);
+        ggml_set_name(uptr->self_kq_mask, "self_kq_mask_dg");
         uptr->self_kq_mask_cnv = uptr->self_kq_mask;
         if (hparams.swa_type != LLAMA_SWA_TYPE_NONE) {
             uptr->self_kq_mask_swa = ggml_new_tensor_4d(ctx0, type_mask, n_kv, n_tokens, 1, 1);
@@ -480,6 +484,7 @@ llama_model_diffusion_gemma::graph::graph(const llama_model & model, const llm_g
         auto uptr = std::make_unique<llm_graph_input_attn_diffusion>(hparams, cparams, P);
         uptr->self_kq_mask = ggml_new_tensor_4d(ctx0, type_mask, n_tokens, n_tokens, 1, 1);
         ggml_set_input(uptr->self_kq_mask);
+        ggml_set_name(uptr->self_kq_mask, "self_kq_mask_dg");
         uptr->self_kq_mask_cnv = uptr->self_kq_mask;
         if (hparams.swa_type != LLAMA_SWA_TYPE_NONE) {
             uptr->self_kq_mask_swa = ggml_new_tensor_4d(ctx0, type_mask, n_tokens, n_tokens, 1, 1);

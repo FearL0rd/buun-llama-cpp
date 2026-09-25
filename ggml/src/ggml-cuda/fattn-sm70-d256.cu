@@ -42,6 +42,7 @@
 #include "fattn-common.cuh"
 #include "fattn-sm70-d256-kernel.cuh"
 #include <cstdio>
+#include <cstring>
 #include <vector>
 
 #ifndef M_LOG2E
@@ -314,6 +315,13 @@ bool ggml_cuda_sm70_d256_supported(int cc, const ggml_tensor * dst) {
     }
     if (!mask || mask->ne[0] < 256 || Q->ne[1] < 256) { // prefill only; decode/MTP/small batches -> stock
         sm70_d256_probe("REJECT: no mask or small batch", cc, Q, K, V, mask);
+        return false;
+    }
+    // DiffusionGemma graphs pass a region-aware mask (canvas queries are bidirectional, prompt queries
+    // causal). This kernel hard-applies a causal mask and ignores the mask memory, so running it would
+    // silently corrupt every diffusion forward on cc 7.0. Fall back to the stock masked fattn.
+    if (mask->name && strncmp(mask->name, "self_kq_mask_dg", 15) == 0) {
+        sm70_d256_probe("REJECT: diffusion mask (needs additive mask)", cc, Q, K, V, mask);
         return false;
     }
     if (Q->ne[1] > mask->ne[0]) { // kv_len (mask->ne[0]) must cover q_len
