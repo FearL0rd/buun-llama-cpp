@@ -224,13 +224,12 @@ std::vector<llama_token> server_diffusion_generate_canvas(
     const int32_t      n_batch  = (int32_t) llama_n_batch(ctx);
     const int32_t      n_ubatch = (int32_t) llama_n_ubatch(ctx);
 
-    // the unified forward needs the whole [prefix | canvas] in one batch; the kv-cache path only
-    // needs an ubatch >= canvas_length (the prompt is prefill-chunked, the canvas decoded alone)
-    const bool use_kv = eb.kv_cache ? n_ubatch >= canvas_length
-                                    : n_batch >= (int32_t) prefix_tokens.size() + canvas_length;
-    if (!use_kv && !(eb.kv_cache && n_batch >= (int32_t) prefix_tokens.size() + canvas_length)) {
+    // unified forward (default): the whole [prefix | canvas] in one batch. The prefix-KV path is
+    // only used when explicitly requested (single-GPU) and the canvas fits in one ubatch.
+    const bool use_kv = eb.kv_cache && n_ubatch >= canvas_length;
+    if (!use_kv && n_batch < (int32_t) prefix_tokens.size() + canvas_length) {
         LOG_ERR("%s: canvas batch too large: needs n_batch >= n_input(%d) + canvas(%d) "
-                "(have n_batch=%d, n_ubatch=%d); raise --batch-size/--ubatch-size or use "
+                "(have n_batch=%d, n_ubatch=%d); raise --batch-size or use "
                 "--diffusion-kv-cache on\n", __func__,
                 (int) prefix_tokens.size(), canvas_length, n_batch, n_ubatch);
         return response;
