@@ -9741,7 +9741,10 @@ private:
                 bool has_think_block = (n >= 4 && nl_tok != LLAMA_TOKEN_NULL &&
                     toks[n - 4] == think_open && toks[n - 3] == nl_tok &&
                     toks[n - 2] == think_close && toks[n - 1] == nl_tok);
-                if (!has_think_block && nl_tok != LLAMA_TOKEN_NULL) {
+                // models whose vocab has no single-token <think> markers (e.g. gemma) must not
+                // get LLAMA_TOKEN_NULL injected here — validate() rejects the prompt
+                if (!has_think_block && think_open != LLAMA_TOKEN_NULL &&
+                        think_close != LLAMA_TOKEN_NULL && nl_tok != LLAMA_TOKEN_NULL) {
                     toks.push_back(think_open);
                     toks.push_back(nl_tok);
                     toks.push_back(think_close);
