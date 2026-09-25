@@ -6778,9 +6778,14 @@ private:
             const gguf_init_params gparams = { /*.no_alloc =*/ true, /*.ctx =*/ nullptr };
             gguf_context * gctx = gguf_init_from_file(params_base.model.path.c_str(), gparams);
             if (gctx) {
-                const int64_t kid = gguf_find_key(gctx, "diffusion-gemma.diffusion.canvas_length");
+                const int64_t kid = gguf_find_key(gctx, "diffusion.canvas_length");
+                int32_t canvas = 0;
                 if (kid >= 0 && gguf_get_kv_type(gctx, kid) == GGUF_TYPE_UINT32) {
-                    const int32_t canvas = (int32_t) gguf_get_val_u32(gctx, kid);
+                    canvas = (int32_t) gguf_get_val_u32(gctx, kid);
+                } else if (kid >= 0 && gguf_get_kv_type(gctx, kid) == GGUF_TYPE_STRING) {
+                    canvas = (int32_t) strtol(gguf_get_val_str(gctx, kid), nullptr, 10);
+                }
+                if (canvas > 0) {
                     if (canvas > params_base.n_outputs_max) {
                         SRV_INF("diffusion canvas model: raising n_outputs_max %d -> %d (canvas_length)\n",
                                 params_base.n_outputs_max, canvas);
