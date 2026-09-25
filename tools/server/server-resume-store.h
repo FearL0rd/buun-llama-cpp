@@ -9,7 +9,9 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <map>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <set>
 #include <string>
@@ -255,8 +257,17 @@ public:
 
     // One committed entry as a single file, its manifest and then its objects as the store holds
     // them, and back into a new entry of this store. The file is replaced whole or not at all. A
-    // placed entry is not whole without the entry of its pool and is refused both ways.
+    // placed entry is not whole without the entry of its pool and is refused both ways. An import
+    // copies nothing: the entry reads the file where it lies, open from here on, until
+    // remove_entry(). It is not listed and cannot be committed over.
     server_resume_reason export_entry(
+        const std::string & id, const std::string & path, uint64_t & bytes, std::string & error) const;
+    // An export off the thread that writes the store: take_entry() moves the committed entry out
+    // of it, so nothing lists, prunes or reuses it, and export_taken() exports it and removes it,
+    // either way. It touches nothing else of the store and may run on another thread. A store
+    // opened again drops what was taken and never exported.
+    server_resume_reason take_entry(const std::string & id, std::string & error);
+    server_resume_reason export_taken(
         const std::string & id, const std::string & path, uint64_t & bytes, std::string & error) const;
     server_resume_reason import_entry(
         const std::string & path, std::string & id, server_resume_manifest & manifest, uint64_t & bytes,
@@ -274,6 +285,12 @@ private:
     std::string dir; // the family namespace
     int lock_fd = -1;
     bool durable = true;
+
+    // imported entry files, by entry id
+    struct mounted_entry;
+    mutable std::mutex mounts_mutex;
+    mutable std::map<std::string, std::shared_ptr<const mounted_entry>> mounts;
+    std::shared_ptr<const mounted_entry> mounted(const std::string & id) const;
 
     std::string entry_dir(const std::string & id) const;
     bool sync_path(const std::string & path) const;

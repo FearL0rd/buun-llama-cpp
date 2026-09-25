@@ -766,19 +766,34 @@ static void test_entry_file(const std::string & root) {
     CHECK(got.generation == manifest.generation && got.chunks.size() == 2 && got.tail_states.size() == 1 &&
           got.ledger == manifest.ledger);
     {
-        const auto listed = into->list();
-        CHECK(listed.size() == 1 && listed[0].id == got_id && entry_verifies(*into, listed[0]));
+        // read where it lies: nothing is copied into the store, and nothing is listed
+        server_resume_entry mounted;
+        mounted.id = got_id;
+        CHECK(into->read_manifest(got_id, mounted.manifest, error) == server_resume_reason::ok &&
+              mounted.manifest.ledger == manifest.ledger && entry_verifies(*into, mounted));
+        CHECK(into->list().empty() && n_files(entries) == 0);
+        CHECK(into->commit(got_id, got, error) != server_resume_reason::ok);
     }
     // the same file again is another entry
     std::string again;
     CHECK(into->import_entry(path, again, got, n_read, error) == server_resume_reason::ok && again != got_id);
-    CHECK(into->list().size() == 2);
 
-    // an export replaces the file whole
+    // an export replaces the file whole; an entry already imported keeps reading the file it opened
     const auto first = file_bytes(path);
     CHECK(add_generation(*from, id, manifest, 32, 48) == server_resume_reason::ok);
     CHECK(from->export_entry(id, path, bytes, error) == server_resume_reason::ok);
     CHECK(bytes == fs::file_size(path) && file_bytes(path) != first);
+    {
+        server_resume_entry mounted;
+        mounted.id = again;
+        CHECK(into->read_manifest(again, mounted.manifest, error) == server_resume_reason::ok &&
+              mounted.manifest.chunks.size() == 2 && entry_verifies(*into, mounted));
+    }
+    std::string drop_error;
+    CHECK(into->uncommit(got_id, drop_error) == server_resume_reason::ok);
+    into->remove_entry(got_id);
+    into->remove_entry(again);
+    CHECK(into->read_manifest(got_id, got, error) == server_resume_reason::object_missing);
 
     // what is refused leaves no entry behind
     const size_t n_entries = n_files(entries);
@@ -863,6 +878,31 @@ static void test_entry_file(const std::string & root) {
     CHECK(from->commit(id_placed, placed, error) == server_resume_reason::ok);
     CHECK(from->export_entry(id_placed, root + "/placed.bin", bytes, error) == server_resume_reason::format_unsupported);
     CHECK(!fs::exists(root + "/placed.bin"));
+
+    // taken out of the store, then exported: the same file, and nothing of it is left
+    const std::string taken = from->directory() + "/taken";
+    CHECK(from->export_entry(id_artifact, path, bytes, error) == server_resume_reason::ok);
+    CHECK(from->take_entry(id_artifact, error) == server_resume_reason::ok);
+    CHECK(from->take_entry(id_artifact, error) == server_resume_reason::object_missing);
+    CHECK(from->read_manifest(id_artifact, got, error) == server_resume_reason::object_missing);
+    for (const auto & entry : from->list()) {
+        CHECK(entry.id != id_artifact);
+    }
+    uint64_t taken_bytes = 0;
+    CHECK(from->export_taken(id_artifact, root + "/taken.bin", taken_bytes, error) == server_resume_reason::ok);
+    CHECK(taken_bytes == bytes && file_bytes(root + "/taken.bin") == file_bytes(path));
+    CHECK(n_files(taken) == 0);
+    // a refused export removes it all the same
+    CHECK(from->take_entry(id_placed, error) == server_resume_reason::ok);
+    CHECK(from->export_taken(id_placed, root + "/placed.bin", bytes, error) == server_resume_reason::format_unsupported);
+    CHECK(n_files(taken) == 0 && !fs::exists(root + "/placed.bin"));
+    // an imported entry is not in the store to take
+    CHECK(into->take_entry(got_id, error) == server_resume_reason::object_missing);
+    // taken and never exported: gone when the store is opened again
+    CHECK(from->take_entry(id, error) == server_resume_reason::ok && n_files(taken) == 1);
+    from.reset();
+    from = server_resume_store::open(root + "/a", FAMILY, reason, error);
+    CHECK(from && !fs::exists(taken));
 }
 
 int main() {

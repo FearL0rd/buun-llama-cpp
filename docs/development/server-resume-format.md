@@ -575,8 +575,15 @@ last-chunk tradeoff an entry of a single chunk goes with its slot here too.
 format: exactly one exported entry (`server_resume_store::export_entry`). The
 slot is captured as §4 describes into a staging store rooted at
 `<slot_save_path>.staging`, which is not durable (its objects are not
-`fsync`ed); the entry is exported to the file and dropped from the staging
-store. The file is written to a staging file, `fsync`ed, renamed and the
+`fsync`ed); the entry is taken out of the staging store (`take_entry`, a
+rename into `<store>/taken/`) and exported to the file off the main loop
+(`export_taken`), so the other slots go on decoding meanwhile. A dynamic VBR
+cache keeps only its capture on the main loop: the export job writes the
+artifact and the ring's checkpoints as an entry of its own store
+(`<slot_save_path>.staging/exports`), commits and exports it, and removes it.
+Exports run one
+at a time in the order of their requests, and the save answers when its file is
+written. The file is written to a staging file, `fsync`ed, renamed and the
 directory synced, so it is replaced whole or not at all. No host cache is
 included; that is what `--resume` is for.
 
@@ -591,16 +598,19 @@ File layout, little-endian:
 The file size must equal the header's file bytes and the sum the manifest
 implies. `restore {"filename"}` sniffs the magic (`is_entry_file`): a resume
 entry file is imported into the staging store (`import_entry`: header seal,
-version and flags, sizes against the header and the manifest, free space, each
-object's header against its record, the payload checked as it is read) under a
-fresh entry id, installed by §7 with checksums, required companions and
-context checkpoints, and dropped again. It restores into any slot index and
-after a restart; the resume key and adapter identity decide as for any entry.
+version and flags, sizes against the header and the manifest, each object's
+header against its record, the payload checked as it is read) under a fresh
+entry id, installed by §7 with checksums, required companions and context
+checkpoints, and dropped again. The import copies nothing: the entry reads the
+objects at their offsets in the file, through the descriptor opened at import,
+so a file replaced meanwhile does not change what is installed. The export
+copies each object with `copy_file_range` where the kernel has it. A file
+restores into any slot index and after a restart; the resume key and adapter identity decide as for any entry.
 A file without the magic is a legacy library file (§8).
 
 Under dynamic VBR the entry is one artifact (§11). Its import needs an
 otherwise empty cache, so a restore while any other slot holds a conversation
-is `cache_shared`, a 400, checked before the file is copied. A placed entry is
+is `cache_shared`, a 400, checked before the file is opened. A placed entry is
 not whole without its pool and is refused by export and import; a slot-file
 save therefore captures a whole, compact (packed rows) artifact.
 

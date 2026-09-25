@@ -3744,6 +3744,31 @@ private:
     std::unique_ptr<server_resume_store> slot_file_store;
     // set while a slot file goes through: see resume_slot_file_scope
     bool resume_slot_file = false;
+    // Slot-file exports, off the main loop and in the order they were posted: each job waits for
+    // the one before it. Posted and drained by the main loop only; destroyed before the store.
+    struct slot_file_exports_t {
+        // where the jobs write a dynamic cache's entry: theirs alone, opened and reset drained
+        std::unique_ptr<server_resume_store> store;
+        std::thread last;
+
+        template <typename F>
+        void post(F && job) {
+            last = std::thread([before = std::move(last), job = std::forward<F>(job)]() mutable {
+                if (before.joinable()) {
+                    before.join();
+                }
+                job();
+            });
+        }
+
+        void drain() {
+            if (last.joinable()) {
+                last.join();
+            }
+        }
+
+        ~slot_file_exports_t() { drain(); }
+    } slot_file_exports;
     uint64_t frontier_next_sequence_epoch = 1;
     uint64_t frontier_ratchet_threshold = 1024;
 
@@ -5036,6 +5061,7 @@ private:
     // Opens the store once and rebuilds the key on every load: the store outlives a sleep, the
     // model and its parameters do not.
     void resume_open() {
+        slot_file_exports.drain();
         resume_key = {};
         if (!params_base.resume && params_base.slot_save_path.empty()) {
             return;
@@ -5047,6 +5073,7 @@ private:
             resume_key = {};
             resume_store.reset();
             slot_file_store.reset();
+            slot_file_exports.store.reset();
             SRV_WRN("%s\n", "RESUME event=disabled reason=resume_key_unavailable");
             return;
         }
@@ -5082,6 +5109,9 @@ private:
         if (!params_base.slot_save_path.empty()) {
             // its entries live for one request; the file of a slot is synced on its own
             open(slot_file_store, params_base.slot_save_path + ".staging", "slot_files", false);
+            if (resume_vbr()) {
+                open(slot_file_exports.store, params_base.slot_save_path + ".staging/exports", "slot_exports", false);
+            }
         }
         if (resume_vbr()) {
             resume_bind_execution();
@@ -5239,23 +5269,48 @@ private:
         return out;
     }
 
-    // The ring's checkpoints of a dynamic save, stored beside its image as tail states of the entry.
-    server_resume_reason resume_write_ring_tails(
-            const server_slot & slot, const std::string & id, server_resume_manifest & next,
-            const std::vector<std::pair<const common_prompt_checkpoint *, const char *>> & ring,
-            uint32_t producer, uint64_t & bytes_written, std::string & error) {
+    // the records of the ring's checkpoints of a dynamic save, in the order of `ring`
+    static std::vector<server_resume_object_record> resume_ring_tail_records(
+            const server_slot & slot, const server_resume_manifest & next,
+            const std::vector<std::pair<const common_prompt_checkpoint *, const char *>> & ring, uint32_t producer) {
         server_resume_prefix_hasher hasher(slot.prompt.tokens);
+        std::vector<server_resume_object_record> out;
         for (const auto & [cp, role] : ring) {
             auto rec = resume_ring_tail_record(*cp, role);
             rec.gen           = next.generation;
             rec.producer      = producer;
             rec.prefix_digest = hasher.at(size_t(rec.pos()));
-            const auto reason = resume_store->write_object(id, rec, cp->data_tgt.data(), cp->data_tgt.size(), error);
+            out.push_back(std::move(rec));
+        }
+        return out;
+    }
+
+    // One tail state of a dynamic save into the entry `id` of `store`.
+    static server_resume_reason resume_write_tail(
+            server_resume_store & store, const std::string & id, server_resume_manifest & next,
+            server_resume_object_record rec, const uint8_t * data, size_t size, uint64_t & bytes_written,
+            std::string & error) {
+        const auto reason = store.write_object(id, rec, data, size, error);
+        if (reason == server_resume_reason::ok) {
+            bytes_written += rec.bytes;
+            next.tail_states.push_back(std::move(rec));
+        }
+        return reason;
+    }
+
+    // The ring's checkpoints of a dynamic save, stored beside its image as tail states of the entry.
+    server_resume_reason resume_write_ring_tails(
+            const server_slot & slot, const std::string & id, server_resume_manifest & next,
+            const std::vector<std::pair<const common_prompt_checkpoint *, const char *>> & ring,
+            uint32_t producer, uint64_t & bytes_written, std::string & error) {
+        auto records = resume_ring_tail_records(slot, next, ring, producer);
+        for (size_t i = 0; i < ring.size(); ++i) {
+            const auto & data = ring[i].first->data_tgt;
+            const auto reason = resume_write_tail(
+                *resume_store, id, next, std::move(records[i]), data.data(), data.size(), bytes_written, error);
             if (reason != server_resume_reason::ok) {
                 return reason;
             }
-            bytes_written += rec.bytes;
-            next.tail_states.push_back(std::move(rec));
         }
         return server_resume_reason::ok;
     }
@@ -6166,6 +6221,43 @@ private:
         };
     }
 
+    // The captured image streamed into the object `rec` of the entry `id` of `store`.
+    static server_resume_reason resume_write_artifact(
+            server_vbr_artifact_store & artifacts, server_resume_store & store, const std::string & id,
+            server_resume_object_record & rec, const server_prompt_cache_vbr_payload & payload, std::string & error) {
+        vbr_artifact_status exported = vbr_artifact_status::internal_error;
+        const auto reason = store.write_object_stream(
+            id, rec, [&](const server_resume_store::put_fn & put) {
+                vbr_artifact_stream_writer writer;
+                writer.context = const_cast<server_resume_store::put_fn *>(&put);
+                writer.write = [](void * context, const uint8_t * data, size_t size) noexcept {
+                    try {
+                        return (*static_cast<const server_resume_store::put_fn *>(context))(data, size);
+                    } catch (...) {
+                        return false;
+                    }
+                };
+                exported = artifacts.export_host_payload(payload, writer, server_resume_limits::max_artifact_bytes);
+                return exported == vbr_artifact_status::ok;
+            }, error);
+        if (reason != server_resume_reason::ok) {
+            error += std::string(" export=") + vbr_artifact_status_name(exported);
+        }
+        return reason;
+    }
+
+    // A slot file of a dynamic cache: the image and the ring's checkpoints as captured, written
+    // with the entry's manifest by slot_file_export off the main loop, into a store of its own
+    // that nothing on the main loop prunes.
+    struct resume_deferred_artifact {
+        server_prompt_cache_vbr_owner payload;
+        server_resume_object_record   rec;
+        server_resume_manifest        next;
+        std::vector<std::pair<server_resume_object_record, std::vector<uint8_t>>> tails;
+    };
+    // set by a slot-file save for slot_file_capture to take
+    std::optional<resume_deferred_artifact> resume_deferred;
+
     // The dynamic route of a save: the VBR artifact exact capture of the sequence, streamed into one
     // object. The capture is an image of the whole pool, so the slots saved after this one record
     // only where their rows lie in it. An artifact is reused whole or not at all, and the one it
@@ -6268,26 +6360,31 @@ private:
         if (resume_store->free_bytes() < bytes_needed) {
             return abandon(server_resume_reason::no_space, "need " + std::to_string(bytes_needed) + " bytes");
         }
+        next.sequence_epoch = slot.prompt.sequence_epoch;
+        if (!resume_ledger_build(tokens, adapter, next.ledger)) {
+            return abandon(server_resume_reason::io_error, "ledger");
+        }
 
-        vbr_artifact_status exported = vbr_artifact_status::internal_error;
-        const auto reason = resume_store->write_object_stream(
-            id, rec, [&](const server_resume_store::put_fn & put) {
-                vbr_artifact_stream_writer writer;
-                writer.context = const_cast<server_resume_store::put_fn *>(&put);
-                writer.write = [](void * context, const uint8_t * data, size_t size) noexcept {
-                    try {
-                        return (*static_cast<const server_resume_store::put_fn *>(context))(data, size);
-                    } catch (...) {
-                        return false;
-                    }
-                };
-                exported = vbr_artifact_store->export_host_payload(
-                    *payload, writer, server_resume_limits::max_artifact_bytes);
-                return exported == vbr_artifact_status::ok;
-            }, error);
+        if (resume_slot_file && slot_file_exports.store) {
+            auto records = resume_ring_tail_records(slot, next, ring, rec.producer);
+            resume_deferred_artifact deferred = {std::move(payload), rec, std::move(next), {}};
+            for (size_t i = 0; i < ring.size(); ++i) {
+                const auto & data = ring[i].first->data_tgt;
+                deferred.tails.emplace_back(std::move(records[i]), std::vector<uint8_t>(data.data(), data.data() + data.size()));
+            }
+            resume_deferred = std::move(deferred);
+            return json {
+                {"outcome", "saved"},
+                {"n_tokens", n_tokens},
+                {"tail_states", ring.size()},
+                {"capture_ms", capture_ms},
+            };
+        }
+
+        const auto reason = resume_write_artifact(*vbr_artifact_store, *resume_store, id, rec, *payload, error);
         payload.reset();
         if (reason != server_resume_reason::ok) {
-            return abandon(reason, error + " export=" + vbr_artifact_status_name(exported));
+            return abandon(reason, error);
         }
 
         uint64_t bytes_written = rec.bytes;
@@ -6295,11 +6392,7 @@ private:
                 slot, id, next, ring, rec.producer, bytes_written, error); ring_reason != server_resume_reason::ok) {
             return abandon(ring_reason, error);
         }
-        next.artifact       = rec;
-        next.sequence_epoch = slot.prompt.sequence_epoch;
-        if (!resume_ledger_build(tokens, adapter, next.ledger)) {
-            return abandon(server_resume_reason::io_error, "ledger");
-        }
+        next.artifact = rec;
         json out = resume_vbr_publish(slot, id, next, bytes_written, t_start);
         if (resume_saved(out)) {
             group.pool_entry = id;
@@ -6881,30 +6974,102 @@ private:
     };
 
     // The slot as one exported entry of the slot-file store: the checkpoints and partial states
-    // come with it, and a dynamic cache saves through its artifact. `bytes` is the file's size.
-    json slot_file_save(server_slot & slot, const std::string & filepath, uint64_t & bytes) {
+    // come with it, and a dynamic cache saves through its artifact. The entry is captured and taken
+    // out of the store here, or its artifact only captured; slot_file_export() writes the file.
+    json slot_file_capture(server_slot & slot) {
         resume_slot_file_scope scope(*this, slot);
         std::vector<server_slot *> members = {&slot};
         resume_group_t group;
         group.members = &members;
         json status = resume_capture_slot(slot, group);
-        if (resume_saved(status)) {
+        if (resume_saved(status) && !resume_deferred) {
             const std::string id = status["entry"];
             std::string error;
-            const auto reason = resume_store->export_entry(id, filepath, bytes, error);
+            const auto reason = resume_store->take_entry(id, error);
             if (reason != server_resume_reason::ok) {
                 status = resume_failed(reason, error);
+                resume_drop_entry(id, error);
             }
-            resume_drop_entry(id, error);
         }
         return status;
     }
 
-    // A slot file back into the slot: imported as an entry, installed, and dropped again. `bytes`
+    // A deferred artifact as an entry of the exports store, committed, exported to `filepath`
+    // and dropped. Off the main loop.
+    server_resume_reason slot_file_write(
+            resume_deferred_artifact & deferred, const std::string & filepath, uint64_t & bytes,
+            uint64_t & bytes_written, std::string & error) {
+        auto & store = *slot_file_exports.store;
+        const std::string id = server_resume_store::new_entry_id();
+        auto reason = resume_write_artifact(*vbr_artifact_store, store, id, deferred.rec, *deferred.payload, error);
+        deferred.payload.reset();
+        bytes_written = deferred.rec.bytes;
+        for (auto & [rec, data] : deferred.tails) {
+            if (reason == server_resume_reason::ok) {
+                reason = resume_write_tail(store, id, deferred.next, std::move(rec), data.data(), data.size(),
+                                           bytes_written, error);
+            }
+        }
+        deferred.next.artifact = deferred.rec;
+        if (reason == server_resume_reason::ok) {
+            reason = store.commit(id, deferred.next, error);
+        }
+        if (reason == server_resume_reason::ok) {
+            reason = store.export_entry(id, filepath, bytes, error);
+        }
+        store.remove_entry(id);
+        return reason;
+    }
+
+    // The captured entry to the file, off the main loop, and the answer to the request.
+    void slot_file_export(const server_task & task, const server_slot & slot, json status, int64_t t_start) {
+        auto res = std::make_unique<server_task_result_slot_save_load>();
+        res->id       = task.id;
+        res->id_slot  = slot.id;
+        res->filename = task.slot_action.filename;
+        res->is_save  = true;
+        res->n_tokens = slot.prompt.tokens.size();
+        slot_file_exports.post([this, store = slot_file_store.get(), filepath = task.slot_action.filepath,
+                                status = std::move(status), t_start, res = std::move(res),
+                                deferred = std::exchange(resume_deferred, std::nullopt)]() mutable {
+            std::string error;
+            uint64_t bytes = 0;
+            server_resume_reason reason = server_resume_reason::io_error;
+            try {
+                if (deferred) {
+                    uint64_t bytes_written = 0;
+                    reason = slot_file_write(*deferred, filepath, bytes, bytes_written, error);
+                    status["bytes_written"] = bytes_written;
+                } else {
+                    const std::string id = status["entry"];
+                    reason = store->export_taken(id, filepath, bytes, error);
+                }
+            } catch (const std::exception & e) {
+                error = e.what();
+            }
+            if (reason != server_resume_reason::ok) {
+                json failed = resume_failed(reason, error);
+                failed["event"] = status["event"];
+                failed["slot"]  = status["slot"];
+                status = std::move(failed);
+            }
+            resume_log(status);
+            if (!resume_saved(status)) {
+                send_error(res->id, "Unable to save slot: " + status.value("reason", std::string()));
+                return;
+            }
+            res->n_bytes = bytes;
+            res->t_ms    = (ggml_time_us() - t_start) / 1000.0;
+            res->resume  = resume_public(status);
+            queue_results.send(std::move(res));
+        });
+    }
+
+    // A slot file back into the slot: an entry read where the file lies, installed, and dropped. `bytes`
     // is the file's size.
     json slot_file_restore(server_slot & slot, const std::string & filepath, uint64_t & bytes) {
         if (resume_vbr() && resume_cache_shared(slot)) {
-            return resume_skipped("cache_shared");  // before the file is copied in
+            return resume_skipped("cache_shared");  // before the file is opened
         }
         resume_slot_file_scope scope(*this, slot);
         std::string id;
@@ -7981,6 +8146,7 @@ private:
     int64_t t_last_load_progress_ms = 0;
 
     void destroy() {
+        slot_file_exports.drain();
         drain_idle_capture();
         if (ctx_tgt) {
             llama_get_memory(ctx_tgt)->vbr_hard_seal_guard_set({});
@@ -17950,16 +18116,14 @@ private:
                     // The resume format, where the slot-file store is open. A fixed cache it cannot
                     // take (positions, media) is saved as the one-state file; a dynamic one has no other.
                     if (slot_file_store && !task.slot_action.legacy) {
-                        uint64_t bytes = 0;
-                        json status = slot_file_save(*slot, filepath, bytes);
+                        json status = slot_file_capture(*slot);
                         status["event"] = "slot_file_save";
                         status["slot"]  = slot->id;
-                        resume_log(status);
                         if (resume_saved(status)) {
-                            send_slot_save_load(task, *slot, true, bytes, (ggml_time_us() - t_start) / 1000.0,
-                                                resume_public(status));
+                            slot_file_export(task, *slot, std::move(status), t_start);
                             break;
                         }
+                        resume_log(status);
                         if (resume_vbr() || status.value("outcome", "") != "skipped") {
                             send_error(task, "Unable to save slot: " + status.value("reason", std::string()),
                                        ERROR_TYPE_SERVER);
