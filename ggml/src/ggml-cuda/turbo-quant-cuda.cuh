@@ -1224,63 +1224,6 @@ uint8_t turbo_find_nearest_2bit(float val) {
     else                                return 3;
 }
 
-// === TURBO2: SET_ROWS kernel ===
-template<typename idx_t>
-static __global__ void k_set_rows_turbo2(
-        const float * __restrict__ src0, const idx_t * __restrict__ src1,
-        block_turbo2_0 * __restrict__ dst, const int64_t ne_total_groups,
-        const int64_t ne00, const int64_t ne01, const int64_t ne02,
-        const int64_t ne10, const int64_t ne11, const int64_t ne12, const int64_t ne13,
-        const int64_t s01, const int64_t s02, const int64_t s03,
-        const int64_t s10, const int64_t s11, const int64_t s12,
-        const float * __restrict__ kmean_mu,
-        const int64_t s1,  const int64_t s2,  const int64_t s3,
-        const uint3 ne00_fd, const uint3 ne01_fd, const uint3 ne02_fd,
-        const uint3 ne11_fd, const uint3 ne12_fd) {
-    const int64_t i = int64_t(blockDim.x) * blockIdx.x + threadIdx.x;
-    if (i >= ne_total_groups) return;
-    const int64_t i_base = i * QK_TURBO2_GROUP;
-    uint32_t tmp = (uint32_t)i_base; uint2 div_mod;
-    div_mod = fast_div_modulo(tmp, ne00_fd); const int64_t i00 = div_mod.y; tmp = div_mod.x;
-    div_mod = fast_div_modulo(tmp, ne01_fd); const int64_t i01 = div_mod.y; tmp = div_mod.x;
-    div_mod = fast_div_modulo(tmp, ne02_fd); const int64_t i02 = div_mod.y; const int64_t i03 = div_mod.x;
-    const int64_t i12 = fastmodulo((uint32_t)i03, ne12_fd);
-    const int64_t i11 = fastmodulo((uint32_t)i02, ne11_fd);
-    const int64_t dst_row = *(src1 + i01*s10 + i11*s11 + i12*s12);
-    const float * grp_src = src0 + i01*s01 + i02*s02 + i03*s03 + i00;
-    block_turbo2_0 * dst_row_ptr = (block_turbo2_0 *)((char *)dst + dst_row*s1 + i02*s2 + i03*s3);
-    const int grp_idx = i00 / QK_TURBO2_GROUP;
-    const int blocks_per_group = QK_TURBO2_GROUP / QK_TURBO2;
-    float x[128]; float norm_sq = 0.0f;
-    for (int j = 0; j < 128; j++) { x[j] = grp_src[j]; norm_sq += x[j] * x[j]; }
-    // K-mean subtract (raw domain): re-derive the norm from the centered vector
-    if (kmean_mu != nullptr) {
-        norm_sq = 0.0f;
-        for (int j = 0; j < 128; j++) { x[j] -= kmean_mu[i00 + j]; norm_sq += x[j] * x[j]; }
-    }
-    float grp_norm = sqrtf(norm_sq);
-    float inv_norm = grp_norm > 1e-10f ? 1.0f / grp_norm : 0.0f;
-    for (int j = 0; j < 128; j++) x[j] *= inv_norm;
-    turbo_rotate_forward_cuda(x, d_turbo_wht_signs1, d_turbo_wht_signs2);
-    float recon_norm_sq = 0.0f;
-    for (int b = 0; b < blocks_per_group; b++) {
-        block_turbo2_0 & blk = dst_row_ptr[grp_idx * blocks_per_group + b];
-        const int off = b * QK_TURBO2;
-        for (int j = 0; j < QK_TURBO2 / 4; j++) blk.qs[j] = 0;
-        for (int j = 0; j < QK_TURBO2; j++) {
-            uint8_t idx = turbo_find_nearest_2bit(x[off + j]);
-            blk.qs[j / 4] |= (idx & 0x3) << ((j % 4) * 2);
-            float c = d_turbo_centroids_2bit[idx];
-            recon_norm_sq += c * c;
-        }
-    }
-    float recon_norm = sqrtf(recon_norm_sq);
-    float corrected_norm = (recon_norm > 1e-10f) ? grp_norm / recon_norm : grp_norm;
-    for (int b = 0; b < blocks_per_group; b++) {
-        dst_row_ptr[grp_idx * blocks_per_group + b].norm = __float2half(corrected_norm);
-    }
-}
-
 // === TURBO2: GET_ROWS dequantize ===
 #define QR_TURBO2_0 2
 static __device__ __forceinline__
@@ -1474,27 +1417,12 @@ static inline void turbo_tcq_load_kv_encode() {
         fprintf(stderr, "TCQ encode: K/V-split codebooks (K=%s V=%s) hotswap=%d\n", kp?kp:"compiled", vp?vp:"compiled", hot);
 }
 
-// TCQ SET_ROWS encode: Viterbi optimal path with right-shift trellis.
-// One block per 128-element group; block width is selected at the launch site.
+// TCQ SET_ROWS encode: Viterbi optimal path with right-shift trellis (HIP; CUDA uses
+// k_set_rows_turbo3_tcq_warp below). One block per 128-element group; block width is selected at
+// the launch site: the 128 barrier-synced ACS steps make RDNA (wave32) barrier-bound, so narrower
+// blocks win large batches and wider ones small decode batches.
 // Double-buffered cost arrays + global memory backtrace (128 syncs/group, was 384)
 template<int nt, typename idx_t>
-// minBlocks=2: the 128-step Viterbi is __syncthreads-latency-bound; a second resident block
-// per SM hides the sync stalls (pp512 tax vs turbo4 was ~4% with minBlocks=1).
-// Viterbi-encode block width. The kernel does 128 sequential s_barrier-synced ACS steps, so the
-// barrier cost scales with waves/block. AMD RDNA (wave32) is barrier-bound here: 512 thr = 16 waves
-// = expensive block barriers; 128 thr = 4 waves = cheap -> +24.5% prefill on gfx1151 (BIT-EXACT,
-// only argmin tie-break differs). NVIDIA is the opposite: the author tuned 512 on a 3090 and 128
-// regresses it (-3.3% pp / -1.7% tg on the Qwen D=128 boxmodel, same-tree A/B 2026-07-08).
-// TODO(gate-axis): the AMD branch is validated only on gfx1151/RDNA3.5. CDNA is wave64 (untested,
-// different barrier math) and discrete RDNA occupancy may differ -> A/B on the RDNA4 9070XT to decide
-// whether to narrow this to RDNA/wave32 (or a runtime warpSize check). See memory project_encode_remap_cuda_gate.
-#ifndef TCQ3_ENC_NT
-#if defined(__HIP_PLATFORM_AMD__) || defined(GGML_USE_HIP)
-#define TCQ3_ENC_NT 128   // AMD RDNA (gfx1151 validated): fewer wave32 waves -> cheaper block barriers
-#else
-#define TCQ3_ENC_NT 512   // NVIDIA: author-tuned optimum (128 regresses on the 3090)
-#endif
-#endif
 static __global__ void __launch_bounds__(nt) k_set_rows_turbo3_tcq(
         const float * __restrict__ src0, const idx_t * __restrict__ src1,
         block_turbo3_tcq * __restrict__ dst, const int64_t ne_total_groups,

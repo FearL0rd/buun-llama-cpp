@@ -879,39 +879,6 @@ static int ragged_tcq1_shared_bt(int device) {
     return use_shared[device];
 }
 
-// TURBO_ENC_LEGACY=1 selects the previous encoders (block-wide turbo3_tcq Viterbi, 1-thread-per-group
-// turbo3/turbo2) instead of the warp / cooperative ones. Same output; kept for A/B. HIP keeps the
-// width-tuned block turbo3_tcq encoder regardless.
-static bool turbo_enc_legacy() {
-    static int legacy = -1;
-    if (legacy < 0) {
-        const char * env = getenv("TURBO_ENC_LEGACY");
-        legacy = env && atoi(env) != 0;
-    }
-    return legacy;
-}
-
-template<typename idx_t>
-static int ragged_tcq3_shared_bt(int device) {
-    static int use_shared[GGML_CUDA_MAX_DEVICES] = {};
-    static bool checked[GGML_CUDA_MAX_DEVICES] = {};
-    if (checked[device]) return use_shared[device];
-    checked[device] = true;
-#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
-    const char * env = getenv("TURBO_TCQ_SHARED_BT");
-    if (!env || atoi(env) != 0) {
-        constexpr int bytes = 128 * 64;
-        int max_shared_optin = 0;
-        CUDA_CHECK(cudaDeviceGetAttribute(&max_shared_optin, cudaDevAttrMaxSharedMemoryPerBlockOptin, device));
-        if (max_shared_optin >= bytes) {
-            CUDA_SET_SHARED_MEMORY_LIMIT((k_set_rows_turbo3_tcq<TCQ3_ENC_NT, idx_t>), bytes);
-            use_shared[device] = 1;
-        }
-    }
-#endif
-    return use_shared[device];
-}
-
 template<typename idx_t>
 static int ragged_tcq2_shared_bt(int device) {
     static int use_shared[GGML_CUDA_MAX_DEVICES] = {};
@@ -1269,10 +1236,10 @@ static __global__ void k_set_rows_turbo8_coop(
 }
 
 // Cooperative turbo3/turbo2 KV-write encode: 128 threads per 128-elem group, one element per thread.
-// Replaces k_set_rows_turbo3/turbo2 (1 thread per group, 512 B local array: ~26/13 us per decode
-// call vs ~4 us for turbo4_coop). Bit-exact with them: per-element math is the same and both norm
-// sums stay serial in element order (thread 0 over shared memory), so FMA rounding matches.
-// turbo3 keeps the InnerQ scale + calibration probes; TURBO_EXTRACT dumping stays on the old kernel.
+// Replaced the 1-thread-per-group encoders (512 B local array: ~26/13 us per decode call vs ~4 us
+// for turbo4_coop). Bit-exact with them: per-element math is the same and both norm sums stay
+// serial in element order (thread 0 over shared memory), so FMA rounding matches. turbo3 keeps the
+// InnerQ scale + calibration probes; k_set_rows_turbo3 remains only for TURBO_EXTRACT dumping.
 template<typename idx_t, int bits>
 static __global__ void __launch_bounds__(128) k_set_rows_turbo23_coop(
         const float * __restrict__ src0, const idx_t * __restrict__ src1, void * __restrict__ dst,
@@ -1496,42 +1463,34 @@ static void set_rows_cuda(ggml_backend_cuda_context & ctx, const ggml_tensor * s
                         const int64_t qs3 = ne2 * qs2;
                         ensure_ragged_tmp(ctx.device, &ragged_tcq_tmp3[ctx.device], &ragged_tcq_tmp3_bytes[ctx.device],
                                 tmp_groups * (int64_t) sizeof(block_turbo3_tcq));
-                        const int use_shared = ragged_tcq3_shared_bt<idx_t>(ctx.device);
-                        if (!use_shared) ensure_tcq_bt_buf(ctx.device, n_blk_total * 128 * 64);
 #if defined(GGML_USE_HIP)
+                        ensure_tcq_bt_buf(ctx.device, n_blk_total * 128 * 64);
                         // gfx1201 A/B: 512 threads wins small decode batches, 256 wins the
                         // middle range, and 128 wins large batches/fill.
                         const bool tcq3_rdna4 = GGML_CUDA_CC_IS_RDNA4(ggml_cuda_info().devices[ctx.device].cc);
                         if (tcq3_rdna4 && ne01 <= 14) {
-                            k_set_rows_turbo3_tcq<512, idx_t><<<(int)n_blk_total, 512, use_shared ? 128 * 64 : 0, stream>>>(
+                            k_set_rows_turbo3_tcq<512, idx_t><<<(int)n_blk_total, 512, 0, stream>>>(
                                 (const float *) src0_d, src1_d, (block_turbo3_tcq *) ragged_tcq_tmp3[ctx.device],
-                                n_blk_total, tcq_bt_buf[ctx.device], use_shared, ne00, ne01, ne02, ne10, ne11, ne12, ne13,
+                                n_blk_total, tcq_bt_buf[ctx.device], 0, ne00, ne01, ne02, ne10, ne11, ne12, ne13,
                                 s01_f, s02_f, s03_f, s10_i, s11_i, s12_i, rg_is_k, kvmean_mu, qs1, qs2, qs3,
                                 ne00_fd, ne01_fd, ne02_fd, ne11_fd, ne12_fd);
                         } else if (tcq3_rdna4 && ne01 <= 28) {
-                            k_set_rows_turbo3_tcq<256, idx_t><<<(int)n_blk_total, 256, use_shared ? 128 * 64 : 0, stream>>>(
+                            k_set_rows_turbo3_tcq<256, idx_t><<<(int)n_blk_total, 256, 0, stream>>>(
                                 (const float *) src0_d, src1_d, (block_turbo3_tcq *) ragged_tcq_tmp3[ctx.device],
-                                n_blk_total, tcq_bt_buf[ctx.device], use_shared, ne00, ne01, ne02, ne10, ne11, ne12, ne13,
+                                n_blk_total, tcq_bt_buf[ctx.device], 0, ne00, ne01, ne02, ne10, ne11, ne12, ne13,
                                 s01_f, s02_f, s03_f, s10_i, s11_i, s12_i, rg_is_k, kvmean_mu, qs1, qs2, qs3,
                                 ne00_fd, ne01_fd, ne02_fd, ne11_fd, ne12_fd);
                         } else {
-                            k_set_rows_turbo3_tcq<128, idx_t><<<(int)n_blk_total, 128, use_shared ? 128 * 64 : 0, stream>>>(
+                            k_set_rows_turbo3_tcq<128, idx_t><<<(int)n_blk_total, 128, 0, stream>>>(
                                 (const float *) src0_d, src1_d, (block_turbo3_tcq *) ragged_tcq_tmp3[ctx.device],
-                                n_blk_total, tcq_bt_buf[ctx.device], use_shared, ne00, ne01, ne02, ne10, ne11, ne12, ne13,
+                                n_blk_total, tcq_bt_buf[ctx.device], 0, ne00, ne01, ne02, ne10, ne11, ne12, ne13,
                                 s01_f, s02_f, s03_f, s10_i, s11_i, s12_i, rg_is_k, kvmean_mu, qs1, qs2, qs3,
                                 ne00_fd, ne01_fd, ne02_fd, ne11_fd, ne12_fd);
                         }
 #else
-                        if (!turbo_enc_legacy()) {
-                            k_set_rows_turbo3_tcq_warp<idx_t><<<(int)n_blk_total, 32, 0, stream>>>(
-                                (const float *) src0_d, src1_d, (block_turbo3_tcq *) ragged_tcq_tmp3[ctx.device],
-                                n_blk_total, ne00, ne01, ne02, ne10, ne11, ne12, ne13,
-                                s01_f, s02_f, s03_f, s10_i, s11_i, s12_i, rg_is_k, kvmean_mu, qs1, qs2, qs3,
-                                ne00_fd, ne01_fd, ne02_fd, ne11_fd, ne12_fd);
-                        } else
-                        k_set_rows_turbo3_tcq<TCQ3_ENC_NT, idx_t><<<(int)n_blk_total, TCQ3_ENC_NT, use_shared ? 128 * 64 : 0, stream>>>(
+                        k_set_rows_turbo3_tcq_warp<idx_t><<<(int)n_blk_total, 32, 0, stream>>>(
                             (const float *) src0_d, src1_d, (block_turbo3_tcq *) ragged_tcq_tmp3[ctx.device],
-                            n_blk_total, tcq_bt_buf[ctx.device], use_shared, ne00, ne01, ne02, ne10, ne11, ne12, ne13,
+                            n_blk_total, ne00, ne01, ne02, ne10, ne11, ne12, ne13,
                             s01_f, s02_f, s03_f, s10_i, s11_i, s12_i, rg_is_k, kvmean_mu, qs1, qs2, qs3,
                             ne00_fd, ne01_fd, ne02_fd, ne11_fd, ne12_fd);
 #endif
@@ -1657,15 +1616,9 @@ static void set_rows_cuda(ggml_backend_cuda_context & ctx, const ggml_tensor * s
     } else if (dst->type == GGML_TYPE_TURBO2_0) {
         GGML_ASSERT(ne00 % QK_TURBO2_GROUP == 0);
         const int64_t ne_total_groups = (ne00 * ne01 * ne02 * ne03) / QK_TURBO2_GROUP;
-        const int num_blocks_grid = (ne_total_groups + CUDA_SET_ROWS_BLOCK_SIZE - 1) / CUDA_SET_ROWS_BLOCK_SIZE;
         const int64_t s01_f = nb01/sizeof(float); const int64_t s02_f = nb02/sizeof(float); const int64_t s03_f = nb03/sizeof(float);
         const int64_t s10_i = nb10/sizeof(idx_t); const int64_t s11_i = nb11/sizeof(idx_t); const int64_t s12_i = nb12/sizeof(idx_t);
         if (ne_total_groups > 0 && ne00 > 0 && ne01 > 0 && ne02 > 0 && ne11 > 0 && ne12 > 0) {
-            const uint3 ne00_fd = init_fastdiv_values((uint32_t) ne00);
-            const uint3 ne01_fd = init_fastdiv_values((uint32_t) ne01);
-            const uint3 ne02_fd = init_fastdiv_values((uint32_t) ne02);
-            const uint3 ne11_fd = init_fastdiv_values((uint32_t) ne11);
-            const uint3 ne12_fd = init_fastdiv_values((uint32_t) ne12);
             const float * kmean_mu = nullptr;
             if (ne00 <= PFHEAD_MAX_C) {
                 const bool is_k = strncmp(dst->name, "cache_k_l", 9) == 0;
@@ -1678,17 +1631,9 @@ static void set_rows_cuda(ggml_backend_cuda_context & ctx, const ggml_tensor * s
                     if (tbl && kl >= 0 && kl < PFHEAD_MAX_L) kmean_mu = tbl + (size_t) kl * PFHEAD_MAX_C;
                 }
             }
-            if (!turbo_enc_legacy()) {
-                k_set_rows_turbo23_coop<idx_t, 2><<<(unsigned)ne_total_groups, 128, 0, stream>>>(
-                    src0_d, src1_d, dst->data, ne00, ne01, ne02, ne11, ne12,
-                    s01_f, s02_f, s03_f, s10_i, s11_i, s12_i, nb1, nb2, nb3, kmean_mu, 0, -1);
-            } else {
-                k_set_rows_turbo2<idx_t><<<num_blocks_grid, CUDA_SET_ROWS_BLOCK_SIZE, 0, stream>>>(
-                    src0_d, src1_d, (block_turbo2_0 *)dst->data,
-                    ne_total_groups, ne00, ne01, ne02, ne10, ne11, ne12, ne13,
-                    s01_f, s02_f, s03_f, s10_i, s11_i, s12_i, kmean_mu, nb1, nb2, nb3,
-                    ne00_fd, ne01_fd, ne02_fd, ne11_fd, ne12_fd);
-            }
+            k_set_rows_turbo23_coop<idx_t, 2><<<(unsigned)ne_total_groups, 128, 0, stream>>>(
+                src0_d, src1_d, dst->data, ne00, ne01, ne02, ne11, ne12,
+                s01_f, s02_f, s03_f, s10_i, s11_i, s12_i, nb1, nb2, nb3, kmean_mu, 0, -1);
         }
     } else if (dst->type == GGML_TYPE_TURBO3_0) {
         GGML_ASSERT(ne00 % QK_TURBO3_GROUP == 0);
@@ -1714,8 +1659,9 @@ static void set_rows_cuda(ggml_backend_cuda_context & ctx, const ggml_tensor * s
                                            : turbo_vmean_table_enc(ctx.device, stream, model_id);
                 if (tbl) kmean_mu = tbl + (size_t) pf_layer * PFHEAD_MAX_C;
             }
+            // TURBO_EXTRACT post-rotation dumping lives in the 1-thread-per-group kernel.
             static const bool t3_extract = []() { const char * e = getenv("TURBO_EXTRACT"); return e && atoi(e) > 0; }();
-            if (!t3_extract && !turbo_enc_legacy()) {
+            if (!t3_extract) {
                 k_set_rows_turbo23_coop<idx_t, 3><<<(unsigned)ne_total_groups, 128, 0, stream>>>(
                     src0_d, src1_d, dst->data, ne00, ne01, ne02, ne11, ne12,
                     s01_f, s02_f, s03_f, s10_i, s11_i, s12_i, nb1, nb2, nb3, kmean_mu, iq_is_k, pf_layer);
@@ -1793,41 +1739,16 @@ static void set_rows_cuda(ggml_backend_cuda_context & ctx, const ggml_tensor * s
                 }
             }
         }
-        // TCQ Viterbi encode: 512 threads per block. The TCQ3 backtrace stores
-        // one predecessor for each 64-state low-bit group per step.
+        // TCQ Viterbi encode: one warp per group on CUDA, width-tuned block kernel on HIP.
         const int64_t s01_f = nb01/sizeof(float); const int64_t s02_f = nb02/sizeof(float); const int64_t s03_f = nb03/sizeof(float);
         const int64_t s10_i = nb10/sizeof(idx_t); const int64_t s11_i = nb11/sizeof(idx_t); const int64_t s12_i = nb12/sizeof(idx_t);
         const int iq_is_k = (strncmp(dst->name, "cache_k_", 8) == 0) ? 1 : 0;
         if (ne_total_groups > 0 && ne00 > 0 && ne01 > 0 && ne02 > 0 && ne11 > 0 && ne12 > 0) {
-            static int tcq3_use_shared_bt[GGML_CUDA_MAX_DEVICES] = {};
-            static bool tcq3_bt_checked[GGML_CUDA_MAX_DEVICES] = {};
-            constexpr int tcq3_bt_shared_bytes = 128 * 64;
-            if (!tcq3_bt_checked[ctx.device]) {
-                tcq3_bt_checked[ctx.device] = true;
-#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
-                const char * tcq_shared_bt_env = getenv("TURBO_TCQ_SHARED_BT");
-                if (!tcq_shared_bt_env || atoi(tcq_shared_bt_env) != 0) {
-                    int max_shared_optin = 0;
-                    CUDA_CHECK(cudaDeviceGetAttribute(&max_shared_optin, cudaDevAttrMaxSharedMemoryPerBlockOptin, ctx.device));
-                    if (max_shared_optin >= tcq3_bt_shared_bytes) {
-                        CUDA_SET_SHARED_MEMORY_LIMIT((k_set_rows_turbo3_tcq<TCQ3_ENC_NT, idx_t>), tcq3_bt_shared_bytes);
-                        tcq3_use_shared_bt[ctx.device] = 1;
-                        fprintf(stderr, "TCQ encode: using shared-memory backtrace (%d bytes/block)\n", tcq3_bt_shared_bytes);
-                    } else {
-                        fprintf(stderr, "TCQ encode: shared-memory backtrace unavailable, only %d bytes/block are available\n", max_shared_optin);
-                    }
-                }
-#endif
-            }
-            if (!tcq3_use_shared_bt[ctx.device]) {
-                ensure_tcq_bt_buf(ctx.device, ne_total_groups * 128 * 64);
-            }
             const uint3 ne00_fd = init_fastdiv_values((uint32_t) ne00);
             const uint3 ne01_fd = init_fastdiv_values((uint32_t) ne01);
             const uint3 ne02_fd = init_fastdiv_values((uint32_t) ne02);
             const uint3 ne11_fd = init_fastdiv_values((uint32_t) ne11);
             const uint3 ne12_fd = init_fastdiv_values((uint32_t) ne12);
-            const int shared_bytes = tcq3_use_shared_bt[ctx.device] ? tcq3_bt_shared_bytes : 0;
             const float * kvmean_mu = nullptr;
             if (strncmp(dst->name, "cache_k_l", 9) == 0 || strncmp(dst->name, "cache_v_l", 9) == 0) {
                 const int pf_layer = atoi(dst->name + 9);
@@ -1839,39 +1760,33 @@ static void set_rows_cuda(ggml_backend_cuda_context & ctx, const ggml_tensor * s
                 }
             }
 #if defined(GGML_USE_HIP)
+            ensure_tcq_bt_buf(ctx.device, ne_total_groups * 128 * 64);
             // gfx1201 A/B: 512 threads wins small decode batches, 256 wins the
             // middle range, and 128 wins large batches/fill.
             const bool tcq3_rdna4 = GGML_CUDA_CC_IS_RDNA4(ggml_cuda_info().devices[ctx.device].cc);
             if (tcq3_rdna4 && ne01 <= 14) {
-                k_set_rows_turbo3_tcq<512, idx_t><<<(int)ne_total_groups, 512, shared_bytes, stream>>>(
+                k_set_rows_turbo3_tcq<512, idx_t><<<(int)ne_total_groups, 512, 0, stream>>>(
                     src0_d, src1_d, (block_turbo3_tcq *)dst->data,
-                    ne_total_groups, tcq_bt_buf[ctx.device], tcq3_use_shared_bt[ctx.device], ne00, ne01, ne02, ne10, ne11, ne12, ne13,
+                    ne_total_groups, tcq_bt_buf[ctx.device], 0, ne00, ne01, ne02, ne10, ne11, ne12, ne13,
                     s01_f, s02_f, s03_f, s10_i, s11_i, s12_i, iq_is_k, kvmean_mu, nb1, nb2, nb3,
                     ne00_fd, ne01_fd, ne02_fd, ne11_fd, ne12_fd);
             } else if (tcq3_rdna4 && ne01 <= 28) {
-                k_set_rows_turbo3_tcq<256, idx_t><<<(int)ne_total_groups, 256, shared_bytes, stream>>>(
+                k_set_rows_turbo3_tcq<256, idx_t><<<(int)ne_total_groups, 256, 0, stream>>>(
                     src0_d, src1_d, (block_turbo3_tcq *)dst->data,
-                    ne_total_groups, tcq_bt_buf[ctx.device], tcq3_use_shared_bt[ctx.device], ne00, ne01, ne02, ne10, ne11, ne12, ne13,
+                    ne_total_groups, tcq_bt_buf[ctx.device], 0, ne00, ne01, ne02, ne10, ne11, ne12, ne13,
                     s01_f, s02_f, s03_f, s10_i, s11_i, s12_i, iq_is_k, kvmean_mu, nb1, nb2, nb3,
                     ne00_fd, ne01_fd, ne02_fd, ne11_fd, ne12_fd);
             } else {
-                k_set_rows_turbo3_tcq<128, idx_t><<<(int)ne_total_groups, 128, shared_bytes, stream>>>(
+                k_set_rows_turbo3_tcq<128, idx_t><<<(int)ne_total_groups, 128, 0, stream>>>(
                     src0_d, src1_d, (block_turbo3_tcq *)dst->data,
-                    ne_total_groups, tcq_bt_buf[ctx.device], tcq3_use_shared_bt[ctx.device], ne00, ne01, ne02, ne10, ne11, ne12, ne13,
+                    ne_total_groups, tcq_bt_buf[ctx.device], 0, ne00, ne01, ne02, ne10, ne11, ne12, ne13,
                     s01_f, s02_f, s03_f, s10_i, s11_i, s12_i, iq_is_k, kvmean_mu, nb1, nb2, nb3,
                     ne00_fd, ne01_fd, ne02_fd, ne11_fd, ne12_fd);
             }
 #else
-            if (!turbo_enc_legacy()) {
-                k_set_rows_turbo3_tcq_warp<idx_t><<<(int)ne_total_groups, 32, 0, stream>>>(
-                    src0_d, src1_d, (block_turbo3_tcq *)dst->data,
-                    ne_total_groups, ne00, ne01, ne02, ne10, ne11, ne12, ne13,
-                    s01_f, s02_f, s03_f, s10_i, s11_i, s12_i, iq_is_k, kvmean_mu, nb1, nb2, nb3,
-                    ne00_fd, ne01_fd, ne02_fd, ne11_fd, ne12_fd);
-            } else
-            k_set_rows_turbo3_tcq<TCQ3_ENC_NT, idx_t><<<(int)ne_total_groups, TCQ3_ENC_NT, shared_bytes, stream>>>(
+            k_set_rows_turbo3_tcq_warp<idx_t><<<(int)ne_total_groups, 32, 0, stream>>>(
                 src0_d, src1_d, (block_turbo3_tcq *)dst->data,
-                ne_total_groups, tcq_bt_buf[ctx.device], tcq3_use_shared_bt[ctx.device], ne00, ne01, ne02, ne10, ne11, ne12, ne13,
+                ne_total_groups, ne00, ne01, ne02, ne10, ne11, ne12, ne13,
                 s01_f, s02_f, s03_f, s10_i, s11_i, s12_i, iq_is_k, kvmean_mu, nb1, nb2, nb3,
                 ne00_fd, ne01_fd, ne02_fd, ne11_fd, ne12_fd);
 #endif
