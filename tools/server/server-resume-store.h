@@ -11,7 +11,6 @@
 #include <functional>
 #include <map>
 #include <memory>
-#include <mutex>
 #include <optional>
 #include <set>
 #include <string>
@@ -286,11 +285,10 @@ private:
     int lock_fd = -1;
     bool durable = true;
 
-    // imported entry files, by entry id
+    // imported entry files, by entry id; export_taken() does not look at them
     struct mounted_entry;
-    mutable std::mutex mounts_mutex;
-    mutable std::map<std::string, std::shared_ptr<const mounted_entry>> mounts;
-    std::shared_ptr<const mounted_entry> mounted(const std::string & id) const;
+    mutable std::map<std::string, std::unique_ptr<const mounted_entry>> mounts;
+    const mounted_entry * mounted(const std::string & id) const;
 
     std::string entry_dir(const std::string & id) const;
     bool sync_path(const std::string & path) const;

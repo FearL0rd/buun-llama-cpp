@@ -581,11 +581,10 @@ rename into `<store>/taken/`) and exported to the file off the main loop
 cache keeps only its capture on the main loop: the export job writes the
 artifact and the ring's checkpoints as an entry of its own store
 (`<slot_save_path>.staging/exports`), commits and exports it, and removes it.
-Exports run one
-at a time in the order of their requests, and the save answers when its file is
-written. The file is written to a staging file, `fsync`ed, renamed and the
-directory synced, so it is replaced whole or not at all. No host cache is
-included; that is what `--resume` is for.
+Exports run one at a time in the order of their requests, and the save answers
+when its file is written. The file is written to a staging file, `fsync`ed,
+renamed and the directory synced, so it is replaced whole or not at all. No host
+cache is included; that is what `--resume` is for.
 
 File layout, little-endian:
 

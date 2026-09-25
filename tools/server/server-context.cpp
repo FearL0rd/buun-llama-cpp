@@ -6255,7 +6255,7 @@ private:
         server_resume_manifest        next;
         std::vector<std::pair<server_resume_object_record, std::vector<uint8_t>>> tails;
     };
-    // set by a slot-file save for slot_file_capture to take
+    // set by a slot-file save, taken at once by slot_file_capture
     std::optional<resume_deferred_artifact> resume_deferred;
 
     // The dynamic route of a save: the VBR artifact exact capture of the sequence, streamed into one
@@ -6367,7 +6367,7 @@ private:
 
         if (resume_slot_file && slot_file_exports.store) {
             auto records = resume_ring_tail_records(slot, next, ring, rec.producer);
-            resume_deferred_artifact deferred = {std::move(payload), rec, std::move(next), {}};
+            resume_deferred_artifact deferred = {std::move(payload), std::move(rec), std::move(next), {}};
             for (size_t i = 0; i < ring.size(); ++i) {
                 const auto & data = ring[i].first->data_tgt;
                 deferred.tails.emplace_back(std::move(records[i]), std::vector<uint8_t>(data.data(), data.data() + data.size()));
@@ -6975,14 +6975,16 @@ private:
 
     // The slot as one exported entry of the slot-file store: the checkpoints and partial states
     // come with it, and a dynamic cache saves through its artifact. The entry is captured and taken
-    // out of the store here, or its artifact only captured; slot_file_export() writes the file.
-    json slot_file_capture(server_slot & slot) {
+    // out of the store here, or its artifact only captured into `deferred`; slot_file_export()
+    // writes the file.
+    json slot_file_capture(server_slot & slot, std::optional<resume_deferred_artifact> & deferred) {
         resume_slot_file_scope scope(*this, slot);
         std::vector<server_slot *> members = {&slot};
         resume_group_t group;
         group.members = &members;
         json status = resume_capture_slot(slot, group);
-        if (resume_saved(status) && !resume_deferred) {
+        deferred = std::exchange(resume_deferred, std::nullopt);
+        if (resume_saved(status) && !deferred) {
             const std::string id = status["entry"];
             std::string error;
             const auto reason = resume_store->take_entry(id, error);
@@ -7022,16 +7024,11 @@ private:
     }
 
     // The captured entry to the file, off the main loop, and the answer to the request.
-    void slot_file_export(const server_task & task, const server_slot & slot, json status, int64_t t_start) {
-        auto res = std::make_unique<server_task_result_slot_save_load>();
-        res->id       = task.id;
-        res->id_slot  = slot.id;
-        res->filename = task.slot_action.filename;
-        res->is_save  = true;
-        res->n_tokens = slot.prompt.tokens.size();
+    void slot_file_export(const server_task & task, const server_slot & slot, json status,
+                          std::optional<resume_deferred_artifact> deferred, int64_t t_start) {
         slot_file_exports.post([this, store = slot_file_store.get(), filepath = task.slot_action.filepath,
-                                status = std::move(status), t_start, res = std::move(res),
-                                deferred = std::exchange(resume_deferred, std::nullopt)]() mutable {
+                                status = std::move(status), t_start, res = slot_save_load_result(task, slot, true),
+                                deferred = std::move(deferred)]() mutable {
             std::string error;
             uint64_t bytes = 0;
             server_resume_reason reason = server_resume_reason::io_error;
@@ -14186,14 +14183,20 @@ private:
         slot.print_timings_tg();
     }
 
-    void send_slot_save_load(const server_task & task, const server_slot & slot, bool is_save, size_t n_bytes,
-                             double t_ms, json resume = nullptr) {
+    static std::unique_ptr<server_task_result_slot_save_load> slot_save_load_result(
+            const server_task & task, const server_slot & slot, bool is_save) {
         auto res = std::make_unique<server_task_result_slot_save_load>();
         res->id       = task.id;
         res->id_slot  = slot.id;
         res->filename = task.slot_action.filename;
         res->is_save  = is_save;
         res->n_tokens = slot.prompt.tokens.size();
+        return res;
+    }
+
+    void send_slot_save_load(const server_task & task, const server_slot & slot, bool is_save, size_t n_bytes,
+                             double t_ms, json resume = nullptr) {
+        auto res = slot_save_load_result(task, slot, is_save);
         res->n_bytes  = n_bytes;
         res->t_ms     = t_ms;
         res->resume   = std::move(resume);
@@ -18132,11 +18135,12 @@ private:
                     // The resume format, where the slot-file store is open. A fixed cache it cannot
                     // take (positions, media) is saved as the one-state file; a dynamic one has no other.
                     if (slot_file_store && !task.slot_action.legacy) {
-                        json status = slot_file_capture(*slot);
+                        std::optional<resume_deferred_artifact> deferred;
+                        json status = slot_file_capture(*slot, deferred);
                         status["event"] = "slot_file_save";
                         status["slot"]  = slot->id;
                         if (resume_saved(status)) {
-                            slot_file_export(task, *slot, std::move(status), t_start);
+                            slot_file_export(task, *slot, std::move(status), std::move(deferred), t_start);
                             break;
                         }
                         resume_log(status);

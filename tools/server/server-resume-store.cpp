@@ -676,10 +676,9 @@ struct server_resume_store::mounted_entry {
     std::map<std::string, uint64_t> offsets; // by object name
 };
 
-std::shared_ptr<const server_resume_store::mounted_entry> server_resume_store::mounted(const std::string & id) const {
-    std::lock_guard<std::mutex> lock(mounts_mutex);
+const server_resume_store::mounted_entry * server_resume_store::mounted(const std::string & id) const {
     const auto it = mounts.find(id);
-    return it == mounts.end() ? nullptr : it->second;
+    return it == mounts.end() ? nullptr : it->second.get();
 }
 
 static server_resume_reason reason_from_errno(int err) {
@@ -1428,11 +1427,8 @@ void server_resume_store::remove_entry(const std::string & id) const {
     if (!entry_id_valid(id)) {
         return;
     }
-    {
-        std::lock_guard<std::mutex> lock(mounts_mutex);
-        if (mounts.erase(id) != 0) {
-            return;
-        }
+    if (mounts.erase(id) != 0) {
+        return;
     }
     // the manifest first: an interrupted removal must not leave an entry that names missing objects
     const std::string directory = entry_dir(id);
@@ -1740,7 +1736,7 @@ server_resume_reason server_resume_store::import_entry(
         return server_resume_reason::object_size_mismatch;
     }
 
-    auto entry = std::make_shared<mounted_entry>();
+    auto entry = std::make_unique<mounted_entry>();
     uint64_t offset = HEADER_SIZE + manifest_bytes;
     for (const auto * object : objects) {
         // the header against the record; the payload is checked as it is read
@@ -1759,10 +1755,7 @@ server_resume_reason server_resume_store::import_entry(
     std::swap(entry->file.fd, file.fd);
 
     id = new_entry_id();
-    {
-        std::lock_guard<std::mutex> lock(mounts_mutex);
-        mounts.emplace(id, std::move(entry));
-    }
+    mounts.emplace(id, std::move(entry));
     bytes = size;
     return server_resume_reason::ok;
 }
