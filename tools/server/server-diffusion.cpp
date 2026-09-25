@@ -215,7 +215,9 @@ std::vector<llama_token> server_diffusion_generate_canvas(
         int32_t                            canvas_length,
         int32_t                            n_predict) {
     std::vector<llama_token> response;
-    if (!ctx || !model || canvas_length <= 0 || n_predict <= 0 ||
+    // n_predict < 0 is the server's "no limit" (webui omits max_tokens). n_predict == 0 means
+    // the caller asked for an empty completion.
+    if (!ctx || !model || canvas_length <= 0 || n_predict == 0 ||
             (int32_t) prefix_tokens.size() + canvas_length > (int32_t) llama_n_ctx_seq(ctx)) {
         return response;
     }
@@ -224,12 +226,14 @@ std::vector<llama_token> server_diffusion_generate_canvas(
     const int32_t      n_batch  = (int32_t) llama_n_batch(ctx);
     const int32_t      n_ubatch = (int32_t) llama_n_ubatch(ctx);
 
-    // unified forward (default): the whole [prefix | canvas] in one batch. The prefix-KV path is
-    // only used when explicitly requested (single-GPU) and the canvas fits in one ubatch.
+    // unified forward (default): the whole [prefix | canvas] in one batch. encode() requires
+    // n_ubatch >= that length, so the physical batch is the limit, not just n_batch. The
+    // prefix-KV path is only used when explicitly requested (single-GPU) and the canvas fits.
     const bool use_kv = eb.kv_cache && n_ubatch >= canvas_length;
-    if (!use_kv && n_batch < (int32_t) prefix_tokens.size() + canvas_length) {
-        LOG_ERR("%s: canvas batch too large: needs n_batch >= n_input(%d) + canvas(%d) "
-                "(have n_batch=%d, n_ubatch=%d); raise --batch-size or use "
+    const int32_t n_limit = std::min(n_batch, n_ubatch);
+    if (!use_kv && n_limit < (int32_t) prefix_tokens.size() + canvas_length) {
+        LOG_ERR("%s: canvas batch too large: needs n_ubatch >= n_input(%d) + canvas(%d) "
+                "(have n_batch=%d, n_ubatch=%d); raise --batch-size/--ubatch-size or use "
                 "--diffusion-kv-cache on\n", __func__,
                 (int) prefix_tokens.size(), canvas_length, n_batch, n_ubatch);
         return response;
@@ -266,14 +270,15 @@ std::vector<llama_token> server_diffusion_generate_canvas(
     std::vector<llama_token> canvas(canvas_length);
     server_diffusion_eb_params eb_one = eb;
     eb_one.kv_cache                   = use_kv;
-    int32_t n_budget                  = n_predict;
+    // -1 (no limit) stops on EOG, a repetition loop, or the context, not before the first step
+    int32_t n_budget                  = n_predict < 0 ? (int32_t) llama_n_ctx_seq(ctx) : n_predict;
 
     while (n_budget > 0) {
         const int32_t prefix_len = (int32_t) prefix.size();
         if (prefix_len + canvas_length >= (int32_t) llama_n_ctx_seq(ctx)) {
             break;  // out of context room: keep what we have
         }
-        if (!use_kv && prefix_len + canvas_length > n_batch) {
+        if (!use_kv && prefix_len + canvas_length > n_limit) {
             break;  // out of batch room: keep what we have
         }
 

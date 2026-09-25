@@ -9848,6 +9848,22 @@ private:
                     if (canvas > params_base.n_outputs_max_per_seq) {
                         params_base.n_outputs_max_per_seq = canvas;
                     }
+                    // encode() of a memoryless canvas is one non-causal batch of [prompt | canvas]
+                    // and requires n_ubatch >= that length. The server default ubatch (512) cannot
+                    // hold a real prompt, so the reply comes back empty. 8192 covers a few thousand
+                    // prompt tokens plus the canvas; a larger --batch-size in the preset is kept.
+                    const int32_t ctx_cap = params_base.n_ctx > 0 ? (int32_t) params_base.n_ctx : 8192;
+                    const int32_t need = std::min(ctx_cap, std::max(params_base.n_batch, 8192));
+                    if (params_base.n_batch < need) {
+                        SRV_INF("diffusion canvas model: raising n_batch %d -> %d\n",
+                                params_base.n_batch, need);
+                        params_base.n_batch = need;
+                    }
+                    if (params_base.n_ubatch < params_base.n_batch) {
+                        SRV_INF("diffusion canvas model: raising n_ubatch %d -> %d\n",
+                                params_base.n_ubatch, params_base.n_batch);
+                        params_base.n_ubatch = params_base.n_batch;
+                    }
                 }
                 gguf_free(gctx);
             }
