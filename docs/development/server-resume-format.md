@@ -3,9 +3,9 @@
 Status: **contract, implemented through P2** (§10 items 1 to 5, with the
 measured results and the limits of v1 there) **and P3** (§11, dynamic VBR). Where the build differs from the
 first design the text says "as built".
-Companion of `server-resume-plan.md` (objective, P0 results, phases). Written
-against `exp/server-resume`; use the symbols, not line numbers, when lines move.
-The P0–P2 and P3 code went through independent review before merge.
+Phases: P0 measurement of the existing code, P1 this contract, P2 fixed-type
+KV, P3 dynamic VBR, P4 open (host prompt cache, adapter transitions). Use the
+symbols, not line numbers, when lines move.
 
 Scope of v1: fixed-type KV (f16, q8_0, turbo, TCQ), dense, hybrid-recurrent and
 SWA/iSWA models, one entry per conversation, direct install into a slot. Images
@@ -36,7 +36,7 @@ What P0 and the P1 code reading established, and what the design takes from it.
 | Streaming handlers (`server-http.cpp`) | A handler parked in the chunked provider is released only by the SSE ping timer (30 s) or a client disconnect | P2 prerequisite: a shutdown flag in the three `should_stop` closures. Without it a supervisor's grace period is spent waiting, not saving |
 | Durable I/O already in the tree | `llama-repack-cache.cpp`: `flock`, staged files, streamed hashing with `sync_write()` every 64 MiB, directory `fsync`, rename. `llama-vram-ledger.cpp`: 0700 directory with ownership check, stale-owner detection by pid and start time. `fs_get_cache_file` forbids subdirectories and `fs_create_directory_with_parents` creates 0755 | The store reuses these patterns behind its own root helper (0700 directories, 0600 files) on `fs_get_cache_directory()` |
 
-Correction to the plan's P0 notes: slot files do have a payload checksum (the
+Slot files do have a payload checksum (the
 library file header above). What is missing is a checksum on the raw state API and
 any integrity unit smaller than the whole file.
 
@@ -69,7 +69,7 @@ In the store an entry is always a directory; the one single-file form is the
 slot file, an exported copy of one entry (§8.1).
 
 Why not the library sequence file with a new envelope version inside it: see the
-first row of §1. What declares a resume manifest (plan §6) is therefore the
+first row of §1. What declares a resume manifest is therefore the
 manifest's own magic and version. Builds that predate it cannot
 open an entry at all: given a manifest by name they fail the library magic check.
 
@@ -94,7 +94,7 @@ open an entry at all: given a manifest by name they fail the library magic check
 The file size must equal 64 + payload bytes. XXH3-64 (vendored under
 `vendor/hash`) detects corruption at memory-copy speed; SHA-256 stays the hash
 for identities. Neither authenticates: anyone who can write the store can forge
-it, as plan §6 already says.
+it.
 
 - **Base chunk payload** — the per-sequence state blob of §1 for the base part
   only, restricted to cells with `p0 <= pos < p1`, **cells in ascending position
@@ -407,9 +407,9 @@ SHA-256, domain `buun.server.resume-compat/v1`, over:
 | Weight values, quantization, file name | provenance; fine-tunes stay eligible by decision |
 
 The adapter identity stays a separate digest and must be equal in v1. The
-producer-to-consumer adapter transition of plan §2 is P4.
+producer-to-consumer adapter transition is left to a later phase.
 
-Documented property of family reuse (plan §2, measured in P0): the restored
+Documented property of family reuse (measured before implementation): the restored
 history is a mixed-model history. The typical next token follows the consumer
 model (median KLD to the consumer's own prefill 3–6× below the distance between
 the two models under f16 KV, about 2× under TCQ, top-1 agreement 0.93–0.98);
