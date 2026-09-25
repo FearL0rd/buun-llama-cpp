@@ -45,6 +45,9 @@ enum class vbr_occupied_replacement_guard_status : uint8_t {
     run_limit_exceeded,
     capacity_unavailable,
     currency_changed,
+    // absent-destination insertion only
+    tier_mismatch,
+    destination_present,
     internal_error,
     _count,
 };
@@ -148,6 +151,9 @@ public:
     // Internal stage authority. The guard retains this immutable capability
     // through validation/adoption; callers must not resolve a second package.
     const vbr_artifact_package_view & recovery_package() const noexcept;
+    // The destination held nothing: there is no recovery package, and the
+    // incoming rows go into free cells beside the preserved ones.
+    bool absent_destination() const noexcept;
     uint64_t packed_rows_expanded() const noexcept;
     void reset() noexcept;
 
@@ -193,6 +199,22 @@ private:
         vbr_occupied_replacement_guard &,
         const vbr_import_schedule_quote &,
         const vbr_import_schedule_quote *) noexcept;
+    friend vbr_occupied_replacement_guard_status
+    vbr_prepare_absent_insertion_guard(
+        const vbr_target_validation_snapshot &,
+        const vbr_artifact_package_view &,
+        const vbr_occupied_replacement_observation &,
+        vbr_occupied_replacement_guard &,
+        const vbr_import_schedule_quote *) noexcept;
+    friend vbr_occupied_replacement_guard_status
+    vbr_explicit_prepare_absent_insertion_guard(
+        llama_memory_i &, llama_seq_id,
+        const vbr_artifact_package_view &,
+        const std::vector<llama_vbr_artifact_domain_binding> &,
+        uint64_t, const void *,
+        vbr_explicit_representation_identity_fn,
+        vbr_occupied_replacement_guard &,
+        const std::vector<vbr_target_companion_snapshot> *) noexcept;
     friend vbr_occupied_replacement_guard_status
     vbr_recheck_occupied_replacement_guard(
         vbr_occupied_replacement_guard &,
@@ -274,3 +296,16 @@ vbr_recheck_occupied_replacement_guard(
     vbr_occupied_replacement_guard & guard,
     const vbr_target_validation_snapshot & target,
     const vbr_occupied_replacement_observation & observation) noexcept;
+
+// A destination that holds nothing, in a pool other sequences occupy: the
+// live controller is the witness, every observed cell is preserved, and the
+// incoming rows take free cells. Only an exact schedule under the live degrade
+// cursor is accepted, since a transform would retype the other sequences' rows
+// (tier_mismatch).
+vbr_occupied_replacement_guard_status
+vbr_prepare_absent_insertion_guard(
+    const vbr_target_validation_snapshot & live_target,
+    const vbr_artifact_package_view & incoming,
+    const vbr_occupied_replacement_observation & observation,
+    vbr_occupied_replacement_guard & output,
+    const vbr_import_schedule_quote * authenticated_incoming = nullptr) noexcept;

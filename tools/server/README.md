@@ -1287,7 +1287,7 @@ The file is one entry in the `--resume` format: the slot's KV state with its con
 
 `filename`: Name of the file to restore the slot's prompt cache from. The file should be located in the directory specified by the `--slot-save-path` server parameter.
 
-Files written by earlier versions still restore on fixed cache types. Under the dynamic VBR cache only resume-format files restore, and only while the other slots are empty (otherwise `400`).
+Files written by earlier versions still restore on fixed cache types. Under the dynamic VBR cache only resume-format files restore. Beside other slots the restore needs the file's tiers to match the cache's and free cells to hold it, and the cache must not have sliding-window or indexed attention (otherwise `400`, the other slots untouched).
 
 **Response format**
 

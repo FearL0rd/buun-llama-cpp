@@ -3705,15 +3705,22 @@ server_vbr_artifact_import_output server_vbr_artifact_store::import_package_impl
             return fail(server_vbr_artifact_import_status::unavailable,
                         impl_->counters.imports_unavailable);
         }
-        if (recovery) {
-            const auto guard_status =
-                vbr_explicit_prepare_occupied_replacement_guard(
+        const bool guarded = recovery || request.absent_insertion;
+        if (guarded) {
+            const auto guard_status = recovery
+                ? vbr_explicit_prepare_occupied_replacement_guard(
                     *request.memory, request.destination, package, *recovery,
                     impl_->domain_bindings, accounting_snapshot.serial,
                     &representation_policy,
                     vbr_explicit_capture_representation_identity,
                     occupied_guard, &schedule_quote,
-                    &context.snapshot.companions);
+                    &context.snapshot.companions)
+                : vbr_explicit_prepare_absent_insertion_guard(
+                    *request.memory, request.destination, package,
+                    impl_->domain_bindings, accounting_snapshot.serial,
+                    &representation_policy,
+                    vbr_explicit_capture_representation_identity,
+                    occupied_guard, &context.snapshot.companions);
             output.occupied_guard_status = guard_status;
             if (guard_status !=
                     vbr_occupied_replacement_guard_status::ready) {
@@ -3753,7 +3760,7 @@ server_vbr_artifact_import_output server_vbr_artifact_store::import_package_impl
         policy.transform_budget_plan = &transform_budget;
         policy.allow_upward = true;
         policy.schedule_quote = &schedule_quote;
-        if (recovery) {
+        if (guarded) {
             policy.occupied_replacement = &occupied_guard;
             policy.occupied_representation_context = &representation_policy;
             policy.occupied_representation_identity =

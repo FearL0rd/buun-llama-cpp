@@ -535,7 +535,7 @@ One log line and one `/slots` field per entry. The string
 | `unsupported_media` | a media chunk without a content id (§4a); capture-side skip, logged at save |
 | `unsupported_positions` | cells that do not take consecutive positions: media under M-RoPE (§4a). At capture, and at install when the ledger has media and the loaded model shares positions |
 | `unsupported_qsa`, `frontier_inconsistent` | capture-side skips, logged at save |
-| `unsupported_artifact`, `capture_refused`, `slot_busy`, `cache_shared`, `slot_not_empty`, `precision_refused`, `execution_identity_unavailable` | dynamic VBR route (§11). On a slot-file restore `cache_shared` is a 400: a dynamic VBR cache restores a slot only while the other slots are empty (§8.1) |
+| `unsupported_artifact`, `capture_refused`, `slot_busy`, `cache_shared`, `tier_mismatch`, `slot_not_empty`, `precision_refused`, `execution_identity_unavailable` | dynamic VBR route (§11). On a slot-file restore beside other slots `cache_shared` and `tier_mismatch` are a 400 (§8.1) |
 | `store_locked`, `store_unwritable`, `no_space`, `io_error` | store level; the server runs without persistence |
 | `checkpoints_dropped=<n>` | warning attached to an `installed_*` outcome |
 | `provenance_limit` | capture skipped before disk mutation because the objects this save carries over already come from 16 producers and the current producer is new; the previous entry is retained rather than misattributing new bytes |
@@ -608,9 +608,15 @@ copies each object with `copy_file_range` where the kernel has it. A file
 restores into any slot index and after a restart; the resume key and adapter identity decide as for any entry.
 A file without the magic is a legacy library file (§8).
 
-Under dynamic VBR the entry is one artifact (§11). Its import needs an
-otherwise empty cache, so a restore while any other slot holds a conversation
-is `cache_shared`, a 400, checked before the file is opened. A placed entry is
+Under dynamic VBR the entry is one artifact (§11). Into an otherwise empty
+cache it is imported whole. Beside other slots it is inserted: the other
+slots' cells stay where they are, the file's rows take free cells, and a
+recurrent state takes a free state cell. The insertion is refused with a 400,
+leaving the other slots untouched, when the other slots hold the cache at
+tiers other than the file's (`tier_mismatch`; restore it while they are
+empty), when the cache has sliding-window or indexed attention
+(`cache_shared`), and when the free cells do not hold the file
+(`context_too_small`). A placed entry is
 not whole without its pool and is refused by export and import; a slot-file
 save therefore captures a whole, compact (packed rows) artifact.
 

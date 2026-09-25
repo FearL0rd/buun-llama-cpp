@@ -1155,6 +1155,36 @@ static void test_complete_tree_barrier_fail_closed() {
               expected, live, { provider, provider }) ==
           vbr_adopt_status::required_companion_unavailable);
 
+    // A shared recurrent target is non-empty at the barrier only when it
+    // implements the prepare the manifest selects.
+    empty = false;
+    provider.prepare_replacement = [](
+            const void *, std::unique_ptr<vbr_parsed_companion_image>,
+            std::unique_ptr<vbr_parsed_companion_image>, llama_seq_id,
+            std::unique_ptr<vbr_prepared_companion_image> &) noexcept {
+        return false;
+    };
+    CHECK(vbr_adopt_check_complete_tree(
+              expected, live, { provider }, true, false) ==
+          vbr_adopt_status::adopted);
+    CHECK(vbr_adopt_check_complete_tree(
+              expected, live, { provider }, true, true) ==
+          vbr_adopt_status::target_drift);
+    provider.prepare_insertion = [](
+            const void *, std::unique_ptr<vbr_parsed_companion_image>,
+            llama_seq_id,
+            std::unique_ptr<vbr_prepared_companion_image> &) noexcept {
+        return false;
+    };
+    CHECK(vbr_adopt_check_complete_tree(
+              expected, live, { provider }, true, true) ==
+          vbr_adopt_status::adopted);
+    CHECK(vbr_adopt_check_complete_tree(expected, live, { provider }) ==
+          vbr_adopt_status::target_drift);
+    provider.prepare_replacement = nullptr;
+    provider.prepare_insertion = nullptr;
+    empty = true;
+
     auto * qsa = reinterpret_cast<llama_memory_hybrid_idx *>(
         uintptr_t(0x4040));
     live[0].qsa_index_owner = qsa;

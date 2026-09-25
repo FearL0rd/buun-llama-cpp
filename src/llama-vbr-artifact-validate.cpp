@@ -1327,11 +1327,14 @@ vbr_manifest_validation_result vbr_validate_unit_manifest_snapshot(
                  policy.destination_sequence ||
              policy.occupied_replacement->incoming_artifact() !=
                  package.reference_artifact() ||
-             !policy.occupied_replacement->recovery_package() ||
+             (!policy.occupied_replacement->recovery_package() &&
+              !policy.occupied_replacement->absent_destination()) ||
              policy.occupied_representation_identity == nullptr)) {
             return terminal_result(
                 vbr_manifest_validation_status::unavailable);
         }
+        const bool absent_insertion = occupied_replacement &&
+            policy.occupied_replacement->absent_destination();
         if (manifest.version <
                 VBR_UNIT_ARTIFACT_FORMAT_VERSION_REFERENCE_PLACEMENT) {
             return terminal_result(
@@ -1843,7 +1846,8 @@ vbr_manifest_validation_result vbr_validate_unit_manifest_snapshot(
             plan.target_cookie = target_companion->target_cookie;
             plan.source = companion.payload;
             plan.parsed = std::move(parsed);
-            if (occupied_replacement &&
+            // An absent destination has nothing to roll back to.
+            if (occupied_replacement && !absent_insertion &&
                 (companion.descriptor.kind ==
                      vbr_artifact_companion_kind::recurrent ||
                  companion.descriptor.kind ==
@@ -2033,12 +2037,17 @@ vbr_manifest_validation_result vbr_validate_unit_manifest_snapshot(
             return terminal_result(vbr_manifest_validation_status::internal_error);
         }
         if (occupied_replacement) {
-            if (target.destination_sequence_absent || target.children.size() != 1 ||
+            if (target.destination_sequence_absent != absent_insertion ||
+                target.children.size() != 1 ||
                 target.children.front().empty ||
                 manifest.stream_placements.size() != 1 ||
                 child_plans.empty()) {
                 return terminal_result(
                     vbr_manifest_validation_status::target_not_empty);
+            }
+            if (absent_insertion && needs_transform) {
+                return terminal_result(
+                    vbr_manifest_validation_status::geometry_mismatch);
             }
             const auto & mappings =
                 policy.occupied_replacement->cell_mapping();

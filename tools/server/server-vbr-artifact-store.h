@@ -370,6 +370,10 @@ struct server_vbr_artifact_import_target {
     uint64_t unowned_cells = 0;
     // see vbr_adopt_policy::pack_rows
     bool pack_rows = false;
+    // Insert into a live pool whose other sequences stay resident. The
+    // destination must hold no cells and the schedule must match the live
+    // degrade cursor exactly.
+    bool absent_insertion = false;
     std::string execution_identity;
     std::string adapter_config_identity;
     bool previously_observed = false;

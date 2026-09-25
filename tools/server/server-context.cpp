@@ -7068,9 +7068,6 @@ private:
     // A slot file back into the slot: an entry read where the file lies, installed, and dropped. `bytes`
     // is the file's size.
     json slot_file_restore(server_slot & slot, const std::string & filepath, uint64_t & bytes) {
-        if (resume_vbr() && resume_cache_shared(slot)) {
-            return resume_skipped("cache_shared");  // before the file is opened
-        }
         resume_slot_file_scope scope(*this, slot);
         std::string id;
         std::string error;
@@ -7502,8 +7499,14 @@ private:
         if (const char * why = resume_vbr_inadmissible(restored, manifest, slot)) {
             return resume_skipped(why);
         }
-        if (resume_cache_shared(slot)) {
-            return resume_skipped("cache_shared");
+        // A slot file comes into a live pool: its rows take free cells under the live degrade
+        // cursor, the other conversations stay. Anything else takes an empty cache.
+        const bool shared = resume_cache_shared(slot);
+        if (shared) {
+            if (!resume_slot_file) {
+                return resume_skipped("cache_shared");
+            }
+            group = nullptr;
         }
         if (slot.prompt.n_tokens() > 0) {
             slot.prompt_clear();
@@ -7590,7 +7593,9 @@ private:
             publish_state.expect_epoch  = manifest.sequence_epoch;
 
             auto target = vbr_import_target_for(slot, memory, uint64_t(manifest.n_tokens), adapter);
-            target.pack_rows       = resume_slot_file;
+            target.pack_rows       = resume_slot_file && !shared;
+            target.absent_insertion    = shared;
+            target.previously_observed = shared;
             target.publish_context = &publish_state;
             target.prepare_publish = vbr_import_prepare_publish;
             target.publish         = vbr_import_publish;
@@ -7610,6 +7615,7 @@ private:
                 {"schedule", vbr_import_schedule_status_name(imported.schedule_status)},
                 {"destination", vbr_import_destination_status_name(imported.destination_status)},
                 {"adopt", vbr_adopt_status_name(imported.adopt_status)},
+                {"guard", vbr_occupied_replacement_guard_status_name(imported.occupied_guard_status)},
                 {"worst_steps", imported.precision.worst_steps},
                 {"deficit", imported.precision.deficit},
                 {"weight", imported.precision.weight},
@@ -7630,6 +7636,16 @@ private:
         }
         if (imported.status != server_vbr_artifact_import_status::ok) {
             slot.mandatory_recovery_reset(server_cache_destruction_reason::restore_failure);
+            // what the live pool cannot take is the request's to change, not a failure
+            if (shared) {
+                using guard_status = vbr_occupied_replacement_guard_status;
+                switch (imported.occupied_guard_status) {
+                    case guard_status::unsupported_tree:     return resume_skipped("cache_shared");
+                    case guard_status::tier_mismatch:        return resume_skipped("tier_mismatch");
+                    case guard_status::capacity_unavailable: return resume_skipped("context_too_small");
+                    default:                                 break;
+                }
+            }
             return refusal(imported);
         }
         common_speculative_sequence_transition(slot.get_spec(), slot.id, vbr_restore_event_for(slot.id, payload));
@@ -18771,10 +18787,14 @@ private:
                         resume_log(status);
                         if (!resume_installed(status)) {
                             // skipped: the file is not for this server (key, adapter, projector),
-                            // or a dynamic VBR cache holds another conversation
+                            // or a dynamic VBR cache holds other conversations it cannot insert beside
                             std::string reason = status.value("reason", std::string());
                             if (reason == "cache_shared") {
-                                reason += ": a dynamic VBR cache restores a slot only while the other slots are empty";
+                                reason += ": this dynamic VBR cache (sliding-window or indexed attention) restores a slot "
+                                          "only while the other slots are empty";
+                            } else if (reason == "tier_mismatch") {
+                                reason += ": the other slots hold the dynamic VBR cache at different tiers than the file; "
+                                          "restore it while they are empty";
                             }
                             send_error(task, "Unable to restore slot: " + reason,
                                        status.value("outcome", "") == "skipped" ? ERROR_TYPE_INVALID_REQUEST

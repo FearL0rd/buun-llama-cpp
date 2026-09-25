@@ -42,6 +42,22 @@ vbr_explicit_prepare_occupied_replacement_guard(
     const std::vector<vbr_target_companion_snapshot> * external_companions =
         nullptr) noexcept;
 
+// The same for a destination that holds nothing in an occupied pool. Refuses
+// with destination_present when it holds cells, tier_mismatch when the
+// incoming schedule is not exact under the live degrade cursor.
+vbr_occupied_replacement_guard_status
+vbr_explicit_prepare_absent_insertion_guard(
+    llama_memory_i & memory,
+    llama_seq_id destination,
+    const vbr_artifact_package_view & incoming,
+    const std::vector<llama_vbr_artifact_domain_binding> & bindings,
+    uint64_t accounting_serial,
+    const void * representation_context,
+    vbr_explicit_representation_identity_fn representation_identity,
+    vbr_occupied_replacement_guard & output,
+    const std::vector<vbr_target_companion_snapshot> * external_companions =
+        nullptr) noexcept;
+
 vbr_occupied_replacement_guard_status
 vbr_explicit_prepare_occupied_prefix_replacement_guard(
     llama_memory_i & memory,

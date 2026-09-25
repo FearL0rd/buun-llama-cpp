@@ -2580,6 +2580,70 @@ static void test_dependency_scoped_projected_catalog_publication() {
               shared_alias.observation, shared_alias_guard) ==
           vbr_occupied_replacement_guard_status::ownership_mismatch);
     shared_guard.reset();
+
+    // Absent insertion: the destination holds nothing, another sequence owns
+    // half the pool, and the incoming rows take the free half with the live
+    // controller as the only witness.
+    occupied_guard_fixture absent_pool = occupied;
+    absent_pool.target.destination_sequence_absent = true;
+    for (auto & cell : absent_pool.cells) {
+        cell.owner_sequence = 93;
+        cell.owns_destination = false;
+        cell.token = llama_token(2000+cell.physical_cell);
+    }
+    absent_pool.bind();
+    vbr_occupied_replacement_guard absent_guard;
+    CHECK(vbr_prepare_absent_insertion_guard(
+              absent_pool.target, occupied_view,
+              absent_pool.observation, absent_guard) ==
+          vbr_occupied_replacement_guard_status::ready);
+    CHECK(absent_guard.ready());
+    CHECK(absent_guard.absent_destination());
+    CHECK(absent_guard.strategy() ==
+          vbr_occupied_replacement_strategy::provisional_free_cells);
+    CHECK(absent_guard.recovery_runs().empty());
+    CHECK(absent_guard.cell_mapping().size() == 8);
+    CHECK(absent_guard.cell_mapping().front()
+              .destination_physical_cell == 8);
+    CHECK(absent_guard.preserved_cells().size() == 8);
+    CHECK(absent_guard.preserved_cells().front().owner_sequence == 93);
+    CHECK(absent_guard.preserved_cells().front().token == 2000);
+    CHECK(vbr_recheck_occupied_replacement_guard(
+              absent_guard, absent_pool.target, absent_pool.observation) ==
+          vbr_occupied_replacement_guard_status::ready);
+    auto absent_mutant = absent_pool;
+    ++absent_mutant.cells.back().token;
+    absent_mutant.bind();
+    CHECK(vbr_recheck_occupied_replacement_guard(
+              absent_guard, absent_mutant.target,
+              absent_mutant.observation) ==
+          vbr_occupied_replacement_guard_status::currency_changed);
+    CHECK(!absent_guard.ready());
+
+    auto absent_present = absent_pool;
+    absent_present.target.destination_sequence_absent = false;
+    absent_present.bind();
+    CHECK(vbr_prepare_absent_insertion_guard(
+              absent_present.target, occupied_view,
+              absent_present.observation, absent_guard) ==
+          vbr_occupied_replacement_guard_status::destination_present);
+    absent_present = absent_pool;
+    absent_present.cells.front().owner_sequence = 92;
+    absent_present.cells.front().owns_destination = true;
+    absent_present.bind();
+    CHECK(vbr_prepare_absent_insertion_guard(
+              absent_present.target, occupied_view,
+              absent_present.observation, absent_guard) ==
+          vbr_occupied_replacement_guard_status::destination_present);
+    // The other sequences sit at a later degrade cursor than the file.
+    auto absent_tiered = absent_pool;
+    absent_tiered.target.children.front().controller_policy.cursor++;
+    absent_tiered.bind();
+    CHECK(vbr_prepare_absent_insertion_guard(
+              absent_tiered.target, occupied_view,
+              absent_tiered.observation, absent_guard) ==
+          vbr_occupied_replacement_guard_status::tier_mismatch);
+    CHECK(!absent_guard.ready());
     auto full_pool_mutant = full_pool;
     full_pool_mutant.cells.back().physical_cell = 6;
     full_pool_mutant.bind();

@@ -109,6 +109,7 @@ class vbr_recurrent_prepared_image final :
     std::vector<uint32_t> rollback_valid_depth;
     std::unique_ptr<vbr_recurrent_parsed_image> recovery;
     bool destination_was_empty = false;
+    bool insertion = false;
     size_t replacement_physical = 0;
     uint32_t replacement_source_row = 0;
     llama_pos replacement_position = -1;
@@ -417,6 +418,71 @@ class vbr_recurrent_prepared_image final :
         return write_rows(*target, uint32_t(physical), *parsed);
     }
 
+    // An empty cell whose row no live cell reads: its bytes are not logical
+    // state, so writing it needs no rollback journal.
+    static bool insertion_cell_free(
+            const llama_memory_recurrent & target, size_t physical) noexcept {
+        if (physical >= target.cells.size() ||
+            !target.cells[physical].is_empty()) {
+            return false;
+        }
+        return std::none_of(target.cells.begin(), target.cells.end(),
+            [physical](const llama_memory_recurrent::mem_cell & cell) {
+                return !cell.is_empty() && cell.src == int32_t(physical);
+            });
+    }
+
+    static bool destination_absent(
+            const llama_memory_recurrent & target,
+            llama_seq_id destination) noexcept {
+        return destination >= 0 &&
+            uint32_t(destination) < target.n_seq_max &&
+            size_t(destination) < target.cells.size() &&
+            target.cells[size_t(destination)].tail < 0 &&
+            std::none_of(target.cells.begin(), target.cells.end(),
+                [destination](const llama_memory_recurrent::mem_cell & cell) {
+                    return cell.has_seq_id(destination);
+                });
+    }
+
+    static bool prepare_insertion(
+            const void * context,
+            std::unique_ptr<vbr_parsed_companion_image> parsed_base,
+            llama_seq_id destination,
+            std::unique_ptr<vbr_prepared_companion_image> & output) noexcept {
+        output.reset();
+        auto * target = static_cast<llama_memory_recurrent *>(
+            const_cast<void *>(context));
+        const auto * parsed = dynamic_cast<const vbr_recurrent_parsed_image *>(
+            parsed_base.get());
+        if (!target || !parsed || !parsed_compatible(*target, *parsed) ||
+            !destination_absent(*target, destination)) {
+            return false;
+        }
+        size_t physical = 0;
+        while (physical < target->cells.size() &&
+               !insertion_cell_free(*target, physical)) {
+            ++physical;
+        }
+        if (physical == target->cells.size() || physical > UINT32_MAX) {
+            return false;
+        }
+        try {
+            auto image = std::make_unique<vbr_recurrent_prepared_image>();
+            image->target = target;
+            image->destination = destination;
+            image->insertion = true;
+            image->replacement_physical = physical;
+            image->replacement_source_row = uint32_t(physical);
+            image->replacement_position = parsed->position;
+            image->replacement_binding_epoch = target->tensor_binding_epoch_;
+            output = std::move(image);
+        } catch (...) {
+            return false;
+        }
+        return write_rows(*target, uint32_t(physical), *parsed);
+    }
+
     static void publish(
             const void * context,
             vbr_prepared_companion_image & base) noexcept {
@@ -436,6 +502,12 @@ class vbr_recurrent_prepared_image final :
         } else {
             GGML_ASSERT(image.replacement_physical < target->cells.size());
             auto & cell = target->cells[image.replacement_physical];
+            if (image.insertion) {
+                cell.seq_id.insert(image.destination);
+                target->cells[size_t(image.destination)].tail =
+                    int32_t(image.replacement_physical);
+                target->used += 1;
+            }
             cell.pos = image.replacement_position;
             cell.src = int32_t(image.replacement_physical);
             cell.src0 = -1;
@@ -459,6 +531,12 @@ class vbr_recurrent_prepared_image final :
                     image->replacement_binding_epoch &&
                 target_empty(context);
         }
+        if (image->insertion) {
+            return target->tensor_binding_epoch_ ==
+                    image->replacement_binding_epoch &&
+                destination_absent(*target, image->destination) &&
+                insertion_cell_free(*target, image->replacement_physical);
+        }
         size_t physical = 0;
         uint32_t row = 0;
         // The controller operation excludes decode writers until the no-fail
@@ -480,7 +558,7 @@ class vbr_recurrent_prepared_image final :
         if (!image.target) {
             return false;
         }
-        if (image.destination_was_empty) {
+        if (image.destination_was_empty || image.insertion) {
             return true;
         }
         // A pending speculative rollback reads a snapshot plane. Preparation
@@ -618,6 +696,8 @@ vbr_companion_adoption_provider vbr_recurrent_companion_adoption_provider(
     provider.prepare = &vbr_recurrent_prepared_image::prepare;
     provider.prepare_replacement =
         &vbr_recurrent_prepared_image::prepare_replacement;
+    provider.prepare_insertion =
+        &vbr_recurrent_prepared_image::prepare_insertion;
     provider.target_empty = &vbr_recurrent_prepared_image::target_empty;
     provider.recheck = &vbr_recurrent_prepared_image::recheck;
     provider.publish_swap = &vbr_recurrent_prepared_image::publish;

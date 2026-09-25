@@ -142,7 +142,8 @@ vbr_adopt_status vbr_adopt_check_complete_tree(
         const std::vector<vbr_adopt_expected_attention> & expected,
         const std::vector<llama_memory_tree_child> & live,
         const std::vector<vbr_companion_adoption_provider> & companions,
-        bool occupied_replacement) noexcept {
+        bool occupied_replacement,
+        bool absent_insertion) noexcept {
     const size_t live_attention = std::count_if(
         live.begin(), live.end(),
         [](const llama_memory_tree_child & child) {
@@ -182,9 +183,11 @@ vbr_adopt_status vbr_adopt_check_complete_tree(
             if (duplicate != companions.end()) {
                 return vbr_adopt_status::required_companion_unavailable;
             }
-            if (!prepared->target_empty(prepared->context) &&
-                (!occupied_replacement ||
-                 prepared->prepare_replacement == nullptr)) {
+            const bool shared_target = occupied_replacement &&
+                (absent_insertion
+                    ? prepared->prepare_insertion != nullptr
+                    : prepared->prepare_replacement != nullptr);
+            if (!prepared->target_empty(prepared->context) && !shared_target) {
                 return vbr_adopt_status::target_drift;
             }
         }
@@ -2087,6 +2090,8 @@ vbr_adopt_result vbr_adopt_empty_manifest(
         out.decision = manifest->decision();
         const bool occupied_replacement =
             manifest->is_occupied_replacement();
+        const bool absent_insertion = occupied_replacement &&
+            manifest->occupied_replacement()->absent_destination();
         recycle = occupied_replacement &&
             manifest->occupied_replacement()->strategy() ==
                 vbr_occupied_replacement_strategy::recycle_incumbent_cells;
@@ -2446,6 +2451,11 @@ vbr_adopt_result vbr_adopt_empty_manifest(
             const bool replacement = plan.recovery_parsed != nullptr;
             const bool layout_aware = provider != server_hooks.companions.end() &&
                 provider->attention_child_id != UINT32_MAX;
+            // Only providers whose target is shared across sequences declare
+            // an insertion path; per-destination companions stay on prepare.
+            const bool insertion = absent_insertion &&
+                provider != server_hooks.companions.end() &&
+                provider->prepare_insertion != nullptr;
             vbr_companion_attention_layout companion_layout;
             if (layout_aware) {
                 const auto child = children.find(provider->attention_child_id);
@@ -2466,13 +2476,17 @@ vbr_adopt_result vbr_adopt_empty_manifest(
                 provider->publish_swap == nullptr ||
                 provider->target_empty == nullptr ||
                 !plan.parsed ||
-                (!replacement &&
+                (!replacement && !insertion &&
                  !provider->target_empty(provider->context))) {
                 return fail(vbr_adopt_status::companion_failed);
             }
             std::unique_ptr<vbr_prepared_companion_image> image;
             const size_t prepared_before = companions.size();
-            const bool prepared = replacement
+            const bool prepared = insertion
+                ? provider->prepare_insertion(
+                    provider->context, std::move(plan.parsed), destination,
+                    image)
+                : replacement
                 ? layout_aware
                     ? provider->prepare_replacement_with_layout(
                         provider->context, std::move(plan.parsed),
@@ -2589,7 +2603,7 @@ vbr_adopt_result vbr_adopt_empty_manifest(
         }
         const auto tree_status = vbr_adopt_check_complete_tree(
             expected_attention, barrier_tree, prepared_providers,
-            occupied_replacement);
+            occupied_replacement, absent_insertion);
         if (tree_status != vbr_adopt_status::adopted) {
             return fail(tree_status);
         }
