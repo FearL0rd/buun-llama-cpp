@@ -879,6 +879,19 @@ static int ragged_tcq1_shared_bt(int device) {
     return use_shared[device];
 }
 
+// TURBO_TCQ3_ENC_LEGACY=1 selects the block-wide turbo3_tcq encoder instead of the warp encoder
+// (same output; kept for A/B). HIP keeps the width-tuned block encoder.
+#if !defined(GGML_USE_HIP)
+static bool tcq3_enc_legacy() {
+    static int legacy = -1;
+    if (legacy < 0) {
+        const char * env = getenv("TURBO_TCQ3_ENC_LEGACY");
+        legacy = env && atoi(env) != 0;
+    }
+    return legacy;
+}
+#endif
+
 template<typename idx_t>
 static int ragged_tcq3_shared_bt(int device) {
     static int use_shared[GGML_CUDA_MAX_DEVICES] = {};
@@ -1388,6 +1401,13 @@ static void set_rows_cuda(ggml_backend_cuda_context & ctx, const ggml_tensor * s
                                 ne00_fd, ne01_fd, ne02_fd, ne11_fd, ne12_fd);
                         }
 #else
+                        if (!tcq3_enc_legacy()) {
+                            k_set_rows_turbo3_tcq_warp<idx_t><<<(int)n_blk_total, 32, 0, stream>>>(
+                                (const float *) src0_d, src1_d, (block_turbo3_tcq *) ragged_tcq_tmp3[ctx.device],
+                                n_blk_total, ne00, ne01, ne02, ne10, ne11, ne12, ne13,
+                                s01_f, s02_f, s03_f, s10_i, s11_i, s12_i, rg_is_k, kvmean_mu, qs1, qs2, qs3,
+                                ne00_fd, ne01_fd, ne02_fd, ne11_fd, ne12_fd);
+                        } else
                         k_set_rows_turbo3_tcq<TCQ3_ENC_NT, idx_t><<<(int)n_blk_total, TCQ3_ENC_NT, use_shared ? 128 * 64 : 0, stream>>>(
                             (const float *) src0_d, src1_d, (block_turbo3_tcq *) ragged_tcq_tmp3[ctx.device],
                             n_blk_total, tcq_bt_buf[ctx.device], use_shared, ne00, ne01, ne02, ne10, ne11, ne12, ne13,
@@ -1708,6 +1728,13 @@ static void set_rows_cuda(ggml_backend_cuda_context & ctx, const ggml_tensor * s
                     ne00_fd, ne01_fd, ne02_fd, ne11_fd, ne12_fd);
             }
 #else
+            if (!tcq3_enc_legacy()) {
+                k_set_rows_turbo3_tcq_warp<idx_t><<<(int)ne_total_groups, 32, 0, stream>>>(
+                    src0_d, src1_d, (block_turbo3_tcq *)dst->data,
+                    ne_total_groups, ne00, ne01, ne02, ne10, ne11, ne12, ne13,
+                    s01_f, s02_f, s03_f, s10_i, s11_i, s12_i, iq_is_k, kvmean_mu, nb1, nb2, nb3,
+                    ne00_fd, ne01_fd, ne02_fd, ne11_fd, ne12_fd);
+            } else
             k_set_rows_turbo3_tcq<TCQ3_ENC_NT, idx_t><<<(int)ne_total_groups, TCQ3_ENC_NT, shared_bytes, stream>>>(
                 src0_d, src1_d, (block_turbo3_tcq *)dst->data,
                 ne_total_groups, tcq_bt_buf[ctx.device], tcq3_use_shared_bt[ctx.device], ne00, ne01, ne02, ne10, ne11, ne12, ne13,
