@@ -464,6 +464,7 @@ llama_model_diffusion_gemma::graph::graph(const llama_model & model, const llm_g
         if (hparams.swa_type != LLAMA_SWA_TYPE_NONE) {
             uptr->self_kq_mask_swa = ggml_new_tensor_4d(ctx0, type_mask, n_kv, C, 1, 1);
             ggml_set_input(uptr->self_kq_mask_swa);
+            ggml_set_name(uptr->self_kq_mask_swa, "self_kq_mask_dg");
             uptr->self_kq_mask_swa_cnv = uptr->self_kq_mask_swa;
         }
         inp_attn = (llm_graph_input_attn_no_cache *) res->add_input(std::move(uptr));
@@ -477,6 +478,7 @@ llama_model_diffusion_gemma::graph::graph(const llama_model & model, const llm_g
         if (hparams.swa_type != LLAMA_SWA_TYPE_NONE) {
             uptr->self_kq_mask_swa = ggml_new_tensor_4d(ctx0, type_mask, n_kv, n_tokens, 1, 1);
             ggml_set_input(uptr->self_kq_mask_swa);
+            ggml_set_name(uptr->self_kq_mask_swa, "self_kq_mask_dg");
             uptr->self_kq_mask_swa_cnv = uptr->self_kq_mask_swa;
         }
         inp_attn = (llm_graph_input_attn_no_cache *) res->add_input(std::move(uptr));
@@ -489,6 +491,7 @@ llama_model_diffusion_gemma::graph::graph(const llama_model & model, const llm_g
         if (hparams.swa_type != LLAMA_SWA_TYPE_NONE) {
             uptr->self_kq_mask_swa = ggml_new_tensor_4d(ctx0, type_mask, n_tokens, n_tokens, 1, 1);
             ggml_set_input(uptr->self_kq_mask_swa);
+            ggml_set_name(uptr->self_kq_mask_swa, "self_kq_mask_dg");
             uptr->self_kq_mask_swa_cnv = uptr->self_kq_mask_swa;
         }
         inp_attn = (llm_graph_input_attn_no_cache *) res->add_input(std::move(uptr));
