@@ -989,6 +989,8 @@ if (NOT LLAMA_USE_SYSTEM_GGML)
     llama_build_and_test(test-alloc.cpp)
     llama_build_and_test(test-backend-meta-replay.cpp)
     set_tests_properties(test-backend-meta-replay PROPERTIES SKIP_RETURN_CODE 77)
+    llama_build_and_test(test-backend-meta-partial-io.cpp)
+    set_tests_properties(test-backend-meta-partial-io PROPERTIES SKIP_RETURN_CODE 77)
 endif()
 
 llama_build(test-export-graph-ops.cpp)

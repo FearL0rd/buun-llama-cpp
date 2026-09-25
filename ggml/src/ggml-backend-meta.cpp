@@ -1576,12 +1576,45 @@ static void ggml_backend_meta_exl3_columns(const ggml_tensor * tensor,
     }
 }
 
+// The unit a get/set of a split tensor splices the shards in: the paths below take whole rows
+// along the split, 0 when any byte range will do.
+static size_t ggml_backend_meta_io_granule(const ggml_tensor * tensor, const ggml_backend_meta_split_state & split_state) {
+    if (split_state.axis < 0 || split_state.axis > GGML_BACKEND_SPLIT_AXIS_2) {
+        return 0;
+    }
+    if (split_state.n_segments != 1 || split_state.nr[0] != 1) {
+        return split_state.axis == GGML_BACKEND_SPLIT_AXIS_0 ? tensor->nb[1] : tensor->nb[2];
+    }
+    return tensor->nb[split_state.axis + 1];
+}
+
+// [offset, offset + size) widened to whole granules; false when it already is
+static bool ggml_backend_meta_io_widen(size_t granule, size_t offset, size_t size, size_t & start, size_t & end) {
+    if (granule == 0 || (offset % granule == 0 && size % granule == 0)) {
+        return false;
+    }
+    start = offset - offset % granule;
+    end   = (offset + size + granule - 1) / granule * granule;
+    return true;
+}
+
+static void ggml_backend_meta_buffer_get_tensor(ggml_backend_buffer_t buffer, const ggml_tensor * tensor, void * data, size_t offset, size_t size);
+
 static void ggml_backend_meta_buffer_set_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
     const size_t n_bufs = ggml_backend_meta_buffer_n_bufs(buffer);
     const ggml_backend_meta_split_state split_state = ggml_backend_meta_get_split_state(tensor, /*assume_sync =*/ false);
     GGML_ASSERT(ggml_is_contiguous(tensor) || split_state.axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
     if (ggml_type_is_exl3(tensor->type) && split_state.axis == GGML_BACKEND_SPLIT_AXIS_0) {
         ggml_backend_meta_exl3_columns(tensor, split_state, n_bufs, data, nullptr, offset, size);
+        return;
+    }
+    // a range that cuts a row (state streamed in fixed-size pieces) is merged into the rows it touches
+    size_t start, end;
+    if (ggml_backend_meta_io_widen(ggml_backend_meta_io_granule(tensor, split_state), offset, size, start, end)) {
+        std::vector<uint8_t> staging(end - start);
+        ggml_backend_meta_buffer_get_tensor(buffer, tensor, staging.data(), start, staging.size());
+        memcpy(staging.data() + (offset - start), data, size);
+        ggml_backend_meta_buffer_set_tensor(buffer, tensor, staging.data(), start, staging.size());
         return;
     }
     // A whole-tensor upload is staged per device and handed to the simple buffer as ONE full set_tensor:
@@ -1765,6 +1798,13 @@ static void ggml_backend_meta_buffer_get_tensor(ggml_backend_buffer_t buffer, co
     GGML_ASSERT(ggml_is_contiguous(tensor) || split_state.axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
     if (ggml_type_is_exl3(tensor->type) && split_state.axis == GGML_BACKEND_SPLIT_AXIS_0) {
         ggml_backend_meta_exl3_columns(tensor, split_state, n_bufs, nullptr, data, offset, size);
+        return;
+    }
+    size_t start, end;
+    if (ggml_backend_meta_io_widen(ggml_backend_meta_io_granule(tensor, split_state), offset, size, start, end)) {
+        std::vector<uint8_t> staging(end - start);
+        ggml_backend_meta_buffer_get_tensor(buffer, tensor, staging.data(), start, staging.size());
+        memcpy(data, staging.data() + (offset - start), size);
         return;
     }
 
