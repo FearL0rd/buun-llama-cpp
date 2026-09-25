@@ -1,6 +1,7 @@
 #include "server-context.h"
 #include "server-chat.h"
 #include "server-common.h"
+#include "server-diffusion.h"
 #include "server-http.h"
 #include "server-cache-authority.h"
 #include "server-cache-destruction-quote.h"
@@ -3504,6 +3505,10 @@ private:
     bool add_bos_token = true;
     bool is_diffusion  = false;
 
+    // diffusion-gemma canvas model state (0 = masked diffusion / not a canvas model)
+    int32_t                    diff_canvas_length = 0;
+    server_diffusion_eb_params diff_eb            = {};
+
     // hybrid/recurrent models need re-evaluation of accepted tokens after
     // rejecting draft tokens, because the recurrent state cannot be rolled back
     bool needs_reeval = false;
@@ -6822,6 +6827,59 @@ private:
 
         if (is_diffusion) {
             SRV_INF("%s", "diffusion model detected — enabling self-speculation\n");
+        }
+
+        // diffusion-gemma canvas model: fixed-size canvas, entropy-bound generation. Enable the
+        // self-conditioning subgraph now so the graph shape is stable from the first decode
+        // (set_sc is a documented no-op for other models). EB params: GGUF metadata, then
+        // reference defaults, then --diffusion-* overrides.
+        {
+            char canvas_str[32] = {};
+            if (llama_model_meta_val_str(model_tgt, "diffusion.canvas_length", canvas_str, sizeof(canvas_str)) >= 0) {
+                diff_canvas_length = (int32_t) strtol(canvas_str, nullptr, 10);
+            }
+        }
+        if (diff_canvas_length > 0) {
+            llama_diffusion_set_sc(model_tgt, nullptr, /*use_sc*/ 0.0f, /*temp_inv*/ 1.0f, /*enabled*/ true);
+            auto meta_f = [&](const char * key, float def) -> float {
+                char buf[32];
+                return llama_model_meta_val_str(model_tgt, key, buf, sizeof(buf)) >= 0 ? strtof(buf, nullptr) : def;
+            };
+            auto meta_i = [&](const char * key, int32_t def) -> int32_t {
+                char buf[32];
+                return llama_model_meta_val_str(model_tgt, key, buf, sizeof(buf)) >= 0 ? (int32_t) strtol(buf, nullptr, 10) : def;
+            };
+            diff_eb.max_denoising_steps  = meta_i("diffusion.eb_max_steps", 48);
+            diff_eb.t_min                = meta_f("diffusion.eb_t_min", 0.4f);
+            diff_eb.t_max                = meta_f("diffusion.eb_t_max", 0.8f);
+            diff_eb.entropy_bound        = meta_f("diffusion.eb_entropy_bound", 0.1f);
+            diff_eb.stability_threshold  = meta_i("diffusion.eb_stability_threshold", 1);
+            diff_eb.confidence_threshold = meta_f("diffusion.eb_confidence_threshold", 0.005f);
+            const auto & dparams = params_base.diffusion;
+            if (dparams.eb_t_min         >= 0)   { diff_eb.t_min                = dparams.eb_t_min; }
+            if (dparams.eb_t_max         >= 0)   { diff_eb.t_max                = dparams.eb_t_max; }
+            if (dparams.eb_entropy_bound >= 0)   { diff_eb.entropy_bound        = dparams.eb_entropy_bound; }
+            if (dparams.eb_stability     >= 0)   { diff_eb.stability_threshold  = dparams.eb_stability; }
+            if (dparams.eb_confidence    >= 0)   { diff_eb.confidence_threshold = dparams.eb_confidence; }
+            if (dparams.eb_max_steps     >  0)   { diff_eb.max_denoising_steps  = dparams.eb_max_steps; }
+            // prefix-KV cache: auto = on for single-GPU (the F32 prompt-KV store is single-device)
+            int gpu_devs = 0;
+            for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
+                const auto dt = ggml_backend_dev_type(ggml_backend_dev_get(i));
+                if (dt == GGML_BACKEND_DEVICE_TYPE_GPU || dt == GGML_BACKEND_DEVICE_TYPE_IGPU) { gpu_devs++; }
+            }
+            if (dparams.eb_kv_cache == 1) {
+                diff_eb.kv_cache = true;
+            } else if (dparams.eb_kv_cache == 2) {
+                diff_eb.kv_cache = false;
+            } else {
+                diff_eb.kv_cache = (gpu_devs <= 1);
+            }
+            SRV_INF("diffusion canvas model: canvas_length=%d, eb: max_steps=%d t=[%.3f,%.3f] "
+                    "entropy_bound=%.4f stability=%d confidence=%.4f kv_cache=%s (%d GPUs)\n",
+                    diff_canvas_length, diff_eb.max_denoising_steps, diff_eb.t_min, diff_eb.t_max,
+                    diff_eb.entropy_bound, diff_eb.stability_threshold, diff_eb.confidence_threshold,
+                    diff_eb.kv_cache ? "on" : "off", gpu_devs);
         }
 
         n_ctx = llama_n_ctx(ctx_tgt);
@@ -19189,6 +19247,15 @@ private:
                 slot.state = SLOT_STATE_GENERATING;
 
                 if (slot.diff_self_spec) {
+                    if (diff_canvas_length > 0) {
+                        // canvas models: the entropy-bound runner regenerates all logits itself;
+                        // the prompt prefill only commits the prompt tokens
+                        SLT_DBG(slot, "diff prefill: n_prompt=%d (canvas model)\n", slot.prompt.n_tokens());
+                        slot.stats.update_prompt_last();
+                        cache_plan_finalize(slot);
+                        slot.i_batch = -1;
+                        return;
+                    }
                     float * logits = llama_get_logits(ctx_tgt);
                     int32_t nv = llama_vocab_n_tokens(vocab);
                     slot.diff_prev_logits.resize(nv);
@@ -19686,6 +19753,55 @@ private:
     // diffusion self-speculation, the spec-cycle report, DFlash tape-off and
     // force_split_seq restore (kept out of post_decode(), which runs per sub-batch)
     void post_cycle() {
+        // canvas diffusion (diffusion-gemma): one request = block-autoregressive entropy-bound
+        // denoising. All steps run synchronously here, like the masked self-spec loop below.
+        // Tokens flow through the normal process_token delivery so streaming, n_predict and
+        // stop handling behave like any other model.
+        auto diffusion_canvas_turn = [&](server_slot & slot) {
+            const int32_t n_prompt = slot.prompt.n_tokens();
+            server_diffusion_eb_params eb = diff_eb;
+            eb.seed = slot.task->params.sampling.seed != LLAMA_DEFAULT_SEED
+                ? (int32_t) slot.task->params.sampling.seed
+                : (int32_t) std::random_device{}();
+
+            const int64_t t_start = ggml_time_us();
+            const std::vector<llama_token> tokens = server_diffusion_generate_canvas(
+                    ctx_tgt, model_tgt, slot.prompt.tokens.get_text_tokens(), slot.id,
+                    eb, diff_canvas_length, slot.task->params.n_predict);
+            // every row this turn wrote is transient: the runner decodes [prompt | canvas]
+            // non-causally, so the K/V rows beyond the prompt are not reusable state
+            server_cache_transient_seq_rm_impl(llama_get_memory(ctx_tgt), slot.id, n_prompt, -1);
+            SLT_INF(slot, "diff canvas: %d tokens in %.1f ms\n",
+                    (int) tokens.size(), (ggml_time_us() - t_start) / 1e3);
+
+            auto accept_special_token = [&](llama_token token) {
+                return params_base.special ||
+                    slot.task->params.sampling.preserved_tokens.find(token) != slot.task->params.sampling.preserved_tokens.end();
+            };
+
+            for (const auto tok : tokens) {
+                completion_token_output result;
+                result.tok          = tok;
+                result.text_to_send = common_token_to_piece(ctx_tgt, tok, accept_special_token(tok));
+                result.prob         = 1.0f;
+                slot.stats.n_gen += 1;
+                if (!process_token(result, slot)) {
+                    slot.print_timings();
+                    send_final_response(slot);
+                    metrics_on_prediction(slot);
+                    slot.release();
+                    return;
+                }
+            }
+            // no EOG / budget stop was hit (block or batch limit): finish with what we have
+            slot.stop           = STOP_TYPE_LIMIT;
+            slot.has_next_token = false;
+            slot.print_timings();
+            send_final_response(slot);
+            metrics_on_prediction(slot);
+            slot.release();
+        };
+
         auto accept_special_token = [&](server_slot & slot, llama_token token) {
             return params_base.special ||
                 slot.task->params.sampling.preserved_tokens.find(token) != slot.task->params.sampling.preserved_tokens.end();
@@ -19694,6 +19810,11 @@ private:
         // diffusion self-speculation — runs independently of the main batch
         for (auto & slot : slots) {
             if (!slot.diff_self_spec || slot.state != SLOT_STATE_GENERATING) {
+                continue;
+            }
+
+            if (diff_canvas_length > 0) {
+                diffusion_canvas_turn(slot);
                 continue;
             }
 

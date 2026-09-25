@@ -43,6 +43,8 @@ add_library(${TARGET} STATIC
     server-queue.h
     server-common.cpp
     server-common.h
+    server-diffusion.cpp
+    server-diffusion.h
     server-context.cpp
     server-context.h
     server-stream.cpp
