@@ -400,6 +400,9 @@ struct vbr_adopt_policy {
     llama_seq_id destination_sequence = -1;
     // Co-residents publish under a fresh lineage: the import is live_rebased.
     const std::vector<vbr_import_co_resident> * co_residents = nullptr;
+    // The reference's rows land from cell 0 instead of at the cells they were
+    // captured from: the image of the cache then ends where they do.
+    bool pack_rows = false;
     bool allow_native = true;
     bool allow_live_rebased = true;
     bool allow_downward = true;

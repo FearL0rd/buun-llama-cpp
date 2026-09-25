@@ -368,6 +368,8 @@ struct server_vbr_artifact_import_target {
     // Rows of the image no sequence of this import takes. They are under the
     // watermark the image publishes, so the destination is priced with them.
     uint64_t unowned_cells = 0;
+    // see vbr_adopt_policy::pack_rows
+    bool pack_rows = false;
     std::string execution_identity;
     std::string adapter_config_identity;
     bool previously_observed = false;

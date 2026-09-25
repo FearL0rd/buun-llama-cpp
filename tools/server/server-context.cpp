@@ -5351,8 +5351,8 @@ private:
     // The conversations the host cache alone holds. A state there has no form a file can take, so
     // each comes back into a slot (the owners' restore of a dynamic cache, the host restore of a
     // fixed one), is saved as a slot's conversation is and gives way to the next. The cache goes
-    // away after this pass and the slots are saved by now: one of them is the stage, each restore
-    // replacing what it holds, and the others leave so that the image saved is of one conversation.
+    // away after this pass and the slots are saved by now, so they leave: one of them is the stage,
+    // and the image saved is of the one conversation it holds.
     size_t resume_capture_hosted(const char * why, server_slot & stage,
                                  const std::vector<const server_slot *> & saved) {
         const bool vbr = resume_vbr();
@@ -5411,11 +5411,7 @@ private:
         for (auto & slot : slots) {
             if (slot.prompt.n_tokens() > 0) {
                 t_used = std::min(t_used, slot.t_last_used);
-                // A replacement wants what it replaces held by the host cache, and a stage that
-                // is not gives way as the others do.
-                if (!vbr || &slot != &stage || !ensure_vbr_replacement_recovery(slot)) {
-                    resume_stage_clear(slot);
-                }
+                resume_stage_clear(slot);
             }
             resume_release_entry(slot);
         }
@@ -5432,12 +5428,15 @@ private:
                 solo.members         = &one;
                 solo.hosted_artifact = vbr ? pinned[i].pin.payload()->reference_artifact().v : 0;
                 const auto restore = [&]() {
+                    // each comes back into an empty cache
+                    resume_stage_clear(stage);
                     if (vbr) {
-                        return try_automatic_vbr_restore(stage, task, {}, nullptr, false, &pinned[i].pin) &&
+                        // packed from cell 0: at the cells they were taken from, the rows
+                        // would make the image saved reach as far as the pool did then
+                        return try_automatic_vbr_restore(stage, task, {}, nullptr, false, &pinned[i].pin, true) &&
                             stage.prompt.n_tokens() == task.tokens.size();
                     }
                     // the state itself: a similarity search may prefer a shorter one it leads
-                    resume_stage_clear(stage);
                     auto source = prompt_cache->states.end();
                     for (auto it = prompt_cache->states.begin(); it != prompt_cache->states.end(); ++it) {
                         if (it->payload.fixed_state_restorable() && it->adapter_config_key == adapter &&
@@ -5450,15 +5449,7 @@ private:
                         stage.prompt_load_entry(*prompt_cache, source) &&
                         stage.prompt.n_tokens() == task.tokens.size();
                 };
-                bool restored = restore();
-                if (vbr && !restored) {
-                    // a cache with no room for two conversations takes one into an empty stage; a
-                    // pin the refused restore consumed is taken again
-                    resume_stage_clear(stage);
-                    restored = (pinned[i].pin.ready() || resume_pin_exact(task.tokens, adapter, pinned[i].pin)) &&
-                        restore();
-                }
-                if (restored) {
+                if (restore()) {
                     // the image reaches as far as the cache has been written
                     llama_memory_breathe(llama_get_memory(ctx_tgt));
                     // 10 ms apart, and never a time that reads as unused
@@ -12724,7 +12715,8 @@ private:
             const common_cache_family_binding & incoming_family,
             size_t * restored_prefix = nullptr,
             bool recovery_refreshed = false,
-            server_prompt_cache_vbr_restore_candidate * prepared = nullptr) noexcept {
+            server_prompt_cache_vbr_restore_candidate * prepared = nullptr,
+            bool pack_rows = false) noexcept {
         if (restored_prefix) {
             *restored_prefix = SIZE_MAX;
         }
@@ -13195,6 +13187,7 @@ private:
 
             const auto make_request = [&]() {
                 auto request = vbr_import_target_for(slot, memory, task.n_tokens(), adapter_identity);
+                request.pack_rows       = pack_rows;
                 request.publish_context = &state;
                 request.prepare_publish = [](
                     void * opaque,

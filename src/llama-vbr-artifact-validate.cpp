@@ -231,8 +231,8 @@ bool authorized_placement_plan(
 bool projected_source_runs(
         const vbr_artifact_package_view & package,
         const std::vector<vbr_artifact_stream_placement> & placements,
-        std::vector<vbr_authorized_cell_run> & runs) {
-    std::vector<uint64_t> packed_rows;
+        std::vector<vbr_authorized_cell_run> & runs,
+        std::vector<uint64_t> & packed_rows) {
     if (placements.size() != 1 ||
         !vbr_projected_packed_rows(package, placements.front(), packed_rows)) {
         return false;
@@ -315,11 +315,14 @@ uint64_t unit_capacity(const vbr_target_unit_snapshot & target) {
 // with fewer slots) lands its reference's rows as a dense prefix, in source
 // physical order: a cell's position, not its index, carries its meaning.
 // When they still overflow, the oldest cells the window already masks are
-// dropped, as a live cache of that size would have pruned them.
+// dropped, as a live cache of that size would have pruned them. A projected
+// package has packed its rows already: a cell then reads the row its range
+// proofs select, source_rows[logical_position].
 bool pack_placement(
         std::vector<vbr_artifact_stream_placement> & placements,
         std::vector<vbr_authorized_cell_run> & runs,
-        uint64_t capacity, llama_pos live_from) {
+        uint64_t capacity, llama_pos live_from,
+        const std::vector<uint64_t> * source_rows) {
     if (placements.size() != 1 || placements.front().cells.empty()) {
         return false;
     }
@@ -359,7 +362,9 @@ bool pack_placement(
     }
     runs.clear();
     for (size_t i = 0; i < cells.size(); ++i) {
-        append_cell_run(runs, uint32_t(i), cells[i].physical_cell);
+        append_cell_run(runs, uint32_t(i), source_rows
+            ? (*source_rows)[size_t(cells[i].logical_position)]
+            : cells[i].physical_cell);
         cells[i].physical_cell = uint32_t(i);
     }
     return true;
@@ -1587,7 +1592,8 @@ vbr_manifest_validation_result vbr_validate_unit_manifest_snapshot(
                 }
             }
             const uint64_t capacity = unit_capacity(*target_unit);
-            const bool pack = capacity < descriptor.wm_cells;
+            const bool projected = !package.projected_ranges().empty();
+            const bool pack = capacity < descriptor.wm_cells || policy.pack_rows;
             const auto & controller =
                 manifest.generation.controllers[descriptor.child_id];
             if (descriptor.logical_unit_id >= controller.units.size()) {
@@ -1634,9 +1640,10 @@ vbr_manifest_validation_result vbr_validate_unit_manifest_snapshot(
                 return terminal_result(
                     vbr_manifest_validation_status::ownership_mismatch);
             }
-            if (!package.projected_ranges().empty() &&
+            std::vector<uint64_t> packed_rows;
+            if (projected &&
                 (!unit_co_cells.empty() ||
-                 !projected_source_runs(package, placements, runs))) {
+                 !projected_source_runs(package, placements, runs, packed_rows))) {
                 return terminal_result(
                     vbr_manifest_validation_status::geometry_mismatch);
             }
@@ -1645,9 +1652,9 @@ vbr_manifest_validation_result vbr_validate_unit_manifest_snapshot(
             uint64_t packed_cells = 0;
             if (pack) {
                 if (occupied_replacement || !unit_co_cells.empty() ||
-                    !package.projected_ranges().empty() ||
                     !pack_placement(placements, runs, capacity,
-                                    target_child->window_live_from)) {
+                                    target_child->window_live_from,
+                                    projected ? &packed_rows : nullptr)) {
                     return terminal_result(
                         vbr_manifest_validation_status::topology_mismatch);
                 }

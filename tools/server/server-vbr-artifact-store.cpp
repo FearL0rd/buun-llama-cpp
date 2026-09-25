@@ -3742,6 +3742,7 @@ server_vbr_artifact_import_output server_vbr_artifact_store::import_package_impl
         };
         policy.destination_sequence = request.destination;
         policy.co_residents = &request.co_residents;
+        policy.pack_rows = request.pack_rows;
         policy.adoption_nonce = impl_->next_reference++;
         if (policy.adoption_nonce == 0) {
             policy.adoption_nonce = impl_->next_reference++;
