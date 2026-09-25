@@ -8571,10 +8571,57 @@ static int ggml_cuda_physical_device_share_count(int device) {
     return info.devices[device].physical_share_count;
 }
 
-void ggml_backend_cuda_get_device_memory(int device, size_t * free, size_t * total) {
+static cudaError_t ggml_cuda_device_memory_info(int device, size_t * free, size_t * total) {
     ggml_cuda_set_device(device);
+    const cudaError_t err = cudaMemGetInfo(free, total);
+#if defined(GGML_USE_HIP) && defined(__linux__)
+    // ROCm 7.2 can charge each small VMM mapping as 2 MiB in hipMemGetInfo:
+    // 2 GiB in 256 KiB chunks reports zero free on a 16 GiB Radeon. Use the
+    // kernel's physical VRAM accounting, which includes other processes and the
+    // desktop. Do not substitute a whole-device total for an APU or partition.
+    if (err == cudaSuccess && !ggml_cuda_info().devices[device].integrated) {
+        char bus_id[32] = {};
+        const int physical = ggml_cuda_info().devices[device].physical_device;
+        if (cudaDeviceGetPCIBusId(bus_id, sizeof(bus_id), physical) == cudaSuccess) {
+            unsigned domain, bus, slot, function;
+            if (sscanf(bus_id, "%x:%x:%x.%x", &domain, &bus, &slot, &function) == 4) {
+                char path[128];
+                const auto read_counter = [&](const char * name, uint64_t & value) {
+                    snprintf(path, sizeof(path), "/sys/bus/pci/devices/%04x:%02x:%02x.%x/%s",
+                            domain, bus, slot, function, name);
+                    FILE * file = fopen(path, "r");
+                    if (!file) {
+                        return false;
+                    }
+                    const bool ok = fscanf(file, "%" SCNu64, &value) == 1;
+                    fclose(file);
+                    return ok;
+                };
+                uint64_t physical_total, used;
+                if (read_counter("mem_info_vram_total", physical_total) &&
+                    read_counter("mem_info_vram_used", used) &&
+                    physical_total == *total && used <= physical_total) {
+                    size_t available = physical_total - used;
+                    // Preserve HIP's optional caller-requested reserve (MiB).
+                    if (const char * env = getenv("HIP_HIDDEN_FREE_MEM")) {
+                        uint64_t mib = 0;
+                        const auto parsed = std::from_chars(env, env + strlen(env), mib);
+                        if (parsed.ec == std::errc() && *parsed.ptr == '\0') {
+                            available = mib > available / (1024 * 1024)
+                                    ? 0 : available - size_t(mib) * 1024 * 1024;
+                        }
+                    }
+                    *free = available;
+                }
+            }
+        }
+    }
+#endif
+    return err;
+}
 
-    CUDA_CHECK(cudaMemGetInfo(free, total));
+void ggml_backend_cuda_get_device_memory(int device, size_t * free, size_t * total) {
+    CUDA_CHECK(ggml_cuda_device_memory_info(device, free, total));
 
     // virtual devices sharing one physical GPU share its memory pool; split it between them
     const int share_count = ggml_cuda_physical_device_share_count(device);
@@ -8721,7 +8768,7 @@ static void ggml_backend_cuda_device_get_memory(ggml_backend_dev_t dev, size_t *
     // context floor (~300-500 MiB), cudaMemGetInfo returns OOM for a NEW process before
     // it has allocated a single byte — report 0 free so the caller's normal failure path
     // produces an honest error instead of an abort (co-tenancy race loser)
-    const cudaError_t err = cudaMemGetInfo(free, total);
+    const cudaError_t err = ggml_cuda_device_memory_info(ctx->device, free, total);
     if (err != cudaSuccess) {
         GGML_LOG_WARN("%s: cudaMemGetInfo failed on device %d (%s) — reporting 0 free\n",
                 __func__, ctx->device, cudaGetErrorString(err));

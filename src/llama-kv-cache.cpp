@@ -3273,9 +3273,11 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare_with_slots(
                 if (p.vmm == nullptr) {
                     continue;
                 }
-                LLAMA_LOG_DEBUG("%s: VBR pool #%zu (device %d): projected %.2f / budget %.2f MiB (mapped %.2f) at %u cells\n",
+                LLAMA_LOG_DEBUG("%s: VBR pool #%zu (device %d): projected %.2f / budget %.2f MiB "
+                        "(effective %.2f, mapped %.2f) at %u cells\n",
                         __func__, pi, p.device, vbr_vmm_projected_bytes(p, wm_next)/1024.0/1024.0,
-                        p.budget/1024.0/1024.0, p.be->vmm_pool_mapped(p.vmm)/1024.0/1024.0, wm_next);
+                        p.budget/1024.0/1024.0, vbr_budget_eff(p)/1024.0/1024.0,
+                        p.be->vmm_pool_mapped(p.vmm)/1024.0/1024.0, wm_next);
             }
             // Runtime-growth demand: the trigger is band-spent and under pressure this
             // boundary (pre-own-loop snapshot) — the own loop's exit makes post-loop
