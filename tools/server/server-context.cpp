@@ -3739,6 +3739,11 @@ private:
     // the host cache holds one (0 otherwise): a conversation that comes back from that node is the
     // state the image is of, as a slot's lineage vouches for its own. Within this process only.
     std::map<std::string, uint64_t> resume_unslotted;
+    // A slot file (--slot-save-path) is one entry of this store, written and read by the resume
+    // save and install. It holds no conversation between two requests.
+    std::unique_ptr<server_resume_store> slot_file_store;
+    // set while a slot file goes through: see resume_slot_file_scope
+    bool resume_slot_file = false;
     uint64_t frontier_next_sequence_epoch = 1;
     uint64_t frontier_ratchet_threshold = 1024;
 
@@ -5032,7 +5037,7 @@ private:
     // model and its parameters do not.
     void resume_open() {
         resume_key = {};
-        if (!params_base.resume) {
+        if (!params_base.resume && params_base.slot_save_path.empty()) {
             return;
         }
         std::array<uint8_t, 32> family = {};
@@ -5041,30 +5046,42 @@ private:
             !llama_model_semantic_family_digest(model_tgt, family.data())) {
             resume_key = {};
             resume_store.reset();
+            slot_file_store.reset();
             SRV_WRN("%s\n", "RESUME event=disabled reason=resume_key_unavailable");
             return;
         }
         resume_key_hex     = server_resume_hex(resume_key.digest.data(), resume_key.digest.size());
         const auto family_hex = server_resume_hex(family.data(), family.size());
+        const bool family_changed = family_hex != resume_family_hex;
+        resume_family_hex = family_hex;
         // a dynamic cache places its window rows, so only a recurrent state is left to the tail
         resume_has_partial =
             llama_model_is_hybrid(model_tgt) || llama_model_is_recurrent(model_tgt) ||
             (llama_model_n_swa(model_tgt) > 0 && !resume_vbr());
-        if (!resume_store || family_hex != resume_family_hex) {
-            resume_family_hex = family_hex;
-            server_resume_reason reason = server_resume_reason::ok;
-            std::string error;
-            resume_store = server_resume_store::open(
-                params_base.resume_path.empty() ? fs_get_cache_directory() : params_base.resume_path,
-                resume_family_hex, reason, error);
-            if (!resume_store) {
-                // a second server of the same family, or a read-only cache: run without persistence
-                SRV_WRN("RESUME event=disabled reason=%s error=%s\n",
-                        server_resume_reason_name(reason), error.c_str());
+        const auto open = [&](std::unique_ptr<server_resume_store> & store, const std::string & root, const char * what,
+                              bool durable) {
+            if (store && !family_changed) {
                 return;
             }
-            SRV_INF("RESUME event=open store=%s key=%.16s partial=%d\n",
-                    resume_store->directory().c_str(), resume_key_hex.c_str(), (int) resume_has_partial);
+            server_resume_reason reason = server_resume_reason::ok;
+            std::string error;
+            store = server_resume_store::open(root, resume_family_hex, reason, error, durable);
+            if (!store) {
+                // a second server of the same family, or a read-only cache: run without persistence
+                SRV_WRN("RESUME event=disabled store=%s reason=%s error=%s\n",
+                        what, server_resume_reason_name(reason), error.c_str());
+                return;
+            }
+            SRV_INF("RESUME event=open store=%s path=%s key=%.16s partial=%d\n",
+                    what, store->directory().c_str(), resume_key_hex.c_str(), (int) resume_has_partial);
+        };
+        if (params_base.resume) {
+            open(resume_store,
+                 params_base.resume_path.empty() ? fs_get_cache_directory() : params_base.resume_path, "resume", true);
+        }
+        if (!params_base.slot_save_path.empty()) {
+            // its entries live for one request; the file of a slot is synced on its own
+            open(slot_file_store, params_base.slot_save_path + ".staging", "slot_files", false);
         }
         if (resume_vbr()) {
             resume_bind_execution();
@@ -5098,21 +5115,32 @@ private:
     // An artifact is bound to the execution identity and the sequence epoch of its capture. Both
     // outlive the process with the store: the identity is the one of the namespace, and no epoch
     // an entry still holds is handed out again. Runs before anything derives from the identity.
+    // Without a resume the slot files keep it, so that a file comes back after a restart.
     void resume_bind_execution() {
+        auto & store = resume_store ? resume_store : slot_file_store;
+        if (!store) {
+            return;
+        }
         std::string error;
         const std::string identity =
-            resume_store->keep_value("execution-identity", frontier_execution_identity, error);
+            store->keep_value("execution-identity", frontier_execution_identity, error);
         if (identity.empty()) {
-            resume_store.reset();
+            store.reset();
             SRV_WRN("RESUME event=disabled reason=execution_identity_unavailable error=%s\n", error.c_str());
             return;
         }
         frontier_execution_identity = identity;
-        for (const auto & entry : resume_store->list()) {
-            if (entry.reason == server_resume_reason::ok && entry.manifest.sequence_epoch < UINT64_MAX) {
-                frontier_next_sequence_epoch =
-                    std::max(frontier_next_sequence_epoch, entry.manifest.sequence_epoch + 1);
+        for (const auto & entry : store->list()) {
+            if (entry.reason == server_resume_reason::ok) {
+                resume_reserve_epoch(entry.manifest);
             }
+        }
+    }
+
+    // an epoch a stored entry carries is not handed out again
+    void resume_reserve_epoch(const server_resume_manifest & manifest) {
+        if (manifest.sequence_epoch < UINT64_MAX) {
+            frontier_next_sequence_epoch = std::max(frontier_next_sequence_epoch, manifest.sequence_epoch + 1);
         }
     }
 
@@ -6821,6 +6849,79 @@ private:
         return status;
     }
 
+    // One slot request of --slot-save-path runs the resume save or install on the slot-file store
+    // in place of the resume store. The slot's conversation in the resume store and what the host
+    // cache vouches for are put aside for the request and back after it.
+    struct resume_slot_file_scope {
+        server_context_impl & ctx;
+        server_slot & slot;
+        std::string entry_id;
+        decltype(server_slot::resume_lineage) lineage;
+        std::map<std::string, uint64_t> unslotted;
+
+        resume_slot_file_scope(server_context_impl & ctx, server_slot & slot) : ctx(ctx), slot(slot) {
+            ctx.resume_store.swap(ctx.slot_file_store);
+            ctx.resume_unslotted.swap(unslotted);
+            ctx.resume_slot_file = true;
+            entry_id = std::move(slot.resume_entry_id);
+            lineage  = slot.resume_lineage;
+            resume_entry_take(slot, {});
+        }
+
+        ~resume_slot_file_scope() {
+            ctx.resume_store.swap(ctx.slot_file_store);
+            ctx.resume_unslotted.swap(unslotted);
+            ctx.resume_slot_file = false;
+            slot.resume_entry_id = std::move(entry_id);
+            slot.resume_lineage  = lineage;
+        }
+
+        // the slot's state is no longer the image of its resume entry
+        void drop_lineage() { lineage = {}; }
+    };
+
+    // The slot as one exported entry of the slot-file store: the checkpoints and partial states
+    // come with it, and a dynamic cache saves through its artifact. `bytes` is the file's size.
+    json slot_file_save(server_slot & slot, const std::string & filepath, uint64_t & bytes) {
+        resume_slot_file_scope scope(*this, slot);
+        std::vector<server_slot *> members = {&slot};
+        resume_group_t group;
+        group.members = &members;
+        json status = resume_capture_slot(slot, group);
+        if (resume_saved(status)) {
+            const std::string id = status["entry"];
+            std::string error;
+            const auto reason = resume_store->export_entry(id, filepath, bytes, error);
+            if (reason != server_resume_reason::ok) {
+                status = resume_failed(reason, error);
+            }
+            resume_drop_entry(id, error);
+        }
+        return status;
+    }
+
+    // A slot file back into the slot: imported as an entry, installed, and dropped again. `bytes`
+    // is the file's size.
+    json slot_file_restore(server_slot & slot, const std::string & filepath, uint64_t & bytes) {
+        if (resume_vbr() && resume_cache_shared(slot)) {
+            return resume_skipped("cache_shared");  // before the file is copied in
+        }
+        resume_slot_file_scope scope(*this, slot);
+        std::string id;
+        std::string error;
+        server_resume_manifest manifest;
+        const auto reason = resume_store->import_entry(filepath, id, manifest, bytes, error);
+        if (reason != server_resume_reason::ok) {
+            return resume_failed(reason, error);
+        }
+        json status = resume_install(slot, id, manifest);
+        resume_drop_entry(id, error);
+        scope.drop_lineage();
+        // the file outlives the store's entries
+        resume_reserve_epoch(manifest);
+        return status;
+    }
+
     static bool resume_installed(const json & status) {
         const std::string outcome = status.value("outcome", "");
         return outcome == "installed_full" || outcome == "installed_prefix";
@@ -7220,6 +7321,14 @@ private:
     // envelope is the owners', so it restores the drafter state it was captured with. The image
     // is of the whole pool: the placed entries of `group` come back in the same import, under
     // their own sequences, and are established as a fixed install establishes a slot.
+    // A dynamic import takes an empty cache, not an empty slot. That also keeps two entries of one
+    // sequence, saved before and after a rewind, out of two slots.
+    bool resume_cache_shared(const server_slot & slot) const {
+        return std::any_of(slots.begin(), slots.end(), [&](const server_slot & other) {
+            return &other != &slot && other.prompt.n_tokens() > 0;
+        });
+    }
+
     json resume_install_artifact(
             server_slot & slot, const std::string & id, const server_resume_manifest & manifest,
             const server_tokens & restored, const std::string & adapter, int64_t t_start,
@@ -7228,11 +7337,7 @@ private:
         if (const char * why = resume_vbr_inadmissible(restored, manifest, slot)) {
             return resume_skipped(why);
         }
-        // The import takes an empty cache, not an empty slot. That also keeps two entries of one
-        // sequence, saved before and after a rewind, out of two slots.
-        if (std::any_of(slots.begin(), slots.end(), [&](const server_slot & other) {
-                return &other != &slot && other.prompt.n_tokens() > 0;
-            })) {
+        if (resume_cache_shared(slot)) {
             return resume_skipped("cache_shared");
         }
         if (slot.prompt.n_tokens() > 0) {
@@ -7320,6 +7425,7 @@ private:
             publish_state.expect_epoch  = manifest.sequence_epoch;
 
             auto target = vbr_import_target_for(slot, memory, uint64_t(manifest.n_tokens), adapter);
+            target.pack_rows       = resume_slot_file;
             target.publish_context = &publish_state;
             target.prepare_publish = vbr_import_prepare_publish;
             target.publish         = vbr_import_publish;
@@ -10393,13 +10499,8 @@ private:
                 params_base.n_cache_reuse = 0;
                 SRV_WRN("%s\n", "cache_reuse is not supported by dynamic VBR (KV tiers change at runtime), it will be disabled");
             }
-            if (!params_base.slot_save_path.empty()) {
-                // llama_state_seq_save_file carries full tier-typed attention KV: a save taken
-                // after any degrade is refused at the lib level, and even entry-tier saves stop
-                // restoring once the target cache has degraded — predictably off beats flaky
-                params_base.slot_save_path.clear();
-                SRV_WRN("%s\n", "slot save/restore (--slot-save-path) is not supported by dynamic VBR (KV tiers change at runtime), it will be disabled");
-            }
+            // Slot files stay: they are saved as resume entries, whose artifact carries the tiers.
+            // The one-state file of llama_state_seq_save_file, which cannot, is refused per request.
             // Context checkpoints (PARTIAL_ONLY):
             //   ordinary hybrid (swa_type == NONE, n_swa == 0) — routed to the recurrent state only
             //     (attention KV skipped, see llama_memory_hybrid::state_write): tier-agnostic and
@@ -10423,9 +10524,8 @@ private:
             }
         }
 
-        // Dynamic VBR may have disabled slot files above.  Hash model shards,
-        // controls, and LoRA sources only for an actually reachable slot-file
-        // endpoint; ordinary servers and the disabled path do no file IO.
+        // Hash model shards, controls, and LoRA sources only for an actually
+        // reachable slot-file endpoint; ordinary servers do no file IO.
         if (!params_base.slot_save_path.empty()) {
             slot_file_runtime_identity =
                 server_slot_file_runtime_identity_build(
@@ -10461,10 +10561,13 @@ private:
 
         // Retention-capacity policy is the normal fixed-cache owner. Explicit
         // --cache-lifecycle still enables the transaction substrate without a
-        // host cache; cache-disabled defaults remain zero-state.
+        // host cache; cache-disabled defaults remain zero-state. A dynamic VBR cache
+        // saves a conversation through the artifact store, which the substrate owns.
         params_base.cache_lifecycle = server_cache_lifecycle_default(
             params_base.cache_lifecycle, prompt_cache != nullptr,
-            params_base.cache_control_api);
+            params_base.cache_control_api) ||
+            (server_vbr_dynamic_active(params_base) &&
+             (params_base.resume || !params_base.slot_save_path.empty()));
         const bool retention_capacity = prompt_cache != nullptr;
         const auto retention_owner_plan = server_retention_owner_plan_for(
             params_base.cache_debug,
@@ -13899,6 +14002,20 @@ private:
             return;
         }
         slot.print_timings_tg();
+    }
+
+    void send_slot_save_load(const server_task & task, const server_slot & slot, bool is_save, size_t n_bytes,
+                             double t_ms, json resume = nullptr) {
+        auto res = std::make_unique<server_task_result_slot_save_load>();
+        res->id       = task.id;
+        res->id_slot  = slot.id;
+        res->filename = task.slot_action.filename;
+        res->is_save  = is_save;
+        res->n_tokens = slot.prompt.tokens.size();
+        res->n_bytes  = n_bytes;
+        res->t_ms     = t_ms;
+        res->resume   = std::move(resume);
+        queue_results.send(std::move(res));
     }
 
     void send_error(const server_task & task, const std::string & error, const enum error_type type = ERROR_TYPE_SERVER) {
@@ -17830,6 +17947,32 @@ private:
                         break;
                     }
 
+                    // The resume format, where the slot-file store is open. A fixed cache it cannot
+                    // take (positions, media) is saved as the one-state file; a dynamic one has no other.
+                    if (slot_file_store && !task.slot_action.legacy) {
+                        uint64_t bytes = 0;
+                        json status = slot_file_save(*slot, filepath, bytes);
+                        status["event"] = "slot_file_save";
+                        status["slot"]  = slot->id;
+                        resume_log(status);
+                        if (resume_saved(status)) {
+                            send_slot_save_load(task, *slot, true, bytes, (ggml_time_us() - t_start) / 1000.0,
+                                                resume_public(status));
+                            break;
+                        }
+                        if (resume_vbr() || status.value("outcome", "") != "skipped") {
+                            send_error(task, "Unable to save slot: " + status.value("reason", std::string()),
+                                       ERROR_TYPE_SERVER);
+                            break;
+                        }
+                    } else if (resume_vbr()) {
+                        send_error(task, slot_file_store
+                                ? "A dynamic VBR cache saves slots only in the resume format"
+                                : "Unable to save slot: the slot-file store is not open",
+                            ERROR_TYPE_NOT_SUPPORTED);
+                        break;
+                    }
+
                     std::vector<char> serialized_tokens;
                     std::vector<char> packed;
                     std::array<uint8_t, 32> token_digest = {};
@@ -17889,15 +18032,7 @@ private:
                     const int64_t t_end = ggml_time_us();
                     const double t_save_ms = (t_end - t_start) / 1000.0;
 
-                    auto res = std::make_unique<server_task_result_slot_save_load>();
-                    res->id       = task.id;
-                    res->id_slot  = id_slot;
-                    res->filename = filename;
-                    res->is_save  = true;
-                    res->n_tokens = slot->prompt.tokens.size();
-                    res->n_bytes  = nwrite;
-                    res->t_ms     = t_save_ms;
-                    queue_results.send(std::move(res));
+                    send_slot_save_load(task, *slot, true, nwrite, t_save_ms);
                 } break;
             case SERVER_TASK_TYPE_CACHE_PLAN_PREFLIGHT:
                 {
@@ -18449,15 +18584,8 @@ private:
                         status["event"] = "install";
                         resume_log(status);
 
-                        auto res = std::make_unique<server_task_result_slot_save_load>();
-                        res->id       = task.id;
-                        res->id_slot  = id_slot;
-                        res->is_save  = false;
-                        res->n_tokens = slot->prompt.tokens.size();
-                        res->n_bytes  = status.value("bytes_read", uint64_t(0));
-                        res->t_ms     = status.value("t_ms", 0.0);
-                        res->resume   = result;
-                        queue_results.send(std::move(res));
+                        send_slot_save_load(task, *slot, false, status.value("bytes_read", uint64_t(0)),
+                                            status.value("t_ms", 0.0), result);
                         break;
                     }
 
@@ -18465,6 +18593,38 @@ private:
 
                     std::string filename = task.slot_action.filename;
                     std::string filepath = task.slot_action.filepath;
+
+                    if (server_resume_store::is_entry_file(filepath)) {
+                        if (!slot_file_store) {
+                            send_error(task, "Unable to restore slot: the slot-file store is not open",
+                                       ERROR_TYPE_NOT_SUPPORTED);
+                            break;
+                        }
+                        uint64_t n_read = 0;
+                        json status = slot_file_restore(*slot, filepath, n_read);
+                        const json result = resume_public(status);
+                        status["event"] = "slot_file_restore";
+                        resume_log(status);
+                        if (!resume_installed(status)) {
+                            // skipped: the file is not for this server (key, adapter, projector),
+                            // or a dynamic VBR cache holds another conversation
+                            std::string reason = status.value("reason", std::string());
+                            if (reason == "cache_shared") {
+                                reason += ": a dynamic VBR cache restores a slot only while the other slots are empty";
+                            }
+                            send_error(task, "Unable to restore slot: " + reason,
+                                       status.value("outcome", "") == "skipped" ? ERROR_TYPE_INVALID_REQUEST
+                                                                                : ERROR_TYPE_SERVER);
+                            break;
+                        }
+                        send_slot_save_load(task, *slot, false, n_read, (ggml_time_us() - t_start) / 1000.0, result);
+                        break;
+                    }
+                    if (resume_vbr()) {
+                        send_error(task, "A dynamic VBR cache restores slots only from the resume format",
+                                   ERROR_TYPE_NOT_SUPPORTED);
+                        break;
+                    }
                     server_slot_frontier_logits_status logits_status =
                         server_slot_frontier_logits_status::not_present;
                     std::array<uint8_t, 32> restored_token_digest = {};
@@ -18630,15 +18790,7 @@ private:
                     const int64_t t_end = ggml_time_us();
                     const double t_restore_ms = (t_end - t_start) / 1000.0;
 
-                    auto res = std::make_unique<server_task_result_slot_save_load>();
-                    res->id       = task.id;
-                    res->id_slot  = id_slot;
-                    res->filename = filename;
-                    res->is_save  = false;
-                    res->n_tokens = slot->prompt.tokens.size();
-                    res->n_bytes  = nread;
-                    res->t_ms     = t_restore_ms;
-                    queue_results.send(std::move(res));
+                    send_slot_save_load(task, *slot, false, nread, t_restore_ms);
                 } break;
             case SERVER_TASK_TYPE_SLOT_ERASE:
                 {
@@ -25055,11 +25207,8 @@ void server_routes::init_routes() {
             return handle_slots_import(req, id_slot);
         }
         // Erase does no state-file IO (prompt clear + seq_rm only), so it is
-        // NOT gated on --slot-save-path. Dynamic VBR clears slot_save_path at
-        // startup (legacy state files cannot carry tier-typed KV), and import
-        // REQUIRES an explicit erase to produce its empty target — keeping
-        // erase behind the path gate made import's precondition unreachable
-        // on exactly the servers that support import.
+        // NOT gated on --slot-save-path: import REQUIRES an explicit erase to
+        // produce its empty target, and needs no slot-file directory.
         if (action == "erase") {
             return handle_slots_erase(req, id_slot);
         }
@@ -25894,6 +26043,12 @@ std::unique_ptr<server_res_generator> server_routes::handle_slots_save(const ser
         return res;
     }
     std::string filepath = params.slot_save_path + filename;
+    // "resume" (the default) or "legacy", the one-state file of upstream
+    const std::string format = json_value(request_data, "format", std::string("resume"));
+    if (format != "resume" && format != "legacy") {
+        res->error(format_error_response("Invalid format: expected \"resume\" or \"legacy\"", ERROR_TYPE_INVALID_REQUEST));
+        return res;
+    }
 
     auto & rd = res->rd;
     {
@@ -25902,6 +26057,7 @@ std::unique_ptr<server_res_generator> server_routes::handle_slots_save(const ser
         task.slot_action.id_slot  = id_slot;
         task.slot_action.filename = filename;
         task.slot_action.filepath = filepath;
+        task.slot_action.legacy   = format == "legacy";
         rd.post_task(std::move(task));
     }
 

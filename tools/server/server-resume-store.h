@@ -179,10 +179,11 @@ void server_resume_store_set_fault(server_resume_fault_fn fn) noexcept;
 class server_resume_store {
 public:
     // <cache root>/resume/<family digest>/, directories 0700, files 0600. takes the writer lock of the
-    // namespace: a second server gets store_locked and runs without persistence
+    // namespace: a second server gets store_locked and runs without persistence. A store that is not
+    // durable syncs nothing: its entries do not outlive the request that wrote them
     static std::unique_ptr<server_resume_store> open(
         const std::string & cache_root, const std::string & family_digest,
-        server_resume_reason & reason, std::string & error);
+        server_resume_reason & reason, std::string & error, bool durable = true);
 
     ~server_resume_store();
 
@@ -252,6 +253,17 @@ public:
 
     uint64_t free_bytes() const;
 
+    // One committed entry as a single file, its manifest and then its objects as the store holds
+    // them, and back into a new entry of this store. The file is replaced whole or not at all. A
+    // placed entry is not whole without the entry of its pool and is refused both ways.
+    server_resume_reason export_entry(
+        const std::string & id, const std::string & path, uint64_t & bytes, std::string & error) const;
+    server_resume_reason import_entry(
+        const std::string & path, std::string & id, server_resume_manifest & manifest, uint64_t & bytes,
+        std::string & error);
+    // whether the file begins as an exported entry does
+    static bool is_entry_file(const std::string & path);
+
     // A short printable value of the namespace that outlives the process: the stored one, else
     // `fresh` is stored and returned. Empty when it can be neither read nor stored.
     std::string keep_value(const std::string & name, const std::string & fresh, std::string & error);
@@ -261,6 +273,8 @@ private:
 
     std::string dir; // the family namespace
     int lock_fd = -1;
+    bool durable = true;
 
     std::string entry_dir(const std::string & id) const;
+    bool sync_path(const std::string & path) const;
 };

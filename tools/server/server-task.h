@@ -214,6 +214,7 @@ struct server_task {
         std::string filename;
         std::string filepath;
         std::string resume_entry; // restore from the resume store instead of a file
+        bool legacy = false;      // save the one-state file of upstream, not an entry
     };
     slot_action slot_action;
 

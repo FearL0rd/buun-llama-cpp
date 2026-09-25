@@ -29,6 +29,8 @@ using json = nlohmann::json;
 
 static constexpr char     MANIFEST_MAGIC[8] = { 'B', 'U', 'U', 'N', 'R', 'S', 'M', 'M' };
 static constexpr char     OBJECT_MAGIC[8]   = { 'B', 'U', 'U', 'N', 'R', 'S', 'M', 'O' };
+static constexpr char     ENTRY_MAGIC[8]    = { 'B', 'U', 'U', 'N', 'R', 'S', 'M', 'E' };
+static constexpr uint32_t ENTRY_VERSION     = 1;
 static constexpr uint32_t HEADER_SIZE       = 64;
 static constexpr size_t   MAX_STRING        = 256;
 static constexpr size_t   MAX_ADAPTERS      = 32;
@@ -558,10 +560,25 @@ static std::string object_name(const server_resume_object_record & record) {
     return name;
 }
 
+// the objects a manifest names, in the order an entry file holds them
+static std::vector<const server_resume_object_record *> manifest_objects(const server_resume_manifest & manifest) {
+    std::vector<const server_resume_object_record *> out;
+    for (const auto & chunk : manifest.chunks) {
+        out.push_back(&chunk);
+    }
+    for (const auto & tail : manifest.tail_states) {
+        out.push_back(&tail);
+    }
+    if (manifest.artifact) {
+        out.push_back(&*manifest.artifact);
+    }
+    return out;
+}
+
 #if defined(_WIN32)
 
 std::unique_ptr<server_resume_store> server_resume_store::open(
-        const std::string &, const std::string &, server_resume_reason & reason, std::string & error) {
+        const std::string &, const std::string &, server_resume_reason & reason, std::string & error, bool) {
     reason = server_resume_reason::store_unwritable;
     error  = "the resume store is not implemented on this platform";
     return nullptr;
@@ -612,6 +629,17 @@ uint64_t server_resume_store::free_bytes() const { return 0; }
 
 std::string server_resume_store::keep_value(const std::string &, const std::string &, std::string &) { return {}; }
 
+server_resume_reason server_resume_store::export_entry(const std::string &, const std::string &, uint64_t &, std::string &) const {
+    return server_resume_reason::io_error;
+}
+
+server_resume_reason server_resume_store::import_entry(
+        const std::string &, std::string &, server_resume_manifest &, uint64_t &, std::string &) {
+    return server_resume_reason::io_error;
+}
+
+bool server_resume_store::is_entry_file(const std::string &) { return false; }
+
 #else
 
 struct fd_guard {
@@ -660,6 +688,10 @@ static bool make_private_dir(const std::string & path, std::string & error) {
 static bool sync_dir(const std::string & path) {
     fd_guard dir(open(path.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC));
     return dir.fd >= 0 && fsync(dir.fd) == 0;
+}
+
+bool server_resume_store::sync_path(const std::string & path) const {
+    return !durable || sync_dir(path);
 }
 
 // the payload checksum of an object that is never in one buffer
@@ -718,6 +750,7 @@ static bool read_all(int fd, uint8_t * data, size_t size) {
 struct staged_file {
     const std::string directory;
     const std::string path;
+    const bool        durable; // else it is renamed unsynced
     fd_guard          file;
     size_t            unsynced = 0;
     bool              keep     = false;
@@ -727,8 +760,8 @@ struct staged_file {
     static constexpr size_t coalesce = 1u << 20;
     std::vector<uint8_t>    pending;
 
-    explicit staged_file(const std::string & directory) :
-        directory(directory), path(directory + "/tmp-" + server_resume_store::new_entry_id()),
+    explicit staged_file(const std::string & directory, bool durable = true) :
+        directory(directory), path(directory + "/tmp-" + server_resume_store::new_entry_id()), durable(durable),
         file(open(path.c_str(), O_CREAT | O_EXCL | O_WRONLY | O_CLOEXEC | O_NOFOLLOW, 0600)) {}
 
     ~staged_file() {
@@ -775,7 +808,7 @@ struct staged_file {
             size     -= n;
             unsynced += n;
             if (unsynced == sync_every) {
-                if (fdatasync(file.fd) != 0) {
+                if (durable && fdatasync(file.fd) != 0) {
                     err = errno;
                     return false;
                 }
@@ -804,7 +837,7 @@ struct staged_file {
         if (!flush()) {
             return failed("cannot write", error);
         }
-        if (fsync(file.fd) != 0) {
+        if (durable && fsync(file.fd) != 0) {
             return failed("cannot sync", error);
         }
         file.reset();
@@ -826,7 +859,7 @@ struct staged_file {
 
 std::unique_ptr<server_resume_store> server_resume_store::open(
         const std::string & cache_root, const std::string & family_digest,
-        server_resume_reason & reason, std::string & error) {
+        server_resume_reason & reason, std::string & error, bool durable) {
     reason = server_resume_reason::store_unwritable;
 
     if (!is_hex(family_digest, 64)) {
@@ -843,7 +876,8 @@ std::unique_ptr<server_resume_store> server_resume_store::open(
     fs::create_directories(root, ec);
 
     std::unique_ptr<server_resume_store> store(new server_resume_store());
-    store->dir = root + "/resume/" + family_digest;
+    store->dir     = root + "/resume/" + family_digest;
+    store->durable = durable;
 
     if (!make_private_dir(root + "/resume", error) || !make_private_dir(store->dir, error) ||
         !make_private_dir(store->dir + "/entries", error)) {
@@ -1112,12 +1146,12 @@ server_resume_reason server_resume_store::write_object_stream(
     if (!make_private_dir(directory, error)) {
         return server_resume_reason::store_unwritable;
     }
-    if (is_new && !sync_dir(dir + "/entries")) {
+    if (is_new && !sync_path(dir + "/entries")) {
         error = "cannot sync " + dir + "/entries";
         return server_resume_reason::io_error;
     }
 
-    staged_file staged(directory);
+    staged_file staged(directory, durable);
     if (staged.file.fd < 0) {
         return staged.failed("cannot create", error);
     }
@@ -1194,7 +1228,7 @@ server_resume_reason server_resume_store::commit(
     const std::string directory = entry_dir(id);
 
     // the objects have to be durable under their names before a manifest names them
-    if (!sync_dir(directory)) {
+    if (!sync_path(directory)) {
         error = "cannot sync " + directory;
         return server_resume_reason::io_error;
     }
@@ -1205,7 +1239,7 @@ server_resume_reason server_resume_store::commit(
         return server_resume_reason::manifest_corrupt;
     }
 
-    staged_file staged(directory);
+    staged_file staged(directory, durable);
     if (staged.file.fd < 0) {
         return staged.failed("cannot create", error);
     }
@@ -1216,7 +1250,7 @@ server_resume_reason server_resume_store::commit(
     if (reason != server_resume_reason::ok) {
         return reason;
     }
-    if (!sync_dir(directory)) {
+    if (!sync_path(directory)) {
         error = "cannot sync " + directory;
         return server_resume_reason::io_error;
     }
@@ -1229,14 +1263,8 @@ void server_resume_store::sweep(const std::string & id, const server_resume_mani
     }
 
     std::set<std::string> keep = { "commit" };
-    for (const auto & chunk : manifest.chunks) {
-        keep.insert(object_name(chunk));
-    }
-    for (const auto & tail : manifest.tail_states) {
-        keep.insert(object_name(tail));
-    }
-    if (manifest.artifact) {
-        keep.insert(object_name(*manifest.artifact));
+    for (const auto * object : manifest_objects(manifest)) {
+        keep.insert(object_name(*object));
     }
 
     std::error_code ec;
@@ -1271,10 +1299,10 @@ server_resume_reason server_resume_store::uncommit(const std::string & id, std::
         error = "injected fault at uncommit_sync";
         return sync_failure;
     }
-    if (!sync_dir(directory)) {
+    if (!sync_path(directory)) {
         // A known entry may already have been removed by retention. Erasing it is
         // idempotent, but still make that absence durable before reporting success.
-        if (errno == ENOENT && sync_dir(dir + "/entries")) {
+        if (errno == ENOENT && sync_path(dir + "/entries")) {
             return server_resume_reason::ok;
         }
         error = "cannot sync " + directory;
@@ -1290,7 +1318,7 @@ void server_resume_store::remove_entry(const std::string & id) const {
     // the manifest first: an interrupted removal must not leave an entry that names missing objects
     const std::string directory = entry_dir(id);
     unlink((directory + "/commit").c_str());
-    sync_dir(directory);
+    sync_path(directory);
 
     std::error_code ec;
     fs::remove_all(directory, ec);
@@ -1404,6 +1432,203 @@ std::string server_resume_store::keep_value(const std::string & name, const std:
         return {};
     }
     return fresh;
+}
+
+// `size` bytes from where `from` is into the staged file
+static bool copy_range(int from, staged_file & to, uint64_t size) {
+    std::vector<uint8_t> buffer((size_t) std::min<uint64_t>(size, 8u << 20));
+    while (size > 0) {
+        const size_t n = (size_t) std::min<uint64_t>(size, buffer.size());
+        if (!read_all(from, buffer.data(), n) || !to.put(buffer.data(), n)) {
+            return false;
+        }
+        size -= n;
+    }
+    return true;
+}
+
+// what a failed copy_range() says: a write fails in the staged file, else it was the read
+static server_resume_reason copy_failed(const staged_file & to, const std::string & from, std::string & error) {
+    if (to.err != 0) {
+        return to.failed("cannot write", error);
+    }
+    error = "cannot read " + from;
+    return server_resume_reason::io_error;
+}
+
+// Entry file: a header, the manifest as a commit holds it, then each object of manifest_objects()
+// as its file in the entry holds it, header and payload.
+//
+//   0  magic "BUUNRSME"   8 u32 version   12 u32 header size   16 u32 objects   20 u32 flags (0)
+//  24  u64 manifest bytes  32 u64 file bytes  40..55 zero  56 u64 xxh3 of bytes 0..55
+static uint64_t entry_file_bytes(uint64_t manifest_bytes, const std::vector<const server_resume_object_record *> & objects) {
+    uint64_t bytes = HEADER_SIZE + manifest_bytes;
+    for (const auto * object : objects) {
+        bytes += HEADER_SIZE + object->bytes;
+    }
+    return bytes;
+}
+
+static bool entry_file_whole(const server_resume_manifest & manifest, std::string & error) {
+    if (manifest.placed()) {
+        error = "a placed entry is not whole without the entry of its pool";
+        return false;
+    }
+    return true;
+}
+
+server_resume_reason server_resume_store::export_entry(
+        const std::string & id, const std::string & path, uint64_t & bytes, std::string & error) const {
+    server_resume_manifest manifest;
+    auto reason = read_manifest(id, manifest, error);
+    if (reason != server_resume_reason::ok) {
+        return reason;
+    }
+    if (!entry_file_whole(manifest, error)) {
+        return server_resume_reason::format_unsupported;
+    }
+    const std::vector<uint8_t> encoded = server_resume_manifest_encode(manifest);
+    const auto objects = manifest_objects(manifest);
+
+    bytes = entry_file_bytes(encoded.size(), objects);
+    uint8_t header[HEADER_SIZE] = {};
+    std::memcpy(header, ENTRY_MAGIC, 8);
+    put_u32(header +  8, ENTRY_VERSION);
+    put_u32(header + 12, HEADER_SIZE);
+    put_u32(header + 16, (uint32_t) objects.size());
+    put_u64(header + 24, encoded.size());
+    put_u64(header + 32, bytes);
+    header_seal(header);
+
+    const fs::path target(path);
+    const std::string directory = target.has_parent_path() ? target.parent_path().string() : ".";
+    staged_file staged(directory);
+    if (staged.file.fd < 0) {
+        return staged.failed("cannot create", error);
+    }
+    if (!staged.put(header, HEADER_SIZE) || !staged.put(encoded.data(), encoded.size())) {
+        return staged.failed("cannot write", error);
+    }
+    for (const auto * object : objects) {
+        const std::string from = entry_dir(id) + "/" + object_name(*object);
+        fd_guard file(-1);
+        reason = open_object(from, *object, file, error);
+        if (reason != server_resume_reason::ok) {
+            return reason;
+        }
+        if (lseek(file.fd, 0, SEEK_SET) != 0 || !copy_range(file.fd, staged, HEADER_SIZE + object->bytes)) {
+            return copy_failed(staged, from, error);
+        }
+    }
+    reason = staged.publish(target.filename().string(), "entry_export", error);
+    if (reason == server_resume_reason::ok && !sync_dir(directory)) {
+        error = "cannot sync " + directory;
+        return server_resume_reason::io_error;
+    }
+    return reason;
+}
+
+server_resume_reason server_resume_store::import_entry(
+        const std::string & path, std::string & id, server_resume_manifest & manifest, uint64_t & bytes,
+        std::string & error) {
+    id.clear();
+    bytes = 0;
+    fd_guard file(::open(path.c_str(), O_RDONLY | O_CLOEXEC));
+    if (file.fd < 0) {
+        error = errno_text("cannot open", path, errno);
+        return errno == ENOENT ? server_resume_reason::object_missing : server_resume_reason::io_error;
+    }
+    struct stat st;
+    if (fstat(file.fd, &st) != 0 || !S_ISREG(st.st_mode)) {
+        error = "cannot stat " + path;
+        return server_resume_reason::io_error;
+    }
+    const uint64_t size = (uint64_t) st.st_size;
+
+    uint8_t header[HEADER_SIZE];
+    if (size < HEADER_SIZE || !read_all(file.fd, header, HEADER_SIZE) ||
+        std::memcmp(header, ENTRY_MAGIC, 8) != 0 || !header_sealed(header)) {
+        error = "entry file header: " + path;
+        return server_resume_reason::manifest_corrupt;
+    }
+    if (get_u32(header + 8) != ENTRY_VERSION || get_u32(header + 12) != HEADER_SIZE || get_u32(header + 20) != 0) {
+        error = "entry file version or flags: " + path;
+        return server_resume_reason::format_unsupported;
+    }
+    const uint64_t manifest_bytes = get_u64(header + 24);
+    if (get_u64(header + 32) != size || manifest_bytes > server_resume_limits::max_manifest_bytes ||
+        manifest_bytes > size - HEADER_SIZE) {
+        error = "entry file size differs from its header: " + path;
+        return server_resume_reason::object_size_mismatch;
+    }
+    std::vector<uint8_t> encoded((size_t) manifest_bytes);
+    if (!read_all(file.fd, encoded.data(), encoded.size())) {
+        error = "cannot read " + path;
+        return server_resume_reason::io_error;
+    }
+    auto reason = server_resume_manifest_decode(encoded.data(), encoded.size(), manifest, error);
+    if (reason != server_resume_reason::ok) {
+        return reason;
+    }
+    if (!entry_file_whole(manifest, error)) {
+        return server_resume_reason::format_unsupported;
+    }
+    const auto objects = manifest_objects(manifest);
+    if (get_u32(header + 16) != objects.size() || entry_file_bytes(manifest_bytes, objects) != size) {
+        error = "entry file size differs from its manifest: " + path;
+        return server_resume_reason::object_size_mismatch;
+    }
+    if (free_bytes() < size) {
+        error = "need " + std::to_string(size) + " bytes";
+        return server_resume_reason::no_space;
+    }
+
+    const std::string entry = new_entry_id();
+    const std::string directory = entry_dir(entry);
+    if (!make_private_dir(directory, error)) {
+        return server_resume_reason::store_unwritable;
+    }
+    const auto fail = [&](server_resume_reason why) {
+        remove_entry(entry);
+        return why;
+    };
+    if (!sync_path(dir + "/entries")) {
+        error = "cannot sync " + dir + "/entries";
+        return fail(server_resume_reason::io_error);
+    }
+    for (const auto * object : objects) {
+        staged_file staged(directory, durable);
+        if (staged.file.fd < 0) {
+            return fail(staged.failed("cannot create", error));
+        }
+        if (!copy_range(file.fd, staged, HEADER_SIZE + object->bytes)) {
+            return fail(copy_failed(staged, path, error));
+        }
+        const std::string name = object_name(*object);
+        reason = staged.publish(name, "entry_import", error);
+        if (reason != server_resume_reason::ok) {
+            return fail(reason);
+        }
+        // the header against the record; the payload is checked as it is read
+        fd_guard copied(-1);
+        reason = open_object(directory + "/" + name, *object, copied, error);
+        if (reason != server_resume_reason::ok) {
+            return fail(reason);
+        }
+    }
+    reason = commit(entry, manifest, error);
+    if (reason != server_resume_reason::ok) {
+        return fail(reason);
+    }
+    id    = entry;
+    bytes = size;
+    return server_resume_reason::ok;
+}
+
+bool server_resume_store::is_entry_file(const std::string & path) {
+    fd_guard file(::open(path.c_str(), O_RDONLY | O_CLOEXEC));
+    uint8_t magic[8];
+    return file.fd >= 0 && read_all(file.fd, magic, sizeof(magic)) && std::memcmp(magic, ENTRY_MAGIC, 8) == 0;
 }
 
 #endif

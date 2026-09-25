@@ -1681,19 +1681,15 @@ std::string server_task_result_metrics::to_metrics() {
 // server_task_result_slot_save_load
 //
 json server_task_result_slot_save_load::to_json() {
-    if (is_save) {
-        return json {
-            { "id_slot",   id_slot },
-            { "filename",  filename },
-            { "n_saved",   n_tokens },
-            { "n_written", n_bytes },
-            { "timings", {
-                { "save_ms", t_ms }
-            }},
-        };
-    }
-
-    json out = {
+    json out = is_save ? json {
+        { "id_slot",   id_slot },
+        { "filename",  filename },
+        { "n_saved",   n_tokens },
+        { "n_written", n_bytes },
+        { "timings", {
+            { "save_ms", t_ms }
+        }},
+    } : json {
         { "id_slot",    id_slot },
         { "filename",   filename },
         { "n_restored", n_tokens },

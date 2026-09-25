@@ -9,6 +9,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <iterator>
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -722,9 +723,159 @@ static void test_artifact(const std::string & root) {
     CHECK(store->list().size() == 2);
 }
 
+static std::vector<uint8_t> file_bytes(const std::string & path) {
+    std::ifstream file(path, std::ios::binary);
+    return std::vector<uint8_t>(std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>());
+}
+
+static void put_file(const std::string & path, const std::vector<uint8_t> & bytes) {
+    std::ofstream(path, std::ios::binary | std::ios::trunc).write((const char *) bytes.data(), bytes.size());
+}
+
+// an entry as one file, out of one store and into another
+static void test_entry_file(const std::string & root) {
+    server_resume_reason reason;
+    std::string error;
+    auto from = server_resume_store::open(root + "/a", FAMILY, reason, error);
+    auto into = server_resume_store::open(root + "/b", FAMILY, reason, error);
+    CHECK(from && into);
+    if (!from || !into) {
+        return;
+    }
+    const std::string entries = into->directory() + "/entries";
+    const std::string path    = root + "/saved.bin";
+
+    // chunks and tail states
+    const std::string id = server_resume_store::new_entry_id();
+    server_resume_manifest manifest = manifest_of(16, 0);
+    manifest.chunks.clear();
+    CHECK(add_generation(*from, id, manifest, 0, 16) == server_resume_reason::ok);
+    CHECK(add_generation(*from, id, manifest, 16, 32) == server_resume_reason::ok);
+    from->sweep(id, manifest);
+
+    uint64_t bytes = 0;
+    CHECK(from->export_entry(id, path, bytes, error) == server_resume_reason::ok);
+    CHECK(bytes == fs::file_size(path) && server_resume_store::is_entry_file(path));
+    CHECK(n_files(root) == 3); // a, b and the file: nothing staged is left beside it
+
+    std::string got_id;
+    server_resume_manifest got;
+    uint64_t n_read = 0;
+    CHECK(into->import_entry(path, got_id, got, n_read, error) == server_resume_reason::ok && n_read == bytes);
+    CHECK(server_resume_store::entry_id_valid(got_id) && got_id != id);
+    CHECK(got.generation == manifest.generation && got.chunks.size() == 2 && got.tail_states.size() == 1 &&
+          got.ledger == manifest.ledger);
+    {
+        const auto listed = into->list();
+        CHECK(listed.size() == 1 && listed[0].id == got_id && entry_verifies(*into, listed[0]));
+    }
+    // the same file again is another entry
+    std::string again;
+    CHECK(into->import_entry(path, again, got, n_read, error) == server_resume_reason::ok && again != got_id);
+    CHECK(into->list().size() == 2);
+
+    // an export replaces the file whole
+    const auto first = file_bytes(path);
+    CHECK(add_generation(*from, id, manifest, 32, 48) == server_resume_reason::ok);
+    CHECK(from->export_entry(id, path, bytes, error) == server_resume_reason::ok);
+    CHECK(bytes == fs::file_size(path) && file_bytes(path) != first);
+
+    // what is refused leaves no entry behind
+    const size_t n_entries = n_files(entries);
+    const auto refused = [&](const std::vector<uint8_t> & content, server_resume_reason want) {
+        put_file(root + "/bad.bin", content);
+        std::string bad_id = "x";
+        const auto why = into->import_entry(root + "/bad.bin", bad_id, got, n_read, error);
+        return why == want && bad_id.empty() && n_files(entries) == n_entries;
+    };
+    const auto whole = file_bytes(path);
+    {
+        auto cut = whole; cut.resize(cut.size() - 1);
+        CHECK(refused(cut, server_resume_reason::object_size_mismatch)); // the header holds the size
+        auto grown = whole; grown.push_back(0);
+        CHECK(refused(grown, server_resume_reason::object_size_mismatch));
+        CHECK(refused(std::vector<uint8_t>(whole.begin(), whole.begin() + 40), server_resume_reason::manifest_corrupt));
+    }
+    {
+        auto flipped = whole; flipped[20] ^= 1; // the flags, under the seal
+        CHECK(refused(flipped, server_resume_reason::manifest_corrupt));
+        auto manifest_byte = whole; manifest_byte[64 + 70] ^= 1;
+        CHECK(refused(manifest_byte, server_resume_reason::manifest_corrupt));
+        // the header of the last object, the frontier tail state
+        auto object_header = whole; object_header[whole.size() - 500 - 64 + 30] ^= 1;
+        CHECK(refused(object_header, server_resume_reason::object_checksum_mismatch));
+    }
+    {
+        // a changed payload byte comes in, and is found where every object is read
+        auto payload_byte = whole; payload_byte[whole.size() - 10] ^= 1;
+        put_file(root + "/bad.bin", payload_byte);
+        std::string bad_id;
+        CHECK(into->import_entry(root + "/bad.bin", bad_id, got, n_read, error) == server_resume_reason::ok);
+        std::vector<uint8_t> payload;
+        CHECK(into->read_object(bad_id, got.tail_states[0], payload, error) == server_resume_reason::object_checksum_mismatch);
+        into->remove_entry(bad_id);
+    }
+    // a file of another format is not an entry file
+    put_file(root + "/bad.bin", pattern(4096, 5));
+    CHECK(!server_resume_store::is_entry_file(root + "/bad.bin"));
+    CHECK(refused(pattern(4096, 5), server_resume_reason::manifest_corrupt));
+    CHECK(!server_resume_store::is_entry_file(root + "/missing.bin"));
+    CHECK(into->import_entry(root + "/missing.bin", got_id, got, n_read, error) == server_resume_reason::object_missing);
+    CHECK(from->export_entry(server_resume_store::new_entry_id(), root + "/none.bin", bytes, error) != server_resume_reason::ok);
+    CHECK(!fs::exists(root + "/none.bin"));
+
+    // an artifact, streamed through
+    const std::string id_artifact = server_resume_store::new_entry_id();
+    const std::vector<uint8_t> payload = pattern(300000, 9);
+    server_resume_object_record record;
+    record.kind          = server_resume_object_kind::artifact;
+    record.p1            = 48;
+    record.gen           = 1;
+    record.prefix_digest = std::string(32, 'c');
+    CHECK(from->write_object(id_artifact, record, payload.data(), payload.size(), error) == server_resume_reason::ok);
+    auto with_artifact = manifest_of(48, 1);
+    with_artifact.artifact       = record;
+    with_artifact.sequence_epoch = 7;
+    with_artifact.tail_states.push_back(tail_of(40, 1, "turn"));
+    const std::vector<uint8_t> ring = pattern(500, 41);
+    CHECK(from->write_object(id_artifact, with_artifact.tail_states[0], ring.data(), ring.size(), error) == server_resume_reason::ok);
+    CHECK(from->commit(id_artifact, with_artifact, error) == server_resume_reason::ok);
+
+    CHECK(from->export_entry(id_artifact, path, bytes, error) == server_resume_reason::ok);
+    CHECK(into->import_entry(path, got_id, got, n_read, error) == server_resume_reason::ok);
+    CHECK(got.artifact && got.artifact->xxh3 == record.xxh3 && got.sequence_epoch == 7 && got.tail_states.size() == 1);
+    std::vector<uint8_t> read;
+    CHECK(into->read_object(got_id, *got.artifact, read, error) == server_resume_reason::ok && read == payload);
+    CHECK(into->read_object(got_id, got.tail_states[0], read, error) == server_resume_reason::ok && read == ring);
+
+    // a placement is not whole without its pool's entry
+    const std::string id_placed = server_resume_store::new_entry_id();
+    server_resume_object_record placement;
+    placement.kind          = server_resume_object_kind::placement;
+    placement.p1            = 32;
+    placement.gen           = 1;
+    placement.prefix_digest = std::string(32, 'd');
+    const std::vector<uint8_t> cells = pattern(640, 3);
+    CHECK(from->write_object(id_placed, placement, cells.data(), cells.size(), error) == server_resume_reason::ok);
+    auto placed = manifest_of(32, 1);
+    placed.artifact = placement;
+    placed.place_in(id_artifact, record);
+    CHECK(from->commit(id_placed, placed, error) == server_resume_reason::ok);
+    CHECK(from->export_entry(id_placed, root + "/placed.bin", bytes, error) == server_resume_reason::format_unsupported);
+    CHECK(!fs::exists(root + "/placed.bin"));
+}
+
 int main() {
     test_manifest_round_trip();
     test_manifest_refusals();
+
+    {
+        const std::string root = (fs::temp_directory_path() / ("test-server-resume-entry-" + server_resume_store::new_entry_id())).string();
+        fs::create_directories(root);
+        test_entry_file(root);
+        std::error_code ec;
+        fs::remove_all(root, ec);
+    }
 
     {
         const std::string root = (fs::temp_directory_path() / ("test-server-resume-artifact-" + server_resume_store::new_entry_id())).string();
