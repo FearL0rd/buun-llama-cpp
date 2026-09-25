@@ -3,11 +3,9 @@
 Status: **contract, implemented through P2** (§10 items 1 to 5, with the
 measured results and the limits of v1 there) **and P3** (§11, dynamic VBR). Where the build differs from the
 first design the text says "as built".
-Companion of `server-resume-plan.md` (objective, P0 results, phases). Frozen
-2026-09-20 against `exp/server-resume`. Line anchors are from that branch; use the
-symbols when lines move. Independent review is deferred by the maintainer until a
-working product exists (one review is planned before the VBR phase), so every
-statement below is the author's reading of the code, not a reviewed result.
+Companion of `server-resume-plan.md` (objective, P0 results, phases). Written
+against `exp/server-resume`; use the symbols, not line numbers, when lines move.
+The P0–P2 and P3 code went through independent review before merge.
 
 Scope of v1: fixed-type KV (f16, q8_0, turbo, TCQ), dense, hybrid-recurrent and
 SWA/iSWA models, one entry per conversation, direct install into a slot. Images
@@ -17,11 +15,11 @@ P3). Out of scope and refused with a reason: media under M-RoPE, drafter state
 on the fixed route (never saved), adapter changes between producer and consumer
 (P4).
 
-## 1. Review of the real owners
+## 1. Review of the existing code
 
 What P0 and the P1 code reading established, and what the design takes from it.
 
-| Owner | Fact | Consequence |
+| Code | Fact | Consequence |
 |---|---|---|
 | Library sequence-state file (`llama-context.cpp`, file v3) | 24-byte header with the declared total size and one FNV-1a-64 over the whole payload; `llama_state_seq_file_snapshot_prepare` reads the whole file into host memory and hashes it before anything is installed; the writer buffers the whole payload, publishes by rename, no `fsync` | Integrity exists but is all-or-nothing: no appending, no partial read, no bounded staging, no durability. A resume entry cannot live in this container |
 | Per-sequence state blob (`llama_kv_cache::state_write`) | `n_stream`; per stream `cell_count`, a meta block (per cell `pos`, seq ids, optional ext), then per layer the K rows and the V rows of all written cells, then a TCQ footer when a TCQ type is present. Rows are contiguous per layer. Cells are written in cell-index order, which is not guaranteed to be position order | A token range is expressible as the same layout restricted to the cells of that range. No new blob grammar is needed, only a range filter and an ordering rule |
@@ -30,7 +28,7 @@ What P0 and the P1 code reading established, and what the design takes from it.
 | Slot semantic envelope `BUUNSLOT` v2 (`server-context.cpp`) | 224-byte header: counts, next position, five SHA-256 digests (runtime identity, adapter identity, token digest, serialized tokens, logits), then the serialized `server_tokens`, then optional logits. The parser refuses any other version, header size or unknown flag bit with `format_mismatch` | Reused as the entry's token ledger at version 3. Older builds refuse a v3 envelope at the header |
 | Slot runtime identity (`buun.server.slot-file-runtime-identity/v2`) | Hashes the build label, context sizes, slot layout and index next to the family digest and the KV settings; any difference reports `model_family_mismatch` | Resume needs its own key (§5) and its own reason codes (§8). The legacy identity is not changed |
 | `SERVER_TASK_TYPE_SLOT_RESTORE` | Defers while the slot is processing; parses the envelope; installs state; on failure runs `mandatory_recovery_reset(restore_failure)`; on success invalidates the frontier record, runs the slot's recovery-reset bookkeeping (drops the destination's checkpoints and draft state), sets the ledger, publishes the slot to the retention observer. It installs no checkpoints | This is the establishment path the resume installer reuses for the slot. Checkpoints need a second, existing door (next row) |
-| Host-cache restore (`server_prompt_cache::commit_restore_delivery`, `server_prompt_cache_mirror_restore_retention`) | Delivers a whole `server_prompt` (tokens and checkpoints) to the slot, then admits the checkpoints as a batch through the publish authority (`admit_live_checkpoints`) and attaches their release operations on the retention observer. Fail-closed: checkpoints that cannot be admitted are retired and dropped, the restore still stands | The owner door for imported checkpoints. Resume does not insert into `slot.prompt.checkpoints` by hand |
+| Host-cache restore (`server_prompt_cache::commit_restore_delivery`, `server_prompt_cache_mirror_restore_retention`) | Delivers a whole `server_prompt` (tokens and checkpoints) to the slot, then admits the checkpoints as a batch through the publish authority (`admit_live_checkpoints`) and attaches their release operations on the retention observer. Fail-closed: checkpoints that cannot be admitted are retired and dropped, the restore still stands | The existing door for imported checkpoints. Resume does not insert into `slot.prompt.checkpoints` by hand |
 | Checkpoint validity (`checkpoint_frontier_is_current`) | A checkpoint is usable only if its computation frontier carries this process's execution identity (random per model load), the slot's current sequence epoch, the current adapter identity, and token/position counts equal to the checkpoint's | A checkpoint read from disk can never pass as saved. Import is a named provenance transition that re-stamps it (§7) |
 | `SERVER_TASK_TYPE_SLOT_SAVE` | Mutates: a one-token target decode to align frontier logits, clears the draft sequence, resets the DFlash ring | Resume capture is a separate read-only path. It saves no logits |
 | Shutdown (`server.cpp`) | The inference loop returns, then `clean_up()` destroys the context. HTTP threads are still alive in between. A second signal exits from the handler. The router force-kills a child after 10 s | Save hook sits between the two. Per-entry commit, most recently used entry first, so a forced kill loses the tail of the list, not the store |
@@ -67,11 +65,12 @@ file the filesystem is the allocator, `rename` is the commit, `unlink` returns
 space at once, and the existing repack-cache code is the template. Chunk overhead
 is unchanged (one 64-byte header and one block of rounding per ≈54 MB chunk on a
 27B TCQ cache, under 0.01 %). A 200k-token conversation is about 50 chunk files.
-A resume entry was never meant to be a portable single file (plan §6).
+In the store an entry is always a directory; the one single-file form is the
+slot file, an exported copy of one entry (§8.1).
 
 Why not the library sequence file with a new envelope version inside it: see the
-first row of §1. The "header that declares a resume manifest" of plan §6 is
-therefore the manifest's own magic and version. Builds that predate it cannot
+first row of §1. What declares a resume manifest (plan §6) is therefore the
+manifest's own magic and version. Builds that predate it cannot
 open an entry at all: given a manifest by name they fail the library magic check.
 
 ### 2.1 Object file (`c-*`, `t-*`)
@@ -437,7 +436,7 @@ Budget: tail states 2 and 3 only. Each costs the model's fixed partial size
 (52.7 MB on a 4B hybrid, 156.9 MB on a 27B; 6 MiB on the measured SWA model),
 install 4–12 ms. More than three is opt-in and not part of v1. Pinning a
 checkpoint at the preamble boundary in the live ring would make `early`
-reliable; that belongs to the checkpoint owners and is only noted here.
+reliable; that belongs to the checkpoint code and is only noted here.
 
 Partial SWA images are valid only on the base chunks of the same entry; they are
 never shared between entries.
@@ -530,13 +529,13 @@ One log line and one `/slots` field per entry. The string
 | `context_too_small` | no restorable position fits |
 | `no_free_slot` | more entries than slots and no host prompt cache; the entry is kept |
 | `host_cache_rejected` | more entries than slots and the host prompt cache did not take the state (its size limit); the entry is kept |
-| `host_restore_refused` | save side, dynamic VBR: the owners' restore did not bring a hosted conversation into the staging slot (§11); an entry it had from an earlier pass is kept |
+| `host_restore_refused` | save side, dynamic VBR: the VBR host cache's restore did not bring a hosted conversation into the staging slot (§11); an entry it had from an earlier pass is kept |
 | `entry_in_use` | the restore action named an entry another slot was restored from or saved as; two slots never write one entry |
 | `state_rejected` | the library refused a blob (type, shape, TCQ fingerprint) |
 | `unsupported_media` | a media chunk without a content id (§4a); capture-side skip, logged at save |
 | `unsupported_positions` | cells that do not take consecutive positions: media under M-RoPE (§4a). At capture, and at install when the ledger has media and the loaded model shares positions |
 | `unsupported_qsa`, `frontier_inconsistent` | capture-side skips, logged at save |
-| `unsupported_artifact`, `capture_refused`, `slot_busy`, `cache_shared`, `slot_not_empty`, `precision_refused`, `execution_identity_unavailable` | dynamic VBR route (§11) |
+| `unsupported_artifact`, `capture_refused`, `slot_busy`, `cache_shared`, `slot_not_empty`, `precision_refused`, `execution_identity_unavailable` | dynamic VBR route (§11). On a slot-file restore `cache_shared` is a 400: a dynamic VBR cache restores a slot only while the other slots are empty (§8.1) |
 | `store_locked`, `store_unwritable`, `no_space`, `io_error` | store level; the server runs without persistence |
 | `checkpoints_dropped=<n>` | warning attached to an `installed_*` outcome |
 | `provenance_limit` | capture skipped before disk mutation because the objects this save carries over already come from 16 producers and the current producer is new; the previous entry is retained rather than misattributing new bytes |
@@ -545,10 +544,12 @@ One log line and one `/slots` field per entry. The string
 its reason. It is never installed by the legacy slot-file route, and the legacy
 route never reads a manifest. Empty slots are skipped without a line.
 
-`/slots/<id>?action=restore` routes by what it is given: a `filename` is a legacy
-library file under `--slot-save-path` and takes the unchanged legacy route; a
-`resume_entry` id is resolved inside the resume namespace and takes steps 3–7
-above. That endpoint is the restart-free test entry for the installer.
+`/slots/<id>?action=restore` routes by what it is given: a `resume_entry` id is
+resolved inside the resume namespace and takes steps 3–7 above; a `filename`
+under `--slot-save-path` is sniffed, and a slot file in the resume format takes
+the same installer (§8.1), while a legacy library file takes the unchanged
+legacy route on fixed-type caches and is refused with 501 under dynamic VBR.
+The `resume_entry` form is the restart-free test entry for the installer.
 
 As built: `POST /slots/<id>?action=restore` with `{"resume_entry": "<32 hex>"}`
 is accepted whenever the server runs with `--resume`, with or without
@@ -567,6 +568,47 @@ save, restart, erase, restart installs nothing; A saved and restored, B takes
 the slot and is erased unsaved, A's entry survives and installs at the next
 start; with both saved, erasing B's slot leaves A's entry alone. Within the
 last-chunk tradeoff an entry of a single chunk goes with its slot here too.
+
+### 8.1 Slot files (`--slot-save-path`)
+
+`POST /slots/<id>?action=save {"filename"}` writes one file in the resume
+format: exactly one exported entry (`server_resume_store::export_entry`). The
+slot is captured as §4 describes into a staging store rooted at
+`<slot_save_path>.staging`, which is not durable (its objects are not
+`fsync`ed); the entry is exported to the file and dropped from the staging
+store. The file is written to a staging file, `fsync`ed, renamed and the
+directory synced, so it is replaced whole or not at all. No host cache is
+included; that is what `--resume` is for.
+
+File layout, little-endian:
+
+| Offset | Size | Part |
+|---|---|---|
+| 0 | 64 | entry header: magic `BUUNRSME`, u32 version = 1, u32 header size = 64, u32 object count, u32 flags = 0, u64 manifest bytes, u64 file bytes, 16 zero bytes, u64 XXH3-64 of bytes 0..55 |
+| 64 | manifest bytes | the manifest exactly as `commit` holds it (§2.2) |
+| … | 64 + payload, per object | each object the manifest references, header and payload, exactly as its file in the entry holds it (§2.1), in manifest order |
+
+The file size must equal the header's file bytes and the sum the manifest
+implies. `restore {"filename"}` sniffs the magic (`is_entry_file`): a resume
+entry file is imported into the staging store (`import_entry`: header seal,
+version and flags, sizes against the header and the manifest, free space, each
+object's header against its record, the payload checked as it is read) under a
+fresh entry id, installed by §7 with checksums, required companions and
+context checkpoints, and dropped again. It restores into any slot index and
+after a restart; the resume key and adapter identity decide as for any entry.
+A file without the magic is a legacy library file (§8).
+
+Under dynamic VBR the entry is one artifact (§11). Its import needs an
+otherwise empty cache, so a restore while any other slot holds a conversation
+is `cache_shared`, a 400, checked before the file is copied. A placed entry is
+not whole without its pool and is refused by export and import; a slot-file
+save therefore captures a whole, compact (packed rows) artifact.
+
+Measured on an RTX 3090, turbo3_tcq KV, save / restore in ms, resume file
+against legacy file: dense 220/103 against 246/225; hybrid 216/119 against
+135/124 (the resume file carries two checkpoints, 218 MB against 114 MB, and
+the restore is warm); SWA 38/9 against 21/19. Dynamic VBR, dense: 2.47 s save,
+3.79 s restore for 1.06 GB.
 
 ## 9. Install route: recommendation and alternative
 
@@ -686,7 +728,7 @@ Under `-ctk vbr` the library sequence state refuses (§3), and the bytes of a
 cache whose tiers move cannot be cut into token ranges. The entry therefore
 carries one object instead of chunks and tail states: the VBR artifact that the
 VBR host prompt cache already captures, validates and imports. Resume owns the
-file and the entry; the artifact's owners own every byte inside it and every
+file and the entry; the VBR artifact library owns every byte inside it and every
 decision about it. One envelope family, two install routes, no downgrade from
 one to the other: an artifact entry is never read by the fixed route, and a
 chunked entry is never offered to the import.
@@ -713,10 +755,10 @@ counter starts above every epoch an entry still holds, so no epoch is handed
 out twice. A namespace whose identity cannot be read or written runs without
 persistence (`execution_identity_unavailable`).
 
-**Capture.** Exact capture of the idle slot through the owners' prepare /
-transfer / publish, with no tenant and no host-cache admission, then the
-owners' export into the object stream. A slot that is not idle is `slot_busy`;
-a capture the owners refuse is `capture_refused` with their status and phase.
+**Capture.** Exact capture of the idle slot through the VBR artifact library's
+prepare / transfer / publish, with no tenant and no host-cache admission, then
+the library's export into the object stream. A slot that is not idle is `slot_busy`;
+a capture the library refuses is `capture_refused` with its status and phase.
 A save whose tokens, length and epoch equal the entry's keeps the artifact
 (`artifact_kept`, no bytes written, 28 ms): under one epoch the same tokens are
 the state the artifact was taken from. Otherwise the previous entry is
@@ -727,10 +769,10 @@ disk). A rewind in a slot re-saves into the slot's entry.
 
 **Install.** Into an empty slot of an empty cache: the clear, the idle boundary
 (`breathe`, which releases the watermark a warmup or a cleared prompt leaves),
-the owners' ingest from the object stream and their import with the same
+the library's ingest from the object stream and its import with the same
 publish pair the host cache uses. It installs whole or the slot starts cold;
-the outcome carries the owners' decision (`native_import`, `live_rebased`,
-`downward_rebase`) or their refusal statuses. The import never retiers the
+the outcome carries the library's decision (`native_import`, `live_rebased`,
+`downward_rebase`) or its refusal statuses. The import never retiers the
 target, and transcodes artifact bytes by at most one rung; an artifact more
 than one rung below what the target holds is `precision_refused` (measured: an
 artifact saved under a 120 MB KV budget against an unconstrained target), and
@@ -740,14 +782,14 @@ measured. After a `downward_rebase` the greedy continuation can differ from a
 server that never restarted, because one rung of transcoding is lossy; the
 native and live-rebased imports measured token-identical.
 
-**The envelope is the owners'.** It carries the companions the capture had:
+**The envelope is the library's.** It carries the companions the capture had:
 recurrent state, and the drafter or accelerator state of a server that runs
 one. "No drafter state" is a property of the fixed route only. Measured with
 the MTP head of a 27B: three companions, identical tokens, acceptance
 unchanged (0.91–0.95).
 
 **Every slot of the cache, one image.** An artifact is an image of the whole
-pool up to its watermark with the placement of one sequence, and the owners'
+pool up to its watermark with the placement of one sequence, and the library's
 import takes an empty cache, not an empty slot ("empty import is a whole-child
 contract"). The rows of the other slots are already inside that image, so the
 route saves the image once and, for every other slot, where its rows lie:
@@ -772,7 +814,7 @@ route saves the image once and, for every other slot, where its rows lie:
 - *Pricing.* The destination is priced with the rows of every placed entry of
   the image, whether or not its sequence joins this import (`unowned_cells`
   for those that do not), because the published watermark is the artifact's.
-- *Refusal.* If the owners refuse the import with co-residents, it is retried
+- *Refusal.* If the library refuses the import with co-residents, it is retried
   once alone; the co-residents report `pool_refused` and start cold.
 - *Fewer slots.* A placed entry that gets no slot is `no_free_slot` and stays
   in the store. It is dropped the next time the image is rewritten, and a
@@ -785,7 +827,7 @@ route saves the image once and, for every other slot, where its rows lie:
   the disk, so the store never holds two images of one cache.
 
 A cache with a child that holds one sequence only (the sliding-window child of
-an iSWA model, or a QSA index) has no image to share: the owners refuse the
+an iSWA model, or a QSA index) has no image to share: the library refuses the
 capture while other sequences are live. The save passes are terminal (shutdown,
 or sleep before the context is destroyed), so there the other slots leave the
 cache and the most recently used conversation is saved alone (`"sole": true`;
@@ -803,12 +845,12 @@ projected domains, Merkle roots in place of payloads), so a save after an idle
 moment would find nothing to capture. With a persistent resume active the idle
 capture still publishes but leaves the source live, as it already does in a
 multi-slot unified cache; a returning conversation then restores through the
-owners' occupied-replacement route, which needs room for both conversations in
+library's occupied-replacement route, which needs room for both conversations in
 the context. The cost is that an idle server keeps its cache mapped.
 
 **The host cache goes through a slot.** A conversation that lives in the VBR
 host cache alone is a projected package, which no file can hold. It is saved
-and brought back by the two doors the owners already have, with no file kind
+and brought back by the two doors the VBR artifact library already has, with no file kind
 of its own:
 
 - *Save.* After the slots are saved, the hosted states of the running
@@ -816,7 +858,7 @@ of its own:
   earlier state of a saved slot or of another hosted state; the newest up to
   the entry bound, `max(8, 4 x slots)`). The most recently used slot is the
   stage, the other slots leave the cache, and the entries of all of them are
-  held. Each hosted conversation is restored into the stage by the owners'
+  held. Each hosted conversation is restored into the stage by the library's
   automatic restore, replacing what the stage holds, and saved as an ordinary
   pool entry (`"hosted": true` in the event) with a last-used time older than
   every slot's, in the order of the host cache. A refused replacement is
@@ -826,7 +868,7 @@ of its own:
 - *Load.* The first artifact entry, newest first, is the pool entry of the
   cache and takes its slot with its co-residents. Every other artifact entry
   is a hosted one: it is installed into an empty staging slot (the install
-  above), published by the owners' idle capture run to completion, and the
+  above), published by the library's idle capture run to completion, and the
   stage is cleared, oldest first so that the host cache's own order returns.
   The outcome is `installed_host`; an entry that is not published stays in the
   store (`host_cache_rejected`). This runs before the pool entry is

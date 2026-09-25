@@ -2,7 +2,7 @@
 
 Status: **P0 to P2 implemented on `exp/server-resume` (fixed-type KV, `--resume`);
 P3 (dynamic VBR: every slot of a dense or hybrid cache, the most recent
-conversation of an iSWA cache) implemented and not yet reviewed; P4 open; the blockers of the independent review (§11) are closed**. Contract, results and the limits
+conversation of an iSWA cache) implemented; P0–P3 independently reviewed; P4 open**. Contract, results and the limits
 of v1: `server-resume-format.md`.
 Created 2026-09-18 against master `ed774445c`.
 This is an engineering plan, not documentation of an available feature.
@@ -10,7 +10,7 @@ This is an engineering plan, not documentation of an available feature.
 ## 1. Objective and agreed product decisions
 
 Avoid repeating expensive prefill after a server restart or model swap by
-persisting reusable conversation state. Reuse existing cache/checkpoint owners,
+persisting reusable conversation state. Reuse the existing cache/checkpoint code,
 serializers, and restore transactions rather than introduce a second cache system.
 
 Decisions agreed with the user:
@@ -95,7 +95,7 @@ must never bypass representation or import validation.
 
 Anchors below are from `ed774445c`; use the symbols when lines move.
 
-| Owner / file | Relevant seam and implication |
+| File | Relevant seam and implication |
 |---|---|
 | `common/common.cpp:1120` | `fs_get_cache_directory()`: `LLAMA_CACHE`, otherwise platform cache root; on Linux XDG or `~/.cache/llama.cpp` |
 | `common/common.cpp:1392` | `common_moe_cache_profile_file()`: existing per-family heatmap persistence, not persisted expert weight placement |
@@ -109,7 +109,7 @@ Anchors below are from `ed774445c`; use the symbols when lines move.
 | `tools/server/server-context.cpp:9698` | `try_automatic_vbr_restore()`: existing artifact admission/import/restore path |
 | `tools/server/server-prompt-cache-payload.{h,cpp}` | Fixed target/draft payloads, immutable VBR package leases, variant sets and allocation accounting |
 | `src/llama-vbr-artifact.{h,cpp}` | Bounded stream encode/decode, representation metadata, payload verification, companion payloads |
-| `src/llama-vbr-artifact-{capture,stage,adopt,catalog}.*` | Existing capture, staged import, publication and lifetime owners |
+| `src/llama-vbr-artifact-{capture,stage,adopt,catalog}.*` | Existing capture, staged import, publication and lifetime code |
 | `tools/server/server-context.cpp:5132,6192` | `destroy()` and `handle_sleeping_state()`: state must be saved before teardown, including explicit sleep/unload |
 | `tools/server/server.cpp:520,573` | Shutdown notification and inference-loop return; avoid disk/GPU work inside a signal handler |
 
@@ -119,7 +119,7 @@ Relevant tests include `test-save-load-state`, `test-state-restore-fragmented`,
 serializers in test fixtures.
 
 Implementation shape: a small server resume coordinator plus a durable object
-store, calling existing owners for capture/import. Generic byte storage must not
+store, calling the existing code for capture/import. Generic byte storage must not
 learn model-specific recurrent, VBR, or speculative-decoding semantics.
 
 ## 4. Snapshot contents and default policy
@@ -188,7 +188,7 @@ Policy:
    replace (1): it does nothing for rewinds.
 
 Do not change the `>=` threshold or the retention rule to make resume pass; those
-belong to the checkpoint owners. Not yet tested: either policy after a restart, and
+belong to the checkpoint code. Not yet tested: either policy after a restart, and
 a Gemma host-cache rotation (host entries carry their checkpoints with the state).
 
 ### Frontier establishment and changed weights
@@ -230,7 +230,7 @@ do not infer support from MTP/DFlash. Report any fallback and its first-request 
 
 ### Saving
 
-1. Stop admitting new inference work and notify the inference owner to quiesce.
+1. Stop admitting new inference work and notify the inference loop to quiesce.
 2. Reach a completed decode/prefill boundary; drain required device work. Do not
    wait for an arbitrarily long answer to finish just to snapshot it.
 3. Freeze the saved-root inventory and obtain stable capture leases.
@@ -245,7 +245,7 @@ do not infer support from MTP/DFlash. Report any fallback and its first-request 
 7. Release leases and continue teardown.
 
 Signal handlers only request shutdown. Capture, CUDA/HIP synchronization and disk
-I/O run in normal control flow while cache owners still exist. Destructors must
+I/O run in normal control flow while the caches still exist. Destructors must
 not perform a second save after explicit save/unload. Failed startup must never
 overwrite a healthy snapshot with empty or partially restored state.
 
@@ -352,46 +352,53 @@ must durably retire its entry records so scanning does not resurrect cleared sta
 Physical freed-space behavior, shared-object lifetimes and filesystem allocation
 must be measured; bounded staging alone does not prove a bounded disk footprint.
 
-### Relationship to `--slot-save-path` files (decided 2026-09-19)
+### Relationship to `--slot-save-path` files
 
-`--slot-save-path` is the same serializer driven by hand: `POST /slots/<id>?action=
-save|restore` writes and reads one slot's tokens plus its per-sequence state behind
-a versioned `BUUNSLOT` header that the restore handler authenticates before the
-state blob reaches the library. P0 measured what it lacks for resume: no lifecycle
-hook, no checkpoint companion (hybrid and SWA models reprocess the history, and an
-SWA rewind of restored state is silently wrong), one checksum over the whole file
-that is only checkable after reading all of it into host memory (no partial read,
-no appending, no bounded staging, no `fsync`), a runtime identity bound to the
-build label, context size and slot layout, no file when dynamic VBR is active,
-and a save that is not read-only.
+The upstream slot file (`POST /slots/<id>?action=save|restore` under
+`--slot-save-path`) is one slot's tokens plus its per-sequence state behind a
+versioned `BUUNSLOT` header. P0 measured what it lacks: no checkpoint companion
+(hybrid and SWA models reprocess the history, and an SWA rewind of restored
+state is silently wrong), one checksum over the whole file that is only
+checkable after reading all of it into host memory, no `fsync`, a runtime
+identity bound to the build label, context size and slot layout, no file when
+dynamic VBR is active, and a save that is not read-only.
 
-Resume does not fork the format. One envelope family, two install routes:
+Resume does not fork the format. One envelope family, one installer, and as
+built the slot file is a resume entry:
 
-- A library sequence-state file (the current container) takes the legacy route
-  unchanged: strict runtime identity, sequence state only.
-- A resume manifest (its own magic and version, holding a version-3 slot
-  envelope as the token ledger) takes the resume installer: resume compatibility
-  key, per-object checksums, required companions, rewinds only through the
-  server's `pos_min` guard or a restored checkpoint, resume reason codes. P1
-  settled that the declaration is the manifest's own header rather than a flag
-  inside the library file, because that container's declared length and
-  whole-payload checksum rule out chunks.
-- Both routes share the state serializer and the state blob layout: a chunk is
-  that layout restricted to a token range. The manifest, checksums and companions
-  are additive; there is one reader to maintain.
-- **No silent downgrade.** A file that declares a manifest and fails any resume
-  check (checksum, missing companion, key mismatch) is refused with its reason. It
-  is never installed through the legacy route as state only.
-- A resume entry is a set of objects under the namespace above, not one file. The
-  `/slots` restore action accepts a resume entry by name and resolves its objects
-  inside the resume namespace; it does not make a resume entry a single portable
-  file, and builds that predate the new header version refuse it at the header.
-- The `/slots` save action may gain an explicit way to publish a resume entry on
-  demand. Its default output stays the legacy file.
+- **Save** writes one file in the resume format: a single exported entry, its
+  manifest then its objects as the store holds them
+  (`server_resume_store::export_entry`, format document §8.1). The capture runs
+  through a staging store at `<slot_save_path>.staging` that is not durable (no
+  `fsync` of its objects); the exported file itself is `fsync`ed and replaced
+  whole or not at all. No host cache is included; that is what `--resume` is
+  for.
+- **Restore** of a `filename` sniffs the file (`is_entry_file`). A resume entry
+  file is imported into the staging store (`import_entry`) and installed by the
+  installer `--resume` uses: resume compatibility key, per-object checksums,
+  required companions, context checkpoints for hybrid and SWA models, rewinds
+  only through the server's `pos_min` guard or a restored checkpoint, resume
+  reason codes. It restores into any slot index and after a restart. A legacy
+  (upstream-format) file still takes the unchanged legacy route on fixed-type
+  caches, and is refused with 501 under dynamic VBR.
+- **Dynamic VBR.** The entry is one artifact. Its import needs an otherwise
+  empty cache, so a restore while any other slot holds a conversation is
+  refused with 400 `cache_shared`, checked before the file is copied.
+- A placed entry (a sequence inside another entry's pool image) is not whole
+  and is refused by export and import; a slot-file save produces a whole,
+  compact (packed rows) artifact instead.
+- **No silent downgrade.** A file that is a resume entry and fails any resume
+  check is refused with its reason. It is never installed through the legacy
+  route as state only.
+- The `resume_entry` restore body (a named entry of the `--resume` namespace)
+  is unchanged; it is the restart-free test and operator entry point for the
+  code that `--resume` runs at startup and wake.
 
-The manual endpoint is therefore the test and operator entry point for the code
-that `--resume` runs at startup and wake: restore a named entry into a slot
-without restarting the server.
+Measured on an RTX 3090, turbo3_tcq KV, save / restore in ms, resume file
+against legacy file: dense 220/103 against 246/225; hybrid 216/119 against
+135/124 (the resume file carries two checkpoints, 218 MB against 114 MB, and
+restores warm); SWA 38/9 against 21/19. Dynamic VBR, dense: 2.47 s / 3.79 s for
+1.06 GB.
 
 ## 7. Memory and disk cost controls
 
@@ -473,7 +480,7 @@ correctness failure or a claim that old KV becomes B's KV after boundary replay.
 - No draft, MTP, DFlash/DFlash2; target-only fallback when optional draft differs.
 - Image/audio/video ledgers and replay boundaries: either supported end-to-end
   or explicitly skipped with cold replay, never restored using text-only identity.
-- CUDA first, then HIP correctness using the same storage/owner contracts;
+- CUDA first, then HIP correctness using the same storage and cache-code contracts;
   Windows compile plus platform-specific atomic-file/locking tests before claiming
   Windows support. Do not put CUDA-specific persistence logic in the shared layer.
 
@@ -506,7 +513,7 @@ mandatory companions before freezing the format or promising broad coverage.
 The contract is `server-resume-format.md`; section numbers below refer to it.
 
 - [x] Review lifecycle ordering, identity, checkpoint dependencies and failure
-  recovery against the real owners identified in P0. (§1, §4, §7)
+  recovery against the existing code identified in P0. (§1, §4, §7)
 - [x] Freeze a versioned manifest/object contract, bounded decode limits and
   provenance transition rules; separate portability versions from build labels.
   (§2, §5, §7 `resume_import`)
@@ -559,7 +566,7 @@ state or destroy unrelated valid entries; record measured peak disk occupancy.
 
 Initial measurements: dense and hybrid models had token-identical continuations
 across restart, sleep/wake, rewind, fewer slots and a killed save. Family reuse
-was measured separately in P0. These do not close the review findings in §11. SWA
+was measured separately in P0. SWA
 above the window is row-exact, not logit-exact (`server-resume-format.md` §10). Without `--resume`
 no resume code runs. Peak disk during a second save of a 221 MB hybrid entry:
 332 MB, i.e. the entry plus the objects being replaced. The retained-cell capture
@@ -582,7 +589,7 @@ prefix tests pass. This is required for the fork's default cache configuration.
 
 Under dynamic VBR a fixed-type state blob is not a restore source: the library
 refuses a save taken after any degrade, and an entry-tier save stops restoring once
-the target cache has degraded. The artifact system is the owner of tiered KV, so a
+the target cache has degraded. The artifact system is what handles tiered KV, so a
 resume entry under VBR holds **one artifact object** instead of chunks and tails.
 
 Save, per slot, at the same two capture points as the fixed route:
@@ -647,7 +654,7 @@ of the artifact store. What the gate found:
 
 - **One conversation per cache (first slice only; lifted by the second slice
   below).** The exact capture is an image of the whole pool with one sequence's
-  placement, and the empty import is a whole-cache contract of its owners. The
+  placement, and the empty import is a whole-cache contract of the VBR artifact library. The
   first slice restored the most recently used conversation and skipped the rest
   (`cache_shared`).
 - **Target emptiness includes the pool watermark.** The warmup leaves one; the
@@ -679,22 +686,22 @@ of the artifact store. What the gate found:
   exception was keyed on the VBR configuration, not on an active resume, so it
   changed every dynamic-VBR server (review of 2026-09-23, R1). It is now keyed
   on an active resume of a dynamic cache and nothing else: a server without
-  `--resume`, or one whose store did not open, displaces as the owners' code
-  does. Removing it altogether was measured too (stage 2 below saves what the
-  host cache holds, and the owners capture an idle source before displacing
+  `--resume`, or one whose store did not open, displaces as the VBR artifact
+  library does. Removing it altogether was measured too (stage 2 below saves what the
+  host cache holds, and the library captures an idle source before displacing
   it): the hosted conversations then come back cold on half the restarts,
   because a package captured from displaced rows is refused on the empty door
-  (the owners' offset finding in stage 2). With the exception in place under a
+  (the library's offset finding in stage 2). With the exception in place under a
   resume the hosted round trip is whole (6 of 6) and one further case is lost
   instead (`idle`, 2 of 3): a conversation installed from the store, extended
   and then displaced by a stranger's request is refused on its way back
-  (`representation_mismatch` in the occupied replacement, for the owners). The
-  exception stays until both owners' doors take such packages. The harness has
+  (`representation_mismatch` in the occupied replacement, a library issue). The
+  exception stays until both of the library's restore doors take such packages. The harness has
   an `idle` scenario whose oracle is `cache_n`, not the text, and `idle_ctl`,
-  the same without `--resume`. The same rule covers the second place the owners
-  clear a live source: after an exact capture on a windowed, recurrent or hybrid
+  the same without `--resume`. The same rule covers the second place the library
+  clears a live source: after an exact capture on a windowed, recurrent or hybrid
   memory, the finisher clears every live conversation once all are proven
-  durable. The owners' pre-displacement capture (merged from master after
+  durable. The library's pre-displacement capture (merged from master after
   stage 2) runs such captures when a request launches, so three live hybrid
   conversations were saved as one placement and two hosted, and the hosted two
   came back cold (a hybrid hosted entry carries no checkpoints past its last
@@ -709,8 +716,8 @@ action, degraded restore, smaller context, fewer slots and overflow pass on dens
 restart, sleep, idle-then-stop and degraded restore on hybrid; MTP on the 27B. On
 hybrid, a conversation that returns from the VBR host cache after another took the
 slot restores (`cache_n` 9344 of 9696) but its greedy continuation differs from the
-reference, identically without `--resume`: a host-cache observation for its owners,
-not a resume result. Fixed-route regression rerun
+reference, identically without `--resume`: a host-cache observation for the VBR host
+cache code, not a resume result. Fixed-route regression rerun
 clean on dense and hybrid. `test-vbr-artifact*` and `test-server-resume-store`
 pass. Open from the P3 list: shared payloads saved once and partial inventory
 admission (both need the multi-conversation import), checkpoint policy for VBR
@@ -723,12 +730,12 @@ restart should give back the server that was stopped. Three routes were weighed:
 
 1. *One artifact per slot.* The exact capture is a pool image, so N slots cost N
    images of the same rows on disk, and the import of the second one needs an
-   occupied destination that preserves foreign rows: new owners' machinery.
+   occupied destination that preserves foreign rows: new machinery in the VBR artifact library.
 2. *Persist the VBR host cache and let slots restore from it.* The projected
    package of the host cache has no wire form; that is P4 and larger.
 3. *One image, co-resident placements (built).* The rows of every slot are
    already in the image of the most recently used one. Saving where the other
-   sequences lie is 16 bytes per token, and the owners' empty import needs one
+   sequences lie is 16 bytes per token, and the library's empty import needs one
    addition: a list of co-resident sequences whose rows validation authorizes,
    the image install assigns and the tracker stamps. The wire format of the
    artifact is unchanged, and nothing about tiers, budget or the host cache is.
@@ -756,7 +763,7 @@ What the gate found:
   three (`transfer_failed`, ring unavailable): an idle capture was in flight.
   The save pass cancels and drains it first; 8 of 8 runs then saved. This
   predates the second slice and affected every VBR save.
-- **Not a resume result, for the VBR owners:** iSWA with dynamic VBR and three
+- **Not a resume result, a VBR cache issue:** iSWA with dynamic VBR and three
   slots reuses no prefix on the next turn of any slot (`cache_n` 0 of 3047),
   without `--resume` and without a restart; the same run on fixed-type KV
   reuses 3047.
@@ -781,7 +788,7 @@ restart, a changed one, and a restart with one slot):
 | dynamic VBR, dense and hybrid: the same, plus tier and group | pass |
 | dynamic VBR under `--vbr-vram 120M`, dense and hybrid: group | pass |
 | dynamic VBR, iSWA, one slot: group | pass |
-| dynamic VBR, iSWA, three slots: group | the 7 multi-slot reuse compares fail as in the owners' finding above; the save is `sole` |
+| dynamic VBR, iSWA, three slots: group | the 7 multi-slot reuse compares fail as in the VBR cache finding above; the save is `sole` |
 | fixed-type KV, iSWA: restart, sleep, fewer | f16 KV passes; turbo3_tcq reuses the full prefix (`cache_n` 9047 of 9047) and its text differs from the one-process reference, as it did before this slice |
 
 Limits: a placed conversation that gets no slot after a restart with fewer slots
@@ -796,14 +803,14 @@ cache, and a restart that gives back the slots only loses them. Two routes:
 
 1. *Write the host cache's packages.* A hosted artifact is a projected package:
    packed rows, no pool image, and no wire form. Giving it one is a new format
-   and a new import door in the owners' store.
-2. *Round trip through a slot (built).* The owners already turn a hosted
+   and a new import door in the VBR artifact store.
+2. *Round trip through a slot (built).* The artifact library already turns a hosted
    package into a live conversation (`try_automatic_vbr_restore`) and a live
    conversation into a hosted package (the idle capture). The save pass is
    terminal, so after the slots are saved one of them is a stage: each hosted
    conversation is restored into it, saved as a slot's conversation is, and
    replaced by the next. At load every artifact entry after the first is
-   installed into an empty staging slot, published by the owners' idle capture
+   installed into an empty staging slot, published by the library's idle capture
    run synchronously, and cleared, oldest first, as the fixed route does with
    `resume_install_host`. No library change, no new file kind, and serving is
    untouched.
@@ -816,15 +823,15 @@ of another hosted state; the newest of them up to the entry bound, which is now
 What the gate found:
 
 - **A resumed slot never reached the host cache.** The install did not publish
-  the restored tokens to the retention owner, so the idle capture saw nothing
+  the restored tokens to the retention observer, so the idle capture saw nothing
   to keep. One call (`slot_restored_tokens_publish`).
 - **The restore goes through the occupied door.** The stage keeps what it holds
-  and each restore replaces it (the owners' occupied replacement), after the
+  and each restore replaces it (the library's occupied replacement), after the
   stage's own conversation is made durable in the host cache so that the
   one-slot handoff gate does not divert to the empty door. A cache with no room
   for two conversations refuses the replacement; the stage is then cleared and
   the restore retried into it.
-- **For the VBR owners, not a resume result:** the empty-destination import
+- **A VBR artifact library issue, not a resume result:** the empty-destination import
   refuses a hosted package whose rows were not at physical cell 0 when it was
   captured (`stage_failed`, `source_hash_mismatch`). `stage_child` in
   `llama-vbr-artifact-stage.cpp` takes `first_physical_cell * row_bytes` as the
@@ -838,7 +845,7 @@ What the gate found:
   (734 MB against 353 MB). This holds for a live slot in ordinary serving too,
   it does not grow past two conversations, and the watermark only shrinks once
   the upper cells are free. Disk and load time of such an entry double.
-- **Under a tight budget the owners' occupied restore declines**
+- **Under a tight budget the library's occupied restore declines**
   (`destination=exhausted`) with or without a restart, so the hosted
   conversations are kept across the restart and reuse nothing in either case.
 - **A hybrid's hosted state ends at its last checkpoint** (2996 of 3047), with
@@ -866,7 +873,7 @@ The R1 and R7 findings are recorded with their slices above. The rest:
 
 - **A hosted candidate could change between the choice and the restore** (R2).
   The save pass picked the hosted states, then restored each by its tokens, and
-  a state the owners replaced in between was restored in its newer form or not
+  a state the host cache replaced in between was restored in its newer form or not
   at all. Each candidate is now pinned (`recovery_pins`) when it is chosen and
   restored by the pin, so the pass saves the states it counted.
 - **A busy slot at shutdown was skipped** (R3). A graceful stop with a request
@@ -889,7 +896,7 @@ The R1 and R7 findings are recorded with their slices above. The rest:
   captures on the queue thread before the loop can return and the SWA frontier
   capture that holds a slot lasts tens of milliseconds. The in-flight branch is
   held by the order of the helper, not by a measurement: a delay seam in the
-  owners' worker would make it measurable.
+  library's capture worker would make it measurable.
 - **An unchanged entry was kept by its tokens** (R4). A save skipped the
   artifact write when the slot held the entry's tokens, so a slot refilled with
   the same tokens under another model of the family, or under
@@ -912,18 +919,18 @@ The R1 and R7 findings are recorded with their slices above. The rest:
 - **A restored slot displaced before its first idle pass lost its projection.**
   The first request after a restart usually diverges from the slot it lands
   on, and a slot displaced before the idle pass has captured it goes to the
-  host by the exact route, which the owners' restore cannot project a
+  host by the exact route, which the library's restore cannot project a
   diverging request onto (a cold prefill for the very conversation the client
   was in the middle of). The install now ends with the idle capture run over
   the restored slots, wave after wave, until each has a host copy; one
-  device-to-host copy per live slot at startup. A wave keeps the owners'
+  device-to-host copy per live slot at startup. A wave keeps the library's
   bounds (eight manifests, one stateful or speculative candidate), so the pass
   runs at most one wave per slot and stops at the first wave that covers no
   further slot (refused, cancelled, displaced). `install_done` and the
   shutdown line report `live`, `exact` (slots with a durable copy: a
   continuation is warm) and `projectable` (a diverging request is warm too),
   and the install warns about the difference. `projectable` is the artifact
-  owner's answer, not the server's inference: the copy must carry no media
+  library's answer, not the server's inference: the copy must carry no media
   and no checkpoints, and the catalog must confirm that the payload the
   restore would pick is current, sealed for projection and laid out as the
   projection requires. A durable copy taken by the exact route (the
@@ -933,7 +940,7 @@ The R1 and R7 findings are recorded with their slices above. The rest:
   nine projectable after the install waves, four hybrid slots none). A
   stateful conversation (hybrid model, a drafter, a speculative slot: the gate
   of the idle pass's checkpoint cut) is exact only: its copy is cut at a sealed
-  checkpoint, which a restored slot has none of, and the owners' restore
+  checkpoint, which a restored slot has none of, and the library's restore
   projects onto a copy without checkpoints only — the ring checkpoint
   persistence of the next slice closes that.
 
@@ -961,291 +968,3 @@ fallbacks for any deferred feature must be documented before release.
   environment gates, keep only the two agreed product flags unless justified.
 - [ ] Public usage/privacy/storage guidance and reproducible scripts/results.
 - [ ] Commit reviewable units; merge/push only when requested.
-
-## 10. Progress log
-
-- 2026-09-18: Initial plan written from current source and user decisions.
-  No implementation, hardware tests, or independent review have been performed.
-  First executable task is P0, not enabling ordinary slot saves under VBR.
-- 2026-09-18: Revised storage policy after user feedback: no backup generation;
-  permit cache loss on interrupted shutdown in exchange for bounded disk usage.
-  Publish slots/prefix entries independently with complete dependency closures,
-  allowing recovery of valid old and new entries from the same store.
-- 2026-09-19: P0 measurements run (single RTX 3090, 1d0f493c7). SWA finding added
-  to §4: the per-sequence writer emits exactly the masked window, so a restored
-  iSWA sequence always sits on the reuse threshold and a pure append reprocesses
-  the whole history unless checkpoints are restored with it. Checkpoint companions
-  moved into the P2 vertical slice for both hybrid and SWA models.
-- 2026-09-19: P0 gap closure (cbaf04301). Gate met for fixed-type KV.
-  - Sequence state plus one partial-state (recurrent/SWA) blob restores hybrid
-    4B and 27B models bit-exactly across a process restart, f16 and turbo3_tcq;
-    the companion is needed with thinking off as well (reply re-render rewind).
-  - On an SWA model, `llama_memory_seq_rm` on restored state succeeds and the
-    continuation is silently wrong. Install must go through the server's
-    `pos_min` guard or a checkpoint; resume code never rewinds SWA state itself.
-  - The state API refuses a wrong KV type, wrong model, too-small context and a
-    truncated blob without crashing. The raw state API has no payload checksum
-    (corrected in P1: the library sequence file does carry one FNV-1a-64 over
-    the whole payload). f16 and undegraded VBR states are mutually accepted.
-  - The semantic family digest hashes `n_layer_all`, `n_layer_nextn` and the pad
-    token id, so a fine-tune without the base's MTP layer is a different family.
-    §2 needs a KV-compatibility key or an explicit override to keep fine-tunes
-    eligible.
-    Resolved (decided by the maintainer): digest v4 hashes the trunk layers
-    only when the model has an appended MTP head (the target context never
-    allocates those layers; router layers and all-NextN sidecars stay bound)
-    and drops the pad token id. Measured on a 4B hybrid, stock with MTP head
-    vs. a fine-tune without it, f16 and turbo3_tcq KV, both directions: the
-    slot file installs (4380 tokens, 0.10–0.22 s), the follow-up reuses the
-    whole prefix, and every inherited-KV reply is a coherent answer that
-    diverges from both the producer's and the consumer's own-KV reply after a
-    shared opening, as §2 expects of a mixed-model history.
-  - Slot files refuse context-size, KV-layout and slot-index mismatches under the
-    label `model_family_mismatch`; resume needs its own reason codes.
-  - With `--kv-unified` and several slots (fixed KV types), launching a task
-    moves every other idle slot into the host cache, so at shutdown only one
-    slot is live and the rest are host entries; an emptied slot cannot be saved
-    and must be skipped. Split KV saves and restores every slot, and a file
-    restores into a different slot index.
-  - The 30 s shutdown delay is the SSE ping interval: a streaming handler parked
-    in the chunked provider is only released by the ping timer or a client
-    disconnect. Save hook: after `start_loop()` returns and before `clean_up()`
-    in `server.cpp`. The wait is removable with a shutdown flag in the
-    `should_stop` closures of `server-http.cpp`.
-  - Sleep/wake restores through a slot file today (first P2 integration test).
-    A restored reply equals the uninterrupted reply; a cold re-prefill reply
-    does not, so regression tests compare restored against uninterrupted.
-  - Found outside resume: with split target KV the MTP draft context is sized
-    for one sequence but shared by all slots, failing requests at `-np 2`; a
-    request pinned by `id_slot` to an empty slot never consults the host cache
-    (slot selection leaves `update_cache` false), which under `--kv-unified`
-    means every pinned follow-up is a cold replay. Entries restored into the
-    host cache rather than a slot would be invisible to pinned requests.
-    Both fixed in 08826ad6e and re-measured: the draft context follows the
-    target's total capacity, and a pinned empty slot performs the host lookup
-    (pinned follow-ups reuse the full prefix), so host-cache restores are
-    visible to pinned requests.
-- 2026-09-20: P1 contract written (`server-resume-format.md`), unreviewed by
-  maintainer decision until a working product exists.
-  - Family handoff measured over four text windows and two history lengths; the
-    behaviour is kept and documented in §2 (an earlier single-window reading
-    that mean reuse error stays below the model distance was too strong).
-  - An entry is a directory of objects: base-state chunks by token range, each
-    the existing state blob layout restricted to that range, plus recurrent/SWA
-    states at positions, plus a manifest published last by rename. Chunking
-    costs under 0.01 % in size. A smaller context installs a prefix instead of
-    refusing: any position on a dense model, a saved recurrent/SWA position on
-    the others.
-  - The library needs a base-only flag, a position-range writer and an append
-    reader; the state serializer itself is unchanged.
-  - Checkpoints read from disk cannot pass the server's validity test (per-load
-    execution identity, sequence epoch), so import re-stamps them as a named
-    transition and admits them through the door host-cache restores use.
-  - The build label, context size, slot count and index leave the identity; a
-    resume key keeps the family, the KV types, RoPE/YaRN and format versions.
-  - Correction: slot files carry a whole-file FNV-1a-64; the missing pieces are
-    smaller integrity units, streaming and durability.
-- 2026-09-20: P3 first slice (dynamic VBR), unreviewed. Details under P3 in §9
-  and in `server-resume-format.md` §11.
-  - A VBR entry is one streamed object holding the VBR artifact envelope,
-    companions included; capture and import go through the artifact store's
-    existing doors, and the envelope's own validation decides precision.
-  - The execution identity the envelope is bound to is kept in the namespace,
-    and the sequence-epoch counter starts above every stored epoch.
-  - An exact capture images the whole pool and an empty import takes the whole
-    cache, so a save keeps the most recently used conversation of a shared
-    cache and an install refuses (`cache_shared`) once another slot holds
-    tokens. Several conversations per cache need an import beside live rows
-    and a capture narrowed to one sequence, both in the VBR artifact system.
-  - Found on the way: a reload after `--sleep-idle-seconds` under VBR aborted
-    without `--resume` too (the artifact store and the host cache outlived the
-    ledger they report to); a cache that never degraded had no side stream for
-    the import; SHA-256 of a payload ran scalar at about 0.3 GB/s.
-  - Measured on a 3090: dense and hybrid restart, sleep, rewind, action restore,
-    fewer slots, overflow, a smaller context, degraded budgets, tier mismatch in
-    both directions (refused, never silently rebased up), MTP companions; the
-    fixed route re-run unchanged.
-- 2026-09-20: P3 second slice, unreviewed. Stage 1 restores every slot of a
-  dynamic cache from one image; stage 2 takes the VBR host cache through a
-  staging slot in both directions. Details and gates under P3 in §9.
-
-## 11. P0–P2 independent review — before VBR
-
-Review base: `08826ad6e`; reviewed head: `655037231`. Three independent
-code reviews covered structure, resource costs, and correctness. The object
-directory/container and existing state-owner integration are worth retaining;
-no wholesale rewrite is proposed. Implementation is not yet accepted for P3.
-
-First cleanup batch (focused gates tracked in the private review ledger):
-
-- [x] Store retirement is idempotent for already-pruned entries. Connecting it
-  to explicit slot erase awaits the conversation-ownership fix below.
-- [x] Unreported overflow entries can fill slots left empty by failed imports.
-  Host-cache staging retains its existing path; test that separately.
-- [x] Limited checkpoint budgets select recent companions before optional early
-  history, then import in chronological order.
-- [x] Release chunk staging on failed captures as well as successful ones.
-- [x] Refuse producer-table overflow instead of assigning new bytes to producer
-  zero. Report `provenance_limit` before changing disk state.
-- [x] Reject over-depth JSON rather than silently dropping its nested fields;
-  avoid signed overflow in tail-position validation.
-- [x] Exclude the POSIX research probe from Windows example builds.
-
-Still required before moving on:
-
-- [x] **State identity:** token-prefix equality does not prove that stored KV or
-  recurrent bytes describe the current live state. Cold refill, family handoff,
-  legacy restore, and slot replacement can invalidate this assumption. Verify
-  serialized bytes or carry a proven lineage before reusing objects; never join
-  old base state to a newly computed unrelated recurrent frontier. Include
-  `cache_prompt:false` as a negative control.
-  Done by bytes (contract §4 step 3): an object is reused only when the live
-  range or tail serializes to its size and checksum. The re-review removed
-  disk-only `early` reuse: base bytes cannot authenticate partial state. Early
-  checkpoints now come from the validated live ring. Gates: cold refill under a fine-tune after a family restore
-  saves the fine-tune's bytes; an inherited append and a restart after it keep
-  the producer's chunks. Known cost: the range blob names the sequence id, so a
-  conversation that comes back in another slot is rewritten once.
-- [x] **Conversation ownership:** the own-slot entry shortcut accepts a match of
-  only one chunk and can overwrite much more than the documented last-chunk
-  tradeoff. Separate entry adoption from object identity; qualify long shared
-  system prompts and returning host-cache conversations.
-  Done: one rule for every entry, all chunks but the last lead the ledger; the
-  slot's previous entry is taken over only when retention would drop it in this
-  save anyway. Gate: 5000 shared tokens, two conversations through one slot of
-  two, both restored whole. Host-cache overflow and fewer-slots scenarios
-  repeat token-identical. Open: a single-chunk entry still goes with its slot.
-- [x] **Explicit erase:** retire the current conversation's disk entry, not a
-  stale entry ID left attached to its slot. Qualify both restart → erase →
-  restart and A → replace with B → erase B (A's entry must survive).
-  Done, both gates, B unsaved and B saved.
-- [x] **Disk bound:** edited histories and replacement conversations can retain
-  almost two inventories until post-save pruning. Honor invalidate-first even
-  with plentiful free space, without deleting unrelated/held entries. Measure
-  peak allocated bytes, not just appended-turn bytes written.
-  Done (contract §4): retention runs before a new entry is written and keeps
-  slot-held entries first; a save replacing more than its last chunk gives up
-  its commit first. Peak allocated bytes 794 MB on a 794 MB entry for both an
-  edited and a replaced history (were 1308 and 1527). A kill inside such a save
-  loses that entry and leaves nothing behind. Appends keep the old commit and
-  duplicate at most one chunk and the tails.
-- [x] **Recoverable VMM import:** the newly reached mapping helper aborts on
-  physical exhaustion. State import must use the recoverable mapping operation
-  and existing rollback, with a forced allocation-failure gate.
-  Done: whole-sequence import and range append map recoverably and fail through
-  their existing rollback; decode's mid-batch backstop is unchanged. Gate:
-  `tests/test-vbr-import-exhausted.cpp` takes the device down to 64 MiB free and
-  imports 448 MiB both ways — refused, no cells left, accepted again with the
-  memory back; each path aborted before. No server route reaches this map today
-  (slot files are off under dynamic VBR, the host restore declines an exhausted
-  destination before importing), so the test is at the library API. It becomes
-  a server path when resume takes dynamic VBR.
-  Extended before dynamic-VBR resume (asked for by the re-review): the gate now
-  starves the import with something to lose. Another sequence of 1024 tokens
-  lives beside the destination, and a third arm appends `[1024, 4096)` onto a
-  live prefix. Device down to 4 MiB free; after each refusal the prefix rows and
-  the other sequence's rows read back byte for byte as before, both sequences
-  keep decoding across the boundary where the controller settles the refusal,
-  and the import is accepted with memory back and reads back as saved. Passes on
-  a dense model, a hybrid one and Gemma 4 (two caches, a 30 MiB import); on the
-  latter two a range alone is not a decodable sequence, so those arms compare
-  rows and do not decode the destination. Controls, each a one-line library
-  break: the append unwind dropping the whole sequence fails the prefix arm, the
-  whole-import unwind clearing the cache fails on the other sequence.
-  The gate found one defect: a context freed with a refused import still
-  unsettled aborted in the tracker's destructor (the refusal is settled at the
-  next decode boundary, and there was none) — what a server does when it frees
-  its context right after a refused restore. The cache now runs the same
-  boundary drain once more when it is destroyed; the gate's last arm frees the
-  context on a refusal, and aborts without that call.
-- [x] **Wrapped SWA state fidelity:** establish the cause with exact row/position
-  comparisons and same-token logits. Different batch sizes and coherent output
-  are not an acceptance substitute.
-  Re-reviewed: `tests/test-state-restore-swa-exact.cpp` on Gemma-4 E2B (window 512,
-  f16, q8_0 and turbo3_tcq KV). All saved rows, including older held rows on the
-  ranged route, read back by position from both caches, equal the live rows bit for bit, below the window and across a
-  wrapped ring of 2185 tokens, for the whole-sequence restore and for the
-  resume route. Two live runs give bit-equal logits. Same-token logits after
-  a wrapped restore differ (max KLD 7e-9, top-1 8/8); the control reproduces
-  that below the window with exact rows moved 200 cells along (max KLD 2e-6),
-  where an unmoved restore is logit-exact. The cause is cell placement, which
-  changes the attention kernels' reduction order and padding, not restored
-  data in that comparison. The original test excluded older held-row payloads;
-  the re-review covers those too and requires successful zero-offset restores,
-  held-position bounds and finite logits. Failed arms can no longer silently
-  disappear. Matching the live ring's layout on restore
-  is not planned. The TCQ server continuation difference is still a limitation,
-  not a passing fidelity gate.
-- [x] **Qualification:** repeat dense/hybrid restart, rewind, sleep/wake and
-  media gates after cleanup; verify missing-entry action leaves a live slot
-  intact, host-cache overflow, resume-off PP/TG, and interrupted replacements.
-  Done on the cleaned-up head, RTX 3090, TCQ 3-bit KV unless noted. All 14
-  review gates pass (missing-entry action, interrupted replacement among them).
-  Greedy continuations against one process: hybrid 17/17 (restart, sleep,
-  rewind, fewer slots, host-cache overflow, restore action, killed save,
-  fine-tune handoff); dense 18/18 with the kill 0.04 s after SIGTERM, the 0.6B
-  save finishing inside the default delay; media 3/3 on SmolVLM2 (q8_0 KV) and
-  on Gemma-4 E2B. The two-conversation `-np 2` → `-np 1` media restart is
-  identical on SmolVLM2; on Gemma-4 it is a `resume_key_mismatch` by design, so
-  both conversations prefill cold: identical under f16 KV, one second turn in
-  other words under TCQ 3-bit. M-RoPE media is skipped as designed, so that cell restores
-  nothing: its second turn is a cold prefill of the history and differs in text
-  from the reference's cached turn under TCQ 3-bit, q8_0 and f16 alike, which
-  is the server without resume. SWA 8/8 with f16 KV; with TCQ 3-bit the turns
-  after a restart or wake diverge in text (contract §10).
-  The earlier dense smaller-context continuation had never run: both requests
-  overflowed the smaller context and the harness compared two failures as equal.
-  With a history that fits it is token-identical, against a live and a cold
-  reference; the harness now refuses an empty reference. Resume off, against
-  master at the review base, 9000-token prefill and 256 generated tokens, three
-  runs in each build order: dense 2000 vs 2000 t/s prefill, 83.4 vs 83.7 t/s
-  generation; hybrid 3169 vs 3164 and 114.6 vs 114.7. The build that runs first
-  in a pair is ahead by 0.2–0.6 % in either order.
-- [x] **Remaining design decisions:** explicitly qualify projector-independent
-  approximate reuse; compact unreferenced producer records before the table
-  fills; measure range-enumeration cost at long context. Keep deferred host-only,
-  VBR, speculative-companion and platform support distinct from passing P2 tests.
-  Done. Projector: presence stays in the key, the file stays provenance; one
-  model under its projector at two precisions continues token-identically
-  (contract §4a), differently trained projectors were not available. Producers:
-  a save keeps the records of the objects it carries over, so a conversation
-  refilled by another model lists that model alone. Range enumeration at 131072
-  tokens, 32 chunks: asking every chunk's size, which is the cell scan alone,
-  takes 13 ms (1.3 ms at 32768); reading all chunks takes 271 ms against 191 ms
-  for the whole sequence on the dense 0.6B (3.06 GB) and 88 ms against 61 ms on
-  the hybrid 4B (0.88 GB). The scan is 2–15 % of a chunked read, so no cell
-  inventory is added. Still deferred, and not covered by any P2 result:
-  host-only conversations at shutdown, dynamic VBR, drafter and speculative
-  companions, non-POSIX platforms.
-
-### Re-review of `7502c100a`
-
-The second independent review found and corrected three remaining cases:
-
-- Optional disk-only early tails could survive a cold refill without proof of
-  recurrent/SWA identity. Early now comes from a validated live checkpoint.
-  This trades indefinite historical checkpoint retention for a sound identity
-  rule; ordinary inherited chunks and live inherited checkpoints still reuse
-  their objects.
-- Erase ignored filesystem errors. Retirement now requires a durable uncommit,
-  preserves the live slot on failure, and retries a failed directory sync even
-  after the commit was unlinked. HTTP errors do not expose storage paths.
-- Unslotted entries could outrank an older live entry under the overall cap.
-  Live slots now have first priority; the same per-key and total caps apply.
-
-The SWA test now compares all held rows and requires every normal restore arm.
-Mutation controls demonstrate why this matters: the previous test succeeded
-when range append was forcibly refused and when older held rows were omitted;
-the revised test fails both controls. F16, Q8 and TCQ 3-bit pass the real
-state/finite-logit gates on Gemma-4 E2B. The known TCQ free-generation difference
-is not reclassified as an exact continuation pass.
-
-Fresh CUDA SM86 build: store unit test, 16 focused server gates (including
-failed unlink, repeated failed directory sync, disk bounds and interrupted
-replacement), and dense/hybrid range-state tests pass. The new early-tail and
-erase-unlink controls fail on `7502c100a` and pass with the fixes. Peak allocated
-bytes for the edited/replaced-history gates remain about 794 MB, not two
-inventories. No wire-format change, new flag, or inference-path optimization.
-The hardened Python harness also passes restart, rewind, sleep/wake,
-smaller-context, fewer-slot and host-overflow scenarios on dense and hybrid
-models. Failed requests and empty outputs are now errors, not matching results.

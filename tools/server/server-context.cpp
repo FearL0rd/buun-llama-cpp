@@ -5092,7 +5092,7 @@ private:
         return resume_store && resume_key.family_compatible;
     }
 
-    // A dynamic cache is saved as one artifact of its owners' envelope, not as token ranges.
+    // A dynamic cache is saved as one artifact of the VBR artifact envelope, not as token ranges.
     bool resume_vbr() const {
         return server_vbr_dynamic_active(params_base);
     }
@@ -5377,7 +5377,7 @@ private:
     }
 
     // The conversations the host cache alone holds. A state there has no form a file can take, so
-    // each comes back into a slot (the owners' restore of a dynamic cache, the host restore of a
+    // each comes back into a slot (the VBR artifact restore of a dynamic cache, the host restore of a
     // fixed one), is saved as a slot's conversation is and gives way to the next. The cache goes
     // away after this pass and the slots are saved by now, so they leave: one of them is the stage,
     // and the image saved is of the one conversation it holds.
@@ -6166,7 +6166,7 @@ private:
         };
     }
 
-    // The dynamic route of a save: the owners' exact capture of the sequence, streamed into one
+    // The dynamic route of a save: the VBR artifact exact capture of the sequence, streamed into one
     // object. The capture is an image of the whole pool, so the slots saved after this one record
     // only where their rows lie in it. An artifact is reused whole or not at all, and the one it
     // replaces leaves the disk before the new one is written: the entry is lost rather than held twice.
@@ -6763,7 +6763,7 @@ private:
     }
 
     // The door that saves an idle slot, of whichever host cache there is. A dynamic cache has the
-    // owners' idle capture, run now rather than at the next quiet moment.
+    // VBR artifact idle capture, run now rather than at the next quiet moment.
     bool resume_host_publish(server_slot & stage) {
         if (!resume_vbr()) {
             const bool durable = prompt_save_durable(stage.prompt_save(*prompt_cache));
@@ -6775,7 +6775,7 @@ private:
         return resume_idle_publish() > 0 || vbr_idle_source_durable(stage);
     }
 
-    // One run of the owners' idle capture over the idle slots: the host copies it published. The
+    // One run of the VBR artifact idle capture over the idle slots: the host copies it published. The
     // session is the bounded displacement kind, which a queued request does not refuse or cancel:
     // a request queued while the server wakes (or starts) waits for this pass instead of stopping it.
     size_t resume_idle_publish() {
@@ -7316,9 +7316,9 @@ private:
         };
     }
 
-    // The dynamic route of an install: the artifact goes back through its owners' import into an
+    // The dynamic route of an install: the artifact goes back through the VBR artifact import into an
     // empty slot. It installs whole or the slot starts cold; the import says why it refused. The
-    // envelope is the owners', so it restores the drafter state it was captured with. The image
+    // envelope is the VBR artifact's, so it restores the drafter state it was captured with. The image
     // is of the whole pool: the placed entries of `group` come back in the same import, under
     // their own sequences, and are established as a fixed install establishes a slot.
     // A dynamic import takes an empty cache, not an empty slot. That also keeps two entries of one
