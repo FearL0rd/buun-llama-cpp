@@ -15,12 +15,13 @@
 
 static size_t n_devs = 0;
 
-static ggml_backend_meta_split_state split_axis_0(const ggml_tensor * tensor, void *) {
+static ggml_backend_meta_split_state split_state(const ggml_tensor * tensor, void *) {
     ggml_backend_meta_split_state state = {};
-    state.axis = GGML_BACKEND_SPLIT_AXIS_0;
-    // "fused": two segments along the row, each split across the devices
+    // "rows": split along axis 1; "fused": two segments along the row, each split across the devices
+    const bool rows = strcmp(tensor->name, "rows") == 0;
+    state.axis = rows ? GGML_BACKEND_SPLIT_AXIS_1 : GGML_BACKEND_SPLIT_AXIS_0;
     const std::vector<int64_t> segments = strcmp(tensor->name, "fused") == 0 ?
-        std::vector<int64_t>{ 64, 32 } : std::vector<int64_t>{ tensor->ne[0] };
+        std::vector<int64_t>{ 64, 32 } : std::vector<int64_t>{ tensor->ne[state.axis] };
     for (size_t s = 0; s < segments.size(); ++s) {
         for (size_t j = 0; j < n_devs; ++j) {
             state.ne[s*n_devs + j] = segments[s] / int64_t(n_devs);
@@ -46,15 +47,17 @@ int main() {
     }
     n_devs = devices.size();
 
-    auto             dev = ggml_backend_meta_device(devices.data(), devices.size(), split_axis_0, nullptr);
+    auto             dev = ggml_backend_meta_device(devices.data(), devices.size(), split_state, nullptr);
     auto             buft = ggml_backend_dev_buffer_type(dev);
     ggml_context_ptr ctx(ggml_init({ ggml_tensor_overhead() * 4, nullptr, true }));
-    ggml_tensor *    tensors[2] = {
+    ggml_tensor *    tensors[3] = {
         ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, 96, 24),
         ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, 96, 24),
+        ggml_new_tensor_3d(ctx.get(), GGML_TYPE_F32, 32, 24, 3),
     };
     ggml_set_name(tensors[0], "single");
     ggml_set_name(tensors[1], "fused");
+    ggml_set_name(tensors[2], "rows");
     ggml_backend_buffer_ptr buf(ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), buft));
     GGML_ASSERT(buf);
 
@@ -76,6 +79,7 @@ int main() {
 
         const std::pair<size_t, size_t> ranges[] = {
             { 0, 1 }, { 7, 1001 }, { row - 3, 6 }, { row, row }, { 5*row + 11, 3*row }, { nbytes - 13, 13 },
+            { tensor->nb[2] < nbytes ? tensor->nb[2] - 5 : 3, 10 },
         };
         for (const auto & [offset, size] : ranges) {
             std::vector<uint8_t> got(size);
