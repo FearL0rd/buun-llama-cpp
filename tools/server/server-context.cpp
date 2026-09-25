@@ -5111,6 +5111,10 @@ private:
             open(slot_file_store, params_base.slot_save_path + ".staging", "slot_files", false);
             if (resume_vbr()) {
                 open(slot_file_exports.store, params_base.slot_save_path + ".staging/exports", "slot_exports", false);
+                if (slot_file_exports.store) {
+                    // drained above: what is left is of an export that was interrupted
+                    slot_file_exports.store->prune(resume_key_hex, 0, 0);
+                }
             }
         }
         if (resume_vbr()) {
@@ -7635,6 +7639,10 @@ private:
             slot.mandatory_recovery_reset(server_cache_destruction_reason::restore_failure);
             // what the live pool cannot take is the request's to change, not a failure
             if (shared) {
+                // the precision preflight refuses before the insertion guard would, for the same reason
+                if (imported.precision_refused) {
+                    return resume_skipped("tier_mismatch");
+                }
                 using guard_status = vbr_occupied_replacement_guard_status;
                 switch (imported.occupied_guard_status) {
                     case guard_status::unsupported_tree:     return resume_skipped("cache_shared");
