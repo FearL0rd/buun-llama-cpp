@@ -3146,7 +3146,10 @@ static bool ggml_cuda_mul_mat_id_needs_sync(const ggml_tensor * dst, const int c
     }
 
     if (dst->ne[2] <= MMVQ_MAX_BATCH_SIZE) {
-        if (ggml_is_quantized(src0->type)) {
+        // must mirror the MMVQ/MMVF selection in ggml_cuda_mul_mat_id, including the
+        // should_use_mmvq batch caps (GA10x/Orin/Ada per-type) — the graph planner relies
+        // on this predicate; a mismatch lets a sync-requiring fallback run mid-capture.
+        if (ggml_cuda_should_use_mmvq(src0->type, cc, dst->ne[2])) {
             if (dst->ne[2] <= get_mmvq_mmid_max_batch(src0->type, cc)) {
                 return false;
             }
@@ -4028,8 +4031,16 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
         if (node->op == GGML_OP_MUL_MAT_ID) {
             // under these conditions, the mul_mat_id operation will need to synchronize the stream, so we cannot use CUDA graphs
             // TODO: figure out a way to enable for larger batch sizes, without hurting performance
-            const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
-            if (ggml_cuda_mul_mat_id_needs_sync(node, cc)) {
+            // heterogeneous rigs: the executing device's cc decides the dispatch path and can differ
+            // from the device binding at guard time - require sync-free dispatch on every device
+            bool mul_mat_id_needs_sync = false;
+            for (const auto & dev : ggml_cuda_info().devices) {
+                if (ggml_cuda_mul_mat_id_needs_sync(node, dev.cc)) {
+                    mul_mat_id_needs_sync = true;
+                    break;
+                }
+            }
+            if (mul_mat_id_needs_sync) {
                 // the mul_mat_id fallback path synchronizes the stream, so we cannot use CUDA graphs
                 // ref: https://github.com/ggml-org/llama.cpp/pull/18958
                 use_cuda_graph = false;
