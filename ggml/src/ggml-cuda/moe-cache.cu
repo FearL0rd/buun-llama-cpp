@@ -1482,6 +1482,12 @@ static bool moe_cache_grow_host(
 }
 
 static void moe_cache_worker(moe_cache_session * session, moe_cache_device * device) {
+#if defined(GGML_USE_HIP)
+    // Keep ROCm's pageable sources on a bounded pinned buffer: direct transfers
+    // can retain pins across the expert arena and exhaust KFD's host allowance.
+    char * stage = nullptr;
+    size_t stage_capacity = 0;
+#endif
     cudaStream_t stream = nullptr;
 
     for (;;) {
@@ -1526,6 +1532,20 @@ static void moe_cache_worker(moe_cache_session * session, moe_cache_device * dev
                         &stream, cudaStreamNonBlocking);
             }
         }
+#if defined(GGML_USE_HIP)
+        if (error == cudaSuccess && stage_capacity < job.bytes) {
+            char * fresh = nullptr;
+            if (cudaMallocHost((void **)&fresh, job.bytes) == cudaSuccess) {
+                if (stage) {
+                    cudaFreeHost(stage);
+                }
+                stage = fresh;
+                stage_capacity = job.bytes;
+            } else {
+                (void)cudaGetLastError();
+            }
+        }
+#endif
         moe_cache_pool * pool = nullptr;
         char * destination = nullptr;
         {
@@ -1548,6 +1568,18 @@ static void moe_cache_worker(moe_cache_session * session, moe_cache_device * dev
                 fill_lock.lock();
             }
             if (error == cudaSuccess) {
+#if defined(GGML_USE_HIP)
+                if (stage && stage_capacity >= job.bytes) {
+                    memcpy(stage, job.source, job.bytes);
+                    error = cudaMemcpyAsync(
+                            destination, stage, job.bytes, cudaMemcpyHostToDevice, stream);
+                    if (error == cudaSuccess) {
+                        error = cudaStreamSynchronize(stream);
+                    }
+                } else {
+                    error = cudaMemcpy(destination, job.source, job.bytes, cudaMemcpyHostToDevice);
+                }
+#else
                 // Source invalidation waits until this stream finishes. Registered
                 // sources can DMA directly; pageable sources use the runtime's
                 // staging, without an additional application bounce buffer.
@@ -1556,6 +1588,7 @@ static void moe_cache_worker(moe_cache_session * session, moe_cache_device * dev
                 if (error == cudaSuccess) {
                     error = cudaStreamSynchronize(stream);
                 }
+#endif
             }
         }
 
@@ -1593,6 +1626,11 @@ static void moe_cache_worker(moe_cache_session * session, moe_cache_device * dev
         cudaStreamSynchronize(stream);
         cudaStreamDestroy(stream);
     }
+#if defined(GGML_USE_HIP)
+    if (stage) {
+        cudaFreeHost(stage);
+    }
+#endif
 }
 
 static bool moe_cache_start_worker(
