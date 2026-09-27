@@ -824,10 +824,18 @@ std::shared_ptr<const artifact_segment_chain> artifact_segment_chain::with_share
         for (const auto & segment : impl_->segments) {
             const uint64_t segment_end = begin + segment.length;
             if (segment_end > end) {
-                const auto * data = segment.storage->data() + segment.offset + (end - begin);
-                const size_t count = size_t(segment_end - end);
-                auto bytes = std::make_shared<const std::vector<uint8_t>>(data, data + count);
-                out.segments.push_back({ std::move(bytes), 0, count });
+                // Whole suffix allocations can keep their existing owners.
+                // A boundary slice must be copied so it cannot retain the
+                // duplicate prefix while accounting charges only the suffix.
+                if (end == begin && segment.offset == 0 &&
+                    segment.length == segment.storage->size()) {
+                    out.segments.push_back(segment);
+                } else {
+                    const auto * data = segment.storage->data() + segment.offset + (end - begin);
+                    const size_t count = size_t(segment_end - end);
+                    auto bytes = std::make_shared<const std::vector<uint8_t>>(data, data + count);
+                    out.segments.push_back({ std::move(bytes), 0, count });
+                }
                 end = segment_end;
                 out.segment_ends.push_back(end);
             }

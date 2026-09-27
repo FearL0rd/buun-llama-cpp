@@ -3414,8 +3414,8 @@ bool server_vbr_empty_handoff_lookup_allowed(
 bool server_vbr_empty_handoff_allowed(
         const server_vbr_empty_handoff_gate & gate) noexcept {
     return server_vbr_empty_handoff_lookup_allowed(gate) &&
-        gate.incoming_prefix > gate.incumbent_lcp &&
-        gate.durable_incumbent_prefix > gate.incumbent_lcp &&
+        gate.incoming_prefix > gate.incumbent_reusable &&
+        gate.durable_incumbent_prefix > gate.incumbent_reusable &&
         (!gate.exact_incumbent_durable || gate.occupied_route_refused) &&
         gate.family_matches;
 }
@@ -13349,28 +13349,25 @@ private:
                 if (server_vbr_empty_handoff_lookup_allowed(handoff_gate)) {
                     // Token overlap is not a reusable frontier when a hybrid
                     // tree has no matching recurrent checkpoint for a rewind.
-                    handoff_gate.incumbent_lcp = occupied_live_reusable;
-                    if (candidate.prefix_tokens() >
-                            handoff_gate.incumbent_lcp) {
-                        // The incumbent witness must itself be a sealed host
-                        // frontier. A projection from some longer artifact is
-                        // not recovery authority for destructive handoff.
-                        durable_incumbent_prepared =
-                            prompt_cache->prepare_vbr_restore(
-                                slot.prompt.tokens,
-                                frontier_execution_identity,
-                                adapter_identity, durable_incumbent, false,
-                                &slot.cache_family);
-                        handoff_gate.durable_incumbent_prefix =
-                            durable_incumbent.prefix_tokens();
-                        handoff_gate.exact_incumbent_durable =
-                            durable_incumbent_prepared &&
-                            durable_incumbent.prefix_tokens() ==
-                                uint64_t(slot.prompt.n_tokens());
-                        handoff_gate.family_matches =
-                            durable_incumbent.cache_family() ==
-                                slot.cache_family;
-                    }
+                    handoff_gate.incumbent_reusable = occupied_live_reusable;
+                    // The incumbent witness must itself be a sealed host
+                    // frontier. A projection from some longer artifact is
+                    // not recovery authority for destructive handoff.
+                    durable_incumbent_prepared =
+                        prompt_cache->prepare_vbr_restore(
+                            slot.prompt.tokens,
+                            frontier_execution_identity,
+                            adapter_identity, durable_incumbent, false,
+                            &slot.cache_family);
+                    handoff_gate.durable_incumbent_prefix =
+                        durable_incumbent.prefix_tokens();
+                    handoff_gate.exact_incumbent_durable =
+                        durable_incumbent_prepared &&
+                        durable_incumbent.prefix_tokens() ==
+                            uint64_t(slot.prompt.n_tokens());
+                    handoff_gate.family_matches =
+                        durable_incumbent.cache_family() ==
+                            slot.cache_family;
                 }
                 const bool handoff_eligible = durable_incumbent_prepared &&
                     server_vbr_empty_handoff_allowed(handoff_gate);

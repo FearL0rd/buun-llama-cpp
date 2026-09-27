@@ -328,6 +328,29 @@ static void test_segment_chain_offsets() {
     auto shared = chain.with_shared_prefix(prefix);
     CHECK(shared && read_chain(*shared) == read_chain(chain));
     CHECK(shared && vbr_capture_stream_digest(*shared) == vbr_capture_stream_digest(chain));
+    // Aligned cuts retain complete suffix chunks; unaligned cuts copy only
+    // the boundary slice. Both remain valid after all source owners go away.
+    for (const size_t prefix_size : { size_t(3), size_t(5) }) {
+        artifact_segment_chain segmented(11);
+        CHECK(segmented.append(a, sizeof(a)));
+        CHECK(segmented.append(b, sizeof(b)));
+        CHECK(segmented.append(a, sizeof(a)));
+        artifact_segment_chain head;
+        std::vector<uint8_t> prefix_bytes(prefix_size);
+        CHECK(segmented.read(0, prefix_bytes.data(), prefix_bytes.size()));
+        CHECK(head.append(prefix_bytes.data(), prefix_bytes.size()));
+        const auto expected = read_chain(segmented);
+        const auto digest = vbr_capture_stream_digest(segmented);
+        const auto revision = segmented.content_revision();
+        const auto retained = segmented.with_shared_prefix(head);
+        CHECK(retained);
+        segmented = artifact_segment_chain();
+        head = artifact_segment_chain();
+        CHECK(retained && retained->segment_count() == 3);
+        CHECK(retained && retained->content_revision() == revision);
+        CHECK(retained && read_chain(*retained) == expected);
+        CHECK(retained && vbr_capture_stream_digest(*retained) == digest);
+    }
     artifact_segment_chain different;
     CHECK(different.append(b, sizeof(b)));
     CHECK(!chain.prefix_matches(different));
