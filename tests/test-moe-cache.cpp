@@ -756,7 +756,7 @@ static bool run_fused_cpu_fallbacks(ggml_backend_t cpu) {
     static int end_calls;
     static int collect_calls;
     bool ok = true;
-    for (ggml_type type : { GGML_TYPE_MXFP4, GGML_TYPE_Q4_K, GGML_TYPE_IQ2_XXS }) {
+    for (ggml_type type : { GGML_TYPE_Q2_0, GGML_TYPE_MXFP4, GGML_TYPE_Q4_K, GGML_TYPE_IQ2_XXS }) {
         for (int tokens : { 1, 4, 8, 16 }) {
             ggml_context * ctx = ggml_init({ 8*ggml_tensor_overhead(), nullptr, true });
             GGML_ASSERT(ctx);
@@ -3939,6 +3939,10 @@ static bool run_pool_limits() {
     ok &= ggml_moe_cache_effective_min_expert_bytes(GGML_TYPE_EXL3_2, 0, ordinary_min) == (128u << 10);
     ok &= ggml_moe_cache_effective_min_expert_bytes(GGML_TYPE_EXL3_2, 1, ordinary_min) == ordinary_min;
     ok &= ggml_moe_cache_effective_min_expert_bytes(GGML_TYPE_Q4_0, 0, ordinary_min) == ordinary_min;
+    for (size_t minimum : { 512u << 10, 1024u << 10 }) {
+        ok &= ggml_moe_cache_effective_min_expert_bytes(GGML_TYPE_Q2_0, 0, minimum) == minimum / 2;
+        ok &= ggml_moe_cache_effective_min_expert_bytes(GGML_TYPE_Q2_0, 1, minimum) == minimum;
+    }
     const size_t expert_bytes = 400u << 10;
     const size_t exl3_limit = ggml_moe_cache_max_pool_slots(GGML_TYPE_EXL3_2, expert_bytes);
     ok &= exl3_limit == std::min(size_t(INT_MAX), SIZE_MAX / expert_bytes);

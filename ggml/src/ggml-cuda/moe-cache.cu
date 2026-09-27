@@ -3869,7 +3869,8 @@ static void * moe_cache_fused_plan(
         return nullptr;
     }
     moe_cache_log_configuration(*session);
-    if (up->expert_size < session->config.min_expert_bytes) {
+    if (up->expert_size < ggml_moe_cache_effective_min_expert_bytes(up->type,
+            session->config.min_expert_explicit, session->config.min_expert_bytes)) {
         return nullptr;
     }
     if (n_tokens > session->config.max_batch) {
