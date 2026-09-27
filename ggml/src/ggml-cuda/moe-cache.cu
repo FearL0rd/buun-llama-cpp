@@ -3392,7 +3392,7 @@ static void moe_cache_end(void * opaque) {
     }
 }
 
-static void * moe_cache_fused_begin_expert_parallel(
+static void * moe_cache_fused_plan_expert_parallel(
         moe_cache_session & session,
         const ggml_moe_cache_tensor_desc * up,
         const ggml_moe_cache_tensor_desc * gate,
@@ -3761,9 +3761,21 @@ static void * moe_cache_fused_begin_expert_parallel(
         child->planned = true;
         child->owns_active = false;
         child->n_result_rows = current.n_hits;
+        child->fused_pending = true;
+        child->fused_hits = current.n_hits;
+        child->fused_candidates = current.n_rows;
+        child->glu_op = glu_op;
+        child->up_min = up_min;
+        child->up_max = up_max;
+        child->gate_min = gate_min;
+        child->gate_max = gate_max;
         child->dispatch_lock = std::move(current.dispatch_lock);
         for (int local = 0; local < current.n_hits; local++) {
             child->row_indices[local] = hit_ranks[current.rows[local]];
+            child->up_slots[local] = current.up_slots[local];
+            child->gate_slots[local] = current.gate_slots[local];
+            child->down_slots[local] = current.down_slots[local];
+            child->hit_acts[local] = current.acts[local];
         }
         current.child = child.get();
         root->children.push_back(std::move(child));
@@ -3787,29 +3799,7 @@ static void * moe_cache_fused_begin_expert_parallel(
         }
     }
 
-    for (route & current : routes) {
-        if (current.n_hits == 0) {
-            continue;
-        }
-        if (!moe_cache_dispatch_internal(
-                current.child, up->type, up->n_in, up->n_out,
-                current.child->n_result_rows,
-                current.up_slots, current.acts,
-                current.pair_pool, current.gate_slots,
-                current.down_pool, current.down_slots,
-                glu_op, up_min, up_max, gate_min, gate_max)) {
-            moe_cache_end(root.release());
-            return nullptr;
-        }
-        std::lock_guard<std::mutex> lock(session.mu);
-        current.device->fused_rows += current.child->n_result_rows;
-        current.device->fused_candidates += current.n_rows;
-        current.device->fused_nodes++;
-        current.device->full_fused_rows += current.child->n_result_rows;
-        current.device->full_fused_nodes++;
-    }
-
-    root->dispatched = true;
+    root->fused_pending = true;
     *hit_mask = mask;
     return root.release();
 }
@@ -3913,7 +3903,7 @@ static void * moe_cache_fused_plan(
     }
 
     if (expert_parallel && down) {
-        return moe_cache_fused_begin_expert_parallel(
+        return moe_cache_fused_plan_expert_parallel(
                 *session, up, gate, down, up_layer, glu_op,
                 up_min, up_max, gate_min, gate_max,
                 ids, n_ids, n_tokens, act_rows, hit_mask);
@@ -4281,10 +4271,26 @@ static void * moe_cache_fused_plan(
 static int moe_cache_fused_dispatch(void * opaque) {
     moe_cache_node * node = (moe_cache_node *)opaque;
     if (!node->fused_pending) {
-        // Expert-parallel plans dispatch while planning.
         return node->dispatched;
     }
     node->fused_pending = false;
+    if (node->composite) {
+        // Keep successful children alive on failure: end() drains them before
+        // releasing their pins, and collect() must not publish a partial result.
+        for (const auto & child : node->children) {
+            if (child != node->children.front() &&
+                    moe_cache_fail(*node->session, "dispatch-after-first")) {
+                std::lock_guard<std::mutex> lock(node->session->mu);
+                child->device->dispatch_failures++;
+                return 0;
+            }
+            if (!moe_cache_fused_dispatch(child.get())) {
+                return 0;
+            }
+        }
+        node->dispatched = true;
+        return 1;
+    }
     const bool full = node->down_pool != nullptr;
     if (!moe_cache_dispatch_internal(
             node, node->wtype, node->n_in, node->n_mid, node->fused_hits,

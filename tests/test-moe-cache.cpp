@@ -752,6 +752,9 @@ static bool run_fused_cpu_fallbacks(ggml_backend_t cpu) {
     static uint64_t forced_mask;
     static int fused_calls;
     static int full_calls;
+    static bool fail_dispatch;
+    static int end_calls;
+    static int collect_calls;
     bool ok = true;
     for (ggml_type type : { GGML_TYPE_MXFP4, GGML_TYPE_Q4_K, GGML_TYPE_IQ2_XXS }) {
         for (int tokens : { 1, 4, 8, 16 }) {
@@ -795,7 +798,7 @@ static bool run_fused_cpu_fallbacks(ggml_backend_t cpu) {
             ok &= ggml_backend_graph_compute(cpu, graph.graph) == GGML_STATUS_SUCCESS;
             std::vector<float> reference(ggml_nelements(graph.out));
             ggml_backend_tensor_get(graph.out, reference.data(), 0, reference.size()*sizeof(float));
-            ggml_moe_cache.fused_dispatch = [](void *) { return 1; };
+            ggml_moe_cache.fused_dispatch = [](void *) { return fail_dispatch ? 0 : 1; };
             ggml_moe_cache.fused_plan = [](
                     const ggml_moe_cache_tensor_desc *, const ggml_moe_cache_tensor_desc *,
                     const ggml_moe_cache_tensor_desc * down, int, float, float, float, float,
@@ -807,25 +810,31 @@ static bool run_fused_cpu_fallbacks(ggml_backend_t cpu) {
                 return &forced_mask;
             };
             ggml_moe_cache.collect = [](void *, int hits, float * const *, int64_t) {
+                ++collect_calls;
                 return hits == 0 ? 1 : 0;
             };
-            ggml_moe_cache.end = [](void *) {};
-            for (uint64_t mask : { UINT64_C(0), UINT64_MAX, UINT64_C(0xf0f0f0f0f0f0f0f0) }) {
-                forced_mask = mask;
-                fused_calls = full_calls = 0;
-                // Reference execution populated the intermediates too. Poison
-                // every computed tensor so omitted up/gate/GLU work cannot pass.
-                poison_graph(graph);
-                std::vector<float> actual(reference.size());
-                ok &= ggml_backend_graph_compute(cpu, graph.graph) == GGML_STATUS_SUCCESS;
-                ggml_backend_tensor_get(graph.out, actual.data(), 0, actual.size()*sizeof(float));
-                // Mixed hits can move an expert below the IQ panel's batch cutoff.
-                const bool match = compare_output(reference, actual, 1e-10);
-                const bool cell_ok = match && fused_calls > 0 && full_calls > 0;
-                printf("cache-fused-cpu-%s-tokens%d-mask%llx: %s\n", ggml_type_name(type),
-                        tokens, (unsigned long long)mask, cell_ok ? "OK" : "FAIL");
-                ok &= cell_ok;
+            ggml_moe_cache.end = [](void *) { ++end_calls; };
+            for (bool failed : { false, true }) {
+                fail_dispatch = failed;
+                for (uint64_t mask : { UINT64_C(0), UINT64_MAX, UINT64_C(0xf0f0f0f0f0f0f0f0) }) {
+                    forced_mask = mask;
+                    fused_calls = full_calls = end_calls = collect_calls = 0;
+                    // Reference execution populated the intermediates too. Poison
+                    // every computed tensor so omitted up/gate/GLU work cannot pass.
+                    poison_graph(graph);
+                    std::vector<float> actual(reference.size());
+                    ok &= ggml_backend_graph_compute(cpu, graph.graph) == GGML_STATUS_SUCCESS;
+                    ggml_backend_tensor_get(graph.out, actual.data(), 0, actual.size()*sizeof(float));
+                    // Mixed hits can move an expert below the IQ panel's batch cutoff.
+                    const bool match = compare_output(reference, actual, 1e-10);
+                    const bool cell_ok = match && fused_calls > 0 && full_calls > 0 &&
+                        end_calls == fused_calls && (failed ? collect_calls == 0 : collect_calls == fused_calls);
+                    printf("cache-fused-cpu-%s-tokens%d-mask%llx-dispatch-fail%d: %s\n", ggml_type_name(type),
+                            tokens, (unsigned long long)mask, failed, cell_ok ? "OK" : "FAIL");
+                    ok &= cell_ok;
+                }
             }
+            fail_dispatch = false;
             const auto forced_api = ggml_moe_cache;
             for (bool window_pair : { false, true }) {
                 ggml_tensor * glu = graph.out->src[1];
@@ -960,7 +969,7 @@ static bool run_scenario(
             max_field_value(log, "collect-fail=") == 0 &&
             (!options.required_field ||
              has_positive_field(log, options.required_field));
-    } else if (strcmp(fail_stage, "dispatch") == 0) {
+    } else if (strcmp(fail_stage, "dispatch") == 0 || strcmp(fail_stage, "dispatch-after-first") == 0) {
         stage_ok = has_positive_field(log, "dispatch-fail=");
     } else if (strcmp(fail_stage, "collect") == 0) {
         stage_ok = has_positive_field(log, "collect-fail=");
@@ -1046,13 +1055,17 @@ static bool run_expert_parallel_partial_scenario(
     const bool collect_fallback = run_scenario(
             "cache-expert-parallel-collect-fallback", "collect",
             cuda, cpu, graph, reference, capture, fallback_options);
+    fallback_options.required_field = "full-fusion=";
+    const bool partial_dispatch_fallback = run_scenario(
+            "cache-expert-parallel-later-dispatch-fallback", "dispatch-after-first",
+            cuda, cpu, graph, reference, capture, fallback_options);
 
     configure_cache(nullptr);
     for (ggml_backend_t backend : owned) {
         ggml_backend_free(backend);
     }
     return output_ok && partial_seen && policy_defaults &&
-        dispatch_fallback && collect_fallback;
+        dispatch_fallback && collect_fallback && partial_dispatch_fallback;
 }
 
 static bool run_multi_token_scenario(
@@ -3081,15 +3094,25 @@ static bool run_fused_full_ffn(
 
     auto execute_full = [&](float * output) {
         uint64_t full_mask = 0;
-        void * full = fused_begin(
+        auto plan = [&]() {
+            return ggml_moe_cache.fused_plan(
                 &up, &gate, &down, GGML_GLU_OP_SWIGLU,
                 -std::numeric_limits<float>::infinity(),
                 std::numeric_limits<float>::infinity(),
                 -std::numeric_limits<float>::infinity(),
                 std::numeric_limits<float>::infinity(),
                 &expert, 1, 1, act_rows, &full_mask);
+        };
+        // Cancelling a plan must release pins/locks without requiring a launch.
+        void * cancelled = plan();
+        if (!cancelled) return false;
+        ggml_moe_cache.end(cancelled);
+        void * full = plan();
         float * full_rows[] = { output };
         const bool result = full && full_mask == UINT64_C(1) &&
+            ggml_moe_cache.collect(full, 1, full_rows, n_in) == 0 &&
+            ggml_moe_cache.fused_dispatch(full) == 1 &&
+            ggml_moe_cache.fused_dispatch(full) == 1 &&
             ggml_moe_cache.collect(full, 1, full_rows, n_in) == 1;
         if (full) {
             ggml_moe_cache.end(full);
@@ -3932,6 +3955,7 @@ static bool run_pool_limits() {
 }
 
 int main(int argc, char ** argv) {
+    const bool profile_writer = argc == 6 && std::strcmp(argv[1], "--profile-writer") == 0;
     if (!run_pool_limits()) return 1;
     if (argc > 0 && argv[0]) {
         std::error_code ec;
@@ -3949,9 +3973,19 @@ int main(int argc, char ** argv) {
         fprintf(stderr, "failed to initialize CPU backend\n");
         return 1;
     }
-    if (!run_fused_cpu_fallbacks(cpu)) {
-        ggml_backend_free(cpu);
-        return 1;
+    auto set_n_threads = (ggml_backend_set_n_threads_t) ggml_backend_reg_get_proc_address(
+            ggml_backend_dev_backend_reg(ggml_backend_get_device(cpu)), "ggml_backend_set_n_threads");
+    // Profile writer subprocesses must reach their rendezvous promptly. They
+    // exercise profile I/O, not the parent's complete CPU fallback matrix.
+    if (!profile_writer) {
+        for (int threads : { 1, 2, 4 }) {
+            if (set_n_threads) set_n_threads(cpu, threads);
+            printf("cache-fused-cpu-fallbacks: threads=%d\n", threads);
+            if (!run_fused_cpu_fallbacks(cpu)) {
+                ggml_backend_free(cpu);
+                return 1;
+            }
+        }
     }
     if (!cuda_device) {
         printf("SKIP: GPU cache scenarios (CUDA/HIP backend unavailable); CPU fallbacks passed\n");
@@ -4106,7 +4140,7 @@ int main(int argc, char ** argv) {
             activations, activation_data.data(), 0,
             activation_data.size() * sizeof(float));
 
-    if (argc == 6 && std::strcmp(argv[1], "--profile-writer") == 0) {
+    if (profile_writer) {
         const bool child_ok = run_profile_writer_child(
                 cuda, cpu, weights, argv[2], (int32_t)std::strtol(argv[3], nullptr, 10),
                 argv[4], argv[5]);
