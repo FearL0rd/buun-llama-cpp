@@ -333,7 +333,7 @@ static void test_q2_0_packed_dot() {
     assert(ggml_blck_size(GGML_TYPE_Q2_0) == 64);
     assert(ggml_type_size(GGML_TYPE_Q2_0) == 18);
     assert(ggml_type_size(GGML_TYPE_Q8_0) == 34);
-    for (const int n : {64, 640, 2560}) {
+    for (const int n : {64, 128, 192, 256, 320, 640, 2560, 32768}) {
         std::vector<uint8_t> x(ggml_row_size(GGML_TYPE_Q2_0, n));
         std::vector<uint8_t> y(ggml_row_size(GGML_TYPE_Q8_0, n));
         for (int pattern = 0; pattern < 256; ++pattern) {

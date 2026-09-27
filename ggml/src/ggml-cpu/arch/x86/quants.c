@@ -698,54 +698,85 @@ void ggml_vec_dot_q1_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const voi
 #endif
 }
 
-void ggml_vec_dot_q2_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
 #if defined(__AVX2__)
-    assert(n % QK2_0 == 0);
-    assert(nrc == 1);
-    UNUSED(nrc);
-    UNUSED(bs);
-    UNUSED(bx);
-    UNUSED(by);
-    const block_q2_0 * GGML_RESTRICT x = vx;
-    const block_q8_0 * GGML_RESTRICT y = vy;
+static inline __m256i q2_0_dot32(const uint8_t * packed_bytes, const int8_t * act) {
     const __m256i mask = _mm256_set1_epi8(3);
     const __m256i one8 = _mm256_set1_epi8(1);
 #if !defined(__AVX512VNNI__) || !defined(__AVX512VL__)
     const __m256i one16 = _mm256_set1_epi16(1);
 #endif
-    float sumf = 0.0f;
-    for (int i = 0; i < n / QK2_0; ++i) {
-        float sumi = 0.0f;
-        for (int k = 0; k < QK2_0 / QK8_0; ++k) {
-            const block_q8_0 * yb = &y[i * (QK2_0 / QK8_0) + k];
 #if defined(__AVX512VBMI__) && defined(__AVX512VL__)
-            // Each 16-bit lane holds eight two-bit codes. Extract those codes
-            // directly into bytes when the CPU supports byte multishift.
-            const __m256i words = _mm256_cvtepu16_epi64(
-                    _mm_loadl_epi64((const __m128i *) (x[i].qs + k * 8)));
-            const __m256i shifts = _mm256_set1_epi64x(INT64_C(0x0e0c0a0806040200));
-            const __m256i codes = _mm256_and_si256(mask,
-                    _mm256_multishift_epi64_epi8(shifts, words));
+    // Each 16-bit lane holds eight two-bit codes. Extract those codes
+    // directly into bytes when the CPU supports byte multishift.
+    const __m256i words = _mm256_cvtepu16_epi64(
+            _mm_loadl_epi64((const __m128i *) packed_bytes));
+    const __m256i shifts = _mm256_set1_epi64x(INT64_C(0x0e0c0a0806040200));
+    const __m256i codes = _mm256_and_si256(mask,
+            _mm256_multishift_epi64_epi8(shifts, words));
 #else
-            // Expand each packed byte into a dword, then place its four codes
-            // into consecutive bytes. No weight repacking or padding is needed.
-            const __m256i packed = _mm256_cvtepu8_epi32(_mm_loadl_epi64((const __m128i *) (x[i].qs + k * 8)));
-            const __m256i codes = _mm256_and_si256(mask, _mm256_or_si256(
-                _mm256_or_si256(packed, _mm256_slli_epi32(packed, 6)),
-                _mm256_or_si256(_mm256_slli_epi32(packed, 12), _mm256_slli_epi32(packed, 18))));
+    // Expand each packed byte into a dword, then place its four codes
+    // into consecutive bytes. No weight repacking or padding is needed.
+    const __m256i packed = _mm256_cvtepu8_epi32(_mm_loadl_epi64((const __m128i *) packed_bytes));
+    const __m256i codes = _mm256_and_si256(mask, _mm256_or_si256(
+        _mm256_or_si256(packed, _mm256_slli_epi32(packed, 6)),
+        _mm256_or_si256(_mm256_slli_epi32(packed, 12), _mm256_slli_epi32(packed, 18))));
 #endif
-            const __m256i qy = _mm256_loadu_si256((const __m256i *) yb->qs);
-            // dot(codes - 1, qy): unsigned codes avoid negating -128 in qy.
-            // Neither 16-bit pair sum can saturate for codes in [0, 3].
+    const __m256i qy = _mm256_loadu_si256((const __m256i *) act);
+    // dot(codes - 1, qy): unsigned codes avoid negating -128 in qy.
+    // Neither 16-bit pair sum can saturate for codes in [0, 3].
 #if defined(__AVX512VNNI__) && defined(__AVX512VL__)
-            const int dot = hsum_i32_8(_mm256_sub_epi32(
-                _mm256_dpbusd_epi32(_mm256_setzero_si256(), codes, qy),
-                _mm256_dpbusd_epi32(_mm256_setzero_si256(), one8, qy)));
+    return _mm256_sub_epi32(
+        _mm256_dpbusd_epi32(_mm256_setzero_si256(), codes, qy),
+        _mm256_dpbusd_epi32(_mm256_setzero_si256(), one8, qy));
 #else
-            const __m256i pairs = _mm256_sub_epi16(_mm256_maddubs_epi16(codes, qy),
-                                                  _mm256_maddubs_epi16(one8, qy));
-            const int dot = hsum_i32_8(_mm256_madd_epi16(pairs, one16));
+    const __m256i pairs = _mm256_sub_epi16(_mm256_maddubs_epi16(codes, qy),
+                                          _mm256_maddubs_epi16(one8, qy));
+    return _mm256_madd_epi16(pairs, one16);
 #endif
+}
+#endif
+
+void ggml_vec_dot_q2_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+#if defined(__AVX2__)
+    assert(n % QK2_0 == 0 && nrc == 1);
+    UNUSED(nrc); UNUSED(bs); UNUSED(bx); UNUSED(by);
+    const block_q2_0 * GGML_RESTRICT x = vx;
+    const block_q8_0 * GGML_RESTRICT y = vy;
+    float sumf = 0.0f;
+    int i = 0;
+#if defined(__AVX512VBMI__) && defined(__AVX512VNNI__) && defined(__AVX512VL__)
+    for (; i + 4 <= n / QK2_0; i += 4) {
+        __m128 sumi = _mm_setzero_ps();
+        for (int k = 0; k < 2; ++k) {
+            const __m256i d0 = q2_0_dot32(x[i+0].qs + k*8, y[2*(i+0)+k].qs);
+            const __m256i d1 = q2_0_dot32(x[i+1].qs + k*8, y[2*(i+1)+k].qs);
+            const __m256i d2 = q2_0_dot32(x[i+2].qs + k*8, y[2*(i+2)+k].qs);
+            const __m256i d3 = q2_0_dot32(x[i+3].qs + k*8, y[2*(i+3)+k].qs);
+            const __m256i halves = _mm256_hadd_epi32(
+                    _mm256_hadd_epi32(d0, d1), _mm256_hadd_epi32(d2, d3));
+            const __m128i dots = _mm_add_epi32(_mm256_castsi256_si128(halves),
+                    _mm256_extracti128_si256(halves, 1));
+            const __m128 scales = _mm_setr_ps(
+                    GGML_CPU_FP16_TO_FP32(y[2*(i+0)+k].d),
+                    GGML_CPU_FP16_TO_FP32(y[2*(i+1)+k].d),
+                    GGML_CPU_FP16_TO_FP32(y[2*(i+2)+k].d),
+                    GGML_CPU_FP16_TO_FP32(y[2*(i+3)+k].d));
+            sumi = _mm_add_ps(sumi, _mm_mul_ps(scales, _mm_cvtepi32_ps(dots)));
+        }
+        float blocks[4];
+        _mm_storeu_ps(blocks, sumi);
+        // Only integer reduction is grouped; keep FP32 block accumulation in
+        // its original order, including the two independently scaled halves.
+        for (int j = 0; j < 4; ++j) {
+            sumf += GGML_CPU_FP16_TO_FP32(x[i+j].d) * blocks[j];
+        }
+    }
+#endif
+    for (; i < n / QK2_0; ++i) {
+        float sumi = 0.0f;
+        for (int k = 0; k < 2; ++k) {
+            const block_q8_0 * yb = &y[2*i+k];
+            const int dot = hsum_i32_8(q2_0_dot32(x[i].qs+k*8, yb->qs));
             // Keep the generic path's two activation scales and FP reduction
             // order; only the exactly representable integer dot is vectorized.
             sumi += GGML_CPU_FP16_TO_FP32(yb->d) * dot;
