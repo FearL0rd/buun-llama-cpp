@@ -4280,9 +4280,9 @@ static void * moe_cache_fused_plan(
 
 static int moe_cache_fused_dispatch(void * opaque) {
     moe_cache_node * node = (moe_cache_node *)opaque;
-    if (!node || !node->fused_pending) {
+    if (!node->fused_pending) {
         // Expert-parallel plans dispatch while planning.
-        return node && node->dispatched;
+        return node->dispatched;
     }
     node->fused_pending = false;
     const bool full = node->down_pool != nullptr;
@@ -4304,25 +4304,6 @@ static int moe_cache_fused_dispatch(void * opaque) {
         device.full_fused_nodes++;
     }
     return 1;
-}
-
-static void * moe_cache_fused_begin(
-        const ggml_moe_cache_tensor_desc * up,
-        const ggml_moe_cache_tensor_desc * gate,
-        const ggml_moe_cache_tensor_desc * down,
-        int glu_op, float up_min, float up_max,
-        float gate_min, float gate_max,
-        const int32_t * ids, int n_ids, int64_t n_tokens,
-        const float * const * act_rows, uint64_t * hit_mask) {
-    void * node = moe_cache_fused_plan(
-            up, gate, down, glu_op, up_min, up_max, gate_min, gate_max,
-            ids, n_ids, n_tokens, act_rows, hit_mask);
-    if (node && !moe_cache_fused_dispatch(node)) {
-        moe_cache_end(node);
-        *hit_mask = 0;
-        return nullptr;
-    }
-    return node;
 }
 
 static void moe_cache_invalidate_session(
@@ -4494,7 +4475,6 @@ void ggml_moe_cache_register(const void * owner) {
     ggml_moe_cache.dispatch = moe_cache_dispatch;
     ggml_moe_cache.collect = moe_cache_collect;
     ggml_moe_cache.end = moe_cache_end;
-    ggml_moe_cache.fused_begin = moe_cache_fused_begin;
     ggml_moe_cache.fused_plan = moe_cache_fused_plan;
     ggml_moe_cache.fused_dispatch = moe_cache_fused_dispatch;
     ggml_moe_cache.invalidate = moe_cache_invalidate;

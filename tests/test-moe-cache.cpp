@@ -795,7 +795,8 @@ static bool run_fused_cpu_fallbacks(ggml_backend_t cpu) {
             ok &= ggml_backend_graph_compute(cpu, graph.graph) == GGML_STATUS_SUCCESS;
             std::vector<float> reference(ggml_nelements(graph.out));
             ggml_backend_tensor_get(graph.out, reference.data(), 0, reference.size()*sizeof(float));
-            ggml_moe_cache.fused_begin = [](
+            ggml_moe_cache.fused_dispatch = [](void *) { return 1; };
+            ggml_moe_cache.fused_plan = [](
                     const ggml_moe_cache_tensor_desc *, const ggml_moe_cache_tensor_desc *,
                     const ggml_moe_cache_tensor_desc * down, int, float, float, float, float,
                     const int32_t *, int rows, int64_t, const float * const *, uint64_t * mask) -> void * {
@@ -2163,6 +2164,26 @@ static bool run_fill_invalidation(
     return output_ok;
 }
 
+// fused_plan + fused_dispatch; NULL (and no hits) when either fails.
+static void * fused_begin(
+        const ggml_moe_cache_tensor_desc * up,
+        const ggml_moe_cache_tensor_desc * gate,
+        const ggml_moe_cache_tensor_desc * down,
+        int glu_op, float up_min, float up_max,
+        float gate_min, float gate_max,
+        const int32_t * ids, int n_rows, int64_t n_tokens,
+        const float * const * act_rows, uint64_t * hit_mask) {
+    void * node = ggml_moe_cache.fused_plan(
+            up, gate, down, glu_op, up_min, up_max, gate_min, gate_max,
+            ids, n_rows, n_tokens, act_rows, hit_mask);
+    if (node && !ggml_moe_cache.fused_dispatch(node)) {
+        ggml_moe_cache.end(node);
+        *hit_mask = 0;
+        return nullptr;
+    }
+    return node;
+}
+
 static void * create_direct_session(
         ggml_backend_t cuda, ggml_backend_t cpu) {
     if (!ggml_moe_cache.session_create) {
@@ -2726,7 +2747,7 @@ static bool run_activation_map_regression(
         ggml_backend_t cpu,
         ggml_tensor * up_weights,
         ggml_tensor * gate_weights) {
-    if (!ggml_moe_cache.fused_begin || !ggml_moe_cache.collect ||
+    if (!ggml_moe_cache.fused_plan || !ggml_moe_cache.fused_dispatch || !ggml_moe_cache.collect ||
         !ggml_moe_cache.end) {
         fprintf(stderr, "cache-activation-map: incomplete cache API\n");
         return false;
@@ -2784,7 +2805,7 @@ static bool run_activation_map_regression(
         }
 
         uint64_t hit_mask = 0;
-        void * node = ok ? ggml_moe_cache.fused_begin(
+        void * node = ok ? fused_begin(
                 &up, &gate, nullptr, GGML_GLU_OP_SWIGLU,
                 -std::numeric_limits<float>::infinity(),
                 std::numeric_limits<float>::infinity(),
@@ -2827,7 +2848,7 @@ static bool run_fused_partial_invalidation(
         const uint8_t * gate_row,
         const std::vector<float> & reference,
         log_capture & capture) {
-    if (!ggml_moe_cache.fused_begin || !ggml_moe_cache.collect ||
+    if (!ggml_moe_cache.fused_plan || !ggml_moe_cache.fused_dispatch || !ggml_moe_cache.collect ||
         !ggml_moe_cache.end) {
         fprintf(stderr, "cache-fused-partial: incomplete cache API\n");
         return false;
@@ -2880,7 +2901,7 @@ static bool run_fused_partial_invalidation(
                        uint64_t expected_mask,
                        const int * reference_rows) {
         uint64_t hit_mask = 0;
-        void * node = ggml_moe_cache.fused_begin(
+        void * node = fused_begin(
                 &up, &gate, nullptr, GGML_GLU_OP_SWIGLU,
                 -std::numeric_limits<float>::infinity(),
                 std::numeric_limits<float>::infinity(),
@@ -2941,7 +2962,7 @@ static bool run_fused_partial_invalidation(
                 weights, unchanged_row, 0, expert_size);
         const int32_t expert = 0;
         uint64_t hit_mask = 0;
-        void * node = ggml_moe_cache.fused_begin(
+        void * node = fused_begin(
                 &up, &gate, nullptr, GGML_GLU_OP_SWIGLU,
                 -std::numeric_limits<float>::infinity(),
                 std::numeric_limits<float>::infinity(),
@@ -3021,7 +3042,7 @@ static bool run_fused_full_ffn(
     float reference[n_in] = {};
     if (ok) {
         uint64_t pair_mask = 0;
-        void * pair = ggml_moe_cache.fused_begin(
+        void * pair = fused_begin(
                 &up, &gate, nullptr, GGML_GLU_OP_SWIGLU,
                 -std::numeric_limits<float>::infinity(),
                 std::numeric_limits<float>::infinity(),
@@ -3060,7 +3081,7 @@ static bool run_fused_full_ffn(
 
     auto execute_full = [&](float * output) {
         uint64_t full_mask = 0;
-        void * full = ggml_moe_cache.fused_begin(
+        void * full = fused_begin(
                 &up, &gate, &down, GGML_GLU_OP_SWIGLU,
                 -std::numeric_limits<float>::infinity(),
                 std::numeric_limits<float>::infinity(),
@@ -3084,7 +3105,7 @@ static bool run_fused_full_ffn(
     bool down_invalidation_ok = false;
     if (ok) {
         uint64_t full_mask = 0;
-        void * full = ggml_moe_cache.fused_begin(
+        void * full = fused_begin(
                 &up, &gate, &down, GGML_GLU_OP_SWIGLU,
                 -std::numeric_limits<float>::infinity(),
                 std::numeric_limits<float>::infinity(),
@@ -3123,7 +3144,7 @@ static bool run_fused_full_ffn(
         }
 
         uint64_t invalid_mask = 0;
-        void * invalid = ggml_moe_cache.fused_begin(
+        void * invalid = fused_begin(
                 &up, &gate, &down, GGML_GLU_OP_SWIGLU,
                 -std::numeric_limits<float>::infinity(),
                 std::numeric_limits<float>::infinity(),

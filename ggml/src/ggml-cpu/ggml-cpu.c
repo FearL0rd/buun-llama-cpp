@@ -2347,9 +2347,9 @@ static void * incr_ptr_aligned(void ** p, size_t size, size_t align) {
     return ptr;
 }
 
-// t0_task (optional) is GPU work for thread 0, handled like the node's own moe-cache hits:
-// it is called with finish=false after the row barrier (dispatch) and finish=true after the
-// chunk loop (collect), and thread 0 takes no chunks meanwhile unless the IQ panel path needs it.
+// t0_task (optional) launches GPU work that the caller collects on thread 0 afterwards. Like the
+// node's own moe-cache hits, it runs on thread 0 after the row barrier, and thread 0 then takes
+// no chunks unless the IQ panel path needs it.
 static void ggml_compute_forward_mul_mat_id_impl(
         const struct ggml_compute_params * params,
               struct ggml_tensor * dst,
@@ -2357,7 +2357,7 @@ static void ggml_compute_forward_mul_mat_id_impl(
                                 bool use_row_mask,
                                 bool allow_moe_cache,
                 struct ggml_tensor * paired_dst,
-                              void (*t0_task)(void *, bool),
+                              void (*t0_task)(void *),
                                 void * t0_arg) {
 
     if (use_row_mask && row_mask == 0) {
@@ -2577,7 +2577,7 @@ static void ggml_compute_forward_mul_mat_id_impl(
     }
 
     if (ith == 0 && t0_task) {
-        t0_task(t0_arg, false);
+        t0_task(t0_arg);
     }
 
     const bool reserved = *t0_reserved;
@@ -2667,10 +2667,6 @@ static void ggml_compute_forward_mul_mat_id_impl(
         }
     }
 
-    if (ith == 0 && t0_task) {
-        t0_task(t0_arg, true);
-    }
-
     if (ith == 0 && moe_cache_node) {
         if (!moe_cache_dispatched ||
             !ggml_moe_cache.collect(moe_cache_node, moe_cache_n_hits, moe_cache_rows, ne0)) {
@@ -2709,9 +2705,6 @@ struct moe_cache_fused_state {
     int collect_ok;
     int skipped;
     int full;
-    // planned by fused_plan; thread 0 still owes fused_dispatch
-    int pending;
-    int dispatched;
     int64_t n_out;
     int32_t ids[MOE_CACHE_MAX_TOPK];
     const float * acts[MOE_CACHE_MAX_TOPK];
@@ -4126,7 +4119,7 @@ static bool ggml_moe_cache_can_fuse(
         const struct ggml_cgraph * cgraph,
         int node_n,
         struct ggml_moe_cache_fusion * fusion) {
-    if (!ggml_moe_cache.fused_begin || !ggml_moe_cache.collect ||
+    if (!ggml_moe_cache.fused_plan || !ggml_moe_cache.fused_dispatch || !ggml_moe_cache.collect ||
         !ggml_moe_cache.end) {
         return false;
     }
@@ -4346,26 +4339,17 @@ static void ggml_compute_forward_swiglu_masked(
     }
 }
 
-// Thread 0 only. Dispatches the planned hits, and on finish collects them; a failed
-// dispatch is reported as a failed collect, so the hit rows are recomputed on the CPU.
-static void ggml_moe_cache_fused_task(void * arg, bool finish) {
-    struct moe_cache_fused_state * state = (struct moe_cache_fused_state *) arg;
-    if (state->pending) {
-        state->pending = 0;
-        state->dispatched = ggml_moe_cache.fused_dispatch(state->node);
-    }
-    if (finish) {
-        state->collect_ok = state->dispatched &&
-            ggml_moe_cache.collect(state->node, state->n_hits, state->rows, state->n_out);
-        ggml_moe_cache.end(state->node);
-        state->node = NULL;
-    }
+static void ggml_moe_cache_fused_dispatch_task(void * arg) {
+    ggml_moe_cache.fused_dispatch(((struct moe_cache_fused_state *) arg)->node);
 }
 
-// Starts the GPU work in an up/gate pass whose node is collected later, during down.
-static void ggml_moe_cache_fused_dispatch_task(void * arg, bool finish) {
-    GGML_UNUSED(finish);
-    ggml_moe_cache_fused_task(arg, false);
+// Thread 0 only. Dispatches the hits if no pass did yet; a failed dispatch is reported
+// as a failed collect, so the hit rows are recomputed on the CPU.
+static void ggml_moe_cache_fused_collect(struct moe_cache_fused_state * state) {
+    state->collect_ok = ggml_moe_cache.fused_dispatch(state->node) &&
+        ggml_moe_cache.collect(state->node, state->n_hits, state->rows, state->n_out);
+    ggml_moe_cache.end(state->node);
+    state->node = NULL;
 }
 
 static int ggml_cpu_try_fuse_moe_cache(
@@ -4434,8 +4418,7 @@ static int ggml_cpu_try_fuse_moe_cache(
         }
         // Planning without launching lets the workers start on the misses at once;
         // thread 0 then dispatches while they compute.
-        const bool split = ggml_moe_cache.fused_plan && ggml_moe_cache.fused_dispatch;
-        state->node = (split ? ggml_moe_cache.fused_plan : ggml_moe_cache.fused_begin)(
+        state->node = ggml_moe_cache.fused_plan(
                 &up_desc, &gate_desc, down ? &down_desc : NULL,
                 (int)GGML_GLU_OP_SWIGLU,
                 fusion.up_min, fusion.up_max,
@@ -4444,7 +4427,7 @@ static int ggml_cpu_try_fuse_moe_cache(
                 state->acts, &state->hit_mask);
         if (!state->node && down) {
             state->hit_mask = 0;
-            state->node = (split ? ggml_moe_cache.fused_plan : ggml_moe_cache.fused_begin)(
+            state->node = ggml_moe_cache.fused_plan(
                     &up_desc, &gate_desc, NULL,
                     (int)GGML_GLU_OP_SWIGLU,
                     fusion.up_min, fusion.up_max,
@@ -4459,8 +4442,6 @@ static int ggml_cpu_try_fuse_moe_cache(
         state->skipped = state->node ? fusion.skipped + state->full : 0;
         if (state->node) {
             struct ggml_tensor * output = state->full ? down : glu;
-            state->pending = split;
-            state->dispatched = !split;
             state->n_out = output->ne[0];
             for (int row = 0; row < n_rows; row++) {
                 if (state->hit_mask & (UINT64_C(1) << row)) {
@@ -4489,11 +4470,13 @@ static int ggml_cpu_try_fuse_moe_cache(
     if (miss_mask != 0) {
         // Share conversion, routing metadata and the chunk schedule for up/gate.
         // Their dot products remain the existing kernels with unchanged numerics.
-        // A full node's GPU work outlasts up/gate, so it is collected during down.
+        // A full node's GPU work outlasts up/gate, so it is collected after down.
         ggml_compute_forward_mul_mat_id_impl(
                 &sub_params, up, miss_mask, true, false, gate,
-                state->full ? ggml_moe_cache_fused_dispatch_task : ggml_moe_cache_fused_task,
-                state);
+                ggml_moe_cache_fused_dispatch_task, state);
+        if (params->ith == 0 && !state->full) {
+            ggml_moe_cache_fused_collect(state);
+        }
         ggml_barrier(params->threadpool);
 
         ggml_compute_forward_swiglu_masked(
@@ -4508,10 +4491,13 @@ static int ggml_cpu_try_fuse_moe_cache(
             ggml_barrier(params->threadpool);
             ggml_compute_forward_mul_mat_id_impl(
                     &sub_params, down, miss_mask, true, false, NULL,
-                    ggml_moe_cache_fused_task, state);
+                    ggml_moe_cache_fused_dispatch_task, state);
+            if (params->ith == 0) {
+                ggml_moe_cache_fused_collect(state);
+            }
         }
     } else if (params->ith == 0) {
-        ggml_moe_cache_fused_task(state, true);
+        ggml_moe_cache_fused_collect(state);
     }
     ggml_barrier(params->threadpool);
 

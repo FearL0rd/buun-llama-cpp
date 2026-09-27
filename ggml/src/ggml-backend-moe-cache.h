@@ -128,18 +128,8 @@ struct ggml_moe_cache_api {
     // Releases slot pins and all per-node ownership. Must be called exactly once for every non-NULL begin result, on every success or failure path.
     void (*end)(void * node);
 
-    // Dispatch one fused up * GLU(gate) operation over experts resident for both tensors. When down is non-NULL, continue through the down projection for rows resident in all three tensors. This is used only after the CPU backend proves that the corresponding nodes form an elidable subgraph. ids and act_rows contain n_rows flattened token-major routed rows. Returns a regular node accepted by collect/end and marks the skipped logical rows in hit_mask.
-    void * (*fused_begin)(const struct ggml_moe_cache_tensor_desc * up,
-                          const struct ggml_moe_cache_tensor_desc * gate,
-                          const struct ggml_moe_cache_tensor_desc * down,
-                          int glu_op, float up_min, float up_max,
-                          float gate_min, float gate_max,
-                          const int32_t * ids, int n_rows, int64_t n_tokens,
-                          const float * const * act_rows, uint64_t * hit_mask);
-
-    // fused_begin split in two: fused_plan pins the hit rows and returns their mask without launching GPU work,
-    // so CPU workers can start on the misses while one thread calls fused_dispatch. On a fused_dispatch
-    // failure, the caller must recompute the hit rows on the CPU; end is still required either way.
+    // Plan one fused up * GLU(gate) operation over experts resident for both tensors. When down is non-NULL, continue through the down projection for rows resident in all three tensors. This is used only after the CPU backend proves that the corresponding nodes form an elidable subgraph. ids and act_rows contain n_rows flattened token-major routed rows. Returns a regular node accepted by collect/end and marks the skipped logical rows in hit_mask.
+    // Planning launches no GPU work, so CPU workers can start on the misses while one thread calls fused_dispatch.
     void * (*fused_plan)(const struct ggml_moe_cache_tensor_desc * up,
                          const struct ggml_moe_cache_tensor_desc * gate,
                          const struct ggml_moe_cache_tensor_desc * down,
@@ -147,6 +137,8 @@ struct ggml_moe_cache_api {
                          float gate_min, float gate_max,
                          const int32_t * ids, int n_rows, int64_t n_tokens,
                          const float * const * act_rows, uint64_t * hit_mask);
+    // Launches a fused_plan node once; repeated calls before collect return the launch result. On 0, the caller must recompute
+    // the hit rows on the CPU. end is required either way.
     int    (*fused_dispatch)(void * node);
 
     // Host buffer mutation or teardown notification. Sessions cancel or finish any fill that still reads the supplied range before this call returns.
