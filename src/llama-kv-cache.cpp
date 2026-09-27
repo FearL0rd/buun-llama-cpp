@@ -4847,6 +4847,9 @@ size_t llama_kv_cache::vbr_flush_deferred_unmaps() {
         }
         flushed += p.unmap_deferred.size();
         p.unmap_deferred.clear();
+        // The mapped-byte floor may have inflated the memo before the tail release.
+        // Reprice against the remaining mappings instead of retaining transient headroom.
+        p.budget_eff_stamp = ~0ull;
     }
     return flushed;
 }

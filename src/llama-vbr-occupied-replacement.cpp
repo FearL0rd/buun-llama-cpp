@@ -607,6 +607,12 @@ vbr_occupied_replacement_guard_status occupied_guard_validate(
             continue;
         }
         const auto & rd = recovery.units()[i].descriptor;
+        // A clean sink stash needs the ordinary empty-tree importer. It is
+        // unsupported by this row-relocation route, not stale representation
+        // evidence that another capture could repair.
+        if (!occupied_unit_admissible(id) || !occupied_unit_admissible(rd)) {
+            return vbr_occupied_replacement_guard_status::unsupported_layout;
+        }
         if (rd.logical_unit_id != i ||
             !occupied_unit_schedule_equal(id, rd) ||
             !occupied_target_unit_matches(

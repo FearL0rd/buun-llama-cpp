@@ -321,6 +321,47 @@ static void test_segment_chain_offsets() {
     CHECK(one == 7);
     CHECK(!chain.read(8, &one, 1));
 
+    artifact_segment_chain prefix;
+    const uint8_t first_five[] = { 0, 1, 2, 3, 4 };
+    CHECK(prefix.append(first_five, sizeof(first_five)));
+    CHECK(chain.prefix_matches(prefix));
+    auto shared = chain.with_shared_prefix(prefix);
+    CHECK(shared && read_chain(*shared) == read_chain(chain));
+    CHECK(shared && vbr_capture_stream_digest(*shared) == vbr_capture_stream_digest(chain));
+    // Aligned cuts retain complete suffix chunks; unaligned cuts copy only
+    // the boundary slice. Both remain valid after all source owners go away.
+    for (const size_t prefix_size : { size_t(3), size_t(5) }) {
+        artifact_segment_chain segmented(11);
+        CHECK(segmented.append(a, sizeof(a)));
+        CHECK(segmented.append(b, sizeof(b)));
+        CHECK(segmented.append(a, sizeof(a)));
+        artifact_segment_chain head;
+        std::vector<uint8_t> prefix_bytes(prefix_size);
+        CHECK(segmented.read(0, prefix_bytes.data(), prefix_bytes.size()));
+        CHECK(head.append(prefix_bytes.data(), prefix_bytes.size()));
+        const auto expected = read_chain(segmented);
+        const auto digest = vbr_capture_stream_digest(segmented);
+        const auto revision = segmented.content_revision();
+        const auto retained = segmented.with_shared_prefix(head);
+        CHECK(retained);
+        segmented = artifact_segment_chain();
+        head = artifact_segment_chain();
+        CHECK(retained && retained->segment_count() == 3);
+        CHECK(retained && retained->content_revision() == revision);
+        CHECK(retained && read_chain(*retained) == expected);
+        CHECK(retained && vbr_capture_stream_digest(*retained) == digest);
+    }
+    artifact_segment_chain different;
+    CHECK(different.append(b, sizeof(b)));
+    CHECK(!chain.prefix_matches(different));
+    CHECK(!chain.with_shared_prefix(different));
+    CHECK(!prefix.with_shared_prefix(chain));
+    artifact_segment_chain empty_prefix;
+    CHECK(!chain.with_shared_prefix(empty_prefix));
+    // Clearing/moving the source owner must not invalidate the shared bytes.
+    prefix = artifact_segment_chain();
+    CHECK(shared && read_chain(*shared) == read_chain(chain));
+
     artifact_segment_chain known_size(8);
     CHECK(known_size.append(a, sizeof(a)));
     const auto incomplete_digest =
@@ -1879,7 +1920,8 @@ static bool publish_occupied_guard_package(
         uint32_t proof_count = 1,
         uint8_t payload_salt = 0,
         ggml_type representation_type = GGML_TYPE_F16,
-        bool shared_positions = false) {
+        bool shared_positions = false,
+        const llama_cache_transaction_fault & fault = {}) {
     reference = {};
     view.reset();
     if (token_count == 0 || proof_count == 0 || proof_count > 4096) {
@@ -1977,10 +2019,14 @@ static bool publish_occupied_guard_package(
         manifest_id, assembly, topology));
     std::vector<vbr_projected_manifest_publish_result> results;
     if (!catalog.publish_projected_batch(
-            assembly, std::move(publications), budget, results) ||
+            assembly, std::move(publications), budget, results, nullptr, fault) ||
         results.size() != 1 ||
         results.front().status !=
             vbr_projected_manifest_publish_status::published) {
+        if (fault.fail_stage_at != UINT32_MAX || fault.fail_commit_at != UINT32_MAX ||
+            fault.fail_after_commit) {
+            return false;
+        }
         fprintf(stderr,
                 "occupied package publication failed: %" PRIu64
                 " size=%zu status=%u\n",
@@ -2412,6 +2458,76 @@ static void test_dependency_scoped_projected_catalog_publication() {
     budget.global_cap_state =
         llama_cache_budget_capacity_state::unbounded;
     std::vector<llama_vbr_projected_publication_claim> publication_claims;
+    {
+        const auto live_ops = ledger.snapshot().live_ops;
+        llama_cache_acct_artifact_id first_id, second_id, third_id, different_id;
+        vbr_artifact_package_view first, second, third, different;
+        CHECK(publish_occupied_guard_package(catalog, topology, budget,
+            701, 8, false, first_id, first, 991));
+        CHECK(publish_occupied_guard_package(catalog, topology, budget,
+            702, 12, false, second_id, second, 991));
+        CHECK(first.units().size() == 1 && second.units().size() == 1);
+        if (!first || !second) {
+            return;
+        }
+        const auto prefix_allocation = first.units()[0].payload_allocations[0].allocation;
+        CHECK(second.units()[0].payload_allocations.size() == 2);
+        CHECK(second.units()[0].payload_allocations[0].allocation == prefix_allocation);
+        CHECK(second.units()[0].payload_allocations.back().resident == 4);
+        CHECK(first.units()[0].unit_version_id != second.units()[0].unit_version_id);
+        first.reset();
+        CHECK(catalog.retire(first_id) == vbr_artifact_retire_status::retired);
+        CHECK(publish_occupied_guard_package(catalog, topology, budget,
+            703, 16, false, third_id, third, 991));
+        CHECK(third.units()[0].payload_allocations.size() == 3);
+        CHECK(third.units()[0].payload_allocations[0].allocation == prefix_allocation);
+        CHECK(third.units()[0].payload_allocations.back().resident == 4);
+        CHECK(read_chain(*third.units()[0].payload_shards[0]).size() == 16);
+        llama_cache_acct_artifact_id equal_id;
+        vbr_artifact_package_view equal;
+        // Different representation generations can have identical bytes. Only
+        // their immutable storage is shared; version identities stay distinct.
+        CHECK(publish_occupied_guard_package(catalog, topology, budget,
+            705, 16, false, equal_id, equal, 991 + 256));
+        CHECK(equal.units()[0].unit_version_id != third.units()[0].unit_version_id);
+        CHECK(equal.units()[0].payload_allocations.size() == third.units()[0].payload_allocations.size());
+        CHECK(equal.units()[0].payload_allocations[0].allocation == prefix_allocation);
+        for (int phase = 0; phase < 3; ++phase) {
+            const auto before_failure = ledger.snapshot().live_ops;
+            const auto references = catalog.snapshot().references;
+            llama_cache_transaction_fault fault;
+            if (phase == 0) { fault.fail_stage_at = 1; }
+            if (phase == 1) { fault.fail_commit_at = 1; }
+            if (phase == 2) { fault.fail_after_commit = true; }
+            llama_cache_acct_artifact_id failed_id;
+            vbr_artifact_package_view failed;
+            CHECK(!publish_occupied_guard_package(catalog, topology, budget,
+                710 + phase, 20, false, failed_id, failed, 991, 0, 1, 0,
+                GGML_TYPE_F16, false, fault));
+            CHECK(ledger.snapshot().live_ops == before_failure);
+            CHECK(catalog.snapshot().references == references);
+        }
+        CHECK(publish_occupied_guard_package(catalog, topology, budget,
+            704, 16, false, different_id, different, 991, 0, 1, 1));
+        CHECK(different.units()[0].payload_allocations.size() == 1);
+        CHECK(different.units()[0].payload_allocations[0].allocation != prefix_allocation);
+        second.reset();
+        CHECK(catalog.retire(second_id) == vbr_artifact_retire_status::retired);
+        // The latest snapshot still owns every shared prefix allocation after
+        // both ancestor manifests have been evicted.
+        vbr_artifact_package_view reread;
+        CHECK(catalog.resolve_reference(third_id, reread) == vbr_artifact_resolve_status::ok);
+        CHECK(read_chain(*reread.units()[0].payload_shards[0]) ==
+              read_chain(*third.units()[0].payload_shards[0]));
+        reread.reset();
+        third.reset();
+        different.reset();
+        equal.reset();
+        CHECK(catalog.retire(third_id) == vbr_artifact_retire_status::retired);
+        CHECK(catalog.retire(different_id) == vbr_artifact_retire_status::retired);
+        CHECK(catalog.retire(equal_id) == vbr_artifact_retire_status::retired);
+        CHECK(ledger.snapshot().live_ops == live_ops);
+    }
     for (size_t i = 0; i < assembly.manifests().size(); ++i) {
         if (assembly.manifests()[i].state !=
                 vbr_capture_manifest_state::ready) {

@@ -549,8 +549,9 @@ public:
     // Dependency-scoped publication. Structural assembly corruption or a
     // malformed publication inventory clears all output and returns false.
     // Missing/stale unit or companion evidence is reported per manifest;
-    // unaffected rows publish independently. Main payload bytes are never
-    // reread: authority comes exclusively from the opaque sealed assembly.
+    // unaffected rows publish independently. Authentication comes from the
+    // opaque sealed assembly, without rehashing main payloads. Storage sharing
+    // may byte-compare a retained prefix; it does not grant new authority.
     bool publish_projected_batch(
         const vbr_capture_manifest_assembly & assembly,
         std::vector<vbr_projected_manifest_publication> && publications,

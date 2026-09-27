@@ -2013,25 +2013,32 @@ size_t server_prompt_cache::active_storage_tokens() const noexcept {
     return active_storage_ ? active_storage_->tokens : 0;
 }
 
+size_t server_prompt_cache::admission_byte_limit() const noexcept {
+    GGML_ASSERT(vbr_exchange_bytes_ <= SIZE_MAX - limit_size);
+    return limit_size == 0 ? 0 : limit_size + vbr_exchange_bytes_;
+}
+
 bool server_prompt_cache::fits_bytes(size_t host_bytes) const noexcept {
     const size_t reserved = active_storage_bytes();
+    const size_t limit = admission_byte_limit();
     return host_bytes <= SIZE_MAX-reserved &&
-        (limit_size == 0 || (reserved <= limit_size && host_bytes <= limit_size-reserved));
+        (limit == 0 || (reserved <= limit && host_bytes <= limit-reserved));
 }
 
 size_t server_prompt_cache::byte_deficit(size_t host_bytes) const noexcept {
     const size_t reserved = active_storage_bytes();
-    if (limit_size == 0 || host_bytes > SIZE_MAX-reserved) {
-        return limit_size == 0 ? 0 : SIZE_MAX;
+    const size_t limit = admission_byte_limit();
+    if (limit == 0 || host_bytes > SIZE_MAX-reserved) {
+        return limit == 0 ? 0 : SIZE_MAX;
     }
-    return host_bytes+reserved > limit_size ? host_bytes+reserved-limit_size : 0;
+    return host_bytes+reserved > limit ? host_bytes+reserved-limit : 0;
 }
 
 size_t server_prompt_cache::effective_host_token_limit(size_t host_bytes, size_t host_tokens) const noexcept {
     const size_t bytes = active_storage_bytes(), tokens = active_storage_tokens();
     if (host_bytes > SIZE_MAX-bytes || host_tokens > SIZE_MAX-tokens) { return 0; }
     const size_t effective = server_prompt_cache_effective_token_limit(
-        limit_size, limit_tokens, host_bytes+bytes, host_tokens+tokens);
+        admission_byte_limit(), limit_tokens, host_bytes+bytes, host_tokens+tokens);
     return effective > tokens ? effective-tokens : 0;
 }
 
@@ -2554,11 +2561,17 @@ static bool server_prompt_cache_vbr_frontier_matches(
         const server_prompt_cache_payload & payload,
         const std::string & execution_identity,
         const std::string & adapter_config_key,
-        bool * raw_token_comparison = nullptr) noexcept {
+        bool * raw_token_comparison = nullptr,
+        int64_t coverage_tokens = -1) noexcept {
     if (raw_token_comparison) {
         *raw_token_comparison = false;
     }
     try {
+        const int64_t n_tokens = coverage_tokens < 0
+            ? prompt.n_tokens() : coverage_tokens;
+        if (n_tokens <= 0 || n_tokens > prompt.n_tokens()) {
+            return false;
+        }
         const auto * artifact = payload.vbr_artifact();
         if (!artifact || execution_identity.empty()) {
             return false;
@@ -2572,20 +2585,22 @@ static bool server_prompt_cache_vbr_frontier_matches(
         if (identity.execution_identity != execution_identity ||
             identity.adapter_config_identity != adapter_config_key ||
             identity.sequence_epoch != prompt.sequence_epoch ||
-            identity.token_count != prompt.n_tokens() ||
-            identity.next_position != prompt.tokens.pos_next()) {
+            identity.token_count != n_tokens ||
+            identity.next_position != prompt.tokens.pos_next(coverage_tokens)) {
             return false;
         }
         if (raw_token_comparison) {
             *raw_token_comparison = true;
         }
-        if (manifest.token_block.tokens !=
-                prompt.tokens.retention_token_ids()) {
+        const auto & tokens = prompt.tokens.retention_token_ids();
+        if (manifest.token_block.tokens.size() != size_t(n_tokens) ||
+            !std::equal(manifest.token_block.tokens.begin(),
+                        manifest.token_block.tokens.end(), tokens.begin())) {
             return false;
         }
         std::string media_identity;
         return prompt.tokens.media_content_identity(
-                   prompt.n_tokens(), media_identity) &&
+                   n_tokens, media_identity) &&
                media_identity == identity.media_content_identity;
     } catch (...) {
         return false;
@@ -2642,6 +2657,29 @@ bool server_prompt_cache::contains_vbr_frontier(
         }
     }
     return false;
+}
+
+llama_cache_acct_artifact_id server_prompt_cache::find_vbr_durable_stem(
+        const server_prompt & prompt,
+        int64_t coverage_tokens,
+        const std::string & execution_identity,
+        const std::string & adapter_config_key,
+        llama_cache_acct_artifact_id required_artifact) const noexcept {
+    if (coverage_tokens <= 0 || coverage_tokens >= prompt.n_tokens()) {
+        return {};
+    }
+    for (auto it = states.begin(); it != states.end(); ++it) {
+        if (it->payload.kind() == server_prompt_cache_payload_kind::vbr_artifact &&
+            (required_artifact.v == 0 || vbr_host_artifact_id(it).v == required_artifact.v) &&
+            it->adapter_config_key == adapter_config_key &&
+            it->vbr_execution_identity == execution_identity &&
+            server_prompt_cache_vbr_frontier_matches(
+                prompt, it->payload, execution_identity, adapter_config_key,
+                nullptr, coverage_tokens)) {
+            return vbr_host_artifact_id(it);
+        }
+    }
+    return {};
 }
 
 bool server_prompt_cache::mark_vbr_frontiers(
@@ -8509,11 +8547,161 @@ bool server_prompt_cache::publish_vbr_restore(
     return true;
 }
 
+namespace {
+
+// Capture workers allocate pageable chunks in separate malloc arenas. Return
+// their free pages after a large release or completed transfer, outside the
+// transaction. This is an allocator hint, never cache-retirement authority.
+struct server_prompt_cache_heap_reclaim {
+    bool pending = false;
+    void note(uint64_t bytes) noexcept {
+        pending |= bytes != UINT64_MAX && bytes >= (64ull << 20);
+    }
+    ~server_prompt_cache_heap_reclaim() {
+#if defined(__GLIBC__)
+        if (pending) {
+            malloc_trim(0);
+        }
+#endif
+    }
+};
+
+} // namespace
+
+server_prompt_cache_vbr_exchange::~server_prompt_cache_vbr_exchange() {
+    (void) settle();
+}
+
+bool server_prompt_cache_vbr_exchange::settle() noexcept {
+    return cache_ && cache_->finish_vbr_exchange(*this);
+}
+
+bool server_prompt_cache::begin_vbr_exchange(
+        server_prompt_cache_vbr_restore_candidate incoming,
+        int32_t destination_slot,
+        server_prompt_cache_vbr_exchange & exchange) noexcept {
+    if (exchange.cache_ || vbr_exchange_ || limit_size == 0 ||
+        !publish_authority || !acct || !retention_obs || !lease_obs ||
+        !lease_execution_identity || destination_slot < 0 ||
+        !incoming.ready() || incoming.cache_ != this ||
+        incoming.requires_prefix_projection_ ||
+        incoming.prefix_tokens_ != incoming.source_tokens_ ||
+        incoming.prepared_slot_ >= 0) {
+        return false;
+    }
+    auto * source = incoming.source_;
+    if (!source || source->recovery_pins != 1 ||
+        !source->prompt.checkpoints.empty() ||
+        source->payload.vbr_has_quality_anchor()) {
+        return false;
+    }
+    const auto * variants = source->payload.vbr_variants();
+    if (!variants || variants->compact_current() != incoming.payload_ ||
+        incoming.payload_.use_count() != 2) {
+        return false;
+    }
+    try {
+        lease_obs->lifecycle_point();
+        server_cache_destruction_artifact artifact;
+        if (!build_host_retention_artifact(*this, *source, artifact) ||
+            artifact.mandatory_anchor ||
+            artifact.candidate.lease.state != server_cache_lease_eval_state::known ||
+            server_cache_lease_is_hard(artifact.candidate.lease)) {
+            return false;
+        }
+        const uint64_t bytes = incoming.payload_->resident_bytes();
+        const size_t current = size();
+        if (bytes == 0 || bytes > limit_size || bytes > SIZE_MAX - limit_size ||
+            bytes > SIZE_MAX - current || fits_bytes(current + size_t(bytes))) {
+            return false;
+        }
+        // This is a transient overlap bound, not a promise of marginal
+        // reclamation: shared backing still goes through ordinary accounting
+        // and the steady limit is enforced at every scope exit.
+        exchange.cache_ = this;
+        exchange.source_ = source;
+        exchange.owner_ = incoming.payload_.get();
+        exchange.incoming_ = std::move(incoming);
+        exchange.committed_exact_ = false;
+        exchange.destination_slot_ = destination_slot;
+        exchange.scheduler_owner_ = std::this_thread::get_id();
+        ++source->recovery_pins;
+        vbr_exchange_ = &exchange;
+        vbr_exchange_bytes_ = size_t(bytes);
+        SRV_DBG("VBR host/live exchange admitted overlap=%zu steady_limit=%zu\n",
+                vbr_exchange_bytes_, limit_size);
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
+bool server_prompt_cache::finish_vbr_exchange(
+        server_prompt_cache_vbr_exchange & exchange) noexcept {
+    GGML_ASSERT(vbr_exchange_ == &exchange && exchange.cache_ == this &&
+                exchange.scheduler_owner_ == std::this_thread::get_id());
+    auto * source = exchange.source_;
+    // The extra recovery pin keeps the source node alive even after import
+    // consumes its candidate. Drop candidate borrows before typed retirement.
+    exchange.incoming_ = {};
+    GGML_ASSERT(source && source->recovery_pins > 0);
+    bool source_pinned = true;
+    const size_t transfer_bytes = vbr_exchange_bytes_;
+    vbr_exchange_ = nullptr;
+    vbr_exchange_bytes_ = 0;
+    exchange.cache_ = nullptr;
+    bool consumed = false;
+    server_prompt_cache_heap_reclaim reclaim;
+    try {
+        auto it = std::find_if(states.begin(), states.end(),
+                [&](const auto & state) { return &state == source; });
+        if (exchange.committed_exact_ && it != states.end() &&
+            it->recovery_pins == 1 && it->payload.vbr_variants() &&
+            it->payload.vbr_variants()->compact_current().get() == exchange.owner_) {
+            lease_obs->lifecycle_point();
+            host_trade_candidate checked;
+            (void) inspect_host_candidate(*this, it, 0,
+                    server_cache_destruction_reason::host_capacity, checked);
+            vbr_artifact_prepared_retire retirement;
+            if (checked.retirement_ready && checked.lease_known &&
+                !checked.hard_leased && !checked.mandatory_anchor &&
+                it->payload.prepare_vbr_retire(acct->serial(), retirement)) {
+                --source->recovery_pins;
+                source_pinned = false;
+                consumed = destroy_retention_capacity_entry(it,
+                        server_cache_destruction_reason::host_consumed_restore,
+                        &retirement);
+                if (consumed) {
+                    // Shared backing can make the marginal retirement quote
+                    // metadata-only. The completed capture/import also freed
+                    // large temporary buffers, independently of that quote.
+                    reclaim.note(transfer_bytes);
+                } else {
+                    ++source->recovery_pins;
+                    source_pinned = true;
+                }
+            }
+        }
+        // Refused/transcoding imports retain their higher-quality host copy.
+        // Ordinary capacity authority chooses any necessary fallback victim.
+        update();
+        SRV_DBG("VBR host/live exchange settled exact=%d consumed=%d\n",
+                int(exchange.committed_exact_), int(consumed));
+    } catch (...) {
+        SRV_WRN("%s", "VBR host/live exchange cleanup deferred to cache maintenance\n");
+    }
+    if (source_pinned) {
+        --source->recovery_pins;
+    }
+    return consumed;
+}
+
 bool server_prompt_cache::commit_vbr_restore(
         server_prompt_cache_vbr_restore_candidate & candidate,
         server_prompt & destination,
         common_cache_family_binding & destination_family,
-        int32_t id_slot) noexcept {
+        int32_t id_slot,
+        bool exact_representation) noexcept {
     if (!candidate.ready() || candidate.cache_ != this ||
         candidate.prepared_slot_ != id_slot || !retention_obs ||
         candidate.adopted_destination_ != &destination) {
@@ -8553,6 +8741,13 @@ bool server_prompt_cache::commit_vbr_restore(
         } catch (...) {
             // Observability cannot change a committed restore terminal.
         }
+    }
+    if (vbr_exchange_ && vbr_exchange_->source_ == source &&
+        vbr_exchange_->owner_ == candidate.payload_.get() &&
+        vbr_exchange_->destination_slot_ == id_slot &&
+        !candidate.requires_prefix_projection_ &&
+        candidate.prefix_tokens_ == candidate.source_tokens_) {
+        vbr_exchange_->committed_exact_ = exact_representation;
     }
     --source->recovery_pins;
     candidate.clear();
@@ -9268,25 +9463,7 @@ bool server_prompt_cache::update_impl(
         !quality_anchor_budget_enabled) {
         return true;
     }
-    // Capture workers allocate large pageable chunks in separate malloc
-    // arenas. Logical eviction can leave GiBs of free pages resident there
-    // while the next worker grows another arena. Reclaim those free pages
-    // once after a large, proven release, outside the retirement transaction.
-    // Apply the same host-pressure treatment to fixed-state payloads; small,
-    // unknown, or purely logical releases do not request a trim.
-    struct heap_reclaim {
-        bool pending = false;
-        void note(uint64_t released) noexcept {
-            pending |= released != UINT64_MAX && released >= (64ull << 20);
-        }
-        ~heap_reclaim() {
-#if defined(__GLIBC__)
-            if (pending) {
-                malloc_trim(0);
-            }
-#endif
-        }
-    } reclaim;
+    server_prompt_cache_heap_reclaim reclaim;
     bool pressure_wave_started = false;
     bool competition_wave_valid = true;
     bool retention_shadow_observed = false;
