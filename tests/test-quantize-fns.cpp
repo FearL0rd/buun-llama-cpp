@@ -375,11 +375,14 @@ static void test_q2_0_packed_dot() {
 static void test_q2_0_repeated_experts() {
     const auto * traits = ggml_get_type_traits_cpu(GGML_TYPE_Q2_0);
     for (int n : {64, 320, 640, 2560, 16384, 16448}) {
-        for (int columns : {7, 33}) for (int rows : {1, 2, 3, 4, 5, 8, 9}) for (int lanes : {1, 2}) {
+        for (int columns : {7, 33, 257}) for (int rows : {1, 2, 3, 4, 5, 8, 9}) for (int lanes : {1, 2}) for (bool from_f32 : {false, true}) {
+            // Span several output-column work chunks and leave a partial tail.
+            if (columns == 257 && n != 640 && n != 2560) continue;
             ggml_context * ctx = ggml_init({4*1024*1024, nullptr, false});
             assert(ctx);
             ggml_tensor * weights = ggml_new_tensor_3d(ctx, GGML_TYPE_Q2_0, n, columns, 2);
-            ggml_tensor * acts = ggml_new_tensor_3d(ctx, GGML_TYPE_Q8_0, n, lanes, rows);
+            ggml_tensor * quantized_acts = ggml_new_tensor_3d(ctx, GGML_TYPE_Q8_0, n, lanes, rows);
+            ggml_tensor * acts = quantized_acts;
             ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 2, rows);
             auto * x = static_cast<uint8_t *>(weights->data);
             auto * y = static_cast<uint8_t *>(acts->data);
@@ -393,12 +396,19 @@ static void test_q2_0_repeated_experts() {
                 memcpy(y + i, &scale, 2);
                 for (int j = 2; j < 34; ++j) y[i + j] = uint8_t(i*13 + j*19);
             }
+            if (from_f32) {
+                acts = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n, lanes, rows);
+                ggml_get_type_traits(GGML_TYPE_Q8_0)->to_float(y, static_cast<float *>(acts->data), ggml_nelements(acts));
+                // The reference uses the same quantized bytes as the worker
+                // conversion, independently of how its blocks are partitioned.
+                ggml_get_type_traits_cpu(GGML_TYPE_Q8_0)->from_float(static_cast<float *>(acts->data), y, ggml_nelements(acts));
+            }
             auto * routes = static_cast<int32_t *>(ids->data);
             for (int i = 0; i < 2*rows; ++i) routes[i] = (i + i/2) % 2;
             ggml_tensor * out = ggml_mul_mat_id(ctx, weights, acts, ids);
             ggml_cgraph * graph = ggml_new_graph(ctx);
             ggml_build_forward_expand(graph, out);
-            for (int threads : {1, 3}) {
+            for (int threads : {1, 3, 6}) {
                 assert(ggml_graph_compute_with_ctx(ctx, graph, threads) == GGML_STATUS_SUCCESS);
                 for (int token = 0; token < rows; ++token) {
                     for (int route = 0; route < 2; ++route) {
@@ -406,7 +416,7 @@ static void test_q2_0_repeated_experts() {
                             float expected = NAN;
                             traits->vec_dot(n, &expected, 0,
                                 x + routes[2*token + route]*weights->nb[2] + row*weights->nb[1], 0,
-                                y + (route % lanes)*acts->nb[1] + token*acts->nb[2], 0, 1);
+                                y + (route % lanes)*quantized_acts->nb[1] + token*quantized_acts->nb[2], 0, 1);
                             const float actual = static_cast<float *>(out->data)[(2*token + route)*columns + row];
                             assert(std::isfinite(actual) && actual == expected);
                         }
