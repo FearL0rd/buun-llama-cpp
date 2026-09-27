@@ -31,6 +31,10 @@
 
 namespace {
 
+bool vbr_release_resident_bytes(
+    const llama_cache_acct_release_set_preview & preview,
+    uint64_t & bytes) noexcept;
+
 json server_json_from_ordered(nlohmann::ordered_json value) {
     return json::parse(value.dump());
 }
@@ -2120,6 +2124,8 @@ server_prompt_cache_vbr_capacity_claim(
       destination_artifact_(other.destination_artifact_),
       incoming_compact_bytes_(other.incoming_compact_bytes_),
       incoming_tokens_(other.incoming_tokens_),
+      projected_bytes_(other.projected_bytes_),
+      competition_epoch_(other.competition_epoch_),
       scheduler_owner_(other.scheduler_owner_) {
     other.clear();
 }
@@ -2135,6 +2141,8 @@ server_prompt_cache_vbr_capacity_claim::operator=(
         destination_artifact_ = other.destination_artifact_;
         incoming_compact_bytes_ = other.incoming_compact_bytes_;
         incoming_tokens_ = other.incoming_tokens_;
+        projected_bytes_ = other.projected_bytes_;
+        competition_epoch_ = other.competition_epoch_;
         scheduler_owner_ = other.scheduler_owner_;
         other.clear();
     }
@@ -2149,6 +2157,8 @@ void server_prompt_cache_vbr_capacity_claim::clear() noexcept {
     destination_artifact_ = {};
     incoming_compact_bytes_ = 0;
     incoming_tokens_ = 0;
+    projected_bytes_ = 0;
+    competition_epoch_ = 0;
     scheduler_owner_ = {};
 }
 
@@ -2280,6 +2290,8 @@ bool server_prompt_cache::prepare_vbr_publication_capacity(
         claim.destination_artifact_ = prepared[0]->destination_artifact_;
         claim.incoming_compact_bytes_ = incoming_compact_bytes;
         claim.incoming_tokens_ = incoming_tokens;
+        claim.projected_bytes_ = projected_bytes;
+        claim.competition_epoch_ = retention_obs->competition_epoch_value();
     }
     claim.cache_ = this;
     claim.scheduler_owner_ = std::this_thread::get_id();
@@ -3143,17 +3155,25 @@ bool server_prompt_cache::preview_vbr_compact_refresh_capacity(
             return true;
         }
         const auto * variants = target->payload.vbr_variants();
-        const auto compact = variants ? variants->compact_current() : nullptr;
+        const auto * compact = variants ? variants->compact_current().get() : nullptr;
         if (!compact) {
             return false;
         }
         const uint64_t committed = size();
-        // Only claim release credit when this logical row is the sole compact
-        // owner. Shared owners remain charged until the exact refresh terminal
-        // proves their union after publication.
-        const uint64_t replaceable =
-            target->payload.vbr_retirement_exclusive()
-                ? compact->resident_bytes() : 0;
+        // Do not copy the compact owner before checking exclusivity. Even an
+        // exclusive logical row can share catalog backing with other rows;
+        // credit only the bytes its compact retirement would really release.
+        uint64_t replaceable = 0;
+        if (acct && target->payload.vbr_retirement_exclusive()) {
+            const std::vector<const vbr_artifact_package_view *> packages {
+                &compact->package(),
+            };
+            llama_cache_acct_release_set_preview preview;
+            if (!compact->package().preview_owned_retire(packages, acct->serial(), preview) ||
+                !vbr_release_resident_bytes(preview, replaceable)) {
+                return false;
+            }
+        }
         const uint64_t base = committed >= replaceable
             ? committed-replaceable : committed;
         return incoming_compact_bytes <= UINT64_MAX-base &&
@@ -4065,7 +4085,6 @@ static void server_prompt_cache_mirror_lease(
 enum class server_prompt_cache_prefix_clone_mode : uint8_t {
     publish_from_prompt = 0,
     share_source,
-    publish_stem,
     branch_prefix,
 };
 
@@ -4081,26 +4100,15 @@ static bool server_prompt_cache_mirror_artifact_clone(
         const std::string & adapter_identity,
         int64_t coverage_tokens,
         server_prompt_cache_prefix_clone_mode prefix_mode =
-            server_prompt_cache_prefix_clone_mode::publish_from_prompt,
-        int64_t source_turn_tokens = -1)
+            server_prompt_cache_prefix_clone_mode::publish_from_prompt)
         noexcept {
     if (!cache.retention_obs) {
         return true;
     }
 
-    common_chat_msg_spans no_spans;
     bool cloned = false;
     bool prefix_prepared = false;
     switch (prefix_mode) {
-        case server_prompt_cache_prefix_clone_mode::publish_stem:
-            cloned = source_turn_tokens > 0 && coverage_tokens > 0 &&
-                coverage_tokens <= source_turn_tokens &&
-                cache.retention_obs->publish(
-                    destination_key, common_retention_pool::attention,
-                    no_spans, true, uint64_t(source_turn_tokens),
-                    uint64_t(coverage_tokens), true,
-                    nullptr, nullptr, &source_key);
-            break;
         case server_prompt_cache_prefix_clone_mode::branch_prefix:
             cloned = coverage_tokens > 0 &&
                 cache.retention_obs->branch_prefix(
@@ -4236,10 +4244,7 @@ bool server_prompt_cache::prepare_vbr_publication_metadata_impl(
             destination_key, common_retention_artifact_kind::host_entry,
             -1,
             state.prompt, state.adapter_config_key,
-            state.prompt.n_tokens(),
-            stem ? server_prompt_cache_prefix_clone_mode::publish_stem
-                 : server_prompt_cache_prefix_clone_mode::publish_from_prompt,
-            source_prompt.n_tokens());
+            state.prompt.n_tokens());
     if (!mirrored) {
         retention_obs->retire(destination_key);
         return false;
@@ -4361,6 +4366,8 @@ bool server_prompt_cache::publish_vbr(
             }
             required_victims.artifacts = capacity->victim_artifacts_;
             required_victims.count = capacity->victim_count_;
+            required_victims.projected_bytes = capacity->projected_bytes_;
+            required_victims.competition_epoch = capacity->competition_epoch_;
         }
         capacity->clear();
     }
@@ -5922,118 +5929,138 @@ static bool server_prompt_cache_plan_vbr_pressure(
         // byte pressure, the victims whose own release covers the deficit
         // rank first; only when none does is every victim eligible (and the
         // bounded pair below).
-        const uint64_t deficit = byte_pressure
-            ? cache.byte_deficit(projected_bytes) : 0;
-        const auto projection = project_host_trade_retention_capacity(
-            cache, reason, cache.states.end(), candidates,
-            shadow_rows, shadow_artifacts, shadow_lineages,
-            ignored_artifact, {}, deficit);
-        // Match the publication terminal's oldest-eligible fallback when
-        // optional semantic retention scores are unavailable (e.g. requests
-        // without message delimiters). Lease and physical release evidence
-        // remain mandatory; missing scores never manufacture reclaim credit.
-        const auto select = [&](const auto & projected,
-                                llama_cache_acct_artifact_id excluded,
-                                uint64_t minimum_release = 0) {
-            const bool ranked = projected.complete &&
-                projected.release_evidence_complete && projected.artifact.v;
-            return std::find_if(candidates.begin(), candidates.end(), [&](const auto & value) {
-                return value.ranking.artifact_id.v &&
-                    value.ranking.artifact_id != excluded &&
-                    (!ranked || value.ranking.artifact_id == projected.artifact) &&
-                    (!byte_pressure || (value.marginal_resident_known &&
-                        value.marginal_resident_bytes >= minimum_release)) &&
-                    value.retirement_ready && value.lease_known &&
-                    !value.hard_leased && !value.mandatory_anchor &&
-                    value.victim->recovery_pins == 0;
-            });
-        };
-        auto selected = select(projection, {}, deficit);
-        if (selected == candidates.end() && deficit != 0) {
-            selected = select(projection, {});
+        // A cheap singleton can belong to a pair that cannot cover the deficit.
+        // Retry the next ranked first victim without granting shared-byte credit
+        // or expanding the two-victim transaction. Previously tried first victims
+        // remain valid partners and retained coverage in each second projection.
+        try {
+            const auto singleton_candidates = candidates;
+            auto first_candidates = candidates;
+            for (size_t attempt = 0; attempt < first_candidates.size(); ++attempt) {
+                plan = {};
+                candidates = first_candidates;
+                const uint64_t deficit = byte_pressure
+                    ? cache.byte_deficit(projected_bytes) : 0;
+                const auto projection = project_host_trade_retention_capacity(
+                    cache, reason, cache.states.end(), candidates,
+                    shadow_rows, shadow_artifacts, shadow_lineages,
+                    ignored_artifact, {}, deficit);
+                // Match the publication terminal's oldest-eligible fallback when
+                // optional semantic retention scores are unavailable (e.g. requests
+                // without message delimiters). Lease and physical release evidence
+                // remain mandatory; missing scores never manufacture reclaim credit.
+                const auto select = [&](const auto & projected,
+                                        llama_cache_acct_artifact_id excluded,
+                                        uint64_t minimum_release = 0) {
+                    const bool ranked = projected.complete &&
+                        projected.release_evidence_complete && projected.artifact.v;
+                    return std::find_if(candidates.begin(), candidates.end(), [&](const auto & value) {
+                        return value.ranking.artifact_id.v &&
+                            value.ranking.artifact_id != excluded &&
+                            (!ranked || value.ranking.artifact_id == projected.artifact) &&
+                            (!byte_pressure || (value.marginal_resident_known &&
+                                value.marginal_resident_bytes >= minimum_release)) &&
+                            value.retirement_ready && value.lease_known &&
+                            !value.hard_leased && !value.mandatory_anchor &&
+                            value.victim->recovery_pins == 0;
+                    });
+                };
+                auto selected = select(projection, {}, deficit);
+                if (selected == candidates.end() && deficit != 0) {
+                    selected = select(projection, {});
+                }
+                if (selected == candidates.end()) {
+                    return false;
+                }
+                const size_t first_index = size_t(selected - candidates.begin());
+                first_candidates[first_index].retirement_ready = false;
+                candidates = singleton_candidates;
+                selected = candidates.begin() + first_index;
+                const size_t first_tokens = size_t(std::max(
+                    0, selected->victim->prompt.n_tokens()));
+                const size_t after_bytes = selected->marginal_resident_bytes >
+                        projected_bytes
+                    ? 0 : projected_bytes -
+                        size_t(selected->marginal_resident_bytes);
+                const size_t after_tokens = first_tokens > projected_tokens
+                    ? 0 : projected_tokens - first_tokens;
+                const auto fits = [&](size_t bytes, size_t tokens) {
+                    return cache.fits_bytes(bytes) &&
+                        (cache.limit_tokens == 0 ||
+                         tokens <= cache.effective_host_token_limit(bytes, tokens));
+                };
+                plan.victims[0] = &*selected->victim;
+                plan.artifacts[0] = selected->ranking.artifact_id;
+                plan.soft_leased[0] = selected->soft_leased;
+                plan.count = 1;
+                if (fits(after_bytes, after_tokens)) {
+                    return true;
+                }
+                // The bounded compound terminal follows two consecutive byte-pressure
+                // decisions only. A token-only second step can have a different retention-capacity
+                // order and remains an explicit unsupported shape.
+                if (max_victims < 2 || !byte_pressure ||
+                    cache.fits_bytes(after_bytes) ||
+                    !selected->ranking.artifact_id.v) {
+                    plan = {};
+                    return false;
+                }
+                if (!populate_vbr_host_trade_marginals_conditioned(
+                        cache, candidates, *selected)) {
+                    plan = {};
+                    return false;
+                }
+                // The second victim answers what the first leaves of the deficit.
+                const uint64_t second_deficit = cache.byte_deficit(after_bytes);
+                const auto second_projection = project_host_trade_retention_capacity(
+                    cache, reason, cache.states.end(), candidates,
+                    shadow_rows, shadow_artifacts, shadow_lineages,
+                    ignored_artifact, selected->ranking.artifact_id, second_deficit);
+                auto second = select(second_projection, selected->ranking.artifact_id, second_deficit);
+                if (second == candidates.end() && second_deficit != 0) {
+                    second = select(second_projection, selected->ranking.artifact_id);
+                }
+                if (second == candidates.end()) {
+                    continue;
+                }
+                if (second == selected) {
+                    return false;
+                }
+                std::vector<const server_prompt_cache_payload *> pair {
+                    &selected->victim->payload,
+                    &second->victim->payload,
+                };
+                llama_cache_acct_release_set_preview preview;
+                uint64_t pair_bytes = 0;
+                if (!server_prompt_cache_payload::preview_vbr_retire_union(
+                        pair, cache.acct->serial(), preview) ||
+                    !vbr_release_resident_bytes(preview, pair_bytes) ||
+                    pair_bytes > SIZE_MAX) {
+                    plan = {};
+                    return false;
+                }
+                const size_t second_tokens = size_t(std::max(
+                    0, second->victim->prompt.n_tokens()));
+                if (second_tokens > after_tokens) {
+                    plan = {};
+                    return false;
+                }
+                const size_t pair_after_bytes = pair_bytes > projected_bytes
+                    ? 0 : projected_bytes - size_t(pair_bytes);
+                const size_t pair_after_tokens = after_tokens - second_tokens;
+                if (!fits(pair_after_bytes, pair_after_tokens)) {
+                    continue;
+                }
+                plan.victims[1] = &*second->victim;
+                plan.artifacts[1] = second->ranking.artifact_id;
+                plan.soft_leased[1] = second->soft_leased;
+                plan.count = 2;
+                return true;
+            }
+        } catch (...) {
         }
-        if (selected == candidates.end()) {
-            return false;
-        }
-        const size_t first_tokens = size_t(std::max(
-            0, selected->victim->prompt.n_tokens()));
-        const size_t after_bytes = selected->marginal_resident_bytes >
-                projected_bytes
-            ? 0 : projected_bytes -
-                size_t(selected->marginal_resident_bytes);
-        const size_t after_tokens = first_tokens > projected_tokens
-            ? 0 : projected_tokens - first_tokens;
-        const auto fits = [&](size_t bytes, size_t tokens) {
-            return cache.fits_bytes(bytes) &&
-                (cache.limit_tokens == 0 ||
-                 tokens <= cache.effective_host_token_limit(bytes, tokens));
-        };
-        plan.victims[0] = &*selected->victim;
-        plan.artifacts[0] = selected->ranking.artifact_id;
-        plan.soft_leased[0] = selected->soft_leased;
-        plan.count = 1;
-        if (fits(after_bytes, after_tokens)) {
-            return true;
-        }
-        // The bounded compound terminal follows two consecutive byte-pressure
-        // decisions only. A token-only second step can have a different retention-capacity
-        // order and remains an explicit unsupported shape.
-        if (max_victims < 2 || !byte_pressure ||
-            cache.fits_bytes(after_bytes) ||
-            !selected->ranking.artifact_id.v) {
-            plan = {};
-            return false;
-        }
-        if (!populate_vbr_host_trade_marginals_conditioned(
-                cache, candidates, *selected)) {
-            plan = {};
-            return false;
-        }
-        // The second victim answers what the first leaves of the deficit.
-        const uint64_t second_deficit = cache.byte_deficit(after_bytes);
-        const auto second_projection = project_host_trade_retention_capacity(
-            cache, reason, cache.states.end(), candidates,
-            shadow_rows, shadow_artifacts, shadow_lineages,
-            ignored_artifact, selected->ranking.artifact_id, second_deficit);
-        auto second = select(second_projection, selected->ranking.artifact_id, second_deficit);
-        if (second == candidates.end() && second_deficit != 0) {
-            second = select(second_projection, selected->ranking.artifact_id);
-        }
-        if (second == candidates.end() || second == selected) {
-            plan = {};
-            return false;
-        }
-        std::vector<const server_prompt_cache_payload *> pair {
-            &selected->victim->payload,
-            &second->victim->payload,
-        };
-        llama_cache_acct_release_set_preview preview;
-        uint64_t pair_bytes = 0;
-        if (!server_prompt_cache_payload::preview_vbr_retire_union(
-                pair, cache.acct->serial(), preview) ||
-            !vbr_release_resident_bytes(preview, pair_bytes) ||
-            pair_bytes > SIZE_MAX) {
-            plan = {};
-            return false;
-        }
-        const size_t second_tokens = size_t(std::max(
-            0, second->victim->prompt.n_tokens()));
-        if (second_tokens > after_tokens) {
-            plan = {};
-            return false;
-        }
-        const size_t pair_after_bytes = pair_bytes > projected_bytes
-            ? 0 : projected_bytes - size_t(pair_bytes);
-        const size_t pair_after_tokens = after_tokens - second_tokens;
-        if (!fits(pair_after_bytes, pair_after_tokens)) {
-            plan = {};
-            return false;
-        }
-        plan.victims[1] = &*second->victim;
-        plan.artifacts[1] = second->ranking.artifact_id;
-        plan.soft_leased[1] = second->soft_leased;
-        plan.count = 2;
-        return true;
+        plan = {};
+        return false;
     }
 
     auto current = cache.states.begin();
@@ -9544,7 +9571,10 @@ bool server_prompt_cache::update_impl(
         if (retention_shadow.pressure_waves != UINT64_MAX) {
             retention_shadow.pressure_waves++;
         }
-        competition_wave_valid =
+        // A pre-transfer capacity citation already priced this competition.
+        // Advancing decay at its publication terminal can change the winner
+        // solely because we revalidated it, refusing an otherwise valid save.
+        competition_wave_valid = required_victims.count != 0 ||
             retention_obs->begin_competition_wave();
     };
     if (quality_anchor_budget_enabled &&
@@ -9587,7 +9617,11 @@ bool server_prompt_cache::update_impl(
             const bool observe_shadow = !retention_shadow_observed;
             uint64_t released_bytes = 0;
             size_t released_tokens = 0;
-            if (required_victims.count == 2) {
+            const bool can_refine_quote = required_victims.count != 0 &&
+                cache_bytes < required_victims.projected_bytes && retention_obs &&
+                retention_obs->competition_epoch_value() ==
+                    required_victims.competition_epoch;
+            if (required_victims.count == 2 || can_refine_quote) {
                 const auto incoming_artifact = incoming != states.end() &&
                         retention_obs
                     ? retention_obs->artifact_id(
@@ -9605,19 +9639,32 @@ bool server_prompt_cache::update_impl(
                         incoming_artifact);
                 bool matches = planned && current.count != 0 &&
                     current.count <= required_victims.count;
+                // Capture quotes are conservative; deduplication can lower
+                // pressure enough to change the canonical victim choice.
+                // Refine only within the cited competition, for a strictly
+                // smaller footprint and no increase in victim count. Original
+                // identities and pins were revalidated by publish_vbr.
+                if (matches && can_refine_quote) {
+                    required_victims.artifacts = current.artifacts;
+                }
                 for (size_t i = 0; matches && i < current.count; ++i) {
                     matches = current.artifacts[i] ==
                         required_victims.artifacts[i];
                 }
-                if (!matches) {
+                if (!matches && required_victims.count > 1) {
+                    if (observe_shadow) {
+                        observe_retention_pressure_choice(
+                            server_cache_destruction_reason::host_capacity,
+                            incoming, incoming, competition_wave_valid);
+                    }
                     refuse_incoming_under_pressure(
                         incoming,
                         server_cache_destruction_reason::host_capacity);
                     return false;
                 }
-                if (current.count == 1) {
+                if (matches && current.count == 1) {
                     required_victims.count = 1;
-                } else {
+                } else if (matches) {
                     const auto first = std::find_if(
                         states.begin(), states.end(), [&](const auto & value) {
                             return &value == current.victims[0];
@@ -9666,6 +9713,8 @@ bool server_prompt_cache::update_impl(
                     continue;
                 }
             }
+            // Unrefined singleton citations retain the existing terminal's
+            // canonical-victim validation and refusal diagnostics.
             if (!evict_front_under_pressure(
                     server_cache_destruction_reason::host_capacity,
                     incoming, competition_wave_valid, observe_shadow,

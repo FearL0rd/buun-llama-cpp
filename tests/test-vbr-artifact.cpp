@@ -7944,7 +7944,19 @@ static vbr_artifact_package prompt_cache_quality_anchor_package(
     return result;
 }
 
-static void test_prompt_cache_vbr_pressure_without_turn_scores(bool compound) {
+enum class pressure_scenario {
+    ordinary, alternative_pair, contracted_quote, contracted_pair, contracted_singleton, stale_quote,
+};
+
+static void test_prompt_cache_vbr_pressure(
+        bool compound, pressure_scenario scenario = pressure_scenario::ordinary,
+        bool ranked = false) {
+    const bool alternative_pair = scenario != pressure_scenario::ordinary;
+    const bool conservative_quote = scenario == pressure_scenario::contracted_quote ||
+                                    scenario == pressure_scenario::contracted_pair ||
+                                    scenario == pressure_scenario::contracted_singleton ||
+                                    scenario == pressure_scenario::stale_quote;
+    const bool contracted_pair = scenario == pressure_scenario::contracted_pair;
     catalog_fixture fixture;
     server_prompt prompt;
     prompt.tokens = server_tokens(llama_tokens { 101, 102 }, false);
@@ -7959,8 +7971,12 @@ static void test_prompt_cache_vbr_pressure_without_turn_scores(bool compound) {
     CHECK(retention.enable_prefix_tracking());
     constexpr int32_t source_slot = 9;
     const auto source_key = server_retention_instance_key::for_slot(source_slot);
+    common_chat_msg_spans spans;
+    if (ranked) {
+        spans.add(COMMON_CHAT_ROLE_USER, 0, prompt.n_tokens());
+    }
     CHECK(retention.publish(source_key, common_retention_pool::attention,
-        {}, false, prompt.n_tokens(), prompt.n_tokens(), true));
+        spans, ranked, prompt.n_tokens(), prompt.n_tokens(), true));
     CHECK(server_prompt_retention_publish_exact_prefix(retention, source_key,
         prompt, identity.adapter_config_identity, prompt.n_tokens()));
 
@@ -7987,13 +8003,112 @@ static void test_prompt_cache_vbr_pressure_without_turn_scores(bool compound) {
             { 0, 0, true, true, storage.stash0.bytes },
             { 0, 1, false, true, storage.payload1.bytes },
         }, fixture.budget);
-        CHECK(published.status == llama_vbr_artifact_publish_status::published);
+        CHECK(published.status == llama_vbr_artifact_publish_status::published ||
+              published.status == llama_vbr_artifact_publish_status::adopted);
         vbr_artifact_package_view view;
         CHECK(fixture.catalog->resolve_reference(published.reference_artifact, view) ==
             vbr_artifact_resolve_status::ok);
         return server_prompt_cache_payload::from_vbr(
             server_prompt_cache_vbr_payload::adopt_owned(std::move(view)));
     };
+    // The cheapest first victim need not belong to a pair that frees enough.
+    // An external owner keeps the older pair's backing alive; the newer pair
+    // can release its shared units together. Admission must try that pair,
+    // without erasing anything until publication or ignoring recovery pins.
+    if (alternative_pair) {
+        const auto publish_entry = [&](uint8_t salt) {
+            auto staged = cache.stage_vbr(prompt, make_payload(salt),
+                identity.execution_identity, identity.adapter_config_identity);
+            server_prompt_cache::iterator state;
+            CHECK(cache.publish(std::move(staged), &prompt, source_slot, &state));
+            return state;
+        };
+        cache.limit_size = 0;
+        auto older_a = publish_entry(1);
+        auto older_b = publish_entry(1);
+        auto external = make_payload(1);
+        auto newer_a = publish_entry(2);
+        const bool singleton_quote = scenario == pressure_scenario::contracted_singleton;
+        auto newer_b = publish_entry(singleton_quote ? 4 : 2);
+        if (ranked) {
+            // Make list order disagree with the stable semantic ranking.
+            // Both admission retries and publication must keep using scores.
+            cache.states.reverse();
+        }
+        auto incoming_payload = make_payload(3);
+        const auto older_key_a = server_retention_instance_key::for_host_entry(&*older_a);
+        const auto older_key_b = server_retention_instance_key::for_host_entry(&*older_b);
+        const auto newer_key_a = server_retention_instance_key::for_host_entry(&*newer_a);
+        const auto newer_key_b = server_retention_instance_key::for_host_entry(&*newer_b);
+        std::vector<const server_prompt_cache_payload *> survivors {
+            &older_a->payload, &older_b->payload, &incoming_payload,
+        };
+        server_prompt_cache_vbr_budget_summary survivor_budget;
+        CHECK(server_prompt_cache_payload::summarize_vbr_budgets(survivors, survivor_budget));
+        cache.limit_size = size_t(survivor_budget.compact_resident_bytes);
+        uint64_t quoted_bytes = incoming_payload.size();
+        if (conservative_quote) {
+            // Capture's upper bound needs newer backing; its smaller measured
+            // publication can retire one or both cheaper older entries instead.
+            llama_cache_acct_release_set_preview preview;
+            CHECK(older_a->payload.preview_vbr_retire(fixture.ledger.serial(), preview));
+            uint64_t singleton_bytes = 0;
+            for (const auto & row : preview.rows) { singleton_bytes += row.resident_allocated; }
+            if (contracted_pair) { singleton_bytes *= 2; }
+            auto all_payloads = survivors;
+            all_payloads.push_back(&newer_a->payload);
+            all_payloads.push_back(&newer_b->payload);
+            server_prompt_cache_vbr_budget_summary all_budget;
+            CHECK(server_prompt_cache_payload::summarize_vbr_budgets(all_payloads, all_budget));
+            const uint64_t projected = all_budget.compact_resident_bytes;
+            uint64_t pair_bytes = projected - cache.limit_size;
+            if (singleton_quote) {
+                CHECK(newer_a->payload.preview_vbr_retire(fixture.ledger.serial(), preview));
+                pair_bytes = 0;
+                for (const auto & row : preview.rows) { pair_bytes += row.resident_allocated; }
+            }
+            CHECK(pair_bytes > singleton_bytes && singleton_bytes > 0);
+            quoted_bytes += pair_bytes - singleton_bytes;
+            cache.limit_size = size_t(projected - singleton_bytes);
+        }
+        server_prompt_cache_vbr_publication_metadata metadata;
+        CHECK(cache.prepare_vbr_publication_metadata(prompt, identity.execution_identity,
+            identity.adapter_config_identity, source_slot, metadata));
+        server_prompt_cache_vbr_publication_metadata * batch[] = { &metadata };
+        server_prompt_cache_vbr_capacity_claim capacity;
+        newer_a->recovery_pins++;
+        if (singleton_quote) { newer_b->recovery_pins++; }
+        CHECK(!cache.prepare_vbr_publication_capacity(batch, 1, quoted_bytes, capacity));
+        newer_a->recovery_pins--;
+        if (singleton_quote) { newer_b->recovery_pins--; }
+        const bool admitted = cache.prepare_vbr_publication_capacity(
+            batch, 1, quoted_bytes, capacity);
+        CHECK(admitted);
+        CHECK(cache.states.size() == 4);
+        if (admitted) {
+            const bool stale = scenario == pressure_scenario::stale_quote;
+            if (stale) { CHECK(retention.begin_competition_wave()); }
+            const auto epoch = retention.competition_epoch_value();
+            CHECK(cache.publish_vbr(metadata, std::move(incoming_payload), {}, false,
+                nullptr, &capacity) == !stale);
+            CHECK(retention.competition_epoch_value() == epoch);
+            CHECK(cache.states.size() == (conservative_quote && !contracted_pair ? 4u : 3u));
+            CHECK((retention.artifact_id(older_key_a).v != 0) == (!conservative_quote || stale));
+            CHECK((retention.artifact_id(older_key_b).v != 0) == !contracted_pair);
+            CHECK((retention.artifact_id(newer_key_a).v != 0) == conservative_quote);
+            CHECK((retention.artifact_id(newer_key_b).v != 0) == conservative_quote);
+        }
+        external = {};
+        incoming_payload = {};
+        cache.limit_size = 1;
+        cache.update();
+        CHECK(cache.states.empty());
+        CHECK(fixture.catalog->snapshot().references == 0);
+        if (ranked) {
+            CHECK(authority.destruction.host_trade_legacy_fallbacks == 0);
+        }
+        return;
+    }
     std::vector<server_prompt_cache::iterator> states;
     for (uint8_t salt : { 1, 2, 3 }) {
         auto staged = cache.stage_vbr(prompt, make_payload(salt),
@@ -8026,7 +8141,11 @@ static void test_prompt_cache_vbr_pressure_without_turn_scores(bool compound) {
     states[2]->recovery_pins--;
     CHECK(cache.prepare_vbr_publication_capacity(batch, 1, incoming.size(), capacity));
     CHECK(capacity.requires_publication_revalidation());
+    const auto cited_epoch = retention.competition_epoch_value();
     CHECK(cache.publish_vbr(metadata, std::move(incoming), {}, false, nullptr, &capacity));
+    // Pre-transfer pricing and publication revalidation are the same pressure
+    // wave. Advancing decay again can change the winner and reject the capture.
+    CHECK(retention.competition_epoch_value() == cited_epoch);
     CHECK(cache.states.size() == (compound ? 2u : 3u));
     CHECK(retention.artifact_id(pinned_key) == pinned_artifact);
     CHECK(states[1]->recovery_pins == 1);
@@ -9217,6 +9336,45 @@ static void test_prompt_cache_vbr_pressure_retires_physical_union() {
           recovery_refresh_reference.reference_artifact);
     CHECK(fixture.catalog->snapshot().references == 1);
 
+    // A same-size recovery refresh fits a full cache when the old backing is
+    // exclusively owned. Neither the preflight's own borrow, a real external
+    // owner, nor deduplicated catalog storage may manufacture release credit.
+    const size_t refresh_bytes = cache.size();
+    cache.limit_size = refresh_bytes;
+    const auto refresh_fits = [&]() {
+        return cache.preview_vbr_compact_refresh_capacity(
+            prompt, fixture.package.manifest.identity.execution_identity,
+            fixture.package.manifest.identity.adapter_config_identity, refresh_bytes);
+    };
+    CHECK(refresh_fits());
+    cache.states.front().recovery_pins++;
+    CHECK(!refresh_fits());
+    cache.states.front().recovery_pins--;
+    auto external_compact = cache.states.front().payload.vbr_compact_owner();
+    CHECK(!refresh_fits());
+    external_compact.reset();
+    CHECK(refresh_fits());
+    const auto shared_refresh_reference = publish_fixture(*fixture.catalog,
+        fixture.package, fixture.completions(), fixture.budget);
+    auto shared_refresh = owned_payload(shared_refresh_reference.reference_artifact);
+    CHECK(cache.states.front().payload.vbr_retirement_exclusive());
+    CHECK(shared_refresh_reference.status == llama_vbr_artifact_publish_status::adopted);
+    llama_cache_acct_release_set_preview refresh_preview;
+    CHECK(cache.states.front().payload.preview_vbr_retire(fixture.ledger.serial(), refresh_preview));
+    uint64_t refresh_released = 0;
+    for (const auto & row : refresh_preview.rows) { refresh_released += row.resident_allocated; }
+    CHECK(refresh_released > 0 && refresh_released < refresh_bytes);
+    // The external catalog row now owns the shared unit's accounting charge;
+    // the cache contains only the old reference's metadata charge. Replacing
+    // that exact charge, not the full logical payload, still fits this limit.
+    CHECK(cache.size() == refresh_released);
+    CHECK(refresh_fits());
+    shared_refresh = {};
+    CHECK(refresh_fits());
+    cache.limit_size = refresh_bytes - 1;
+    CHECK(!refresh_fits());
+    cache.limit_size = 0;
+
     // Without an anchor allowance the same degraded refresh still updates
     // compact-current, but retires the former high-quality owner instead of
     // creating hidden anchor debt or a second logical node.
@@ -10342,8 +10500,15 @@ int main(int argc, char ** argv) {
     }
 #ifdef VBR_PROMPT_CACHE_PUBLICATION_TEST
     if (argc == 2 && strcmp(argv[1], "--host-pressure-only") == 0) {
-        test_prompt_cache_vbr_pressure_without_turn_scores(false);
-        test_prompt_cache_vbr_pressure_without_turn_scores(true);
+        test_prompt_cache_vbr_pressure(true, pressure_scenario::alternative_pair, true);
+        test_prompt_cache_vbr_pressure(true, pressure_scenario::contracted_quote, true);
+        test_prompt_cache_vbr_pressure(true, pressure_scenario::alternative_pair);
+        test_prompt_cache_vbr_pressure(true, pressure_scenario::contracted_quote);
+        test_prompt_cache_vbr_pressure(true, pressure_scenario::contracted_pair);
+        test_prompt_cache_vbr_pressure(true, pressure_scenario::contracted_singleton);
+        test_prompt_cache_vbr_pressure(true, pressure_scenario::stale_quote);
+        test_prompt_cache_vbr_pressure(false);
+        test_prompt_cache_vbr_pressure(true);
         test_prompt_cache_vbr_pressure_retires_physical_union();
         return failures == 0 ? 0 : 1;
     }
@@ -10415,9 +10580,16 @@ int main(int argc, char ** argv) {
     test_prompt_cache_vbr_longest_feasible_restore_selection();
     test_prompt_cache_vbr_media_lookup();
     test_prompt_cache_vbr_atomic_logical_publication();
-    test_prompt_cache_vbr_pressure_without_turn_scores(false);
+    test_prompt_cache_vbr_pressure(true, pressure_scenario::alternative_pair, true);
+    test_prompt_cache_vbr_pressure(true, pressure_scenario::contracted_quote, true);
+    test_prompt_cache_vbr_pressure(true, pressure_scenario::alternative_pair);
+    test_prompt_cache_vbr_pressure(true, pressure_scenario::contracted_quote);
+    test_prompt_cache_vbr_pressure(true, pressure_scenario::contracted_pair);
+    test_prompt_cache_vbr_pressure(true, pressure_scenario::contracted_singleton);
+    test_prompt_cache_vbr_pressure(true, pressure_scenario::stale_quote);
+    test_prompt_cache_vbr_pressure(false);
     test_prompt_cache_vbr_exchange();
-    test_prompt_cache_vbr_pressure_without_turn_scores(true);
+    test_prompt_cache_vbr_pressure(true);
     test_prompt_cache_vbr_pressure_retires_physical_union();
 #endif
     if (failures != 0) {

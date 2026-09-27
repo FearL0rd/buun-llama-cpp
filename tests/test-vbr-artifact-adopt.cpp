@@ -1612,6 +1612,7 @@ struct seam final : vbr_adopt_test_seam {
     uint64_t upward_stash_rows = 0;
     uint32_t upward_syncs = 0;
     bool occupied_mode = false;
+    uint32_t expected_occupied_mappings = 1;
     bool recycle_mode = false;
     bool transformed_recycle_mode = false;
     bool operation_quarantined = false;
@@ -1825,13 +1826,14 @@ struct seam final : vbr_adopt_test_seam {
             : recovery ? recovery_transfer_calls++ : UINT32_MAX;
         transfer_order.push_back(read.kind);
         if (occupied_mode && read.kind == vbr_staged_read_kind::unit_payload) {
-            if (!child.image_ready || read.projection_ranges.size() != 1) {
+            if (!child.image_ready || read.projection_ranges.empty()) {
                 return false;
             }
-            relocated_offsets.push_back({
-                read.projection_ranges.front().source_offset,
-                read.destination_offset,
-            });
+            uint64_t destination = read.destination_offset;
+            for (const auto & range : read.projection_ranges) {
+                relocated_offsets.push_back({ range.source_offset, destination });
+                destination += range.size;
+            }
         }
         size_t written = bytes.size();
         bool fail_after_write = false;
@@ -2089,7 +2091,8 @@ struct seam final : vbr_adopt_test_seam {
     bool session_mapped_prefixes_complete(
             uint32_t child_id) const noexcept override {
         return child_id < children.size() &&
-            children[child_id].mapped == (occupied_mode ? 1u : 5u);
+            (occupied_mode ? children[child_id].mapped == expected_occupied_mappings
+                           : children[child_id].mapped == 5u);
     }
 
     bool session_barrier(uint32_t child_id, uint64_t serial,
@@ -2440,7 +2443,8 @@ struct fixture {
                      bool transformed_recycle_import = false,
                      bool occupied_spec_companion_import = false,
                      bool permuted_placement = false,
-                     uint32_t reference_cells = 5)
+                     uint32_t reference_cells = 5,
+                     bool packed_recycle = false)
         : source(package(
               bytes, companion,
               upward_import ? upward_source : GGML_TYPE_TURBO8_0,
@@ -2463,9 +2467,11 @@ struct fixture {
           transformed_recycle(transformed_recycle_import) {
         CHECK(!(downward && upward));
         CHECK(!recycle || occupied);
+        CHECK(!packed_recycle || (recycle && permuted_placement && reference_cells == 5));
         if (occupied) {
             target.live.resize(1);
             target.occupied_mode = true;
+            target.expected_occupied_mappings = permuted_placement ? 2 : 1;
             target.recycle_mode = recycle;
             target.transformed_recycle_mode = transformed_recycle;
         }
@@ -2657,7 +2663,9 @@ struct fixture {
                 occupied_spec_companion
                     ? vbr_artifact_companion_kind::required_spec_payload
                     : vbr_artifact_companion_kind::recurrent);
-            permute(recovery_source);
+            if (!packed_recycle) {
+                permute(recovery_source);
+            }
             for (size_t i = 0;
                  i < recovery_source.manifest.controller_policy.size() &&
                  i < source.manifest.controller_policy.size(); ++i) {
@@ -2740,7 +2748,7 @@ struct fixture {
             for (uint32_t i = 0; i < cells.size(); ++i) {
                 cells[i] = { 0, i, llama_pos(i), llama_pos(10+i),
                     llama_pos(20+i), 0, 1, true };
-                if (permuted_placement) {
+                if (permuted_placement && !packed_recycle) {
                     cells[i].logical_position = (i + 2)%cells.size();
                 }
             }
@@ -3459,8 +3467,44 @@ static void test_occupied_permuted_placement() {
             CHECK(mappings[i].destination_physical_cell ==
                   (recycle ? (i + 3)%5 : i + 5));
         }
-        const auto validated = vbr_validate_unit_manifest_snapshot(f.snapshot, f.view, f.policy);
-        CHECK(validated.status == vbr_manifest_validation_status::validated);
+        if (recycle) {
+            const auto validated = vbr_validate_unit_manifest_snapshot(f.snapshot, f.view, f.policy);
+            CHECK(validated.status == vbr_manifest_validation_status::validated);
+        }
+        if (!recycle) {
+            // Two disjoint source runs become one packed read per shard when
+            // their destination rows are adjacent. Completion must count reads,
+            // not source runs, and preserve their logical ordering.
+            const auto sentinel = f.target.incumbent_sentinel;
+            const auto result = adopt_occupied(f);
+            CHECK(result.status == vbr_adopt_status::adopted);
+            CHECK(result.h2d_bytes == 10);
+            CHECK(f.target.transfer_calls == 2);
+            CHECK(f.target.relocated_offsets.size() == 4);
+            for (size_t i = 0; i < f.target.relocated_offsets.size(); ++i) {
+                CHECK(f.target.relocated_offsets[i].first == (i % 2 == 0 ? 3 : 0));
+                CHECK(f.target.relocated_offsets[i].second == (i % 2 == 0 ? 5 : 7));
+            }
+            CHECK(f.target.incumbent_sentinel == sentinel);
+            CHECK(f.target.session_mapped_prefixes_complete(0));
+            f.target.children[0].mapped = 1;
+            CHECK(!f.target.session_mapped_prefixes_complete(0));
+            f.target.children[0].mapped = 3;
+            CHECK(!f.target.session_mapped_prefixes_complete(0));
+            f.target.children[0].mapped = 2;
+            fixture failed(false, false, false, GGML_TYPE_TURBO8_0, GGML_TYPE_F16,
+                           0, vbr_artifact_clean_stash_state::absent_at_source,
+                           false, false, true, false, false, false, true);
+            const auto refused = adopt_occupied(failed, vbr_adopt_phase::unit_h2d, true);
+            CHECK(refused.status == vbr_adopt_status::transfer_failed);
+            CHECK(failed.target.transfer_calls == 2);
+            CHECK(failed.target.publish_calls == 0);
+            CHECK(failed.target.children[0].mapped == 0);
+            CHECK(failed.target.incumbent_sentinel == sentinel);
+            CHECK(std::all_of(failed.target.children[0].destination.begin(),
+                              failed.target.children[0].destination.end(),
+                              [](uint8_t value) { return value == 0; }));
+        }
     }
 }
 
@@ -3511,10 +3555,14 @@ static void check_recycle_restored(
     }
 }
 
-static void test_occupied_recycle_success_and_zero_growth() {
-    fixture f(false, false, false, GGML_TYPE_TURBO8_0, GGML_TYPE_F16,
+static fixture make_recycle_fixture(bool packed) {
+    return fixture(false, false, false, GGML_TYPE_TURBO8_0, GGML_TYPE_F16,
               0, vbr_artifact_clean_stash_state::absent_at_source,
-              false, false, true, true);
+              false, false, true, true, false, false, packed, 5, packed);
+}
+
+static void test_occupied_recycle_success_and_zero_growth(bool packed = false) {
+    auto f = make_recycle_fixture(packed);
     auto staged = f.stage();
     CHECK(staged.status == vbr_adopt_stage_status::staged);
     CHECK(staged.manifest && staged.staged);
@@ -3522,6 +3570,10 @@ static void test_occupied_recycle_success_and_zero_growth() {
         return;
     }
     CHECK(staged.staged->read_count() == 4);
+    for (const auto & read : staged.staged->reads()) {
+        const bool packed_incoming = packed && read.kind == vbr_staged_read_kind::unit_payload;
+        CHECK(read.projection_ranges.size() == (packed_incoming ? 2u : 1u));
+    }
     CHECK(device_transfer_staging_reserved(f.ledger.snapshot()) == 0);
 
     vbr_composite_publish_hooks hooks;
@@ -3550,11 +3602,11 @@ static void test_occupied_recycle_success_and_zero_growth() {
     CHECK(f.target.children[0].published);
 }
 
-static void test_occupied_recycle_partial_write_and_late_fault_matrix() {
+static void test_occupied_recycle_partial_write_and_late_fault_matrix(bool packed = false) {
+    // Packed incoming ranges are [3, 5), [0, 3): stop before, across, and
+    // after their boundary, then require exact incumbent recovery.
     for (const uint32_t bytes_before_failure : { 1u, 3u, 5u }) {
-        fixture f(false, false, false, GGML_TYPE_TURBO8_0, GGML_TYPE_F16,
-                  0, vbr_artifact_clean_stash_state::absent_at_source,
-                  false, false, true, true);
+        auto f = make_recycle_fixture(packed);
         f.target.fail_incoming_transfer_at = 0;
         f.target.fail_incoming_after_bytes = bytes_before_failure;
         const auto result = adopt_occupied(f);
@@ -3562,19 +3614,15 @@ static void test_occupied_recycle_partial_write_and_late_fault_matrix() {
         check_recycle_restored(f, result, 1);
     }
 
-    fixture late(false, false, false, GGML_TYPE_TURBO8_0, GGML_TYPE_F16,
-                 0, vbr_artifact_clean_stash_state::absent_at_source,
-                 false, false, true, true);
+    auto late = make_recycle_fixture(packed);
     const auto late_result = adopt_occupied(
         late, vbr_adopt_phase::complete_tree_barrier, false);
     CHECK(late_result.status != vbr_adopt_status::adopted);
     check_recycle_restored(late, late_result, 2);
 }
 
-static void test_occupied_recycle_replay_failure_quarantines() {
-    fixture f(false, false, false, GGML_TYPE_TURBO8_0, GGML_TYPE_F16,
-              0, vbr_artifact_clean_stash_state::absent_at_source,
-              false, false, true, true);
+static void test_occupied_recycle_replay_failure_quarantines(bool packed = false) {
+    auto f = make_recycle_fixture(packed);
     f.target.fail_incoming_transfer_at = 0;
     f.target.fail_incoming_after_bytes = 3;
     f.target.fail_recovery_transfer_at = 1;
@@ -7291,6 +7339,9 @@ int main(int argc, char ** argv) {
     adoption_fixture::test_occupied_recycle_success_and_zero_growth();
     adoption_fixture::test_occupied_recycle_partial_write_and_late_fault_matrix();
     adoption_fixture::test_occupied_recycle_replay_failure_quarantines();
+    adoption_fixture::test_occupied_recycle_success_and_zero_growth(true);
+    adoption_fixture::test_occupied_recycle_partial_write_and_late_fault_matrix(true);
+    adoption_fixture::test_occupied_recycle_replay_failure_quarantines(true);
     adoption_fixture::test_occupied_transformed_recycle_uses_recovery_geometry();
     adoption_fixture::test_occupied_replacement_tracker_consumes_canonical_map();
     adoption_fixture::test_occupied_replacement_tracker_consumes_canonical_map(true);

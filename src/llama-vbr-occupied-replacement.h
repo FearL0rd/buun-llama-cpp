@@ -109,6 +109,10 @@ struct vbr_occupied_replacement_relocation_run {
     uint32_t cell_count = 0;
 };
 
+// Source-fragmented runs with adjacent destinations share one packed H2D read.
+size_t vbr_occupied_relocation_read_count(
+    const std::vector<vbr_occupied_replacement_relocation_run> & runs) noexcept;
+
 // Canonical cell order is (temporal position, y, x), not temporal position
 // alone: M-RoPE media has multiple spatial cells at the same position. This
 // preserves Qwen's row-major image order so contiguous rows stay one copy run.

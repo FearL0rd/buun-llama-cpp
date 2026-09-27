@@ -2128,6 +2128,7 @@ void test_lifecycle_defaults_and_reuse_thresholds() {
     CHECK(vbr_reclaim.successful_attempt_is_state_sealed);
     CHECK(vbr_reclaim.multi_fresh_pressure_isolated);
     CHECK(vbr_reclaim.fragmented_projection_retries_exact);
+    CHECK(vbr_reclaim.projected_capture_requires_idle_source);
     CHECK(vbr_reclaim.stash_projection_retries_exact);
     CHECK(vbr_reclaim.isolated_capture_drains_without_backoff);
     CHECK(vbr_reclaim.unchanged_admission_refusal_is_suppressed);
@@ -2246,6 +2247,73 @@ void test_lifecycle_shadow_prefix_failure_does_not_change_authority() {
     CHECK(shadow.last.proposed_artifact.v == 0);
     CHECK(authority.destruction.host_trade_retention_capacity_executed == 0);
     CHECK(authority.destruction.host_trade_legacy_fallbacks == 1);
+}
+
+void test_vbr_stem_retains_source_turn_geometry(common_retention_pool pool) {
+    server_cache_authority authority;
+    const std::string execution = "vbr-stem-turn-geometry";
+    server_prompt_cache cache(0, 0);
+    configure_host_trade(authority, cache, execution);
+    CHECK(authority.retention.enable_prefix_tracking());
+    auto entry = make_retention_entry("adapter", 100, 8, 1);
+    auto source = entry.front().prompt.clone();
+    source.sequence_epoch = 1;
+    const auto source_key = server_retention_instance_key::for_slot(0);
+    CHECK(publish_live_retention(authority.retention, source, 0, pool).v != 0);
+    CHECK(server_prompt_retention_publish_exact_prefix(
+        authority.retention, source_key, source, "adapter", source.n_tokens()));
+    common_retention_lineage_record original;
+    CHECK(authority.retention.lineage_for_instance(source_key, original));
+
+    // A capture can retain an older prefix while the live token vector has
+    // grown beyond the last published turn table. That table still describes
+    // the saved prefix; rebuilding it from absent spans loses its score.
+    source.tokens = server_tokens(llama_tokens {
+        100, 101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111 }, false);
+    for (int64_t coverage : { 4, 8 }) {
+        server_prompt_cache_vbr_publication_metadata prepared;
+        CHECK(cache.prepare_vbr_stem_publication_metadata(
+            source, coverage, execution, "adapter", 0, prepared));
+        CHECK(prepared.ready());
+        struct observation {
+            uint64_t lineage;
+            uint64_t coverage;
+            size_t hosts = 0;
+            bool valid = true;
+        } observed { original.lineage_id, uint64_t(coverage) };
+        const auto inventory = authority.retention.value_snapshots(
+            &observed, [](void * context, const server_retention_value_snapshot & value) noexcept {
+                auto & state = *static_cast<observation *>(context);
+                if (value.kind == common_retention_artifact_kind::host_entry) {
+                    state.hosts++;
+                    state.valid &= value.stamp.lineage_id == state.lineage &&
+                        value.stamp.coverage_tokens == state.coverage &&
+                        value.stamp.state == common_retention_score_state::known &&
+                        !value.stamp.mandatory_anchor;
+                }
+                return true;
+            });
+        CHECK(inventory.status == server_retention_value_snapshot_status::complete);
+        CHECK(observed.valid && observed.hosts == 1);
+    }
+    for (int64_t coverage : { 9, 12 }) {
+        server_prompt_cache_vbr_publication_metadata prepared;
+        CHECK(!cache.prepare_vbr_stem_publication_metadata(
+            source, coverage, execution, "adapter", 0, prepared));
+        CHECK(!prepared.ready());
+    }
+    size_t remaining = 0;
+    const auto inventory = authority.retention.value_snapshots(
+        &remaining, [](void * context, const server_retention_value_snapshot &) noexcept {
+            ++*static_cast<size_t *>(context);
+            return true;
+        });
+    CHECK(inventory.status == server_retention_value_snapshot_status::complete);
+    CHECK(remaining == 1);
+    common_retention_lineage_record after;
+    CHECK(authority.retention.lineage_for_instance(source_key, after));
+    CHECK(after == original);
+    CHECK(authority.retention.prefix_tracking_available());
 }
 
 void test_lifecycle_retention_capacity_executes_decayed_fallback() {
@@ -5505,6 +5573,8 @@ int main(int argc, char ** argv) {
     test_lifecycle_defaults_and_reuse_thresholds();
     test_slot_prompt_admission_boundaries();
     test_lifecycle_shadow_prefix_failure_does_not_change_authority();
+    test_vbr_stem_retains_source_turn_geometry(common_retention_pool::attention);
+    test_vbr_stem_retains_source_turn_geometry(common_retention_pool::recurrent);
     test_lifecycle_retention_capacity_executes_decayed_fallback();
     test_lifecycle_retention_capacity_accounting_fault_falls_back_to_fifo();
     test_lifecycle_retention_capacity_handles_incoming_publication();
