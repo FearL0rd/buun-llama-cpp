@@ -5878,6 +5878,168 @@ static void test_prompt_cache_vbr_media_lookup() {
     cache.states.clear();
 }
 
+static void test_prompt_cache_vbr_exchange() {
+    for (int mode = 0; mode < 13; ++mode) {
+        // 0: cancelled, 1: exact, 2: transcoded, 3: exact soft lease, 4: hard lease,
+        // 5: externally borrowed, 6: no pressure, 7: uncommitted publication,
+        // 8: late hard lease, 9: cancelled after publishing an outgoing entry,
+        // 10: destructor cancellation, 11: transcoded with outgoing publication.
+        // 12: exact with outgoing publication, then reuse the scope and cancel.
+        catalog_fixture fixture;
+        server_prompt prompt;
+        prompt.tokens = server_tokens(llama_tokens { 101, 102 }, false);
+        prompt.sequence_epoch = 3;
+        auto & identity = fixture.package.manifest.identity;
+        CHECK(prompt.tokens.media_content_identity(prompt.n_tokens(), identity.media_content_identity));
+        identity.next_position = prompt.tokens.pos_next();
+        const auto published = publish_fixture(*fixture.catalog,
+                fixture.package, fixture.completions(), fixture.budget);
+        vbr_artifact_package_view view;
+        CHECK(fixture.catalog->resolve_reference(published.reference_artifact, view) ==
+                vbr_artifact_resolve_status::ok);
+        auto owner = server_prompt_cache_vbr_payload::adopt_owned(std::move(view));
+        CHECK(owner);
+        if (!owner) { return; }
+        const size_t payload_bytes = size_t(owner->resident_bytes());
+        server_cache_authority authority;
+        occupied_replacement_fallback fallback;
+        authority.leases.bind_fallback_provider(&fallback);
+        server_retention_sidecar_store retention;
+        retention.configure(&fixture.ledger, fixture.host, &authority.leases);
+        CHECK(retention.enable_prefix_tracking());
+        constexpr int32_t source_slot = 4, target_slot = 0;
+        const auto source_key = server_retention_instance_key::for_slot(source_slot);
+        common_chat_msg_spans spans;
+        spans.add(COMMON_CHAT_ROLE_USER, 0, prompt.n_tokens());
+        CHECK(retention.publish(source_key, common_retention_pool::attention,
+                spans, true, prompt.n_tokens(), prompt.n_tokens(), true));
+        CHECK(server_prompt_retention_publish_exact_prefix(retention, source_key, prompt,
+                identity.adapter_config_identity, prompt.n_tokens()));
+        server_prompt_cache cache(0, 0);
+        cache.acct = &fixture.ledger;
+        cache.publish_authority = &authority;
+        cache.retention_obs = &retention;
+        cache.lease_obs = &authority.leases;
+        cache.lease_execution_identity = &identity.execution_identity;
+        auto payload = server_prompt_cache_payload::from_vbr(owner);
+        owner.reset();
+        auto staged = cache.stage_vbr(prompt, std::move(payload),
+                identity.execution_identity, identity.adapter_config_identity);
+        server_prompt_cache::iterator source;
+        CHECK(cache.publish(std::move(staged), &prompt, source_slot, &source));
+        if (cache.states.empty()) { return; }
+        cache.limit_size = cache.size() + 1;
+        if (mode == 6) { cache.limit_size += payload_bytes * 2; }
+        const size_t steady_limit = cache.limit_size;
+        const auto grant_host_lease = [&](bool hard) {
+            server_cache_lease_identity lease_identity;
+            CHECK(server_cache_lease_build_identity(identity.execution_identity,
+                    identity.adapter_config_identity, source->prompt.tokens,
+                    source->prompt.n_tokens(), lease_identity));
+            const server_cache_lease_subject subject {
+                retention.artifact_id(server_retention_instance_key::for_host_entry(&*source)),
+                common_retention_artifact_kind::host_entry, -1,
+            };
+            const auto scope = server_cache_lease_scope::from(authority.leases.new_context_scope());
+            if (hard) {
+                CHECK(authority.leases.grant_hard(subject, scope, lease_identity, UINT64_MAX/2));
+            } else {
+                CHECK(authority.leases.grant_soft(subject, scope, lease_identity, UINT64_MAX/2));
+            }
+        };
+        if (mode == 3 || mode == 4) { grant_host_lease(mode == 4); }
+        server_prompt_cache_vbr_owner borrowed;
+        if (mode == 5) { borrowed = source->payload.vbr_variants()->compact_current(); }
+        server_prompt_cache_vbr_restore_candidate incoming;
+        const auto select = [&](server_prompt_cache_vbr_restore_candidate & candidate) {
+            return cache.prepare_vbr_restore(prompt.tokens, identity.execution_identity,
+                    identity.adapter_config_identity, candidate, false);
+        };
+        CHECK(select(incoming));
+        server_prompt destination;
+        common_cache_family_binding family;
+        {
+            server_prompt_cache_vbr_exchange exchange;
+            const bool admitted = cache.begin_vbr_exchange(std::move(incoming), target_slot, exchange);
+            CHECK(admitted == (mode <= 3 || mode >= 7));
+            CHECK(cache.limit_size == steady_limit);
+            if (admitted) {
+                CHECK(source->recovery_pins == 2);
+                CHECK(cache.fits_bytes(steady_limit + payload_bytes));
+                CHECK(!cache.fits_bytes(steady_limit + payload_bytes + 1));
+                server_prompt_cache_vbr_restore_candidate nested_candidate;
+                CHECK(select(nested_candidate));
+                server_prompt_cache_vbr_exchange nested;
+                CHECK(!cache.begin_vbr_exchange(std::move(nested_candidate), target_slot, nested));
+                CHECK(source->recovery_pins == 2);
+                if (mode == 8) { grant_host_lease(true); }
+                if (mode >= 9) {
+                    auto peer_package = fixture.package;
+                    peer_package.manifest.identity.adapter_config_identity = "outgoing";
+                    const auto peer_published = publish_fixture(*fixture.catalog,
+                            peer_package, fixture.completions(), fixture.budget);
+                    vbr_artifact_package_view peer_view;
+                    CHECK(fixture.catalog->resolve_reference(peer_published.reference_artifact, peer_view) ==
+                            vbr_artifact_resolve_status::ok);
+                    auto peer_payload = server_prompt_cache_payload::from_vbr(
+                            server_prompt_cache_vbr_payload::adopt_owned(std::move(peer_view)));
+                    auto outgoing = cache.stage_vbr(prompt, std::move(peer_payload),
+                            identity.execution_identity, "outgoing");
+                    CHECK(outgoing.size() == 1);
+                    CHECK(cache.publish(std::move(outgoing), &prompt, source_slot));
+                    CHECK(cache.states.size() == 2);
+                }
+                if (mode == 1 || mode == 2 || mode == 3 || mode == 7 || mode == 8 || mode >= 11) {
+                    CHECK(cache.prepare_vbr_restore_destination(*exchange.candidate(), destination, target_slot));
+                    CHECK(cache.publish_vbr_restore(*exchange.candidate()));
+                    if (mode != 7) {
+                        CHECK(cache.commit_vbr_restore(*exchange.candidate(), destination,
+                                family, target_slot, mode != 2 && mode != 11));
+                    }
+                }
+                if (mode != 10) {
+                    CHECK(exchange.settle() == (mode == 1 || mode == 3 || mode == 12));
+                    CHECK(!exchange.settle());
+                }
+                if (mode == 12) {
+                    CHECK(cache.states.size() == 1);
+                    CHECK(cache.states.front().adapter_config_key == "outgoing");
+                    CHECK(cache.states.front().recovery_pins == 0);
+                    CHECK(cache.fits_bytes(cache.size()));
+                    server_prompt_cache_vbr_restore_candidate next;
+                    CHECK(cache.prepare_vbr_restore(prompt.tokens, identity.execution_identity,
+                            "outgoing", next, false));
+                    CHECK(cache.begin_vbr_exchange(std::move(next), target_slot, exchange));
+                    CHECK(!exchange.settle()); // previous exact commit is not authority for this source
+                    CHECK(cache.states.size() == 1);
+                    CHECK(cache.states.front().adapter_config_key == "outgoing");
+                }
+            }
+        }
+        CHECK(cache.limit_size == steady_limit);
+        CHECK(!cache.fits_bytes(steady_limit + 1));
+        CHECK(cache.fits_bytes(cache.size()));
+        CHECK(cache.states.empty() == (mode == 1 || mode == 3));
+        if (mode >= 9) { CHECK(cache.states.size() == 1); }
+        if (!cache.states.empty()) {
+            if (mode != 12) { CHECK(&cache.states.front() == &*source); }
+            CHECK(cache.states.front().recovery_pins == 0);
+        }
+        if (mode == 1 || mode == 3) { CHECK(destination.tokens.size() == 2); }
+        if (mode == 3) {
+            server_cache_lease_identity live_identity;
+            CHECK(server_cache_lease_build_identity(identity.execution_identity,
+                    identity.adapter_config_identity, destination.tokens,
+                    destination.n_tokens(), live_identity));
+            const auto live_lease = authority.leases.inspect(
+                    retention.artifact_id(server_retention_instance_key::for_slot(target_slot)),
+                    live_identity);
+            CHECK(live_lease.state == server_cache_lease_eval_state::known);
+            CHECK(live_lease.cls == server_cache_lease_class::soft);
+        }
+    }
+}
+
 static void test_prompt_cache_vbr_atomic_logical_publication() {
     static_assert(!std::is_copy_constructible_v<
         server_prompt_cache_vbr_restore_candidate>);
@@ -10222,6 +10384,7 @@ int main(int argc, char ** argv) {
     test_prompt_cache_vbr_media_lookup();
     test_prompt_cache_vbr_atomic_logical_publication();
     test_prompt_cache_vbr_pressure_without_turn_scores(false);
+    test_prompt_cache_vbr_exchange();
     test_prompt_cache_vbr_pressure_without_turn_scores(true);
     test_prompt_cache_vbr_pressure_retires_physical_union();
 #endif

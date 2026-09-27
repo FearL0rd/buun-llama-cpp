@@ -1028,6 +1028,31 @@ private:
 
 class server_cache_recovery_pin;
 
+// Scheduler-scoped overlap for an exact host/live exchange. The incoming
+// host stays pinned until import commits; destruction settles ordinary cache
+// limits on success, refusal, or an early launch return. Must not outlive cache.
+class server_prompt_cache_vbr_exchange {
+public:
+    server_prompt_cache_vbr_exchange() = default;
+    ~server_prompt_cache_vbr_exchange();
+    server_prompt_cache_vbr_exchange(const server_prompt_cache_vbr_exchange &) = delete;
+    server_prompt_cache_vbr_exchange & operator=(const server_prompt_cache_vbr_exchange &) = delete;
+    server_prompt_cache_vbr_restore_candidate * candidate() noexcept {
+        return cache_ ? &incoming_ : nullptr;
+    }
+    bool settle() noexcept;
+
+private:
+    server_prompt_cache * cache_ = nullptr;
+    server_prompt_cache_state * source_ = nullptr;
+    const server_prompt_cache_vbr_payload * owner_ = nullptr;
+    server_prompt_cache_vbr_restore_candidate incoming_;
+    bool committed_exact_ = false;
+    int32_t destination_slot_ = -1;
+    std::thread::id scheduler_owner_;
+    friend struct server_prompt_cache;
+};
+
 // Move-only pre-import capability for replacing an occupied live prompt. It
 // owns both durable host pins and the provisional prompt/launch association
 // through the core import transaction. The adopter's no-fail callback performs
@@ -1398,7 +1423,16 @@ private:
     struct active_storage_state;
     std::shared_ptr<active_storage_state> active_storage_;
     void detach_active_storage_accounting() noexcept;
+    server_prompt_cache_vbr_exchange * vbr_exchange_ = nullptr;
+    size_t vbr_exchange_bytes_ = 0;
+    size_t admission_byte_limit() const noexcept;
+    bool finish_vbr_exchange(server_prompt_cache_vbr_exchange & exchange) noexcept;
+    friend class server_prompt_cache_vbr_exchange;
 public:
+
+    bool begin_vbr_exchange(server_prompt_cache_vbr_restore_candidate incoming,
+                           int32_t destination_slot,
+                           server_prompt_cache_vbr_exchange & exchange) noexcept;
 
     std::list<server_prompt_cache_state> states;
     using iterator = std::list<server_prompt_cache_state>::iterator;
@@ -1577,7 +1611,8 @@ public:
         server_prompt_cache_vbr_restore_candidate & candidate,
         server_prompt & destination,
         common_cache_family_binding & destination_family,
-        int32_t id_slot) noexcept;
+        int32_t id_slot,
+        bool exact_representation = false) noexcept;
 
     // CPU-only preparation for an occupied destination. The incoming
     // candidate must be exact (not a parent projection) and must improve the

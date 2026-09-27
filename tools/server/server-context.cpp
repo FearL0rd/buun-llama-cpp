@@ -13761,7 +13761,7 @@ private:
                 slot.cache_family = incoming_family;
             }
             const bool committed = prompt_cache->commit_vbr_restore(
-                candidate, slot.prompt, slot.cache_family, slot.id);
+                candidate, slot.prompt, slot.cache_family, slot.id, exact_reusable_restore);
             GGML_ASSERT(committed);
             if (!committed) {
                 return false;
@@ -13844,6 +13844,27 @@ private:
             ? params_base.lora_adapters
             : construct_lora_list(task.params.lora);
 
+        // Bound the first exchange route to an idle single-slot handoff.
+        // Multi-slot, speculative, and persistent owners keep non-consuming
+        // restores until their independent lifetime contracts are supported.
+        // Only the empty-destination commit certifies consumption; an occupied
+        // replacement keeps both owners through its existing rollback terminal.
+        server_prompt_cache_vbr_exchange exchange;
+        server_prompt_cache_vbr_restore_candidate exchange_candidate;
+        if (params_base.vbr_prompt_cache && slots.size() == 1 && !ctx_dft && !slot.can_speculate() &&
+            !resume_keeps_sources_live() && prompt_cache &&
+            vbr_artifact_store && server_vbr_dynamic_active(params_base) &&
+            prompt_cache->limit_size != 0 && !slot.prompt.tokens.empty() &&
+            !slot.prompt.tokens.has_media() && !task.tokens.has_media() &&
+            eligible_vbr_displacement_source(slot, task) &&
+            are_lora_equal(task_loras, slot.lora) && !lora_all_alora(slot.lora) && task.params.cache_prompt &&
+            task.type == SERVER_TASK_TYPE_COMPLETION && !task.is_child() && !task.is_parent() &&
+            prompt_cache->prepare_vbr_restore(task.tokens, frontier_execution_identity,
+                lora_config_identity(slot.lora), exchange_candidate,
+                true, nullptr, vbr_artifact_store.get())) {
+            (void) prompt_cache->begin_vbr_exchange(
+                    std::move(exchange_candidate), slot.id, exchange);
+        }
         preserve_vbr_before_displacement(slot, task);
 
         if (!are_lora_equal(task_loras, slot.lora)) {
@@ -13969,7 +13990,11 @@ private:
             std::make_unique<const server_task>(std::move(task));
         size_t restored_prefix = SIZE_MAX;
         bool automatically_restored = try_automatic_vbr_restore(
-            slot, *launched_task, incoming_family, &restored_prefix);
+            slot, *launched_task, incoming_family, &restored_prefix, false,
+            exchange.candidate());
+        if (exchange.settle()) {
+            slot.vbr_idle_capture_source_reset();
+        }
 
         size_t retained_prefix = restored_prefix != SIZE_MAX
             ? restored_prefix
@@ -16191,6 +16216,16 @@ private:
     // can replace it or expand its shared physical layout. Stateful sources
     // may need both a reusable checkpoint stem and a complete rollback image;
     // at most two waves use the existing publication and safe-clear machinery.
+    bool eligible_vbr_displacement_source(const server_slot & source, const server_task & task) {
+        if (source.state != SLOT_STATE_IDLE || source.is_processing() ||
+            source.hard_lease_blocks_live_prefix() || queue_tasks.has_deferred_for_slot(source.id) ||
+            source.prompt.tokens.size() < SERVER_PROMPT_CACHE_MIN_RETENTION_REUSE_TOKENS) {
+            return false;
+        }
+        const size_t common = source.prompt.tokens.get_common_prefix(task.tokens);
+        return common < source.prompt.tokens.size() - common;
+    }
+
     void preserve_vbr_before_displacement(server_slot & slot, const server_task & task) noexcept {
         if (!params_base.vbr_prompt_cache || !prompt_cache || !vbr_artifact_store ||
             vbr_idle_exact_capture || task.type != SERVER_TASK_TYPE_COMPLETION ||
@@ -16198,13 +16233,7 @@ private:
             return;
         }
         const auto eligible = [&](const server_slot & source) {
-            if (source.state != SLOT_STATE_IDLE || source.is_processing() ||
-                source.hard_lease_blocks_live_prefix() || queue_tasks.has_deferred_for_slot(source.id) ||
-                source.prompt.tokens.size() < SERVER_PROMPT_CACHE_MIN_RETENTION_REUSE_TOKENS) {
-                return false;
-            }
-            const size_t common = source.prompt.tokens.get_common_prefix(task.tokens);
-            return common < source.prompt.tokens.size() - common;
+            return eligible_vbr_displacement_source(source, task);
         };
         server_slot * source = nullptr;
         if (!slot.prompt.tokens.empty()) {
