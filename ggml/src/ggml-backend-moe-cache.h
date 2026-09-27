@@ -137,6 +137,18 @@ struct ggml_moe_cache_api {
                           const int32_t * ids, int n_rows, int64_t n_tokens,
                           const float * const * act_rows, uint64_t * hit_mask);
 
+    // fused_begin split in two: fused_plan pins the hit rows and returns their mask without launching GPU work,
+    // so CPU workers can start on the misses while one thread calls fused_dispatch. On a fused_dispatch
+    // failure, the caller must recompute the hit rows on the CPU; end is still required either way.
+    void * (*fused_plan)(const struct ggml_moe_cache_tensor_desc * up,
+                         const struct ggml_moe_cache_tensor_desc * gate,
+                         const struct ggml_moe_cache_tensor_desc * down,
+                         int glu_op, float up_min, float up_max,
+                         float gate_min, float gate_max,
+                         const int32_t * ids, int n_rows, int64_t n_tokens,
+                         const float * const * act_rows, uint64_t * hit_mask);
+    int    (*fused_dispatch)(void * node);
+
     // Host buffer mutation or teardown notification. Sessions cancel or finish any fill that still reads the supplied range before this call returns.
     void (*invalidate)(const void * base, size_t size);
 };

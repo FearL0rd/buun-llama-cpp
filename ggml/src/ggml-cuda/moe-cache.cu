@@ -363,6 +363,19 @@ struct moe_cache_node {
     int n_result_rows = 0;
     int row_indices[moe_cache_node_rows_max];
     std::vector<std::unique_ptr<moe_cache_node>> children;
+    // Fused operation staged by fused_plan until fused_dispatch.
+    bool fused_pending = false;
+    int fused_hits = 0;
+    int fused_candidates = 0;
+    int glu_op = -1;
+    float up_min = 0.0f;
+    float up_max = 0.0f;
+    float gate_min = 0.0f;
+    float gate_max = 0.0f;
+    int32_t up_slots[moe_cache_node_rows_max];
+    int32_t gate_slots[moe_cache_node_rows_max];
+    int32_t down_slots[moe_cache_node_rows_max];
+    const float * hit_acts[moe_cache_node_rows_max];
 };
 
 static std::mutex g_registry_mu;
@@ -3801,7 +3814,7 @@ static void * moe_cache_fused_begin_expert_parallel(
     return root.release();
 }
 
-static void * moe_cache_fused_begin(
+static void * moe_cache_fused_plan(
         const ggml_moe_cache_tensor_desc * up,
         const ggml_moe_cache_tensor_desc * gate,
         const ggml_moe_cache_tensor_desc * down,
@@ -4067,13 +4080,13 @@ static void * moe_cache_fused_begin(
     node->dispatch_lock = std::move(dispatch_lock);
     node->planned = true;
 
-    int32_t up_slots[moe_cache_node_rows_max];
-    int32_t gate_slots[moe_cache_node_rows_max];
-    int32_t down_slots[moe_cache_node_rows_max];
+    int32_t * up_slots = node->up_slots;
+    int32_t * gate_slots = node->gate_slots;
+    int32_t * down_slots = node->down_slots;
     int32_t resident_up[moe_cache_node_rows_max];
     int32_t resident_gate[moe_cache_node_rows_max];
     int32_t resident_down[moe_cache_node_rows_max];
-    const float * hit_acts[moe_cache_node_rows_max];
+    const float ** hit_acts = node->hit_acts;
     uint64_t mask = 0;
     int hits = 0;
     bool full_ready = true;
@@ -4248,28 +4261,68 @@ static void * moe_cache_fused_begin(
         session->cv.notify_all();
     }
 
-    if (hits == 0 || !moe_cache_dispatch_internal(
-            node.get(), up->type, up->n_in, up->n_out, hits,
-            up_slots, hit_acts, pool, gate_slots,
-            down_pool, down ? down_slots : nullptr, glu_op,
-            up_min, up_max, gate_min, gate_max)) {
+    if (hits == 0) {
         moe_cache_end(node.release());
         return nullptr;
     }
 
-    {
-        std::lock_guard<std::mutex> lock(session->mu);
-        selected->fused_rows += hits;
-        selected->fused_candidates += n_ids;
-        selected->fused_nodes++;
-        if (down) {
-            selected->full_fused_rows += hits;
-            selected->full_fused_nodes++;
-        }
-    }
-
+    node->fused_pending = true;
+    node->fused_hits = hits;
+    node->fused_candidates = n_ids;
+    node->glu_op = glu_op;
+    node->up_min = up_min;
+    node->up_max = up_max;
+    node->gate_min = gate_min;
+    node->gate_max = gate_max;
     *hit_mask = mask;
     return node.release();
+}
+
+static int moe_cache_fused_dispatch(void * opaque) {
+    moe_cache_node * node = (moe_cache_node *)opaque;
+    if (!node || !node->fused_pending) {
+        // Expert-parallel plans dispatch while planning.
+        return node && node->dispatched;
+    }
+    node->fused_pending = false;
+    const bool full = node->down_pool != nullptr;
+    if (!moe_cache_dispatch_internal(
+            node, node->wtype, node->n_in, node->n_mid, node->fused_hits,
+            node->up_slots, node->hit_acts, node->pool, node->gate_slots,
+            node->down_pool, full ? node->down_slots : nullptr, node->glu_op,
+            node->up_min, node->up_max, node->gate_min, node->gate_max)) {
+        return 0;
+    }
+
+    std::lock_guard<std::mutex> lock(node->session->mu);
+    moe_cache_device & device = *node->device;
+    device.fused_rows += node->fused_hits;
+    device.fused_candidates += node->fused_candidates;
+    device.fused_nodes++;
+    if (full) {
+        device.full_fused_rows += node->fused_hits;
+        device.full_fused_nodes++;
+    }
+    return 1;
+}
+
+static void * moe_cache_fused_begin(
+        const ggml_moe_cache_tensor_desc * up,
+        const ggml_moe_cache_tensor_desc * gate,
+        const ggml_moe_cache_tensor_desc * down,
+        int glu_op, float up_min, float up_max,
+        float gate_min, float gate_max,
+        const int32_t * ids, int n_ids, int64_t n_tokens,
+        const float * const * act_rows, uint64_t * hit_mask) {
+    void * node = moe_cache_fused_plan(
+            up, gate, down, glu_op, up_min, up_max, gate_min, gate_max,
+            ids, n_ids, n_tokens, act_rows, hit_mask);
+    if (node && !moe_cache_fused_dispatch(node)) {
+        moe_cache_end(node);
+        *hit_mask = 0;
+        return nullptr;
+    }
+    return node;
 }
 
 static void moe_cache_invalidate_session(
@@ -4442,6 +4495,8 @@ void ggml_moe_cache_register(const void * owner) {
     ggml_moe_cache.collect = moe_cache_collect;
     ggml_moe_cache.end = moe_cache_end;
     ggml_moe_cache.fused_begin = moe_cache_fused_begin;
+    ggml_moe_cache.fused_plan = moe_cache_fused_plan;
+    ggml_moe_cache.fused_dispatch = moe_cache_fused_dispatch;
     ggml_moe_cache.invalidate = moe_cache_invalidate;
 }
 
