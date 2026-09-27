@@ -3960,6 +3960,7 @@ static bool run_pool_limits() {
 
 int main(int argc, char ** argv) {
     const bool profile_writer = argc == 6 && std::strcmp(argv[1], "--profile-writer") == 0;
+    const bool host_buffer = argc == 2 && std::strcmp(argv[1], "--host-buffer") == 0;
     if (!run_pool_limits()) return 1;
     if (argc > 0 && argv[0]) {
         std::error_code ec;
@@ -4052,8 +4053,10 @@ int main(int argc, char ** argv) {
     ggml_set_name(ids, "moe_cache_test_ids");
     ggml_set_name(activations, "moe_cache_test_activations");
 
-    ggml_backend_buffer_t static_buffer =
-        ggml_backend_alloc_ctx_tensors(static_ctx, cpu);
+    const auto static_buft = host_buffer ? ggml_backend_dev_host_buffer_type(cuda_device)
+                                         : ggml_backend_get_default_buffer_type(cpu);
+    ggml_backend_buffer_t static_buffer = static_buft
+        ? ggml_backend_alloc_ctx_tensors_from_buft(static_ctx, static_buft) : nullptr;
     if (!static_buffer) {
         fprintf(stderr, "failed to allocate CPU tensors\n");
         ggml_free(static_ctx);
@@ -4063,6 +4066,18 @@ int main(int argc, char ** argv) {
     }
     ggml_backend_buffer_set_usage(
             static_buffer, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+    if (host_buffer) {
+        // Do not silently qualify the CPU fallback if pinned allocation failed.
+        if (ggml_backend_buffer_get_type(static_buffer) != static_buft) {
+            fprintf(stderr, "requested host buffer allocation fell back to another type\n");
+            ggml_backend_buffer_free(static_buffer);
+            ggml_free(static_ctx);
+            ggml_backend_free(cuda);
+            ggml_backend_free(cpu);
+            return 1;
+        }
+        printf("cache-source-buffer: %s\n", ggml_backend_buft_name(static_buft));
+    }
 
     std::vector<float> weights_f32(ggml_nelements(weights));
     for (size_t index = 0; index < weights_f32.size(); index++) {

@@ -1482,8 +1482,6 @@ static bool moe_cache_grow_host(
 }
 
 static void moe_cache_worker(moe_cache_session * session, moe_cache_device * device) {
-    char * stage = nullptr;
-    size_t stage_capacity = 0;
     cudaStream_t stream = nullptr;
 
     for (;;) {
@@ -1528,20 +1526,6 @@ static void moe_cache_worker(moe_cache_session * session, moe_cache_device * dev
                         &stream, cudaStreamNonBlocking);
             }
         }
-        if (error == cudaSuccess && stage_capacity < job.bytes) {
-            char * fresh = nullptr;
-            cudaError_t alloc_error = cudaMallocHost((void **)&fresh, job.bytes);
-            if (alloc_error == cudaSuccess) {
-                if (stage) {
-                    cudaFreeHost(stage);
-                }
-                stage = fresh;
-                stage_capacity = job.bytes;
-            } else {
-                (void)cudaGetLastError();
-            }
-        }
-
         moe_cache_pool * pool = nullptr;
         char * destination = nullptr;
         {
@@ -1563,16 +1547,15 @@ static void moe_cache_worker(moe_cache_session * session, moe_cache_device * dev
             if (session->config.serial_fill) {
                 fill_lock.lock();
             }
-            if (error == cudaSuccess && stage && stage_capacity >= job.bytes) {
-                memcpy(stage, job.source, job.bytes);
+            if (error == cudaSuccess) {
+                // Source invalidation waits until this stream finishes. Registered
+                // sources can DMA directly; pageable sources use the runtime's
+                // staging, without an additional application bounce buffer.
                 error = cudaMemcpyAsync(
-                        destination, stage, job.bytes, cudaMemcpyHostToDevice, stream);
+                        destination, job.source, job.bytes, cudaMemcpyHostToDevice, stream);
                 if (error == cudaSuccess) {
                     error = cudaStreamSynchronize(stream);
                 }
-            } else if (error == cudaSuccess) {
-                error = cudaMemcpy(
-                        destination, job.source, job.bytes, cudaMemcpyHostToDevice);
             }
         }
 
@@ -1609,9 +1592,6 @@ static void moe_cache_worker(moe_cache_session * session, moe_cache_device * dev
     if (stream) {
         cudaStreamSynchronize(stream);
         cudaStreamDestroy(stream);
-    }
-    if (stage) {
-        cudaFreeHost(stage);
     }
 }
 
