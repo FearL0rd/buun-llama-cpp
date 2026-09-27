@@ -202,8 +202,10 @@ static void ggml_cuda_mul_mat_q_impl(
                                         ne11, ne12, ne13, stream);
 
             } else {
-                quantize_mmq_q8_1_cuda(src1_d, nullptr, src1_q8_1, src0->type, ne10, s11, s12, s13, ne10_padded,
-                                       ne11, ne12, ne13, stream);
+                const auto quantize = ggml_cuda_use_wide_q5_mmq(cc, src0, dst) ?
+                    quantize_mmq_q8_1_quantized_sum_cuda : quantize_mmq_q8_1_cuda;
+                quantize(src1_d, nullptr, src1_q8_1, src0->type, ne10, s11, s12, s13, ne10_padded,
+                         ne11, ne12, ne13, stream);
             }
             CUDA_CHECK(cudaGetLastError());
         }

@@ -3101,8 +3101,9 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         ggml_cuda_mul_mat_f(ctx, src0, src1, nullptr, dst);
         return;
     }
-    const bool force_mmq = hint == GGML_HINT_FORCE_MMQ &&
-            GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= GGML_CUDA_CC_AMPERE && cc < GGML_CUDA_CC_ADA_LOVELACE;
+    const bool wide_q5_mmq = ggml_cuda_use_wide_q5_mmq(cc, src0, dst);
+    const bool force_mmq = wide_q5_mmq || (hint == GGML_HINT_FORCE_MMQ &&
+            GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= GGML_CUDA_CC_AMPERE && cc < GGML_CUDA_CC_ADA_LOVELACE);
     if (!force_mmq && ggml_cuda_f8_mmvq_layout_supported(src0) &&
             ggml_cuda_should_use_mmvq(src0->type, cc, ne11)) {
         ggml_cuda_mul_mat_vec_q(ctx, src0, src1, nullptr, dst);
