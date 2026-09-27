@@ -1295,6 +1295,10 @@ static void test_companion_payload() {
     auto parallel = package;
     for (uint32_t workers : { 0u, 1u, 2u, 3u, 4u, 8u, 64u }) {
         parallel = package;
+        for (auto & value : parallel.companions) {
+            value.section_checksum = {};
+            value.payload_digest = {};
+        }
         CHECK(vbr_artifact_prepare(parallel, workers) == vbr_artifact_status::ok);
         CHECK(parallel.manifest.manifest_digest == package.manifest.manifest_digest);
         CHECK(vbr_artifact_validate_prepared_package(parallel, workers) == vbr_artifact_status::ok);
@@ -1310,6 +1314,34 @@ static void test_companion_payload() {
         source->bytes[0] ^= 1;
     }
     CHECK(vbr_artifact_validate_prepared_package(parallel, 4) == vbr_artifact_status::ok);
+    for (uint32_t workers : { 1u, 4u }) {
+        auto unreadable = package;
+        unreadable.companions[0].payload.read = nullptr;
+        CHECK(vbr_artifact_prepare(unreadable, workers) == vbr_artifact_status::content_id_mismatch);
+        CHECK(unreadable.manifest.manifest_digest == package.manifest.manifest_digest);
+
+        // Both companion jobs may read concurrently. Fail after the first
+        // full transfer chunk, not just in metadata validation.
+        struct failing_reader {
+            mutable std::atomic<unsigned> late_reads { 0 };
+        } reader;
+        unreadable = package;
+        auto & value = unreadable.companions[0];
+        value.payload_bytes = value.payload.size = 1024*1024 + 1;
+        value.payload.context = &reader;
+        value.payload.read = [](const void * context, uint64_t offset,
+                                uint8_t * destination, size_t size) noexcept {
+            if (offset != 0) {
+                static_cast<const failing_reader *>(context)->late_reads.fetch_add(1, std::memory_order_relaxed);
+                return false;
+            }
+            std::memset(destination, 0, size);
+            return true;
+        };
+        CHECK(vbr_artifact_prepare(unreadable, workers) == vbr_artifact_status::content_id_mismatch);
+        CHECK(reader.late_reads.load() != 0);
+        CHECK(unreadable.manifest.manifest_digest == package.manifest.manifest_digest);
+    }
     parallel.unit_blobs[0].descriptor.shards[0].payload.read = nullptr;
     auto serial_failure = parallel;
     CHECK(vbr_artifact_prepare(parallel, 4) == vbr_artifact_prepare(serial_failure));
