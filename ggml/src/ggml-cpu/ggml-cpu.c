@@ -2347,13 +2347,18 @@ static void * incr_ptr_aligned(void ** p, size_t size, size_t align) {
     return ptr;
 }
 
+// t0_task (optional) launches GPU work that the caller collects on thread 0 afterwards. Like the
+// node's own moe-cache hits, it runs on thread 0 after the row barrier, and thread 0 then takes
+// no chunks unless the IQ panel path needs it.
 static void ggml_compute_forward_mul_mat_id_impl(
         const struct ggml_compute_params * params,
               struct ggml_tensor * dst,
                             uint64_t row_mask,
                                 bool use_row_mask,
                                 bool allow_moe_cache,
-                struct ggml_tensor * paired_dst) {
+                struct ggml_tensor * paired_dst,
+                              void (*t0_task)(void *),
+                                void * t0_arg) {
 
     if (use_row_mask && row_mask == 0) {
         return;
@@ -2422,8 +2427,11 @@ static void ggml_compute_forward_mul_mat_id_impl(
     struct mmid_row_mapping * matrix_rows = // [n_as][ids->ne[0]*ids->ne[1]]
         incr_ptr_aligned(&wdata_cur, n_as*ids->ne[0]*ids->ne[1]*sizeof(struct mmid_row_mapping), sizeof(int64_t));
 
-    char (*atomic_current_chunk)[CACHE_LINE_SIZE] = // [n_as]
-        incr_ptr_aligned(&wdata_cur, CACHE_LINE_SIZE * n_as, CACHE_LINE_SIZE);
+    char (*atomic_current_chunk)[CACHE_LINE_SIZE] = // [n_as + 1]
+        incr_ptr_aligned(&wdata_cur, CACHE_LINE_SIZE * (n_as + 1), CACHE_LINE_SIZE);
+
+    // published by thread 0 before the row barrier
+    int * t0_reserved = (int *) atomic_current_chunk[n_as];
 
     // IQ panel gemm (see iqp.h); per expert eligibility is decided below, but the work buffer is
     // reserved for the whole node (ggml_graph_plan sizes it without params, use_ref only skips the dispatch)
@@ -2544,23 +2552,12 @@ static void ggml_compute_forward_mul_mat_id_impl(
             }
         }
 
-        if (moe_cache_node && moe_cache_n_hits > 0) {
-            if (!ggml_moe_cache.dispatch(moe_cache_node, (int) type, ne00, ne01,
-                                         moe_cache_n_hits, moe_cache_compact, moe_cache_acts)) {
-                for (int i = 0; i < moe_cache_n_hits; i++) {
-                    const int expert = moe_cache_experts[i];
-                    MMID_MATRIX_ROW(expert, matrix_row_counts[expert]) =
-                        (struct mmid_row_mapping) {moe_cache_ids[i], moe_cache_tokens[i]};
-                    matrix_row_counts[expert] += 1;
-                }
-                moe_cache_n_hits = 0;
-                ggml_moe_cache.end(moe_cache_node);
-                moe_cache_node = NULL;
-            }
-        } else if (moe_cache_node) {
+        if (moe_cache_node && moe_cache_n_hits == 0) {
             ggml_moe_cache.end(moe_cache_node);
             moe_cache_node = NULL;
         }
+
+        *t0_reserved = nth > 1 && !iqp && (moe_cache_node || t0_task);
     }
 
     // reset current_chunk
@@ -2571,7 +2568,25 @@ static void ggml_compute_forward_mul_mat_id_impl(
 
     ggml_barrier(params->threadpool);
 
-    for (int cur_a = 0; cur_a < n_as; ++cur_a) {
+    // Hit rows are dispatched only now, so the workers never wait on the launch.
+    // A failed dispatch leaves them to thread 0 below, as a failed collect does.
+    bool moe_cache_dispatched = false;
+    if (ith == 0 && moe_cache_node) {
+        moe_cache_dispatched = ggml_moe_cache.dispatch(moe_cache_node, (int) type, ne00, ne01,
+                                                       moe_cache_n_hits, moe_cache_compact, moe_cache_acts);
+    }
+
+    if (ith == 0 && t0_task) {
+        t0_task(t0_arg);
+    }
+
+    const bool reserved = *t0_reserved;
+
+    // workers of the chunk schedule; thread 0 drops out while it serves the GPU
+    const int nw = reserved ? nth - 1 : nth;
+    const int iw = reserved ? ith - 1 : ith;
+
+    for (int cur_a = 0; cur_a < n_as && iw >= 0; ++cur_a) {
         const int64_t cne1 = matrix_row_counts[cur_a];
 
         if (cne1 == 0) {
@@ -2607,15 +2622,15 @@ static void ggml_compute_forward_mul_mat_id_impl(
         int64_t nchunk0 = (nr0 + chunk_size - 1) / chunk_size;
         int64_t nchunk1 = (nr1 + chunk_size - 1) / chunk_size;
 
-        if (nchunk0 * nchunk1 < nth * 4 || disable_chunking) {
-            nchunk0 = nr0 > nr1 ? nth : 1;
-            nchunk1 = nr0 > nr1 ? 1 : nth;
+        if (nchunk0 * nchunk1 < nw * 4 || disable_chunking) {
+            nchunk0 = nr0 > nr1 ? nw : 1;
+            nchunk1 = nr0 > nr1 ? 1 : nw;
         }
 
         const int64_t dr0 = (nr0 + nchunk0 - 1) / nchunk0;
         const int64_t dr1 = (nr1 + nchunk1 - 1) / nchunk1;
 
-        int current_chunk = ith;
+        int current_chunk = iw;
 
         atomic_int * current_chunk_ctr = (atomic_int *)(atomic_current_chunk + cur_a);
 
@@ -2643,16 +2658,18 @@ static void ggml_compute_forward_mul_mat_id_impl(
                         matrix_rows, row_size, src1_cont, wdata);
             }
 
-            if (nth >= nchunk0 * nchunk1) {
+            if (nw >= nchunk0 * nchunk1) {
                 break;
             }
 
-            current_chunk = atomic_fetch_add_explicit(current_chunk_ctr, 1, memory_order_relaxed);
+            // the counter starts at nth; chunks nw..nth-1 are not claimed initially when reserved
+            current_chunk = atomic_fetch_add_explicit(current_chunk_ctr, 1, memory_order_relaxed) - (nth - nw);
         }
     }
 
     if (ith == 0 && moe_cache_node) {
-        if (!ggml_moe_cache.collect(moe_cache_node, moe_cache_n_hits, moe_cache_rows, ne0)) {
+        if (!moe_cache_dispatched ||
+            !ggml_moe_cache.collect(moe_cache_node, moe_cache_n_hits, moe_cache_rows, ne0)) {
             const void * wdata = (src1->type == vec_dot_type) ? src1->data : params->wdata;
             const size_t row_size = ggml_row_size(vec_dot_type, ne10);
             for (int i = 0; i < moe_cache_n_hits; i++) {
@@ -2678,7 +2695,7 @@ static void ggml_compute_forward_mul_mat_id(
         ggml_cpu_exl3_compute(params, dst);
         return;
     }
-    ggml_compute_forward_mul_mat_id_impl(params, dst, 0, false, true, NULL);
+    ggml_compute_forward_mul_mat_id_impl(params, dst, 0, false, true, NULL, NULL, NULL);
 }
 
 struct moe_cache_fused_state {
@@ -2688,6 +2705,7 @@ struct moe_cache_fused_state {
     int collect_ok;
     int skipped;
     int full;
+    int64_t n_out;
     int32_t ids[MOE_CACHE_MAX_TOPK];
     const float * acts[MOE_CACHE_MAX_TOPK];
     float * rows[MOE_CACHE_MAX_TOPK];
@@ -3902,8 +3920,8 @@ struct ggml_cplan ggml_graph_plan(
                         cur += n_as * sizeof(int64_t) + sizeof(int64_t);
                         // matrix_rows
                         cur += n_as*ids->ne[0]*ids->ne[1]*sizeof(struct mmid_row_mapping) + sizeof(int64_t);
-                        // atomic_current_chunk
-                        cur += CACHE_LINE_SIZE*n_as + CACHE_LINE_SIZE;
+                        // atomic_current_chunk + shared schedule line
+                        cur += CACHE_LINE_SIZE*(n_as + 1) + CACHE_LINE_SIZE;
                         // the IQ panel path needs one scratch panel per thread on top of that
                         if (ggml_cpu_iqp_supports_mul_mat_id(node)) {
                             cur += n_tasks * ggml_cpu_iqp_scratch_size(node) + 64;
@@ -4101,7 +4119,7 @@ static bool ggml_moe_cache_can_fuse(
         const struct ggml_cgraph * cgraph,
         int node_n,
         struct ggml_moe_cache_fusion * fusion) {
-    if (!ggml_moe_cache.fused_begin || !ggml_moe_cache.collect ||
+    if (!ggml_moe_cache.fused_plan || !ggml_moe_cache.fused_dispatch || !ggml_moe_cache.collect ||
         !ggml_moe_cache.end) {
         return false;
     }
@@ -4289,22 +4307,13 @@ static void ggml_compute_forward_swiglu_masked(
         const struct ggml_tensor * up,
         struct ggml_tensor * dst,
         uint64_t row_mask,
-        bool reserve_thread_zero,
         bool clamped,
         float up_min,
         float up_max,
         float gate_min,
         float gate_max) {
     const int64_t n_rows = ggml_nrows(dst);
-    const int worker_count = reserve_thread_zero && params->nth > 1
-        ? params->nth - 1 : params->nth;
-    const int worker = reserve_thread_zero && params->nth > 1
-        ? params->ith - 1 : params->ith;
-    if (worker < 0) {
-        return;
-    }
-
-    for (int64_t row = worker; row < n_rows; row += worker_count) {
+    for (int64_t row = params->ith; row < n_rows; row += params->nth) {
         GGML_ASSERT(row < MOE_CACHE_MAX_TOPK);
         if ((row_mask & (UINT64_C(1) << row)) == 0) {
             continue;
@@ -4328,6 +4337,19 @@ static void ggml_compute_forward_swiglu_masked(
             dst_row[col] = ggml_silu_f32(gate_value) * up_value;
         }
     }
+}
+
+static void ggml_moe_cache_fused_dispatch_task(void * arg) {
+    ggml_moe_cache.fused_dispatch(((struct moe_cache_fused_state *) arg)->node);
+}
+
+// Thread 0 only. Dispatches the hits if no pass did yet; a failed dispatch is reported
+// as a failed collect, so the hit rows are recomputed on the CPU.
+static void ggml_moe_cache_fused_collect(struct moe_cache_fused_state * state) {
+    state->collect_ok = ggml_moe_cache.fused_dispatch(state->node) &&
+        ggml_moe_cache.collect(state->node, state->n_hits, state->rows, state->n_out);
+    ggml_moe_cache.end(state->node);
+    state->node = NULL;
 }
 
 static int ggml_cpu_try_fuse_moe_cache(
@@ -4394,7 +4416,9 @@ static int ggml_cpu_try_fuse_moe_cache(
                 state->acts[row] = (const float *)((const char *)acts->data + token*acts->nb[2] + (id % acts->ne[1])*acts->nb[1]);
             }
         }
-        state->node = ggml_moe_cache.fused_begin(
+        // Planning without launching lets the workers start on the misses at once;
+        // thread 0 then dispatches while they compute.
+        state->node = ggml_moe_cache.fused_plan(
                 &up_desc, &gate_desc, down ? &down_desc : NULL,
                 (int)GGML_GLU_OP_SWIGLU,
                 fusion.up_min, fusion.up_max,
@@ -4403,7 +4427,7 @@ static int ggml_cpu_try_fuse_moe_cache(
                 state->acts, &state->hit_mask);
         if (!state->node && down) {
             state->hit_mask = 0;
-            state->node = ggml_moe_cache.fused_begin(
+            state->node = ggml_moe_cache.fused_plan(
                     &up_desc, &gate_desc, NULL,
                     (int)GGML_GLU_OP_SWIGLU,
                     fusion.up_min, fusion.up_max,
@@ -4418,6 +4442,7 @@ static int ggml_cpu_try_fuse_moe_cache(
         state->skipped = state->node ? fusion.skipped + state->full : 0;
         if (state->node) {
             struct ggml_tensor * output = state->full ? down : glu;
+            state->n_out = output->ne[0];
             for (int row = 0; row < n_rows; row++) {
                 if (state->hit_mask & (UINT64_C(1) << row)) {
                     state->rows[state->n_hits++] =
@@ -4445,12 +4470,17 @@ static int ggml_cpu_try_fuse_moe_cache(
     if (miss_mask != 0) {
         // Share conversion, routing metadata and the chunk schedule for up/gate.
         // Their dot products remain the existing kernels with unchanged numerics.
+        // A full node's GPU work outlasts up/gate, so it is collected after down.
         ggml_compute_forward_mul_mat_id_impl(
-                &sub_params, up, miss_mask, true, false, gate);
+                &sub_params, up, miss_mask, true, false, gate,
+                ggml_moe_cache_fused_dispatch_task, state);
+        if (params->ith == 0 && !state->full) {
+            ggml_moe_cache_fused_collect(state);
+        }
         ggml_barrier(params->threadpool);
 
         ggml_compute_forward_swiglu_masked(
-                params, gate, up, glu, miss_mask, !state->full,
+                params, gate, up, glu, miss_mask,
                 fusion.clamped, fusion.up_min, fusion.up_max,
                 fusion.gate_min, fusion.gate_max);
 
@@ -4460,31 +4490,29 @@ static int ggml_cpu_try_fuse_moe_cache(
             // collect() then writes only the complementary hit rows.
             ggml_barrier(params->threadpool);
             ggml_compute_forward_mul_mat_id_impl(
-                    &sub_params, down, miss_mask, true, false, NULL);
-            ggml_barrier(params->threadpool);
+                    &sub_params, down, miss_mask, true, false, NULL,
+                    ggml_moe_cache_fused_dispatch_task, state);
+            if (params->ith == 0) {
+                ggml_moe_cache_fused_collect(state);
+            }
         }
-    }
-    if (params->ith == 0) {
-        state->collect_ok = ggml_moe_cache.collect(
-                state->node, state->n_hits, state->rows,
-                state->full ? down->ne[0] : glu->ne[0]);
-        ggml_moe_cache.end(state->node);
-        state->node = NULL;
+    } else if (params->ith == 0) {
+        ggml_moe_cache_fused_collect(state);
     }
     ggml_barrier(params->threadpool);
 
     if (!state->collect_ok) {
         ggml_compute_forward_mul_mat_id_impl(
-                &sub_params, up, state->hit_mask, true, false, gate);
+                &sub_params, up, state->hit_mask, true, false, gate, NULL, NULL);
         ggml_barrier(params->threadpool);
         ggml_compute_forward_swiglu_masked(
-                params, gate, up, glu, state->hit_mask, false,
+                params, gate, up, glu, state->hit_mask,
                 fusion.clamped, fusion.up_min, fusion.up_max,
                 fusion.gate_min, fusion.gate_max);
         if (state->full) {
             ggml_barrier(params->threadpool);
             ggml_compute_forward_mul_mat_id_impl(
-                    &sub_params, down, state->hit_mask, true, false, NULL);
+                    &sub_params, down, state->hit_mask, true, false, NULL, NULL, NULL);
         }
     }
 

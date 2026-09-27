@@ -326,6 +326,49 @@ static void test_bonsai_codecs() {
     assert(pq == ptq);
 }
 
+// Raw blocks cover every packed code byte and the entire signed activation
+// range, including -128 (not normally emitted by the float quantizer).
+static void test_q2_0_packed_dot() {
+    const auto * traits = ggml_get_type_traits_cpu(GGML_TYPE_Q2_0);
+    assert(ggml_blck_size(GGML_TYPE_Q2_0) == 64);
+    assert(ggml_type_size(GGML_TYPE_Q2_0) == 18);
+    assert(ggml_type_size(GGML_TYPE_Q8_0) == 34);
+    for (const int n : {64, 640, 2560}) {
+        std::vector<uint8_t> x(ggml_row_size(GGML_TYPE_Q2_0, n));
+        std::vector<uint8_t> y(ggml_row_size(GGML_TYPE_Q8_0, n));
+        for (int pattern = 0; pattern < 256; ++pattern) {
+            float expected = 0.0f;
+            for (int block = 0; block < n / 64; ++block) {
+                const float dx = (block % 5 == 4) ? 0.0f : 0.25f;
+                const ggml_fp16_t dxh = ggml_fp32_to_fp16(dx);
+                memcpy(x.data() + block * 18, &dxh, 2);
+                float partial = 0.0f;
+                for (int chunk = 0; chunk < 2; ++chunk) {
+                    const float dy = chunk == 0 ? 0.5f : -2.0f;
+                    const ggml_fp16_t dyh = ggml_fp32_to_fp16(dy);
+                    uint8_t * qy = y.data() + (block * 2 + chunk) * 34;
+                    memcpy(qy, &dyh, 2);
+                    int dot = 0;
+                    for (int b = 0; b < 8; ++b) {
+                        const uint8_t packed = uint8_t(pattern + block * 13 + b * 17);
+                        x[block * 18 + 2 + chunk * 8 + b] = packed;
+                        for (int j = 0; j < 4; ++j) {
+                            const int value = ((pattern + block * 31 + chunk * 97 + b * 4 + j) & 255) - 128;
+                            qy[2 + b * 4 + j] = uint8_t(value);
+                            dot += (((packed >> (2 * j)) & 3) - 1) * value;
+                        }
+                    }
+                    partial += dy * dot;
+                }
+                expected += dx * partial;
+            }
+            float actual = NAN;
+            traits->vec_dot(n, &actual, 0, x.data(), 0, y.data(), 0, 1);
+            assert(actual == expected);
+        }
+    }
+}
+
 int main(int argc, char * argv[]) {
     bool verbose = false;
 
@@ -343,6 +386,7 @@ int main(int argc, char * argv[]) {
 
     ggml_cpu_init();
     test_bonsai_codecs();
+    test_q2_0_packed_dot();
 
     int num_failed = 0;
 

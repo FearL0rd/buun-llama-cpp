@@ -698,6 +698,48 @@ void ggml_vec_dot_q1_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const voi
 #endif
 }
 
+void ggml_vec_dot_q2_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+#if defined(__AVX2__)
+    assert(n % QK2_0 == 0);
+    assert(nrc == 1);
+    UNUSED(nrc);
+    UNUSED(bs);
+    UNUSED(bx);
+    UNUSED(by);
+    const block_q2_0 * GGML_RESTRICT x = vx;
+    const block_q8_0 * GGML_RESTRICT y = vy;
+    const __m256i mask = _mm256_set1_epi8(3);
+    const __m256i one8 = _mm256_set1_epi8(1);
+    const __m256i one16 = _mm256_set1_epi16(1);
+    float sumf = 0.0f;
+    for (int i = 0; i < n / QK2_0; ++i) {
+        float sumi = 0.0f;
+        for (int k = 0; k < QK2_0 / QK8_0; ++k) {
+            const block_q8_0 * yb = &y[i * (QK2_0 / QK8_0) + k];
+            // Expand each packed byte into a dword, then place its four codes
+            // into consecutive bytes. No weight repacking or padding is needed.
+            const __m256i packed = _mm256_cvtepu8_epi32(_mm_loadl_epi64((const __m128i *) (x[i].qs + k * 8)));
+            const __m256i codes = _mm256_and_si256(mask, _mm256_or_si256(
+                _mm256_or_si256(packed, _mm256_slli_epi32(packed, 6)),
+                _mm256_or_si256(_mm256_slli_epi32(packed, 12), _mm256_slli_epi32(packed, 18))));
+            const __m256i qy = _mm256_loadu_si256((const __m256i *) yb->qs);
+            // dot(codes - 1, qy): unsigned codes avoid negating -128 in qy.
+            // Neither 16-bit pair sum can saturate for codes in [0, 3].
+            const __m256i pairs = _mm256_sub_epi16(_mm256_maddubs_epi16(codes, qy),
+                                                  _mm256_maddubs_epi16(one8, qy));
+            const int dot = hsum_i32_8(_mm256_madd_epi16(pairs, one16));
+            // Keep the generic path's two activation scales and FP reduction
+            // order; only the exactly representable integer dot is vectorized.
+            sumi += GGML_CPU_FP16_TO_FP32(yb->d) * dot;
+        }
+        sumf += GGML_CPU_FP16_TO_FP32(x[i].d) * sumi;
+    }
+    *s = sumf;
+#else
+    ggml_vec_dot_q2_0_q8_0_generic(n, s, bs, vx, bx, vy, by, nrc);
+#endif
+}
+
 void ggml_vec_dot_q4_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
     const int qk = QK8_0;
     const int nb = n / qk;

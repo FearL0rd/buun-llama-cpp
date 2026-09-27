@@ -1078,10 +1078,11 @@ static common_speculative_output_limits server_output_limits(const common_params
     // per-seq floor (~64 tokens) — e.g. any follow-up turn that re-processes context.
     // DFlash may only be detected from the draft GGUF after the target context is
     // created (same ordering problem as the verify floor below), so gate on has_dft()
-    // too. output_reserve grows its buffers lazily, so the higher cap costs nothing
-    // until a batch actually requests that many outputs (the pre-cap reservation).
+    // too, except for an explicit MTP sidecar: it uses the same hidden-state
+    // handoff as embedded MTP, not output-all embeddings. Reserving a full-vocab
+    // output for every prompt row can otherwise crowd out the expert cache.
     if (params.speculative.has_type(COMMON_SPECULATIVE_TYPE_DFLASH) ||
-        params.speculative.has_dft()) {
+        (params.speculative.has_dft() && !params.speculative.has_external_mtp_sidecar())) {
         return { (int32_t) params.n_batch, (int32_t) params.n_batch };
     }
 
@@ -10043,10 +10044,11 @@ private:
             auto resolved_dft = make_params_dft();
             auto & params_dft = resolved_dft.params;
 
-            // the helper pins n_outputs_max to the base n_parallel (MTP-path semantics);
-            // this path historically inherited the base value — keep that (0 = derive from
-            // n_batch), a DFlash drafter emits logits for whole blocks
-            params_dft.n_outputs_max = params_base.n_outputs_max;
+            // Preserve the helper's one-output-per-sequence cap for an MTP
+            // sidecar. Other external drafters may emit whole blocks of logits.
+            if (!params_base.speculative.has_external_mtp_sidecar()) {
+                params_dft.n_outputs_max = params_base.n_outputs_max;
+            }
 
             params_dft.n_parallel   = 1;
             params_dft.n_ctx        = params_spec.n_ctx == 0 ? llama_n_ctx_seq(ctx_tgt) : params_spec.n_ctx;

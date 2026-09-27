@@ -972,6 +972,34 @@ static bool llama_model_has_cacheable_moe_weights(
     return false;
 }
 
+static int llama_moe_cache_expert_parallel(const llama_model & model, int requested) {
+    if (requested == 0) {
+        return 0;
+    }
+    const auto host_weight = [](const ggml_tensor * tensor) {
+        if (!tensor) return false;
+        const ggml_backend_buffer_t buffer = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
+        return buffer && ggml_backend_buffer_is_host(buffer);
+    };
+    for (const auto & layer : model.layers) {
+        for (const auto & pair : {
+                std::make_pair(layer.ffn_up_exps, layer.ffn_gate_exps),
+                std::make_pair(layer.ffn_up_chexps, layer.ffn_gate_chexps)}) {
+            if (host_weight(pair.first) && host_weight(pair.second) &&
+                    pair.first->type != pair.second->type) {
+                // Expert fanout currently requires a fused up/gate/down bundle
+                // and suppresses ordinary cache admission. Mixed up/gate quants
+                // cannot form that bundle; retain ordinary multi-device routing
+                // instead of silently leaving every expert on the CPU (#141).
+                LLAMA_LOG_WARN("MoE cache: asymmetric up/gate types (%s/%s) use ordinary multi-device cache routing; fused expert fanout disabled\n",
+                        ggml_type_name(pair.first->type), ggml_type_name(pair.second->type));
+                return 0;
+            }
+        }
+    }
+    return requested;
+}
+
 uint32_t llama_context::effective_reserve_n_seqs(const llama_memory_context_i * mctx) const {
     const uint32_t capacity = mctx
         ? mctx->get_max_graph_seqs()
@@ -1032,6 +1060,8 @@ void llama_context::sched_reserve() {
             cparams.moe_cache_budget_mib, backend_ptrs);
     const ggml_moe_cache_mode moe_cache_mode = moe_cache_eligible
         ? (ggml_moe_cache_mode)cparams.moe_cache_mode : GGML_MOE_CACHE_MODE_OFF;
+    const int moe_cache_expert_parallel = moe_cache_eligible
+        ? llama_moe_cache_expert_parallel(model, cparams.moe_cache_expert_parallel) : 0;
     const char * moe_cache_requested = "provider";
     switch (cparams.moe_cache_mode) {
         case LLAMA_MOE_CACHE_MODE_OFF:  moe_cache_requested = "off";  break;
@@ -1066,7 +1096,7 @@ void llama_context::sched_reserve() {
     ggml_backend_sched_set_moe_cache(
             sched.get(), moe_cache_mode,
             cparams.moe_cache_budget_mib,
-            cparams.moe_cache_expert_parallel,
+            moe_cache_expert_parallel,
             cparams.moe_cache_cpu_overlap,
             cparams.moe_cache_profile_path.empty() ? nullptr :
                 cparams.moe_cache_profile_path.c_str());
@@ -1133,7 +1163,7 @@ void llama_context::sched_reserve() {
                 ggml_backend_sched_set_moe_cache(
                         sched.get(), moe_cache_mode,
                         cparams.moe_cache_budget_mib,
-                        cparams.moe_cache_expert_parallel,
+                        moe_cache_expert_parallel,
                         cparams.moe_cache_cpu_overlap,
                         cparams.moe_cache_profile_path.empty() ? nullptr :
                             cparams.moe_cache_profile_path.c_str());
