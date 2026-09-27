@@ -374,11 +374,11 @@ static void test_q2_0_packed_dot() {
 // could take the same optimized route and hide an indexing or rounding error.
 static void test_q2_0_repeated_experts() {
     const auto * traits = ggml_get_type_traits_cpu(GGML_TYPE_Q2_0);
-    for (int n : {64, 320, 640, 2560}) {
-        for (int rows : {1, 2, 3, 4, 5, 8, 9}) for (int lanes : {1, 2}) {
+    for (int n : {64, 320, 640, 2560, 16384, 16448}) {
+        for (int columns : {7, 33}) for (int rows : {1, 2, 3, 4, 5, 8, 9}) for (int lanes : {1, 2}) {
             ggml_context * ctx = ggml_init({4*1024*1024, nullptr, false});
             assert(ctx);
-            ggml_tensor * weights = ggml_new_tensor_3d(ctx, GGML_TYPE_Q2_0, n, 7, 2);
+            ggml_tensor * weights = ggml_new_tensor_3d(ctx, GGML_TYPE_Q2_0, n, columns, 2);
             ggml_tensor * acts = ggml_new_tensor_3d(ctx, GGML_TYPE_Q8_0, n, lanes, rows);
             ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 2, rows);
             auto * x = static_cast<uint8_t *>(weights->data);
@@ -402,12 +402,12 @@ static void test_q2_0_repeated_experts() {
                 assert(ggml_graph_compute_with_ctx(ctx, graph, threads) == GGML_STATUS_SUCCESS);
                 for (int token = 0; token < rows; ++token) {
                     for (int route = 0; route < 2; ++route) {
-                        for (int row = 0; row < 7; ++row) {
+                        for (int row = 0; row < columns; ++row) {
                             float expected = NAN;
                             traits->vec_dot(n, &expected, 0,
                                 x + routes[2*token + route]*weights->nb[2] + row*weights->nb[1], 0,
                                 y + (route % lanes)*acts->nb[1] + token*acts->nb[2], 0, 1);
-                            const float actual = static_cast<float *>(out->data)[(2*token + route)*7 + row];
+                            const float actual = static_cast<float *>(out->data)[(2*token + route)*columns + row];
                             assert(std::isfinite(actual) && actual == expected);
                         }
                     }

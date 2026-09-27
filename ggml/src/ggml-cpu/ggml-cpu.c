@@ -2300,7 +2300,9 @@ static void ggml_compute_forward_mul_mat_id_one_chunk(
     enum ggml_type    const vec_dot_type = type_traits_cpu[type].vec_dot_type;
 
 #if defined(__AVX512VBMI__) && defined(__AVX512VNNI__) && defined(__AVX512VL__)
-    if (type == GGML_TYPE_Q2_0 && ir1_end - ir1_start > 1) {
+    // Amortize activation preparation over at least one output-column tile.
+    const bool prepare_q2 = ne00 <= 16384 && ir0_end - ir0_start >= 16;
+    if (type == GGML_TYPE_Q2_0 && (prepare_q2 || ir1_end - ir1_start > 1)) {
         for (int64_t first = ir1_start; first < ir1_end; first += 4) {
             const int nr = (int) MIN(4, ir1_end - first);
             const void * ys[4];
@@ -2311,6 +2313,12 @@ static void ggml_compute_forward_mul_mat_id_one_chunk(
                 ys[r] = (const char *) wdata + (src1_cont || src1->type != vec_dot_type
                     ? (i11 + rm.i2 * ne11) * row_size : i11 * nb11 + rm.i2 * nb12);
                 outs[r] = (float *) ((char *) dst->data + rm.i1 * nb1 + rm.i2 * nb2);
+            }
+            if (prepare_q2) {
+                for (int r = 0; r < nr; ++r) outs[r] += ir0_start;
+                ggml_vec_dot_q2_0_q8_0_batch_rows(ne00, outs, src0_cur + ir0_start * nb01,
+                        nb01, ys, nr, ir0_end - ir0_start);
+                continue;
             }
             for (int64_t row = ir0_start; row < ir0_end; ++row) {
                 float sums[4];

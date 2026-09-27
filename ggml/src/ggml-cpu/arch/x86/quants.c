@@ -796,9 +796,20 @@ void ggml_vec_dot_q2_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const voi
 }
 
 #if defined(__AVX512VBMI__) && defined(__AVX512VNNI__) && defined(__AVX512VL__)
-// Reuse unpacked weights across tokens selecting the same expert. Each row
-// preserves the ordinary dot's FP32 block order; only integer work is shared.
-static inline void q2_0_batch_impl(int n, float * s, const void * vx, const void * const * vy, int nr) {
+static inline __m256i q2_0_codes_dot(__m256i codes, const int8_t * act) {
+    return _mm256_dpbusd_epi32(_mm256_setzero_si256(), codes,
+            _mm256_loadu_si256((const __m256i *) act));
+}
+
+struct q2_0_prepared_act {
+    int16_t sums[512];
+    float scales[512];
+};
+
+// Reuse unpacked weights across tokens selecting the same expert, optionally
+// sharing activation metadata across output columns. Preserve FP32 block order.
+static inline void q2_0_batch_impl(int n, float * s, const void * vx, const void * const * vy, int nr,
+                                 const struct q2_0_prepared_act * prepared) {
     const block_q2_0 * x = vx;
     for (int r = 0; r < nr; ++r) s[r] = 0.0f;
     int i = 0;
@@ -812,15 +823,19 @@ static inline void q2_0_batch_impl(int n, float * s, const void * vx, const void
             const __m256i c3 = q2_0_unpack32(x[i+3].qs + k*8);
             for (int r = 0; r < nr; ++r) {
                 const block_q8_0 * y = vy[r];
-                const __m256i d0 = q2_0_dot32_codes(c0, y[2*(i+0)+k].qs);
-                const __m256i d1 = q2_0_dot32_codes(c1, y[2*(i+1)+k].qs);
-                const __m256i d2 = q2_0_dot32_codes(c2, y[2*(i+2)+k].qs);
-                const __m256i d3 = q2_0_dot32_codes(c3, y[2*(i+3)+k].qs);
+                const __m256i d0 = prepared ? q2_0_codes_dot(c0, y[2*(i+0)+k].qs) : q2_0_dot32_codes(c0, y[2*(i+0)+k].qs);
+                const __m256i d1 = prepared ? q2_0_codes_dot(c1, y[2*(i+1)+k].qs) : q2_0_dot32_codes(c1, y[2*(i+1)+k].qs);
+                const __m256i d2 = prepared ? q2_0_codes_dot(c2, y[2*(i+2)+k].qs) : q2_0_dot32_codes(c2, y[2*(i+2)+k].qs);
+                const __m256i d3 = prepared ? q2_0_codes_dot(c3, y[2*(i+3)+k].qs) : q2_0_dot32_codes(c3, y[2*(i+3)+k].qs);
                 const __m256i halves = _mm256_hadd_epi32(
                         _mm256_hadd_epi32(d0, d1), _mm256_hadd_epi32(d2, d3));
-                const __m128i dots = _mm_add_epi32(_mm256_castsi256_si128(halves),
+                __m128i dots = _mm_add_epi32(_mm256_castsi256_si128(halves),
                         _mm256_extracti128_si256(halves, 1));
-                const __m128 scales = _mm_setr_ps(
+                if (prepared) {
+                    dots = _mm_sub_epi32(dots, _mm_cvtepi16_epi32(_mm_loadl_epi64(
+                            (const __m128i *) (prepared[r].sums + k*(n/QK2_0) + i))));
+                }
+                const __m128 scales = prepared ? _mm_loadu_ps(prepared[r].scales + k*(n/QK2_0) + i) : _mm_setr_ps(
                         GGML_CPU_FP16_TO_FP32(y[2*(i+0)+k].d),
                         GGML_CPU_FP16_TO_FP32(y[2*(i+1)+k].d),
                         GGML_CPU_FP16_TO_FP32(y[2*(i+2)+k].d),
@@ -840,8 +855,11 @@ static inline void q2_0_batch_impl(int n, float * s, const void * vx, const void
             const __m256i codes = q2_0_unpack32(x[i].qs + k*8);
             for (int r = 0; r < nr; ++r) {
                 const block_q8_0 * y = vy[r];
-                const int dot = hsum_i32_8(q2_0_dot32_codes(codes, y[2*i+k].qs));
-                sums[r] += GGML_CPU_FP16_TO_FP32(y[2*i+k].d) * dot;
+                const int dot = prepared
+                    ? hsum_i32_8(q2_0_codes_dot(codes, y[2*i+k].qs)) - prepared[r].sums[k*(n/QK2_0)+i]
+                    : hsum_i32_8(q2_0_dot32_codes(codes, y[2*i+k].qs));
+                const float scale = prepared ? prepared[r].scales[k*(n/QK2_0)+i] : GGML_CPU_FP16_TO_FP32(y[2*i+k].d);
+                sums[r] += scale * dot;
             }
         }
         for (int r = 0; r < nr; ++r) s[r] += GGML_CPU_FP16_TO_FP32(x[i].d) * sums[r];
@@ -853,9 +871,39 @@ void ggml_vec_dot_q2_0_q8_0_batch(int n, float * s, const void * vx, const void 
     // Literal counts let the compiler keep each row's accumulators in registers.
     switch (nr) {
         case 1: ggml_vec_dot_q2_0_q8_0(n, s, 0, vx, 0, vy[0], 0, 1); break;
-        case 2: q2_0_batch_impl(n, s, vx, vy, 2); break;
-        case 3: q2_0_batch_impl(n, s, vx, vy, 3); break;
-        case 4: q2_0_batch_impl(n, s, vx, vy, 4); break;
+        case 2: q2_0_batch_impl(n, s, vx, vy, 2, NULL); break;
+        case 3: q2_0_batch_impl(n, s, vx, vy, 3, NULL); break;
+        case 4: q2_0_batch_impl(n, s, vx, vy, 4, NULL); break;
+    }
+}
+
+void ggml_vec_dot_q2_0_q8_0_batch_rows(int n, float * const * dst, const void * vx, size_t stride,
+                                    const void * const * vy, int nr, int64_t rows) {
+    assert(n % QK2_0 == 0 && n <= 16384 && nr >= 1 && nr <= 4);
+    // Reuse exact signed-byte sums and FP16-to-FP32 scale conversions across
+    // output columns. Scratch is bounded at 12 KiB, with no weight repacking.
+    struct q2_0_prepared_act prepared[4];
+    for (int r = 0; r < nr; ++r) {
+        const block_q8_0 * y = vy[r];
+        for (int b = 0; b < n / QK8_0; ++b) {
+            // Adjacent entries feed adjacent weight blocks in one half-block
+            // pass, so four corrections need one load rather than a gather.
+            const int index = (b%2)*(n/QK2_0)+b/2;
+            prepared[r].sums[index] = (int16_t) hsum_i32_8(
+                    q2_0_codes_dot(_mm256_set1_epi8(1), y[b].qs));
+            prepared[r].scales[index] = GGML_CPU_FP16_TO_FP32(y[b].d);
+        }
+    }
+    for (int64_t row = 0; row < rows; ++row) {
+        float sums[4];
+        const void * x = (const char *) vx + row * stride;
+        switch (nr) {
+            case 1: q2_0_batch_impl(n, sums, x, vy, 1, prepared); break;
+            case 2: q2_0_batch_impl(n, sums, x, vy, 2, prepared); break;
+            case 3: q2_0_batch_impl(n, sums, x, vy, 3, prepared); break;
+            case 4: q2_0_batch_impl(n, sums, x, vy, 4, prepared); break;
+        }
+        for (int r = 0; r < nr; ++r) dst[r][row] = sums[r];
     }
 }
 #endif
