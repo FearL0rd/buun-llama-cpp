@@ -2656,12 +2656,14 @@ llama_cache_acct_artifact_id server_prompt_cache::find_vbr_durable_stem(
         const server_prompt & prompt,
         int64_t coverage_tokens,
         const std::string & execution_identity,
-        const std::string & adapter_config_key) const noexcept {
+        const std::string & adapter_config_key,
+        llama_cache_acct_artifact_id required_artifact) const noexcept {
     if (coverage_tokens <= 0 || coverage_tokens >= prompt.n_tokens()) {
         return {};
     }
     for (auto it = states.begin(); it != states.end(); ++it) {
         if (it->payload.kind() == server_prompt_cache_payload_kind::vbr_artifact &&
+            (required_artifact.v == 0 || vbr_host_artifact_id(it).v == required_artifact.v) &&
             it->adapter_config_key == adapter_config_key &&
             it->vbr_execution_identity == execution_identity &&
             server_prompt_cache_vbr_frontier_matches(

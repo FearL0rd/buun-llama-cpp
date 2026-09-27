@@ -1685,6 +1685,17 @@ struct common_prompt_checkpoint {
     // checkpoint copies/restores but never enters checkpoint payload bytes.
     common_cache_family_binding cache_family;
 
+    // Runtime-only evidence that this checkpoint has a durable VBR stem.
+    // The server seals the prefix and tier epochs after publication. This is
+    // never serialized and never authorizes physical rollback or slot clear.
+    std::array<uint8_t, 32> vbr_host_stem_identity = {};
+    uint64_t vbr_host_stem_artifact = 0;
+
+    void clear_vbr_host_stem() {
+        vbr_host_stem_identity = {};
+        vbr_host_stem_artifact = 0;
+    }
+
     common_shared_byte_buffer data_tgt;
     common_shared_byte_buffer data_dft;
     // Fixed-F16 Qwen4 QSA index image at the same logical frontier. It is

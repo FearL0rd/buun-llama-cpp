@@ -2792,6 +2792,7 @@ size_t common_prompt_checkpoint::size() const {
 }
 
 void common_prompt_checkpoint::clear() {
+    clear_vbr_host_stem();
     n_tokens = 0;
     id_task  = -1;
 
@@ -2815,6 +2816,7 @@ void common_prompt_checkpoint::update_pos(
         int64_t n_tokens,
         llama_pos pos_min,
         llama_pos pos_max) {
+    clear_vbr_host_stem();
     this->n_tokens = n_tokens;
     this->pos_min  = pos_min;
     this->pos_max  = pos_max;
@@ -2824,6 +2826,7 @@ void common_prompt_checkpoint::update_tgt(
         llama_context * ctx,
         llama_seq_id seq_id,
         llama_state_seq_flags flags) {
+    clear_vbr_host_stem();
     if (ctx == nullptr) {
         return;
     }
@@ -2844,6 +2847,7 @@ void common_prompt_checkpoint::update_dft(
         llama_context * ctx,
         llama_seq_id seq_id,
         llama_state_seq_flags flags) {
+    clear_vbr_host_stem();
     if (ctx == nullptr) {
         return;
     }
@@ -2908,11 +2912,13 @@ bool common_prompt_checkpoint::try_load_dft(
 }
 
 void common_prompt_checkpoint::clear_tgt() {
+    clear_vbr_host_stem();
     data_tgt.clear();
     data_qsa.clear();
 }
 
 void common_prompt_checkpoint::clear_dft() {
+    clear_vbr_host_stem();
     data_dft.clear();
     data_dft_full_sequence = false;
     accel.spec.clear();

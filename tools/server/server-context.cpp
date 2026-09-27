@@ -15168,14 +15168,20 @@ private:
             const vbr_artifact_identity_block & checkpoint_identity,
             const std::array<uint8_t, 32> & prefix_digest,
             const llama_memory_vbr_representation_identity & representation,
-            const std::array<uint8_t, 32> & full_source_identity) {
-        if (slot.vbr_restored_stem_identity != vbr_idle_publication_identity(
-                prefix_digest, representation.tier_epoch, representation.tier_epoch_swa)) {
+            const std::array<uint8_t, 32> & full_source_identity,
+            const common_prompt_checkpoint * checkpoint = nullptr) {
+        const auto stem_identity = vbr_idle_publication_identity(
+            prefix_digest, representation.tier_epoch, representation.tier_epoch_swa);
+        const bool local_stem = checkpoint && checkpoint->vbr_host_stem_artifact != 0 &&
+            checkpoint->vbr_host_stem_identity == stem_identity;
+        if (!local_stem && slot.vbr_restored_stem_identity != stem_identity) {
             return false;
         }
         const auto saved_stem = cache.find_vbr_durable_stem(
             slot.prompt, checkpoint_identity.token_count,
-            checkpoint_identity.execution_identity, checkpoint_identity.adapter_config_identity);
+            checkpoint_identity.execution_identity, checkpoint_identity.adapter_config_identity,
+            local_stem ? llama_cache_acct_artifact_id { checkpoint->vbr_host_stem_artifact }
+                       : llama_cache_acct_artifact_id {});
         if (saved_stem.v == 0) {
             return false;
         }
@@ -16255,7 +16261,7 @@ private:
 
         struct candidate {
             server_slot * slot = nullptr;
-            const common_prompt_checkpoint * checkpoint = nullptr;
+            common_prompt_checkpoint * checkpoint = nullptr;
             uint64_t manifest_id = 0;
             std::array<uint8_t, 32> attempt_identity = {};
             std::array<uint8_t, 32> full_source_identity = {};
@@ -16661,7 +16667,7 @@ private:
             // excluded here because its PARTIAL_ONLY checkpoint contains
             // tier-sensitive attention bytes rather than a recurrent-only
             // companion.
-            const common_prompt_checkpoint * checkpoint_frontier = nullptr;
+            common_prompt_checkpoint * checkpoint_frontier = nullptr;
             bool checkpoint_candidate_seen = false;
             std::array<uint8_t, 32> attempt_identity =
                 full_source_identity;
@@ -16698,7 +16704,7 @@ private:
                  idle.can_speculate())) {
                 bool demanded_checkpoint_seen = false;
                 const auto consider_checkpoint = [&] (
-                        const common_prompt_checkpoint & checkpoint,
+                        common_prompt_checkpoint & checkpoint,
                         bool demanded) {
                     if (checkpoint_frontier || checkpoint.empty() ||
                         !checkpoint.computation_frontier.valid() ||
@@ -16784,7 +16790,7 @@ private:
             // This is not the exact live recovery image for occupied replacement.
             if (checkpoint_stem && reuse_vbr_restored_stem(
                     *prompt_cache, idle, manifest.identity, token_identity_digest,
-                    representation, full_source_identity)) {
+                    representation, full_source_identity, checkpoint_frontier)) {
                 continue;
             }
 
@@ -17905,6 +17911,16 @@ private:
                 }
                 source.vbr_idle_stem_source_valid = true;
                 source.vbr_idle_stem_retry = false;
+                if (found->checkpoint && representation_stable) {
+                    std::array<uint8_t, 32> prefix_digest = {};
+                    if (source.prompt.tokens.retention_token_prefix_digest(
+                            found->selected_tokens, prefix_digest)) {
+                        found->checkpoint->vbr_host_stem_identity = vbr_idle_publication_identity(
+                            prefix_digest, found->tier_epoch, found->tier_epoch_swa);
+                        found->checkpoint->vbr_host_stem_artifact =
+                            source.vbr_idle_stem_host_artifact.v;
+                    }
+                }
                 source.vbr_idle_capture_attempt_identity =
                     found->attempt_identity;
                 source.vbr_idle_capture_terminal = true;
@@ -23830,6 +23846,32 @@ bool server_vbr_restored_stem_for_test(
         }
         slot.vbr_idle_capture_source_reset();
         if (reuse(representation) || slot.vbr_idle_stem_source_valid) {
+            return false;
+        }
+        // A locally retained checkpoint has its own publication witness, not
+        // the slot's host-import stamp. Eviction and either tier epoch changing
+        // invalidate reuse; no exact live recovery authority is acquired.
+        common_prompt_checkpoint local;
+        local.vbr_host_stem_identity = context.vbr_idle_publication_identity(
+            prefix_digest, representation.tier_epoch, representation.tier_epoch_swa);
+        const auto artifact = cache.find_vbr_durable_stem(
+            slot.prompt, checkpoint.token_count, execution, adapter);
+        local.vbr_host_stem_artifact = artifact.v != 0 ? artifact.v : UINT64_MAX;
+        const auto reuse_local = [&](llama_memory_vbr_representation_identity current) {
+            return context.reuse_vbr_restored_stem(
+                cache, slot, checkpoint, prefix_digest, current, source_digest, &local);
+        };
+        if (reuse_local({ 8, 11 }) || reuse_local({ 7, 12 }) ||
+            reuse_local(representation) != available ||
+            slot.vbr_idle_capture_representation_valid) {
+            return false;
+        }
+        local.vbr_host_stem_artifact = UINT64_MAX;
+        if (reuse_local(representation)) {
+            return false;
+        }
+        local.clear_vbr_host_stem();
+        if (reuse_local(representation)) {
             return false;
         }
     }
