@@ -699,12 +699,8 @@ void ggml_vec_dot_q1_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const voi
 }
 
 #if defined(__AVX2__)
-static inline __m256i q2_0_dot32(const uint8_t * packed_bytes, const int8_t * act) {
+static inline __m256i q2_0_unpack32(const uint8_t * packed_bytes) {
     const __m256i mask = _mm256_set1_epi8(3);
-    const __m256i one8 = _mm256_set1_epi8(1);
-#if !defined(__AVX512VNNI__) || !defined(__AVX512VL__)
-    const __m256i one16 = _mm256_set1_epi16(1);
-#endif
 #if defined(__AVX512VBMI__) && defined(__AVX512VL__)
     // Each 16-bit lane holds eight two-bit codes. Extract those codes
     // directly into bytes when the CPU supports byte multishift.
@@ -721,6 +717,11 @@ static inline __m256i q2_0_dot32(const uint8_t * packed_bytes, const int8_t * ac
         _mm256_or_si256(packed, _mm256_slli_epi32(packed, 6)),
         _mm256_or_si256(_mm256_slli_epi32(packed, 12), _mm256_slli_epi32(packed, 18))));
 #endif
+    return codes;
+}
+
+static inline __m256i q2_0_dot32_codes(__m256i codes, const int8_t * act) {
+    const __m256i one8 = _mm256_set1_epi8(1);
     const __m256i qy = _mm256_loadu_si256((const __m256i *) act);
     // dot(codes - 1, qy): unsigned codes avoid negating -128 in qy.
     // Neither 16-bit pair sum can saturate for codes in [0, 3].
@@ -729,10 +730,15 @@ static inline __m256i q2_0_dot32(const uint8_t * packed_bytes, const int8_t * ac
         _mm256_dpbusd_epi32(_mm256_setzero_si256(), codes, qy),
         _mm256_dpbusd_epi32(_mm256_setzero_si256(), one8, qy));
 #else
+    const __m256i one16 = _mm256_set1_epi16(1);
     const __m256i pairs = _mm256_sub_epi16(_mm256_maddubs_epi16(codes, qy),
                                           _mm256_maddubs_epi16(one8, qy));
     return _mm256_madd_epi16(pairs, one16);
 #endif
+}
+
+static inline __m256i q2_0_dot32(const uint8_t * packed_bytes, const int8_t * act) {
+    return q2_0_dot32_codes(q2_0_unpack32(packed_bytes), act);
 }
 #endif
 
@@ -788,6 +794,71 @@ void ggml_vec_dot_q2_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const voi
     ggml_vec_dot_q2_0_q8_0_generic(n, s, bs, vx, bx, vy, by, nrc);
 #endif
 }
+
+#if defined(__AVX512VBMI__) && defined(__AVX512VNNI__) && defined(__AVX512VL__)
+// Reuse unpacked weights across tokens selecting the same expert. Each row
+// preserves the ordinary dot's FP32 block order; only integer work is shared.
+static inline void q2_0_batch_impl(int n, float * s, const void * vx, const void * const * vy, int nr) {
+    const block_q2_0 * x = vx;
+    for (int r = 0; r < nr; ++r) s[r] = 0.0f;
+    int i = 0;
+    for (; i + 4 <= n / QK2_0; i += 4) {
+        __m128 sums[4];
+        for (int r = 0; r < nr; ++r) sums[r] = _mm_setzero_ps();
+        for (int k = 0; k < 2; ++k) {
+            const __m256i c0 = q2_0_unpack32(x[i+0].qs + k*8);
+            const __m256i c1 = q2_0_unpack32(x[i+1].qs + k*8);
+            const __m256i c2 = q2_0_unpack32(x[i+2].qs + k*8);
+            const __m256i c3 = q2_0_unpack32(x[i+3].qs + k*8);
+            for (int r = 0; r < nr; ++r) {
+                const block_q8_0 * y = vy[r];
+                const __m256i d0 = q2_0_dot32_codes(c0, y[2*(i+0)+k].qs);
+                const __m256i d1 = q2_0_dot32_codes(c1, y[2*(i+1)+k].qs);
+                const __m256i d2 = q2_0_dot32_codes(c2, y[2*(i+2)+k].qs);
+                const __m256i d3 = q2_0_dot32_codes(c3, y[2*(i+3)+k].qs);
+                const __m256i halves = _mm256_hadd_epi32(
+                        _mm256_hadd_epi32(d0, d1), _mm256_hadd_epi32(d2, d3));
+                const __m128i dots = _mm_add_epi32(_mm256_castsi256_si128(halves),
+                        _mm256_extracti128_si256(halves, 1));
+                const __m128 scales = _mm_setr_ps(
+                        GGML_CPU_FP16_TO_FP32(y[2*(i+0)+k].d),
+                        GGML_CPU_FP16_TO_FP32(y[2*(i+1)+k].d),
+                        GGML_CPU_FP16_TO_FP32(y[2*(i+2)+k].d),
+                        GGML_CPU_FP16_TO_FP32(y[2*(i+3)+k].d));
+                sums[r] = _mm_add_ps(sums[r], _mm_mul_ps(scales, _mm_cvtepi32_ps(dots)));
+            }
+        }
+        for (int r = 0; r < nr; ++r) {
+            float blocks[4];
+            _mm_storeu_ps(blocks, sums[r]);
+            for (int j = 0; j < 4; ++j) s[r] += GGML_CPU_FP16_TO_FP32(x[i+j].d) * blocks[j];
+        }
+    }
+    for (; i < n / QK2_0; ++i) {
+        float sums[4] = {0};
+        for (int k = 0; k < 2; ++k) {
+            const __m256i codes = q2_0_unpack32(x[i].qs + k*8);
+            for (int r = 0; r < nr; ++r) {
+                const block_q8_0 * y = vy[r];
+                const int dot = hsum_i32_8(q2_0_dot32_codes(codes, y[2*i+k].qs));
+                sums[r] += GGML_CPU_FP16_TO_FP32(y[2*i+k].d) * dot;
+            }
+        }
+        for (int r = 0; r < nr; ++r) s[r] += GGML_CPU_FP16_TO_FP32(x[i].d) * sums[r];
+    }
+}
+
+void ggml_vec_dot_q2_0_q8_0_batch(int n, float * s, const void * vx, const void * const * vy, int nr) {
+    assert(n % QK2_0 == 0 && nr >= 1 && nr <= 4);
+    // Literal counts let the compiler keep each row's accumulators in registers.
+    switch (nr) {
+        case 1: ggml_vec_dot_q2_0_q8_0(n, s, 0, vx, 0, vy[0], 0, 1); break;
+        case 2: q2_0_batch_impl(n, s, vx, vy, 2); break;
+        case 3: q2_0_batch_impl(n, s, vx, vy, 3); break;
+        case 4: q2_0_batch_impl(n, s, vx, vy, 4); break;
+    }
+}
+#endif
 
 void ggml_vec_dot_q4_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
     const int qk = QK8_0;

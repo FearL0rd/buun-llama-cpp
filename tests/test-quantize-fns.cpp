@@ -369,6 +369,55 @@ static void test_q2_0_packed_dot() {
     }
 }
 
+// Repeated expert routes exercise multi-row reuse, including incomplete groups.
+// Compare with ordinary dots on the same packed bytes, not a second graph that
+// could take the same optimized route and hide an indexing or rounding error.
+static void test_q2_0_repeated_experts() {
+    const auto * traits = ggml_get_type_traits_cpu(GGML_TYPE_Q2_0);
+    for (int n : {64, 320, 640, 2560}) {
+        for (int rows : {1, 2, 3, 4, 5, 8, 9}) for (int lanes : {1, 2}) {
+            ggml_context * ctx = ggml_init({4*1024*1024, nullptr, false});
+            assert(ctx);
+            ggml_tensor * weights = ggml_new_tensor_3d(ctx, GGML_TYPE_Q2_0, n, 7, 2);
+            ggml_tensor * acts = ggml_new_tensor_3d(ctx, GGML_TYPE_Q8_0, n, lanes, rows);
+            ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 2, rows);
+            auto * x = static_cast<uint8_t *>(weights->data);
+            auto * y = static_cast<uint8_t *>(acts->data);
+            for (size_t i = 0; i < ggml_nbytes(weights); i += 18) {
+                const ggml_fp16_t scale = ggml_fp32_to_fp16(float(int(i % 97) - 48)*0.00317f);
+                memcpy(x + i, &scale, 2);
+                for (int j = 2; j < 18; ++j) x[i + j] = uint8_t(i*17 + j*29);
+            }
+            for (size_t i = 0; i < ggml_nbytes(acts); i += 34) {
+                const ggml_fp16_t scale = ggml_fp32_to_fp16(float(int(i % 43) - 21)*0.00291f);
+                memcpy(y + i, &scale, 2);
+                for (int j = 2; j < 34; ++j) y[i + j] = uint8_t(i*13 + j*19);
+            }
+            auto * routes = static_cast<int32_t *>(ids->data);
+            for (int i = 0; i < 2*rows; ++i) routes[i] = (i + i/2) % 2;
+            ggml_tensor * out = ggml_mul_mat_id(ctx, weights, acts, ids);
+            ggml_cgraph * graph = ggml_new_graph(ctx);
+            ggml_build_forward_expand(graph, out);
+            for (int threads : {1, 3}) {
+                assert(ggml_graph_compute_with_ctx(ctx, graph, threads) == GGML_STATUS_SUCCESS);
+                for (int token = 0; token < rows; ++token) {
+                    for (int route = 0; route < 2; ++route) {
+                        for (int row = 0; row < 7; ++row) {
+                            float expected = NAN;
+                            traits->vec_dot(n, &expected, 0,
+                                x + routes[2*token + route]*weights->nb[2] + row*weights->nb[1], 0,
+                                y + (route % lanes)*acts->nb[1] + token*acts->nb[2], 0, 1);
+                            const float actual = static_cast<float *>(out->data)[(2*token + route)*7 + row];
+                            assert(std::isfinite(actual) && actual == expected);
+                        }
+                    }
+                }
+            }
+            ggml_free(ctx);
+        }
+    }
+}
+
 int main(int argc, char * argv[]) {
     bool verbose = false;
 
@@ -387,6 +436,7 @@ int main(int argc, char * argv[]) {
     ggml_cpu_init();
     test_bonsai_codecs();
     test_q2_0_packed_dot();
+    test_q2_0_repeated_experts();
 
     int num_failed = 0;
 
