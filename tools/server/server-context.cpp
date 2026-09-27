@@ -13270,6 +13270,7 @@ private:
                     common_cache_plan_provider::host_cache_entry);
             };
             llama_memory_i * memory = nullptr;
+            size_t occupied_live_reusable = 0;
             bool cleared_for_empty_handoff = false;
             const bool occupied_prefix_projection =
                 occupied_candidate && candidate.requires_prefix_projection();
@@ -13316,6 +13317,19 @@ private:
                 // useful durable host prefixes. This is the same destructive
                 // rebind the subsequent cold path would perform, moved before
                 // import so failure naturally falls through to cold prefill.
+                server_prompt_cache_reuse_context reuse;
+                reuse.live_pos_min = memory->seq_pos_min(slot.id);
+                reuse.n_swa = n_swa;
+                reuse.frontier_required = slot.frontier_ratchet_flipped;
+                reuse.execution_identity = frontier_execution_identity;
+                reuse.vbr_state = llama_memory_vbr_state(memory, slot.id, 0);
+                const size_t lcp = slot.prompt.tokens.get_common_prefix(task.tokens);
+                reuse.exact_frontier_logits = can_reuse_live_frontier_logits(slot, task, lcp);
+                occupied_live_reusable = server_prompt_cache_reusable_prefix(
+                    slot.prompt, task.tokens, lcp, reuse.live_pos_min, reuse, adapter_identity);
+                if (candidate.prefix_tokens() <= occupied_live_reusable) {
+                    return false;
+                }
                 server_vbr_empty_handoff_gate handoff_gate;
                 handoff_gate.slot_count = slots.size();
                 handoff_gate.incoming_prefix = candidate.prefix_tokens();
@@ -13333,8 +13347,9 @@ private:
                 server_prompt_cache_vbr_restore_candidate durable_incumbent;
                 bool durable_incumbent_prepared = false;
                 if (server_vbr_empty_handoff_lookup_allowed(handoff_gate)) {
-                    handoff_gate.incumbent_lcp =
-                        slot.prompt.tokens.get_common_prefix(task.tokens);
+                    // Token overlap is not a reusable frontier when a hybrid
+                    // tree has no matching recurrent checkpoint for a rewind.
+                    handoff_gate.incumbent_lcp = occupied_live_reusable;
                     if (candidate.prefix_tokens() >
                             handoff_gate.incumbent_lcp) {
                         // The incumbent witness must itself be a sealed host
@@ -13376,19 +13391,6 @@ private:
                 }
             }
             if (occupied_candidate && !cleared_for_empty_handoff) {
-                server_prompt_cache_reuse_context reuse;
-                reuse.live_pos_min = memory->seq_pos_min(slot.id);
-                reuse.n_swa = n_swa;
-                reuse.frontier_required = slot.frontier_ratchet_flipped;
-                reuse.execution_identity = frontier_execution_identity;
-                reuse.vbr_state = llama_memory_vbr_state(memory, slot.id, 0);
-                const size_t lcp = slot.prompt.tokens.get_common_prefix(task.tokens);
-                reuse.exact_frontier_logits = can_reuse_live_frontier_logits(slot, task, lcp);
-                const size_t reusable = server_prompt_cache_reusable_prefix(
-                    slot.prompt, task.tokens, lcp, reuse.live_pos_min, reuse, adapter_identity);
-                if (candidate.prefix_tokens() <= reusable) {
-                    return false;
-                }
                 if (!ensure_vbr_replacement_recovery(slot)) {
                     vbr_automatic_restore_occupied_fallbacks++;
                     return false;
@@ -13400,7 +13402,7 @@ private:
                         std::move(candidate), slot.prompt, slot.cache_family,
                         incoming_family, slot.id,
                         frontier_execution_identity, adapter_identity,
-                        ticket, &replacement_diagnostics, reusable)) {
+                        ticket, &replacement_diagnostics, occupied_live_reusable)) {
                     vbr_automatic_restore_occupied_fallbacks++;
                     SLT_DBG(
                         slot,
@@ -13505,20 +13507,27 @@ private:
                         int(imported.precision.known), imported.precision.worst_steps,
                         imported.precision.deficit, imported.precision.weight);
                     using guard_status = vbr_occupied_replacement_guard_status;
-                    // A tree the guard cannot replace atomically (iSWA), or a
-                    // cache without room for both conversations, takes the
-                    // empty handoff instead, which it proves durable.
+                    // Unsupported trees/layouts (including a clean sink stash),
+                    // or insufficient room for both conversations, can use the
+                    // independently proven durable empty handoff. A fresh
+                    // recovery capture may itself reveal an unsupported layout.
                     const bool no_route =
-                        imported.occupied_guard_status == guard_status::unsupported_tree;
+                        imported.occupied_guard_status == guard_status::unsupported_tree ||
+                        imported.occupied_guard_status == guard_status::unsupported_layout;
                     const bool no_room =
                         imported.occupied_guard_status == guard_status::capacity_unavailable;
-                    if (!recovery_refreshed && !quarantined && (no_route || no_room) &&
+                    if (!quarantined && (no_route || no_room) &&
                         !vbr_occupied_route_unsupported && !vbr_occupied_route_full) {
                         vbr_occupied_route_unsupported = no_route;
                         vbr_occupied_route_full        = no_room;
                         ticket = {};
                         const bool restored = try_automatic_vbr_restore(
                             slot, task, incoming_family, restored_prefix, true);
+                        // Layout refusal is specific to this live image, not
+                        // a permanent property of the model's memory tree.
+                        if (imported.occupied_guard_status == guard_status::unsupported_layout) {
+                            vbr_occupied_route_unsupported = false;
+                        }
                         vbr_occupied_route_full = false;
                         return restored;
                     }

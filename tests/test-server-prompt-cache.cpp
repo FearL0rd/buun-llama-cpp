@@ -2073,6 +2073,15 @@ void test_lifecycle_defaults_and_reuse_thresholds() {
     unsupported_route.exact_incumbent_durable = true;
     unsupported_route.occupied_route_refused = true;
     CHECK(server_vbr_empty_handoff_allowed(unsupported_route));
+    // A recurrent rewind can have thousands of equal tokens but no usable
+    // live frontier. The gate consumes the reusable count, not raw overlap.
+    auto rewind_handoff = unsupported_route;
+    rewind_handoff.incumbent_lcp = 0;
+    rewind_handoff.incoming_prefix = 7996;
+    rewind_handoff.durable_incumbent_prefix = 8256;
+    CHECK(server_vbr_empty_handoff_allowed(rewind_handoff));
+    rewind_handoff.incumbent_lcp = 8000;
+    CHECK(!server_vbr_empty_handoff_allowed(rewind_handoff));
     rejects_handoff(
         [](auto & gate) { gate.durable_incumbent_prefix = 0; });
     rejects_handoff([](auto & gate) {
