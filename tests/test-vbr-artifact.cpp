@@ -8157,6 +8157,131 @@ static void test_prompt_cache_vbr_pressure(
     CHECK(fixture.catalog->snapshot().references == 0);
 }
 
+static void test_prompt_cache_vbr_pressure_lossless_pair() {
+    enum class scenario { retained_provider, pinned, mutual_only, unscored, decayed_singleton };
+    for (const auto mode : { scenario::retained_provider, scenario::pinned,
+                            scenario::mutual_only, scenario::unscored, scenario::decayed_singleton }) {
+        catalog_fixture fixture;
+        CHECK(server_tokens(llama_tokens { 101, 102 }, false).media_content_identity(
+            2, fixture.package.manifest.identity.media_content_identity));
+        server_cache_authority authority;
+        server_retention_sidecar_store retention;
+        retention.configure(&fixture.ledger, fixture.host, &authority.leases);
+        CHECK(retention.enable_prefix_tracking());
+        const auto & identity = fixture.package.manifest.identity;
+        server_prompt_cache cache(0, 0);
+        cache.acct = &fixture.ledger;
+        cache.publish_authority = &authority;
+        cache.destruction_obs = &authority.destruction;
+        cache.retention_obs = &retention;
+        cache.lease_obs = &authority.leases;
+        cache.lease_execution_identity = &identity.execution_identity;
+        cache.retention_capacity_authority = true;
+        CHECK(cache.enable_retention_shadow());
+
+        const auto make_prompt = [&](int slot, llama_token first) {
+            server_prompt prompt;
+            prompt.tokens = server_tokens(llama_tokens { first, first + 1 }, false);
+            prompt.sequence_epoch = 3;
+            common_chat_msg_spans spans;
+            spans.add(COMMON_CHAT_ROLE_USER, 0, 2);
+            const auto key = server_retention_instance_key::for_slot(slot);
+            CHECK(retention.publish(key, common_retention_pool::attention,
+                spans, mode != scenario::unscored, 2, 2, true));
+            CHECK(server_prompt_retention_publish_exact_prefix(retention, key,
+                prompt, identity.adapter_config_identity, 2));
+            return prompt;
+        };
+        const auto make_payload = [&](llama_token first, uint8_t salt) {
+            fixture_storage storage;
+            storage.payload0.bytes[0] ^= salt;
+            storage.payload1.bytes[0] ^= salt;
+            storage.stash0.bytes[0] ^= salt;
+            storage.stash1.bytes[0] ^= salt;
+            auto package = make_package(storage);
+            package.manifest.identity = identity;
+            package.manifest.token_block.tokens = { first, first + 1 };
+            const auto published = publish_fixture(*fixture.catalog, package, {
+                { 0, 1, true, true, storage.stash1.bytes },
+                { 0, 0, false, true, storage.payload0.bytes },
+                { 0, 0, true, true, storage.stash0.bytes },
+                { 0, 1, false, true, storage.payload1.bytes },
+            }, fixture.budget);
+            CHECK(published.status == llama_vbr_artifact_publish_status::published ||
+                  published.status == llama_vbr_artifact_publish_status::adopted);
+            vbr_artifact_package_view view;
+            CHECK(fixture.catalog->resolve_reference(published.reference_artifact, view) ==
+                vbr_artifact_resolve_status::ok);
+            return server_prompt_cache_payload::from_vbr(
+                server_prompt_cache_vbr_payload::adopt_owned(std::move(view)));
+        };
+        auto redundant = make_prompt(9, 101);
+        auto useful = make_prompt(10, 201);
+        auto incoming_prompt = make_prompt(11, 301);
+        const auto publish = [&](const server_prompt & prompt, int slot, llama_token first, uint8_t salt) {
+            auto staged = cache.stage_vbr(prompt, make_payload(first, salt),
+                identity.execution_identity, identity.adapter_config_identity);
+            server_prompt_cache::iterator state;
+            CHECK(cache.publish(std::move(staged), &prompt, slot, &state));
+            return state;
+        };
+        auto large = publish(useful, 10, 201, 2);
+        auto small_a = publish(redundant, 9, 101, 1);
+        auto small_b = publish(redundant, 9, 101, 1);
+        auto external = make_payload(101, 1);
+        retention.retire(server_retention_instance_key::for_slot(10));
+        if (mode == scenario::pinned) { small_a->recovery_pins++; }
+        if (mode == scenario::mutual_only) { retention.retire(server_retention_instance_key::for_slot(9)); }
+        const auto key_a = server_retention_instance_key::for_host_entry(&*small_a);
+        const auto key_b = server_retention_instance_key::for_host_entry(&*small_b);
+        const auto key_large = server_retention_instance_key::for_host_entry(&*large);
+        const auto released = [&](const server_prompt_cache_payload & payload) {
+            llama_cache_acct_release_set_preview preview;
+            CHECK(payload.preview_vbr_retire(fixture.ledger.serial(), preview));
+            uint64_t bytes = 0;
+            for (const auto & row : preview.rows) { bytes += row.resident_allocated; }
+            return bytes;
+        };
+        const uint64_t deficit = mode == scenario::decayed_singleton ? 1 :
+            std::max(released(small_a->payload), released(small_b->payload)) + 1;
+        CHECK(released(large->payload) >= deficit);
+        if (mode == scenario::decayed_singleton) {
+            CHECK(released(small_a->payload) >= deficit);
+            for (unsigned epoch = 0; epoch < 512; ++epoch) {
+                CHECK(retention.begin_competition_wave());
+            }
+        }
+        auto incoming = make_payload(301, 3);
+        server_prompt_cache_vbr_budget_summary budget;
+        CHECK(server_prompt_cache_payload::summarize_vbr_budgets(
+            { &small_a->payload, &small_b->payload, &large->payload, &incoming }, budget));
+        cache.limit_size = size_t(budget.compact_resident_bytes - deficit);
+        server_prompt_cache_vbr_publication_metadata metadata;
+        CHECK(cache.prepare_vbr_publication_metadata(incoming_prompt,
+            identity.execution_identity, identity.adapter_config_identity, 11, metadata));
+        server_prompt_cache_vbr_publication_metadata * batch[] = { &metadata };
+        server_prompt_cache_vbr_capacity_claim capacity;
+        CHECK(cache.prepare_vbr_publication_capacity(batch, 1, incoming.size(), capacity));
+        CHECK(cache.states.size() == 3);
+        const auto epoch = retention.competition_epoch_value();
+        CHECK(cache.publish_vbr(metadata, std::move(incoming), {}, false, nullptr, &capacity));
+        CHECK(retention.competition_epoch_value() == epoch);
+        // Only a jointly redundant, unpinned pair may displace the useful singleton.
+        CHECK((retention.artifact_id(key_large).v != 0) == (mode == scenario::retained_provider));
+        CHECK((retention.artifact_id(key_a).v != 0) == (mode != scenario::retained_provider));
+        CHECK((retention.artifact_id(key_b).v != 0) == (mode != scenario::retained_provider));
+        if (mode != scenario::unscored) {
+            CHECK(authority.destruction.host_trade_legacy_fallbacks == 0);
+        }
+        if (mode == scenario::pinned) { small_a->recovery_pins--; }
+        external = {};
+        cache.limit_size = 1;
+        cache.update();
+        CHECK(cache.states.empty());
+        CHECK(fixture.catalog->snapshot().references == 0);
+    }
+}
+
 static void test_prompt_cache_vbr_pressure_retires_physical_union() {
     catalog_fixture fixture;
 
@@ -10509,6 +10634,7 @@ int main(int argc, char ** argv) {
         test_prompt_cache_vbr_pressure(true, pressure_scenario::stale_quote);
         test_prompt_cache_vbr_pressure(false);
         test_prompt_cache_vbr_pressure(true);
+        test_prompt_cache_vbr_pressure_lossless_pair();
         test_prompt_cache_vbr_pressure_retires_physical_union();
         return failures == 0 ? 0 : 1;
     }
@@ -10590,6 +10716,7 @@ int main(int argc, char ** argv) {
     test_prompt_cache_vbr_pressure(false);
     test_prompt_cache_vbr_exchange();
     test_prompt_cache_vbr_pressure(true);
+    test_prompt_cache_vbr_pressure_lossless_pair();
     test_prompt_cache_vbr_pressure_retires_physical_union();
 #endif
     if (failures != 0) {
