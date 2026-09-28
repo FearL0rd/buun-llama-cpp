@@ -2296,25 +2296,29 @@ static int moe_cache_prefill_copy(void * opaque, void * backend_opaque,
     if (!opaque) return false;
     auto backend = (ggml_backend_t) backend_opaque;
     if (!backend || !ggml_backend_is_cuda(backend) ||
-            source->type != GGML_TYPE_Q2_0 || destination->type != source->type ||
+            !moe_cache_type_supported(source->type) || destination->type != source->type ||
+            !source->buffer || !ggml_backend_buffer_is_host(source->buffer) ||
             !ggml_is_contiguous(source) || !ggml_is_contiguous(destination) ||
             !ggml_are_same_shape(source, destination) || source->ne[3] != 1 ||
             source->ne[2] > 512 || source->ne[2] < 1 || !selected ||
             n_words < size_t((source->ne[2] + 31) / 32)) return false;
     auto * ctx = (ggml_backend_cuda_context *) backend->context;
-    // Performance-qualified on SM120 and canonical Q2_0 cache bytes only.
-    // In particular, do not copy opaque/repacked expert formats this way.
-    if (ggml_cuda_info().devices[ctx->device].cc != GGML_CUDA_CC_BLACKWELL) return false;
+    // Pools contain unmodified host bytes. The scheduler's compute destination
+    // also uses canonical bytes, unlike immutable backend-repacked weights.
     const auto buffer = destination->view_src ? destination->view_src->buffer : destination->buffer;
-    if (!buffer || buffer->buft != ggml_backend_cuda_buffer_type(ctx->device)) return false;
+    if (!buffer || buffer->buft != ggml_backend_cuda_buffer_type(ctx->device) ||
+            ggml_backend_buffer_get_usage(buffer) != GGML_BACKEND_BUFFER_USAGE_COMPUTE) return false;
     const size_t expert_size = source->nb[2];
     if (!expert_size || expert_size % sizeof(uint4) || uintptr_t(destination->data) % alignof(uint4)) return false;
 
     auto & session = *(moe_cache_session *) opaque;
     std::unique_lock<std::mutex> lock(session.mu);
-    if (session.stopping || session.dormant || session.active_scopes == 0 || session.devices.size() != 1) return false;
-    auto & device = *session.devices[0];
-    if (device.dead || device.logical != ctx->device) return false;
+    if (session.stopping || session.dormant || session.active_scopes == 0) return false;
+    const auto local = std::find_if(session.devices.begin(), session.devices.end(), [&](const auto & device) {
+        return device->logical == ctx->device;
+    });
+    if (local == session.devices.end() || (*local)->dead) return false;
+    auto & device = **local;
     const int pool_index = moe_cache_find_pool(device, expert_size, source->type);
     if (pool_index < 0) return false;
     const auto & pool = *device.pools[pool_index];
