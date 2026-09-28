@@ -4366,6 +4366,7 @@ static bool run_stream_staging_case(ggml_backend_dev_t dev,
             // would itself seed the profile and hide a missing fused-path seed.
             auto copy_buffer = ggml_backend_alloc_buffer(gpu, ggml_nbytes(up));
             GGML_ASSERT(copy_buffer);
+            ggml_backend_buffer_set_usage(copy_buffer, GGML_BACKEND_BUFFER_USAGE_COMPUTE);
             const uint32_t selected[2] = { 0, UINT32_C(1) << 31 };
             for (auto w : { up, gate, down }) {
                 ggml_tensor dst = *w;
@@ -4440,28 +4441,20 @@ static bool run_stream_staging(ggml_backend_dev_t device,
     return ok;
 }
 
-static bool run_prefill_copy(ggml_backend_dev_t dev, ggml_backend_t gpu, ggml_backend_t cpu) {
-    configure_cache(nullptr);
-    ggml_moe_cache_config config = {};
-    ggml_moe_cache_device_caps caps = {};
-    if (!ggml_moe_cache.query_config(0, 4, &config) || !ggml_moe_cache.query_device(dev, &config, &caps)) return false;
-    if (caps.compute_capability != 1200) {
-        printf("cache-prefill-copy: SKIP (requires consumer SM120)\n");
-        return true;
-    }
-    if (!ggml_moe_cache.prefill_copy) return false;
+static bool run_prefill_copy_type(ggml_backend_dev_t dev, ggml_backend_t gpu, ggml_backend_t cpu, ggml_type type) {
     bool all_ok = true;
     for (bool pinned : {false, true}) {
         bool ok = true;
         const auto check = [&](bool passed, const char * label) {
-            if (!passed) fprintf(stderr, "cache-prefill-copy: pinned=%d %s FAIL\n", int(pinned), label);
+            if (!passed) fprintf(stderr, "cache-prefill-copy: type=%s pinned=%d %s FAIL\n",
+                ggml_type_name(type), int(pinned), label);
             ok &= passed;
         };
         auto host_ctx = ggml_init({2 * ggml_tensor_overhead(), nullptr, true});
         auto gpu_ctx = ggml_init({2 * ggml_tensor_overhead(), nullptr, true});
         // The provider requires at least 64 resident slots. Exercise all masks
         // of the first eight experts; the rest also verify untouched storage.
-        auto source = ggml_new_tensor_3d(host_ctx, GGML_TYPE_Q2_0, 256, 128, 64);
+        auto source = ggml_new_tensor_3d(host_ctx, type, 256, 128, 64);
         auto destination = ggml_dup_tensor(gpu_ctx, source);
         ggml_set_name(source, "blk.0.ffn_up_exps.weight");
         auto host_buft = pinned ? ggml_backend_dev_host_buffer_type(dev) : ggml_backend_cpu_buffer_type();
@@ -4469,6 +4462,7 @@ static bool run_prefill_copy(ggml_backend_dev_t dev, ggml_backend_t gpu, ggml_ba
         auto gpu_buffer = ggml_backend_alloc_ctx_tensors(gpu_ctx, gpu);
         GGML_ASSERT(host_buffer && gpu_buffer);
         ggml_backend_buffer_set_usage(host_buffer, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+        ggml_backend_buffer_set_usage(gpu_buffer, GGML_BACKEND_BUFFER_USAGE_COMPUTE);
         const size_t bytes = ggml_nbytes(source), expert = source->nb[2];
         std::vector<uint8_t> input(bytes), expected(bytes), actual(bytes), sentinel(bytes, 0xa5);
         // Copy-only test: cover every byte value, without interpreting weights.
@@ -4482,7 +4476,10 @@ static bool run_prefill_copy(ggml_backend_dev_t dev, ggml_backend_t gpu, ggml_ba
         for (int e : {2, 0, 3, 1}) ready &= wait_for_direct_resident(source, e);
         check(ready, "resident warmup");
         for (uint32_t mask = 0; ready && mask < 256; ++mask) {
-            ggml_backend_tensor_set(destination, sentinel.data(), 0, bytes);
+            // Use the scheduler's stream. Small buffer_set_tensor uploads may
+            // use a separate staging stream that only graph execution waits on.
+            ggml_backend_tensor_set_async(gpu, destination, sentinel.data(), 0, bytes);
+            ggml_backend_synchronize(gpu);
             const uint32_t selected[2] = {mask, 0};
             const bool copied = ggml_moe_cache.prefill_copy(session, gpu, source, destination, selected, 2);
             const bool wanted = (mask & 15) != 0;
@@ -4497,14 +4494,20 @@ static bool run_prefill_copy(ggml_backend_dev_t dev, ggml_backend_t gpu, ggml_ba
             }
             ggml_backend_tensor_get(destination, actual.data(), 0, bytes);
             if (copied != wanted || actual != expected) {
-                fprintf(stderr, "cache-prefill-copy: pinned=%d mask=%u copied=%d expected=%d FAIL\n",
-                    int(pinned), mask, int(copied), int(wanted));
+                fprintf(stderr, "cache-prefill-copy: type=%s pinned=%d mask=%u copied=%d expected=%d FAIL\n",
+                    ggml_type_name(type), int(pinned), mask, int(copied), int(wanted));
+                const auto mismatch = std::mismatch(actual.begin(), actual.end(), expected.begin());
+                if (mismatch.first != actual.end()) {
+                    fprintf(stderr, "cache-prefill-copy: first mismatch byte=%zu actual=%u expected=%u\n",
+                        size_t(mismatch.first - actual.begin()), unsigned(*mismatch.first), unsigned(*mismatch.second));
+                }
                 ok = false;
                 break;
             }
         }
         const uint32_t mask[2] = {15, 0};
-        ggml_backend_tensor_set(destination, sentinel.data(), 0, bytes);
+        ggml_backend_tensor_set_async(gpu, destination, sentinel.data(), 0, bytes);
+        ggml_backend_synchronize(gpu);
         check(!ggml_moe_cache.prefill_copy(nullptr, gpu, source, destination, mask, 2), "null session");
         check(!ggml_moe_cache.prefill_copy(session, gpu, source, destination, mask, 1), "short bitset");
         check(!ggml_moe_cache.prefill_copy(session, cpu, source, destination, mask, 2), "CPU backend");
@@ -4512,8 +4515,11 @@ static bool run_prefill_copy(ggml_backend_dev_t dev, ggml_backend_t gpu, ggml_ba
         unaligned.data = (char *) destination->data + 1;
         check(!ggml_moe_cache.prefill_copy(session, gpu, source, &unaligned, mask, 2), "unaligned destination");
         auto unsupported = *source;
-        unsupported.type = GGML_TYPE_Q4_0;
+        unsupported.type = GGML_TYPE_F32;
         check(!ggml_moe_cache.prefill_copy(session, gpu, &unsupported, destination, mask, 2), "unsupported type");
+        ggml_backend_buffer_set_usage(gpu_buffer, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+        check(!ggml_moe_cache.prefill_copy(session, gpu, source, destination, mask, 2), "non-compute destination");
+        ggml_backend_buffer_set_usage(gpu_buffer, GGML_BACKEND_BUFFER_USAGE_COMPUTE);
         ggml_moe_cache.session_leave(session);
         check(!ggml_moe_cache.prefill_copy(session, gpu, source, destination, mask, 2), "outside scope");
         ggml_moe_cache.session_enter(session);
@@ -4528,11 +4534,106 @@ static bool run_prefill_copy(ggml_backend_dev_t dev, ggml_backend_t gpu, ggml_ba
         ggml_backend_buffer_free(host_buffer);
         ggml_free(gpu_ctx);
         ggml_free(host_ctx);
-        printf("cache-prefill-copy: pinned=%d masks=256 exact-padding untouched-refusals invalidation %s\n",
-            int(pinned), ok ? "OK" : "FAIL");
+        printf("cache-prefill-copy: type=%s pinned=%d masks=256 exact-padding untouched-refusals invalidation %s\n",
+            ggml_type_name(type), int(pinned), ok ? "OK" : "FAIL");
         all_ok &= ok;
     }
     return all_ok;
+}
+
+static bool run_prefill_copy(ggml_backend_dev_t dev, ggml_backend_t gpu, ggml_backend_t cpu) {
+    configure_cache(nullptr);
+    if (!ggml_moe_cache.prefill_copy) return false;
+    bool all_ok = true;
+    // Ask the provider for its supported canonical weight formats rather than
+    // maintaining a second list. This includes every EXL3 codebook/bit width.
+    int tested_types = 0;
+    for (int value = 0; value < GGML_TYPE_COUNT; ++value) {
+        const auto type = ggml_type(value);
+        if (!ggml_blck_size(type) || 256 % ggml_blck_size(type)) continue;
+        ggml_moe_cache_shape_caps shape = {};
+        if (!ggml_moe_cache.query_shape(type, 256, 128, 64,
+                ggml_row_size(type, 256) * 128, &shape)) continue;
+        ++tested_types;
+        all_ok &= run_prefill_copy_type(dev, gpu, cpu, type);
+    }
+    printf("cache-prefill-copy: formats=%d %s\n", tested_types, all_ok && tested_types > 0 ? "OK" : "FAIL");
+    all_ok &= tested_types > 0;
+    return all_ok;
+}
+
+static bool run_prefill_copy_multi(ggml_backend_dev_t dev, ggml_backend_t gpu, ggml_backend_t cpu) {
+    auto other_dev = find_other_cuda_device(dev);
+    if (!other_dev) {
+        printf("cache-prefill-copy-multi: SKIP (requires two GPUs)\n");
+        return true;
+    }
+    auto other = ggml_backend_dev_init(other_dev, nullptr);
+    GGML_ASSERT(other);
+    configure_cache(nullptr);
+    set_env("GGML_CUDA_MOE_CACHE_NDEV", "2");
+    set_env("GGML_CUDA_MOE_CACHE_EXPERT_PARALLEL", "0");
+    ggml_backend_t devices[] = {gpu, other};
+    void * backends[] = {gpu, other, cpu};
+    auto session = ggml_moe_cache.session_create(backends, 3, nullptr);
+    GGML_ASSERT(session);
+    auto hc = ggml_init({2 * ggml_tensor_overhead(), nullptr, true});
+    ggml_tensor * source[2];
+    for (int i = 0; i < 2; ++i) {
+        source[i] = ggml_new_tensor_3d(hc, GGML_TYPE_MXFP4, 256, 128, 64);
+        ggml_format_name(source[i], "blk.%d.ffn_up_exps.weight", i);
+    }
+    auto hb = ggml_backend_alloc_ctx_tensors(hc, cpu);
+    GGML_ASSERT(hb);
+    ggml_backend_buffer_set_usage(hb, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+    const size_t bytes = ggml_nbytes(source[0]), expert = source[0]->nb[2];
+    std::vector<uint8_t> input[2], actual(bytes), expected(bytes), sentinel(bytes, 0xa5);
+    ggml_context * dc[2];
+    ggml_tensor * destination[2];
+    ggml_backend_buffer_t db[2];
+    for (int i = 0; i < 2; ++i) {
+        input[i].resize(bytes);
+        for (size_t j = 0; j < bytes; ++j) input[i][j] = uint8_t(j * 37 + i * 83);
+        ggml_backend_tensor_set(source[i], input[i].data(), 0, bytes);
+        dc[i] = ggml_init({ggml_tensor_overhead(), nullptr, true});
+        destination[i] = ggml_dup_tensor(dc[i], source[i]);
+        db[i] = ggml_backend_alloc_ctx_tensors(dc[i], devices[i]);
+        GGML_ASSERT(db[i]);
+        ggml_backend_buffer_set_usage(db[i], GGML_BACKEND_BUFFER_USAGE_COMPUTE);
+    }
+    ggml_moe_cache.session_enter(session);
+    bool ok = wait_for_direct_resident(source[0], 63) && wait_for_direct_resident(source[1], 63);
+    const uint32_t selected[] = {0, UINT32_C(1) << 31};
+    int owners[] = {-1, -1};
+    for (int s = 0; s < 2; ++s) for (int d = 0; d < 2; ++d) {
+        ggml_backend_tensor_set_async(devices[d], destination[d], sentinel.data(), 0, bytes);
+        ggml_backend_synchronize(devices[d]);
+        const bool copied = ggml_moe_cache.prefill_copy(session, devices[d], source[s], destination[d], selected, 2);
+        expected = sentinel;
+        if (copied) {
+            ok &= owners[s] == -1;
+            owners[s] = d;
+            std::memcpy(expected.data() + 63 * expert, input[s].data() + 63 * expert, expert);
+        }
+        ggml_backend_tensor_get(destination[d], actual.data(), 0, bytes);
+        ok &= actual == expected;
+        // A backend must never write another device's destination buffer.
+        ok &= !ggml_moe_cache.prefill_copy(session, devices[1-d], source[s], destination[d], selected, 2);
+    }
+    ok &= owners[0] >= 0 && owners[1] >= 0 && owners[0] != owners[1];
+    ggml_moe_cache.session_leave(session);
+    ggml_moe_cache.session_destroy(session);
+    for (int i = 0; i < 2; ++i) {
+        ggml_backend_buffer_free(db[i]);
+        ggml_free(dc[i]);
+    }
+    ggml_backend_buffer_free(hb);
+    ggml_free(hc);
+    ggml_backend_free(other);
+    configure_cache(nullptr);
+    printf("cache-prefill-copy-multi: local-owners=%d,%d exact-last-expert no-peer-fallback %s\n",
+        owners[0], owners[1], ok ? "OK" : "FAIL");
+    return ok;
 }
 
 int main(int argc, char ** argv) {
@@ -5062,6 +5163,7 @@ int main(int argc, char ** argv) {
     ok &= run_admission_policy(cuda, cpu, capture);
     ok &= run_stream_staging(cuda_device, cuda, cpu, capture);
     ok &= run_prefill_copy(cuda_device, cuda, cpu);
+    ok &= run_prefill_copy_multi(cuda_device, cuda, cpu);
 
     if (flat_hits_expected) {
         uint64_t factor_1 = 0;
