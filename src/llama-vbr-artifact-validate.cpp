@@ -2143,7 +2143,8 @@ vbr_manifest_validation_result vbr_validate_unit_manifest_snapshot(
             if (shard_count == 0 ||
                 recovery_runs.size() >
                     VBR_OCCUPIED_REPLACEMENT_MAX_RUNS-guard_runs.size() ||
-                guard_runs.size()+recovery_runs.size() > 4096/shard_count) {
+                vbr_occupied_relocation_read_count(guard_runs) +
+                    vbr_occupied_relocation_read_count(recovery_runs) > 4096/shard_count) {
                 return terminal_result(
                     vbr_manifest_validation_status::geometry_mismatch);
             }
@@ -2799,7 +2800,8 @@ vbr_manifest_validation_result vbr_validate_attention_prefix_projection(
             if (shard_count == 0 || incoming_runs.empty() ||
                 recovery_runs.size() >
                     VBR_OCCUPIED_REPLACEMENT_MAX_RUNS-incoming_runs.size() ||
-                incoming_runs.size()+recovery_runs.size() >
+                vbr_occupied_relocation_read_count(incoming_runs) +
+                    vbr_occupied_relocation_read_count(recovery_runs) >
                     4096/shard_count) {
                 return terminal_result(
                     vbr_manifest_validation_status::geometry_mismatch);

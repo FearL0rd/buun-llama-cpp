@@ -1708,10 +1708,13 @@ bool prepared_identity_equal(
     return true;
 }
 
-bool prepare_companion(
+enum class companion_hash_kind { section, payload };
+
+bool prepare_companion_hash(
         uint32_t index,
         const std::vector<vbr_artifact_portable_topology> & topologies,
-        vbr_artifact_companion_payload & companion) {
+        vbr_artifact_companion_payload & companion,
+        companion_hash_kind kind) {
     if (companion.kind >= vbr_artifact_companion_kind::_count ||
         companion.format_version == 0 ||
         !digest_nonzero(companion.build_identity_digest) ||
@@ -1721,10 +1724,10 @@ bool prepare_companion(
         companion.payload.size != companion.payload_bytes) {
         return false;
     }
-    if (!digest_matches_source(
+    if (kind == companion_hash_kind::section) {
+        return digest_matches_source(
             DOMAIN_COMPANION, index, 0, companion.payload,
-            companion.section_checksum)) {
-        return false;
+            companion.section_checksum);
     }
     llama_sha256_writer hash;
     hash.string(DOMAIN_COMPANION, sizeof(DOMAIN_COMPANION) - 1);
@@ -1743,6 +1746,14 @@ bool prepare_companion(
     }
     companion.payload_digest = typed_digest<vbr_payload_digest>(hash);
     return companion.payload_digest.valid();
+}
+
+bool prepare_companion(
+        uint32_t index,
+        const std::vector<vbr_artifact_portable_topology> & topologies,
+        vbr_artifact_companion_payload & companion) {
+    return prepare_companion_hash(index, topologies, companion, companion_hash_kind::section) &&
+           prepare_companion_hash(index, topologies, companion, companion_hash_kind::payload);
 }
 
 bool emit_topology(emitter & out, const vbr_artifact_portable_topology & topology) {
@@ -3387,9 +3398,23 @@ vbr_artifact_status vbr_artifact_prepare(
         } else {
             // Independent units keep canonical ordering and every byte hash;
             // no partial metadata is published.
-            std::vector<vbr_artifact_status> statuses(count);
-            for_each_index_parallel(count, workers, [&](size_t i) {
-                statuses[i] = prepare_one(i);
+            // A recurrent companion can be much larger than any attention
+            // unit. Its independent section and payload digests write distinct
+            // fields, so let the existing worker budget process them separately.
+            // Serial readers retain the original two-pass order above.
+            const size_t jobs = count + package.companions.size();
+            std::vector<vbr_artifact_status> statuses(jobs);
+            for_each_index_parallel(jobs, workers, [&](size_t i) {
+                if (i < package.unit_blobs.size()) {
+                    statuses[i] = prepare_unit(uint32_t(i));
+                    return;
+                }
+                const size_t offset = i - package.unit_blobs.size();
+                statuses[i] = prepare_companion_hash(
+                    uint32_t(offset / 2), package.topologies,
+                    package.companions[offset / 2],
+                    offset % 2 == 0 ? companion_hash_kind::section : companion_hash_kind::payload)
+                    ? vbr_artifact_status::ok : vbr_artifact_status::content_id_mismatch;
             });
             for (const auto status : statuses) {
                 if (status != vbr_artifact_status::ok) {

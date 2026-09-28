@@ -13514,7 +13514,7 @@ private:
                         imported.occupied_guard_status == guard_status::unsupported_tree ||
                         imported.occupied_guard_status == guard_status::unsupported_layout;
                     const bool no_room =
-                        imported.occupied_guard_status == guard_status::capacity_unavailable;
+                        server_vbr_artifact_import_capacity_refused(imported);
                     if (!quarantined && (no_route || no_room) &&
                         !vbr_occupied_route_unsupported && !vbr_occupied_route_full) {
                         vbr_occupied_route_unsupported = no_route;
@@ -15245,6 +15245,13 @@ private:
             (transfer_retry || capacity_retry);
     }
 
+    static bool vbr_projected_capture_allowed(
+            bool readiness_only, int32_t preserve_slot, size_t slot_count) noexcept {
+        // Projected publication requires an idle source. Prompt-boundary and
+        // background readiness capture retain the exact worker's lifecycle.
+        return !readiness_only && (preserve_slot < 0 || slot_count > 1);
+    }
+
     static bool vbr_idle_retry_exact(
             vbr_explicit_capture_phase phase,
             vbr_capture_stream_status stream_status,
@@ -16264,16 +16271,23 @@ private:
             if (!session) {
                 break;
             }
-            (void) publish_idle_vbr_batch(session, false, source->id, attention_reuse);
-            if (!vbr_idle_exact_capture) {
-                break;
+            const auto previous_exact_retry = source->vbr_idle_exact_retry_identity;
+            size_t completed = publish_idle_vbr_batch(session, false, source->id, attention_reuse);
+            if (!vbr_idle_exact_capture &&
+                source->vbr_idle_exact_retry_identity != previous_exact_retry) {
+                // Retry the rejected projection in this wave. A checkpoint
+                // stem still needs the second wave for full-source recovery;
+                // idle maintenance would run after source replacement.
+                completed += publish_idle_vbr_batch(session, false, source->id, attention_reuse);
             }
-            // No decode or queue yielding while the worker reads live KV.
-            if (vbr_idle_exact_capture->worker.joinable()) {
-                vbr_idle_exact_capture->worker.join();
+            if (vbr_idle_exact_capture) {
+                // No decode or queue yielding while the worker reads live KV.
+                if (vbr_idle_exact_capture->worker.joinable()) {
+                    vbr_idle_exact_capture->worker.join();
+                }
+                completed += finish_idle_exact_vbr_capture(
+                    true, false, wave == 0 ? &attention_reuse : nullptr);
             }
-            const size_t completed = finish_idle_exact_vbr_capture(
-                true, false, wave == 0 ? &attention_reuse : nullptr);
             published += completed;
             if (completed == 0) {
                 break;
@@ -17082,12 +17096,19 @@ private:
             candidates.front().slot &&
             candidates.front().slot->vbr_idle_exact_retry_identity ==
                 candidates.front().attempt_identity;
+        // A foreground multi-slot save needs this sequence's attention rows,
+        // not the sibling slots' live layout. Keep its recurrent/draft state
+        // in companions, just as for idle projected capture. Readiness
+        // preparation still uses exact capture, and unsupported
+        // layouts (including a requested exact retry) retain that fallback.
         const bool projected_stateful_capture =
-            preserve_slot < 0 && !readiness_only && stateful_companion_capture &&
+            vbr_projected_capture_allowed(readiness_only, preserve_slot, slots.size()) &&
+            stateful_companion_capture &&
             projected_attention_layout_supported && !exact_layout_retry &&
             candidates.size() == 1 && manifests.size() == 1;
-        const bool exact_companion_capture = preserve_slot >= 0 || readiness_only || exact_layout_retry ||
-            (stateful_companion_capture && !projected_stateful_capture);
+        const bool exact_companion_capture = !projected_stateful_capture &&
+            (preserve_slot >= 0 || readiness_only || exact_layout_retry ||
+             stateful_companion_capture);
         // Bound every capture by configured durable host capacity (and the
         // library's 16 GiB per-wave ceiling), not by a small transport-window
         // constant that would silently truncate long reusable prefixes. The
@@ -17421,12 +17442,22 @@ private:
                 server_prompt_cache_vbr_capacity_status::invalid;
             bool capacity_refused = false;
             uint64_t capacity_retry_manifest_id = 0;
+            int64_t deadline_us = 0;
+
+            bool continue_capture() const noexcept {
+                return session && session->continue_capture() &&
+                    (deadline_us == 0 || ggml_time_us() < deadline_us);
+            }
         } admission_state {
             this, &capture_session, prompt_cache.get(), &candidates,
             &admitted_publications, &capacity_claim,
             has_refresh_candidate, has_fresh_candidate,
             representation.tier_epoch, representation.tier_epoch_swa,
         };
+        if (preserve_slot >= 0) {
+            admission_state.deadline_us = ggml_time_us() +
+                int64_t(VBR_BLOCKING_CAPTURE_DEADLINE_US);
+        }
         server_vbr_projected_capture_admission admission;
         admission.context = &admission_state;
         admission.frontier = candidates.size() == 1 &&
@@ -17446,13 +17477,12 @@ private:
                 const server_vbr_projected_capture_admission::quote & quote)
                 noexcept {
             auto * context = static_cast<idle_admission_context *>(opaque);
-            auto * session = context ? context->session : nullptr;
             if (!context || !context->cache || !context->candidates ||
-                !session || !session->continue_capture()) {
+                !context->continue_capture()) {
                 return false;
             }
             if (context->has_refresh) {
-                return !context->has_fresh && session->continue_capture();
+                return !context->has_fresh && context->continue_capture();
             }
             for (const auto & durable : quote.durable) {
                 auto found = std::find_if(
@@ -17532,14 +17562,13 @@ private:
                     return false;
                 }
             }
-            return session->continue_capture();
+            return context->continue_capture();
         };
         admission.admit = [](
                 void * opaque,
                 const server_vbr_projected_capture_admission::quote & quote)
                 noexcept {
             auto * context = static_cast<idle_admission_context *>(opaque);
-            auto * session = context ? context->session : nullptr;
             // Planning can include controller settlement, projection and
             // recurrent sizing. The store now holds the exact transfer-
             // staging and durable claims plus the persistent ring operation
@@ -17548,8 +17577,7 @@ private:
             // cancel between bounded recurrent writes or attention chunks.
             if (!context || !context->cache || !context->candidates ||
                 !context->admitted ||
-                !context->capacity || !session ||
-                !session->continue_capture()) {
+                !context->capacity || !context->continue_capture()) {
                 return false;
             }
             // Refresh owns a separate in-place transaction. Do not partition
@@ -17557,7 +17585,7 @@ private:
             // this first bounded capacity-claim slice.
             if (context->has_refresh) {
                 return !context->has_fresh &&
-                    session->continue_capture();
+                    context->continue_capture();
             }
             context->admitted->clear();
             for (const auto & durable : quote.durable) {
@@ -17617,7 +17645,7 @@ private:
                 }
                 return false;
             }
-            if (!session->continue_capture()) {
+            if (!context->continue_capture()) {
                 *context->capacity = {};
                 return false;
             }
@@ -17625,8 +17653,7 @@ private:
         };
         admission.continue_capture = [](void * opaque) noexcept {
             auto * context = static_cast<idle_admission_context *>(opaque);
-            auto * session = context ? context->session : nullptr;
-            return session && session->continue_capture();
+            return context && context->continue_capture();
         };
         const bool projected_ok =
             vbr_artifact_store->capture_projected_host_batch(
@@ -24465,6 +24492,17 @@ server_vbr_retention_wiring_for_test() {
 server_vbr_reclaim_policy_result
 server_vbr_reclaim_policy_for_test() {
     server_vbr_reclaim_policy_result result;
+    result.projected_capture_requires_idle_source = true;
+    for (const bool readiness : { false, true }) {
+        for (const int32_t preserve : { -1, 0 }) {
+            for (const size_t slots : { size_t(1), size_t(2) }) {
+                const bool expected = !readiness && (preserve == -1 || slots == 2);
+                result.projected_capture_requires_idle_source &=
+                    server_context_impl::vbr_projected_capture_allowed(
+                        readiness, preserve, slots) == expected;
+            }
+        }
+    }
     {
         vbr_artifact_identity_block identity {
             "vbr-attempt-test", "adapter", "media", 1, 3, 3,

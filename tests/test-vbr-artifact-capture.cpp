@@ -1921,7 +1921,8 @@ static bool publish_occupied_guard_package(
         uint8_t payload_salt = 0,
         ggml_type representation_type = GGML_TYPE_F16,
         bool shared_positions = false,
-        const llama_cache_transaction_fault & fault = {}) {
+        const llama_cache_transaction_fault & fault = {},
+        bool reverse_logical_order = false) {
     reference = {};
     view.reset();
     if (token_count == 0 || proof_count == 0 || proof_count > 4096) {
@@ -1961,6 +1962,11 @@ static bool publish_occupied_guard_package(
     manifest.manifest_id = manifest_id;
     manifest.placements.push_back(projected_placement(
         manifest_id, llama_seq_id(manifest_id), physical));
+    if (reverse_logical_order) {
+        for (uint32_t i = 0; i < token_count; ++i) {
+            manifest.placements.front().cells[i].logical_position = token_count-1-i;
+        }
+    }
     bind_projected_manifest_metadata(manifest, target);
     manifest.identity.token_count = token_count;
     manifest.identity.next_position = token_count;
@@ -3228,7 +3234,8 @@ static void test_dependency_scoped_projected_catalog_publication() {
 
     const auto validate_recycle_fanout = [&](uint32_t proof_count,
                                              uint64_t manifest_base,
-                                             bool accepted) {
+                                             bool accepted,
+                                             bool fragmented_source = false) {
         llama_cache_acct_artifact_id recovery_reference;
         llama_cache_acct_artifact_id incoming_reference;
         vbr_artifact_package_view recovery_view;
@@ -3238,7 +3245,8 @@ static void test_dependency_scoped_projected_catalog_publication() {
             recovery_reference, recovery_view, 900, 8, proof_count));
         CHECK(publish_occupied_guard_package(
             catalog, topology, budget, manifest_base + 1, 8, false,
-            incoming_reference, incoming_view, 900, 8, proof_count, 1));
+            incoming_reference, incoming_view, 900, 8, proof_count, 1,
+            GGML_TYPE_F16, false, {}, fragmented_source));
         CHECK(recovery_reference.v != 0 && incoming_reference.v != 0);
         CHECK(recovery_reference != incoming_reference);
 
@@ -3260,7 +3268,7 @@ static void test_dependency_scoped_projected_catalog_publication() {
               vbr_occupied_replacement_guard_status::ready);
         CHECK(guard.strategy() ==
               vbr_occupied_replacement_strategy::recycle_incumbent_cells);
-        CHECK(guard.relocation_runs().size() == 1);
+        CHECK(guard.relocation_runs().size() == (fragmented_source ? 8u : 1u));
         CHECK(guard.recovery_runs().size() == 1);
 
         prefix_validator_serials serials;
@@ -3304,6 +3312,32 @@ static void test_dependency_scoped_projected_catalog_publication() {
             : vbr_manifest_validation_status::geometry_mismatch));
         CHECK(bool(validated.proof) == accepted);
         CHECK(accepted ? !guard.ready() : guard.ready());
+        if (fragmented_source && validated.proof) {
+            vbr_adopt_stage_policy stage_policy;
+            stage_policy.ledger = &ledger;
+            stage_policy.budget = &budget;
+            stage_policy.pinned_domain = pinned;
+            stage_policy.pinned_ring_bytes = 8192;
+            stage_policy.chunk_bytes = 4096;
+            stage_policy.lanes.push_back({ device, nullptr, nullptr, false });
+            auto staged = vbr_stage_validated_manifest(std::move(validated.proof), stage_policy);
+            CHECK(staged.status == vbr_adopt_stage_status::staged);
+            CHECK(staged.staged);
+            if (staged.staged) {
+                CHECK(staged.staged->reads().size() == 2*proof_count);
+                for (const auto & read : staged.staged->reads()) {
+                    CHECK(read.destination_offset == 0);
+                    CHECK(read.size == 8);
+                    if (read.kind == vbr_staged_read_kind::unit_payload) {
+                        CHECK(read.projection_ranges.size() == 8);
+                        for (size_t i = 0; i < read.projection_ranges.size(); ++i) {
+                            CHECK(read.projection_ranges[i].source_offset == 7-i);
+                            CHECK(read.projection_ranges[i].size == 1);
+                        }
+                    }
+                }
+            }
+        }
         validated.proof.reset();
         guard.reset();
         incoming_view.reset();
@@ -3317,6 +3351,10 @@ static void test_dependency_scoped_projected_catalog_publication() {
     // exact validator limit; one additional shard fails before staging.
     validate_recycle_fanout(2048, 300, true);
     validate_recycle_fanout(2049, 400, false);
+    // Fragmented source rows still make one contiguous write per shard.
+    // The raw run product (512 * 9) exceeds the descriptor limit, but the
+    // packed incoming and exact recovery writes need only 512 * 2 reads.
+    validate_recycle_fanout(512, 500, true, true);
 
     llama_cache_acct_artifact_id run_reference;
     vbr_artifact_package_view run_view;
@@ -6032,6 +6070,28 @@ static void test_server_import_route_classification() {
           status::validation_failed);
 
     server_vbr_artifact_import_output fallback;
+    CHECK(!server_vbr_artifact_import_capacity_refused(fallback));
+    fallback.status = status::unavailable;
+    CHECK(!server_vbr_artifact_import_capacity_refused(fallback));
+    fallback.destination_status = vbr_import_destination_status::exhausted;
+    CHECK(server_vbr_artifact_import_capacity_refused(fallback));
+    const auto capacity_refusal = fallback;
+    const auto refuses_capacity_fallback = [&](auto mutate) {
+        auto output = capacity_refusal;
+        mutate(output);
+        CHECK(!server_vbr_artifact_import_capacity_refused(output));
+    };
+    refuses_capacity_fallback([](auto & output) { output.adopt_attempted = true; });
+    refuses_capacity_fallback([](auto & output) { output.h2d_bytes = 1; });
+    refuses_capacity_fallback([](auto & output) { output.h2d_chunks = 1; });
+    refuses_capacity_fallback([](auto & output) {
+        output.recovery = vbr_adopt_recovery_outcome::quarantined;
+    });
+    refuses_capacity_fallback([](auto & output) { output.status = status::adopt_failed; });
+    refuses_capacity_fallback([](auto & output) { output.status = status::ok; });
+    fallback.destination_status = vbr_import_destination_status::invalid;
+    fallback.occupied_guard_status = vbr_occupied_replacement_guard_status::capacity_unavailable;
+    CHECK(server_vbr_artifact_import_capacity_refused(fallback));
     for (const auto retryable : {
             status::validation_failed,
             status::report_only,

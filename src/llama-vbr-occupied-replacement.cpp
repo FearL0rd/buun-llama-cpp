@@ -24,6 +24,17 @@ struct vbr_occupied_replacement_guard::map {
     std::vector<vbr_occupied_replacement_cell> preserved_cells;
 };
 
+size_t vbr_occupied_relocation_read_count(
+        const std::vector<vbr_occupied_replacement_relocation_run> & runs) noexcept {
+    size_t count = 0;
+    uint64_t next = UINT64_MAX;
+    for (const auto & run : runs) {
+        count += run.first_destination_physical_cell != next;
+        next = uint64_t(run.first_destination_physical_cell) + run.cell_count;
+    }
+    return count;
+}
+
 bool vbr_order_placement_cells(
         const vbr_artifact_stream_placement & placement,
         std::vector<const vbr_artifact_cell_placement *> & cells) {

@@ -957,6 +957,8 @@ private:
     llama_cache_acct_artifact_id destination_artifact_;
     uint64_t incoming_compact_bytes_ = 0;
     size_t incoming_tokens_ = 0;
+    size_t projected_bytes_ = 0;
+    uint64_t competition_epoch_ = 0;
     std::thread::id scheduler_owner_;
     friend struct server_prompt_cache;
 };
@@ -964,6 +966,8 @@ private:
 struct server_prompt_cache_vbr_pressure_citation {
     std::array<llama_cache_acct_artifact_id, 2> artifacts {};
     size_t count = 0;
+    size_t projected_bytes = 0;
+    uint64_t competition_epoch = 0;
 };
 
 enum class server_prompt_cache_vbr_capacity_status : uint8_t {
