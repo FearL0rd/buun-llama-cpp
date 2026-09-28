@@ -111,6 +111,12 @@ struct ggml_moe_cache_api {
     void   (*session_enter)(void * session);
     void   (*session_leave)(void * session);
 
+    // Copy selected host experts to their ordinary device layout, reusing cached
+    // bytes where available. selected is an expert-indexed 32-bit bitset.
+    // Returns 0 without writing/submitting work when the normal copy is needed.
+    int (*prefill_copy)(void * session, void * backend, const struct ggml_tensor * source,
+            struct ggml_tensor * destination, const uint32_t * selected, size_t n_words);
+
     // Begin one CPU MUL_MAT_ID node. Returns an opaque plan, or NULL when the stock CPU path should handle the complete node.
     void * (*begin)(const char * tensor_name, const void * host_base, size_t expert_size,
                     int64_t n_in, int64_t n_out, int wtype, int64_t n_expert,

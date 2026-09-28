@@ -2299,6 +2299,37 @@ static void ggml_compute_forward_mul_mat_id_one_chunk(
     ggml_vec_dot_t    const vec_dot      = type_traits_cpu[type].vec_dot;
     enum ggml_type    const vec_dot_type = type_traits_cpu[type].vec_dot_type;
 
+#if defined(__AVX512VBMI__) && defined(__AVX512VNNI__) && defined(__AVX512VL__)
+    // Amortize activation preparation over at least one output-column tile.
+    const bool prepare_q2 = ne00 <= 16384 && ir0_end - ir0_start >= 16;
+    if (type == GGML_TYPE_Q2_0 && (prepare_q2 || ir1_end - ir1_start > 1)) {
+        for (int64_t first = ir1_start; first < ir1_end; first += 4) {
+            const int nr = (int) MIN(4, ir1_end - first);
+            const void * ys[4];
+            float * outs[4];
+            for (int r = 0; r < nr; ++r) {
+                const struct mmid_row_mapping rm = MMID_MATRIX_ROW(cur_a, first + r);
+                const int64_t i11 = rm.i1 % ne11;
+                ys[r] = (const char *) wdata + (src1_cont || src1->type != vec_dot_type
+                    ? (i11 + rm.i2 * ne11) * row_size : i11 * nb11 + rm.i2 * nb12);
+                outs[r] = (float *) ((char *) dst->data + rm.i1 * nb1 + rm.i2 * nb2);
+            }
+            if (prepare_q2) {
+                for (int r = 0; r < nr; ++r) outs[r] += ir0_start;
+                ggml_vec_dot_q2_0_q8_0_batch_rows(ne00, outs, src0_cur + ir0_start * nb01,
+                        nb01, ys, nr, ir0_end - ir0_start);
+                continue;
+            }
+            for (int64_t row = ir0_start; row < ir0_end; ++row) {
+                float sums[4];
+                ggml_vec_dot_q2_0_q8_0_batch(ne00, sums, src0_cur + row * nb01, ys, nr);
+                for (int r = 0; r < nr; ++r) outs[r][row] = sums[r];
+            }
+        }
+        return;
+    }
+#endif
+
     const int64_t blck_0 = 16;
     const int64_t blck_1 = 16;
 
@@ -4352,6 +4383,12 @@ static void ggml_moe_cache_fused_collect(struct moe_cache_fused_state * state) {
     state->node = NULL;
 }
 
+static bool ggml_moe_cache_data_overlaps(const struct ggml_tensor * a, const struct ggml_tensor * b) {
+    const uintptr_t ap = (uintptr_t) a->data;
+    const uintptr_t bp = (uintptr_t) b->data;
+    return ap >= bp ? ap - bp < ggml_nbytes(b) : bp - ap < ggml_nbytes(a);
+}
+
 static int ggml_cpu_try_fuse_moe_cache(
         const struct ggml_cgraph * cgraph,
         int node_n,
@@ -4372,6 +4409,15 @@ static int ggml_cpu_try_fuse_moe_cache(
     const struct ggml_tensor * gate_weight = gate->src[0];
     const struct ggml_tensor * acts = up->src[1];
     const struct ggml_tensor * ids = up->src[2];
+    // Failed GPU collection must still be able to recompute from the original
+    // activations. These aliases are legal for the unfused graph, but not for
+    // a fusion that may retry after writing its output.
+    if (ggml_moe_cache_data_overlaps(acts, glu)) {
+        return 0;
+    }
+    if (down && ggml_moe_cache_data_overlaps(acts, down)) {
+        down = NULL;
+    }
     const int n_ids = (int)ids->ne[0];
     const int n_tokens = (int)ids->ne[1];
     const int n_rows = n_ids*n_tokens;
@@ -4489,9 +4535,13 @@ static int ggml_cpu_try_fuse_moe_cache(
             // uncached rows through down while the GPUs compute the cached rows;
             // collect() then writes only the complementary hit rows.
             ggml_barrier(params->threadpool);
+            // Up/gate already dispatched the whole GPU FFN. A second dispatch
+            // task would only reserve thread 0 for an idempotent no-op here;
+            // let it compute CPU misses until collection instead. This trades
+            // early result collection for an extra CPU worker on the down rows.
             ggml_compute_forward_mul_mat_id_impl(
                     &sub_params, down, miss_mask, true, false, NULL,
-                    ggml_moe_cache_fused_dispatch_task, state);
+                    NULL, NULL);
             if (params->ith == 0) {
                 ggml_moe_cache_fused_collect(state);
             }
@@ -4502,17 +4552,21 @@ static int ggml_cpu_try_fuse_moe_cache(
     ggml_barrier(params->threadpool);
 
     if (!state->collect_ok) {
+        // Down may reuse up/gate storage with a different row stride. Retrying
+        // just the GPU rows could overwrite already-computed CPU down rows.
+        // Recompute the complete FFN on this rare failure path.
+        const uint64_t retry_mask = state->full ? valid_mask : state->hit_mask;
         ggml_compute_forward_mul_mat_id_impl(
-                &sub_params, up, state->hit_mask, true, false, gate, NULL, NULL);
+                &sub_params, up, retry_mask, true, false, gate, NULL, NULL);
         ggml_barrier(params->threadpool);
         ggml_compute_forward_swiglu_masked(
-                params, gate, up, glu, state->hit_mask,
+                params, gate, up, glu, retry_mask,
                 fusion.clamped, fusion.up_min, fusion.up_max,
                 fusion.gate_min, fusion.gate_max);
         if (state->full) {
             ggml_barrier(params->threadpool);
             ggml_compute_forward_mul_mat_id_impl(
-                    &sub_params, down, state->hit_mask, true, false, NULL, NULL, NULL);
+                    &sub_params, down, retry_mask, true, false, NULL, NULL, NULL);
         }
     }
 

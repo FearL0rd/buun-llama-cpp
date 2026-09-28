@@ -5,6 +5,14 @@
 #include <climits>
 #include <cstdint>
 
+// Wide Q5 heads amortize MMQ setup at verification batch sizes. Keep single-token
+// dispatch and shapes outside the RTX 5070 sweep unchanged.
+inline bool ggml_cuda_use_wide_q5_mmq(int cc, const ggml_tensor * w, const ggml_tensor * dst) {
+    return cc == GGML_CUDA_CC_BLACKWELL && w->type == GGML_TYPE_Q5_K &&
+           w->ne[0] >= 512 && w->ne[0] <= 8192 && w->ne[1] >= 32768 &&
+           dst->ne[1] >= 2 && dst->ne[1] <= 6 && dst->ne[2] == 1 && dst->ne[3] == 1;
+}
+
 #define MMQ_DP4A_MAX_BATCH_SIZE 64  // Max. batch size to use for dp4a MMQ kernels when FP16 tensor cores are available.
 #define MMQ_PTQ1_0_MAX_BATCH_SIZE (1 << 30)  // MMQ at every batch unless GGML_CUDA_PTQ1_0_MMQ_MAX_BATCH lowers it
 #define MMQ_ITER_K                256
@@ -33,8 +41,8 @@ struct block_q8_1_mmq {
     // To avoid shared memory bank conflicts each block is padded with 16 bytes.
     // This padding is also used to store block scales/partial sums.
     // The scales multiplied with the quantized data are equal to the unquantized values.
-    // The partial sums are obtained by summing up a subgroup of the contained values (prior to quantization)
-    //     and are only needed for performance reasons.
+    // Partial sums normally use the original values. The wide-Q5-head route uses
+    // reconstructed Q8 sums instead, matching MMVQ's offset correction.
     //
     // The exact data stored depends on the x data type.
     union {
