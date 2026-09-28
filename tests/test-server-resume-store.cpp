@@ -295,12 +295,16 @@ static size_t n_files(const std::string & directory, const std::string & prefix 
 }
 
 // on Windows the directories hold an access list for this user alone, not a mode
-#if !defined(_WIN32)
-static unsigned mode_of(const std::string & path) {
+static bool has_mode(const std::string & path, unsigned mode) {
+#if defined(_WIN32)
+    (void) path;
+    (void) mode;
+    return true;
+#else
     struct stat st;
-    return stat(path.c_str(), &st) == 0 ? st.st_mode & 0777 : 0;
-}
+    return stat(path.c_str(), &st) == 0 && (st.st_mode & 0777) == mode;
 #endif
+}
 
 // writes the objects of one generation over [p0, p1) and names them in the manifest
 static server_resume_reason add_generation(
@@ -360,12 +364,10 @@ static void test_store(const std::string & root) {
         std::fprintf(stderr, "open: %s\n", error.c_str());
         return;
     }
-#if !defined(_WIN32)
-    CHECK(mode_of(root + "/resume") == 0700);
-    CHECK(mode_of(store->directory()) == 0700);
-    CHECK(mode_of(store->directory() + "/entries") == 0700);
-    CHECK(mode_of(store->directory() + "/writer.lock") == 0600);
-#endif
+    CHECK(has_mode(root + "/resume", 0700));
+    CHECK(has_mode(store->directory(), 0700));
+    CHECK(has_mode(store->directory() + "/entries", 0700));
+    CHECK(has_mode(store->directory() + "/writer.lock", 0600));
     CHECK(store->free_bytes() > 0);
     CHECK(store->list().empty());
 
@@ -384,11 +386,9 @@ static void test_store(const std::string & root) {
     server_resume_manifest manifest = manifest_of(16, 0);
     manifest.chunks.clear();
     CHECK(add_generation(*store, id, manifest, 0, 16) == server_resume_reason::ok);
-#if !defined(_WIN32)
-    CHECK(mode_of(entry_dir) == 0700);
-    CHECK(mode_of(entry_dir + "/commit") == 0600);
-    CHECK(mode_of(entry_dir + "/c-0-16-1") == 0600);
-#endif
+    CHECK(has_mode(entry_dir, 0700));
+    CHECK(has_mode(entry_dir + "/commit", 0600));
+    CHECK(has_mode(entry_dir + "/c-0-16-1", 0600));
     CHECK(n_files(entry_dir) == 3);
 
     CHECK(add_generation(*store, id, manifest, 16, 32) == server_resume_reason::ok);

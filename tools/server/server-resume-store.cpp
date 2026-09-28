@@ -624,9 +624,36 @@ static std::string errno_text(const char * what, const std::string & path, int e
 //
 
 #if defined(_WIN32)
-
 using file_t = HANDLE;
 static const file_t no_file = INVALID_HANDLE_VALUE;
+static void close_file(file_t f) { CloseHandle(f); }
+#else
+using file_t = int;
+static constexpr file_t no_file = -1;
+static void close_file(file_t f) { close(f); }
+#endif
+
+struct fd_guard {
+    file_t fd = no_file;
+
+    fd_guard() = default;
+    explicit fd_guard(file_t fd) : fd(fd) {}
+    ~fd_guard() { reset(); }
+
+    fd_guard(const fd_guard &) = delete;
+    fd_guard & operator=(const fd_guard &) = delete;
+
+    bool ok() const { return fd != no_file; }
+
+    void reset() {
+        if (ok()) {
+            close_file(fd);
+            fd = no_file;
+        }
+    }
+};
+
+#if defined(_WIN32)
 
 static void set_errno_from_win(DWORD err) {
     switch (err) {
@@ -666,6 +693,11 @@ static std::wstring wide(const std::string & path) {
     return w.size() >= 2 && w[1] == L':' ? L"\\\\?\\" + w : w;
 }
 
+// a trailing separator but a drive's root, which without it is where that drive's working directory is
+static bool strippable_separator(const std::string & path) {
+    return path.size() > 1 && (path.back() == '/' || path.back() == '\\') && !(path.size() == 3 && path[1] == ':');
+}
+
 // every file is shared for deletion, so a file that is open can still be replaced, as on POSIX
 static file_t open_file(const std::string & path, DWORD access, DWORD disposition, bool nofollow) {
     const HANDLE h = CreateFileW(wide(path).c_str(), access, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
@@ -695,10 +727,6 @@ static file_t open_lock(const std::string & path) {
     return open_file(path, GENERIC_READ | GENERIC_WRITE, OPEN_ALWAYS, true);
 }
 
-static void close_file(file_t f) {
-    CloseHandle(f);
-}
-
 // a byte far past the text of the file: a lock on Windows keeps others from reading what it covers
 static bool lock_exclusive(file_t f) {
     OVERLAPPED at = {};
@@ -710,33 +738,19 @@ static bool lock_exclusive(file_t f) {
     return true;
 }
 
-static constexpr size_t io_max = 1u << 30;
-
-static int64_t read_some(file_t f, uint8_t * data, size_t size) {
-    DWORD n = 0;
-    if (!ReadFile(f, data, (DWORD) std::min(size, io_max), &n, nullptr)) {
-        set_errno_from_win();
-        return -1;
-    }
-    return n;
-}
-
-static int64_t write_some(file_t f, const uint8_t * data, size_t size) {
-    DWORD n = 0;
-    if (!WriteFile(f, data, (DWORD) std::min(size, io_max), &n, nullptr)) {
-        set_errno_from_win();
-        return -1;
-    }
-    return n;
-}
-
-// these move the file position, unlike pread() and pwrite()
-static int64_t pread_some(file_t f, uint8_t * data, size_t size, uint64_t offset) {
+// at the file position, or at `offset` when one is given, which moves the position too, unlike
+// pread() and pwrite()
+static int64_t io_some(file_t f, void * data, size_t size, const uint64_t * offset, bool write) {
     OVERLAPPED at = {};
-    at.Offset     = (DWORD) offset;
-    at.OffsetHigh = (DWORD) (offset >> 32);
-    DWORD n = 0;
-    if (!ReadFile(f, data, (DWORD) std::min(size, io_max), &n, &at)) {
+    if (offset) {
+        at.Offset     = (DWORD) *offset;
+        at.OffsetHigh = (DWORD) (*offset >> 32);
+    }
+    const DWORD chunk = (DWORD) std::min<size_t>(size, 1u << 30);
+    DWORD       n     = 0;
+    const bool  ok    = write ? WriteFile(f, data, chunk, &n, offset ? &at : nullptr) :
+                                ReadFile(f, data, chunk, &n, offset ? &at : nullptr);
+    if (!ok) {
         const DWORD err = GetLastError();
         if (err == ERROR_HANDLE_EOF) {
             return 0;
@@ -747,16 +761,20 @@ static int64_t pread_some(file_t f, uint8_t * data, size_t size, uint64_t offset
     return n;
 }
 
+static int64_t read_some(file_t f, uint8_t * data, size_t size) {
+    return io_some(f, data, size, nullptr, false);
+}
+
+static int64_t write_some(file_t f, const uint8_t * data, size_t size) {
+    return io_some(f, (void *) data, size, nullptr, true);
+}
+
+static int64_t pread_some(file_t f, uint8_t * data, size_t size, uint64_t offset) {
+    return io_some(f, data, size, &offset, false);
+}
+
 static int64_t pwrite_some(file_t f, const uint8_t * data, size_t size, uint64_t offset) {
-    OVERLAPPED at = {};
-    at.Offset     = (DWORD) offset;
-    at.OffsetHigh = (DWORD) (offset >> 32);
-    DWORD n = 0;
-    if (!WriteFile(f, data, (DWORD) std::min(size, io_max), &n, &at)) {
-        set_errno_from_win();
-        return -1;
-    }
-    return n;
+    return io_some(f, (void *) data, size, &offset, true);
 }
 
 static bool sync_file(file_t f) {
@@ -806,7 +824,8 @@ static bool rename_path(const std::string & from, const std::string & to) {
     const HANDLE h = CreateFileW(source.c_str(), DELETE | SYNCHRONIZE, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
         nullptr, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
     if (h != INVALID_HANDLE_VALUE) {
-        // FILE_RENAME_INFO in its FileRenameInfoEx form, with flags in place of ReplaceIfExists
+        // FILE_RENAME_INFO in its FileRenameInfoEx form, which the SDK declares only when it targets
+        // Windows 10
         struct rename_info {
             DWORD  flags;
             HANDLE root;
@@ -855,10 +874,6 @@ static bool rename_path(const std::string & from, const std::string & to) {
     return true;
 }
 
-static bool path_exists(const std::string & path) {
-    return GetFileAttributesW(wide(path).c_str()) != INVALID_FILE_ATTRIBUTES;
-}
-
 static std::vector<uint8_t> token_info(TOKEN_INFORMATION_CLASS what) {
     std::vector<uint8_t> info;
     HANDLE token;
@@ -875,47 +890,62 @@ static std::vector<uint8_t> token_info(TOKEN_INFORMATION_CLASS what) {
     return info;
 }
 
-// A directory whose access list admits this user alone, inherited by all it holds. An existing one
-// must be ours: its owner is this user, or whom this user's token makes owner (an administrator's
-// group). Its access list is left as it is, since a change would be carried down to every file
-static bool make_private_dir(const std::string & path, std::string & error) {
-    const std::wstring w     = wide(path);
-    const auto         user  = token_info(TokenUser);
-    const auto         owner = token_info(TokenOwner);
-    LPWSTR             sid   = nullptr;
-    if (user.empty() || owner.empty() || !ConvertSidToStringSidW(((const TOKEN_USER *) user.data())->User.Sid, &sid)) {
+// this process's user, whom its token makes owner of what it creates (an administrator's group),
+// and an access list that admits the user alone, inherited by all a directory holds
+struct process_identity {
+    std::vector<uint8_t> user  = token_info(TokenUser);
+    std::vector<uint8_t> owner = token_info(TokenOwner);
+    PSECURITY_DESCRIPTOR sd    = nullptr;
+
+    process_identity() {
+        LPWSTR sid = nullptr;
+        if (user.empty() || owner.empty() || !ConvertSidToStringSidW(user_sid(), &sid)) {
+            return;
+        }
+        const std::wstring sddl = std::wstring(L"D:P(A;OICI;FA;;;") + sid + L")";
+        LocalFree(sid);
+        if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(sddl.c_str(), SDDL_REVISION_1, &sd, nullptr)) {
+            sd = nullptr;
+        }
+    }
+    ~process_identity() { LocalFree(sd); }
+
+    PSID user_sid() const { return ((const TOKEN_USER *) user.data())->User.Sid; }
+    PSID owner_sid() const { return ((const TOKEN_OWNER *) owner.data())->Owner; }
+};
+
+// A directory only this user can enter. An existing one must be ours, and its access list is left
+// as it is, since a change would be carried down to every file
+static bool make_private_dir(const std::string & path, std::string & error, bool * created = nullptr) {
+    static const process_identity me;
+    if (!me.sd) {
         error = "cannot read the user of this process";
         return false;
     }
-    const std::wstring sddl = std::wstring(L"D:P(A;OICI;FA;;;") + sid + L")";
-    LocalFree(sid);
-
-    PSECURITY_DESCRIPTOR sd = nullptr;
-    if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(sddl.c_str(), SDDL_REVISION_1, &sd, nullptr)) {
-        set_errno_from_win();
-        error = errno_text("cannot describe access to", path, errno);
-        return false;
+    const std::wstring  w  = wide(path);
+    SECURITY_ATTRIBUTES sa = { sizeof(sa), me.sd, FALSE };
+    const bool made = CreateDirectoryW(w.c_str(), &sa) != 0;
+    if (created) {
+        *created = made;
     }
-    SECURITY_ATTRIBUTES sa = { sizeof(sa), sd, FALSE };
-    const bool  created = CreateDirectoryW(w.c_str(), &sa) != 0;
-    const DWORD err     = GetLastError();
-    LocalFree(sd);
-    if (!created && err != ERROR_ALREADY_EXISTS) {
-        set_errno_from_win(err);
+    if (made) {
+        return true;
+    }
+    if (GetLastError() != ERROR_ALREADY_EXISTS) {
+        set_errno_from_win();
         error = errno_text("cannot create", path, errno);
         return false;
     }
 
     const DWORD          attributes = GetFileAttributesW(w.c_str());
-    PSID                 dir_owner  = nullptr;
-    PSECURITY_DESCRIPTOR dir_sd     = nullptr;
+    PSID                 owner      = nullptr;
+    PSECURITY_DESCRIPTOR sd         = nullptr;
     const bool ours = attributes != INVALID_FILE_ATTRIBUTES && (attributes & FILE_ATTRIBUTE_DIRECTORY) &&
         !(attributes & FILE_ATTRIBUTE_REPARSE_POINT) &&
-        GetNamedSecurityInfoW(w.c_str(), SE_FILE_OBJECT, OWNER_SECURITY_INFORMATION, &dir_owner, nullptr, nullptr,
-                              nullptr, &dir_sd) == ERROR_SUCCESS &&
-        (EqualSid(dir_owner, ((const TOKEN_USER *) user.data())->User.Sid) ||
-         EqualSid(dir_owner, ((const TOKEN_OWNER *) owner.data())->Owner));
-    LocalFree(dir_sd);
+        GetNamedSecurityInfoW(w.c_str(), SE_FILE_OBJECT, OWNER_SECURITY_INFORMATION, &owner, nullptr, nullptr,
+                              nullptr, &sd) == ERROR_SUCCESS &&
+        (EqualSid(owner, me.user_sid()) || EqualSid(owner, me.owner_sid()));
+    LocalFree(sd);
     if (!ours) {
         error = path + " is not a directory of this user";
         return false;
@@ -944,8 +974,9 @@ static long long process_id() {
 
 #else
 
-using file_t = int;
-static constexpr file_t no_file = -1;
+static bool strippable_separator(const std::string & path) {
+    return path.size() > 1 && path.back() == '/';
+}
 
 static file_t open_read(const std::string & path, bool nofollow) {
     return ::open(path.c_str(), O_RDONLY | O_CLOEXEC | (nofollow ? O_NOFOLLOW : 0));
@@ -959,44 +990,33 @@ static file_t open_lock(const std::string & path) {
     return ::open(path.c_str(), O_CREAT | O_RDWR | O_CLOEXEC | O_NOFOLLOW, 0600);
 }
 
-static void close_file(file_t f) {
-    close(f);
-}
-
 static bool lock_exclusive(file_t f) {
     return flock(f, LOCK_EX | LOCK_NB) == 0;
 }
 
-static int64_t read_some(file_t f, uint8_t * data, size_t size) {
+template <typename F>
+static int64_t retry_eintr(F call) {
     ssize_t n;
     do {
-        n = read(f, data, size);
+        n = call();
     } while (n < 0 && errno == EINTR);
     return n;
+}
+
+static int64_t read_some(file_t f, uint8_t * data, size_t size) {
+    return retry_eintr([&] { return read(f, data, size); });
 }
 
 static int64_t write_some(file_t f, const uint8_t * data, size_t size) {
-    ssize_t n;
-    do {
-        n = write(f, data, size);
-    } while (n < 0 && errno == EINTR);
-    return n;
+    return retry_eintr([&] { return write(f, data, size); });
 }
 
 static int64_t pread_some(file_t f, uint8_t * data, size_t size, uint64_t offset) {
-    ssize_t n;
-    do {
-        n = pread(f, data, size, (off_t) offset);
-    } while (n < 0 && errno == EINTR);
-    return n;
+    return retry_eintr([&] { return pread(f, data, size, (off_t) offset); });
 }
 
 static int64_t pwrite_some(file_t f, const uint8_t * data, size_t size, uint64_t offset) {
-    ssize_t n;
-    do {
-        n = pwrite(f, data, size, (off_t) offset);
-    } while (n < 0 && errno == EINTR);
-    return n;
+    return retry_eintr([&] { return pwrite(f, data, size, (off_t) offset); });
 }
 
 static bool sync_file(file_t f) {
@@ -1036,14 +1056,13 @@ static bool rename_path(const std::string & from, const std::string & to) {
     return rename(from.c_str(), to.c_str()) == 0;
 }
 
-static bool path_exists(const std::string & path) {
-    struct stat st;
-    return lstat(path.c_str(), &st) == 0;
-}
-
 // a directory only its owner can enter. an existing one must be ours and is narrowed to 0700
-static bool make_private_dir(const std::string & path, std::string & error) {
-    if (mkdir(path.c_str(), 0700) != 0 && errno != EEXIST) {
+static bool make_private_dir(const std::string & path, std::string & error, bool * created = nullptr) {
+    const bool made = mkdir(path.c_str(), 0700) == 0;
+    if (created) {
+        *created = made;
+    }
+    if (!made && errno != EEXIST) {
         error = errno_text("cannot create", path, errno);
         return false;
     }
@@ -1060,13 +1079,8 @@ static bool make_private_dir(const std::string & path, std::string & error) {
 }
 
 static bool sync_dir(const std::string & path) {
-    const int dir = ::open(path.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
-    if (dir < 0) {
-        return false;
-    }
-    const bool ok = fsync(dir) == 0;
-    close(dir);
-    return ok;
+    fd_guard dir(::open(path.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC));
+    return dir.ok() && fsync(dir.fd) == 0;
 }
 
 static uint64_t free_bytes_at(const std::string & path) {
@@ -1082,26 +1096,6 @@ static long long process_id() {
 }
 
 #endif
-
-struct fd_guard {
-    file_t fd = no_file;
-
-    fd_guard() = default;
-    explicit fd_guard(file_t fd) : fd(fd) {}
-    ~fd_guard() { reset(); }
-
-    fd_guard(const fd_guard &) = delete;
-    fd_guard & operator=(const fd_guard &) = delete;
-
-    bool ok() const { return fd != no_file; }
-
-    void reset() {
-        if (ok()) {
-            close_file(fd);
-            fd = no_file;
-        }
-    }
-};
 
 struct server_resume_store::writer_lock {
     fd_guard file;
@@ -1343,12 +1337,7 @@ std::unique_ptr<server_resume_store> server_resume_store::open(
     }
 
     std::string root = cache_root;
-#if defined(_WIN32)
-    // but a drive's root, which without its separator is where that drive's working directory is
-    while (root.size() > 1 && (root.back() == '/' || root.back() == '\\') && !(root.size() == 3 && root[1] == ':')) {
-#else
-    while (root.size() > 1 && root.back() == '/') {
-#endif
+    while (strippable_separator(root)) {
         root.pop_back();
     }
 
@@ -1656,8 +1645,8 @@ server_resume_reason server_resume_store::write_object_stream(
     }
 
     const std::string directory = entry_dir(id);
-    const bool is_new = !path_exists(directory);
-    if (!make_private_dir(directory, error)) {
+    bool is_new = false;
+    if (!make_private_dir(directory, error, &is_new)) {
         return server_resume_reason::store_unwritable;
     }
     if (is_new && !sync_path(dir + "/entries")) {
