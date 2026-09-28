@@ -4535,9 +4535,13 @@ static int ggml_cpu_try_fuse_moe_cache(
             // uncached rows through down while the GPUs compute the cached rows;
             // collect() then writes only the complementary hit rows.
             ggml_barrier(params->threadpool);
+            // Up/gate already dispatched the whole GPU FFN. A second dispatch
+            // task would only reserve thread 0 for an idempotent no-op here;
+            // let it compute CPU misses until collection instead. This trades
+            // early result collection for an extra CPU worker on the down rows.
             ggml_compute_forward_mul_mat_id_impl(
                     &sub_params, down, miss_mask, true, false, NULL,
-                    ggml_moe_cache_fused_dispatch_task, state);
+                    NULL, NULL);
             if (params->ith == 0) {
                 ggml_moe_cache_fused_collect(state);
             }

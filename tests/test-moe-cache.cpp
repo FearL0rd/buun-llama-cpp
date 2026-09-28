@@ -4086,6 +4086,309 @@ static bool run_pool_limits() {
     return ok;
 }
 
+// Compare transient experts with fully resident GPU execution, including
+// cancellation, source invalidation and failures before output publication.
+static bool run_stream_staging_case(ggml_backend_dev_t dev,
+                                    ggml_backend_t     gpu,
+                                    ggml_backend_t     cpu,
+                                    log_capture &      capture,
+                                    int                T,
+                                    const char *       dedicated_down,
+                                    bool               boundary) {
+    constexpr int K = 2560, F = 640;
+    const int     E    = boundary ? 32 : 64;
+    constexpr int topk = 10;
+    const int     R    = T * topk;
+    GGML_ASSERT(T >= 2 && T <= 4);
+    uint64_t resident = 0;
+    for (int t = 0; t < T; ++t) {
+        resident |= 1ULL << (t * topk + 1);
+    }
+    const float inf = std::numeric_limits<float>::infinity();
+    bool        ok  = true;
+    for (bool pinned : { true, false }) {
+        auto ctx   = ggml_init({ 8 * ggml_tensor_overhead(), nullptr, true });
+        auto up    = ggml_new_tensor_3d(ctx, GGML_TYPE_Q2_0, K, F, E);
+        auto gate  = ggml_dup_tensor(ctx, up);
+        auto down  = ggml_new_tensor_3d(ctx, GGML_TYPE_Q2_0, F, K, E);
+        auto dummy = boundary ? ggml_dup_tensor(ctx, up) : nullptr;
+        ggml_set_name(up, "blk.0.ffn_up_exps.weight");
+        ggml_set_name(gate, "blk.0.ffn_gate_exps.weight");
+        ggml_set_name(down, "blk.0.ffn_down_exps.weight");
+        if (dummy) {
+            ggml_set_name(dummy, "blk.1.ffn_up_exps.weight");
+        }
+        auto buft = pinned ? ggml_backend_dev_host_buffer_type(dev) : ggml_backend_cpu_buffer_type();
+        GGML_ASSERT(buft);
+        auto buffer = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft);
+        GGML_ASSERT(buffer);
+        ggml_backend_buffer_set_usage(buffer, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+        int seed = 0;
+        for (auto w : { up, gate, down }) {
+            std::vector<float>   values(K * F);
+            std::vector<uint8_t> bytes(ggml_nbytes(w) / E);
+            for (int e = 0; e < E; ++e) {
+                for (size_t i = 0; i < values.size(); ++i) {
+                    values[i] = .012f * std::sin(float(i + 31 * e + 71 * seed) * .017f);
+                }
+                GGML_ASSERT(ggml_quantize_chunk(w->type, values.data(), bytes.data(), 0, w->ne[1], w->ne[0], nullptr) ==
+                            bytes.size());
+                ggml_backend_tensor_set(w, bytes.data(), e * bytes.size(), bytes.size());
+            }
+            ++seed;
+        }
+        auto desc = [&](ggml_tensor * w) {
+            return ggml_moe_cache_tensor_desc{ w->name,  w->data, ggml_nbytes(w) / E, w->ne[0],
+                                               w->ne[1], E,       (int32_t) w->type };
+        };
+        auto                       ud = desc(up), gd = desc(gate), dd = desc(down);
+        std::vector<float>         acts(K * T), ref(R * K), out(R * K);
+        std::vector<const float *> rows(R);
+        std::vector<int32_t>       ids(R);
+        for (size_t i = 0; i < acts.size(); ++i) {
+            acts[i] = std::sin(float(i) * .037f);
+        }
+        for (int i = 0; i < R; ++i) {
+            rows[i] = acts.data() + (i / topk) * K;
+        }
+        auto routes = [&](int e1) {
+            for (int t = 0; t < T; ++t) {
+                for (int j = 0; j < topk; ++j) {
+                    ids[t * topk + j] = j == 1 ? 0 : (j == 0 ? e1 : e1 + j - 1);
+                }
+            }
+        };
+        auto start = [&](const char * fail = nullptr) {
+            configure_cache(fail, "4", "1", boundary ? "46" : "40", dedicated_down);
+            void * s = create_direct_session(gpu, cpu);
+            GGML_ASSERT(s);
+            ggml_moe_cache.session_enter(s);
+            if (dummy) {
+                (void) direct_begin_ready(dummy->name, dummy->data, ggml_nbytes(dummy) / E, dummy->ne[0], dummy->ne[1],
+                                          dummy->type, E);
+            }
+            for (auto w : { up, gate, down }) {
+                (void) direct_begin_ready(w->name, w->data, ggml_nbytes(w) / E, w->ne[0], w->ne[1], w->type, E);
+            }
+            for (auto w : { up, gate, down }) {
+                GGML_ASSERT(wait_for_direct_pool(w->name, w->data, ggml_nbytes(w) / E, w->ne[0], w->ne[1], w->type, E));
+            }
+            return s;
+        };
+        auto warm = [&](int e) {
+            for (auto w : { up, gate, down }) {
+                GGML_ASSERT(wait_for_direct_resident(w, e));
+            }
+        };
+        auto plan = [&](uint64_t & mask) {
+            return ggml_moe_cache.fused_plan(&ud, &gd, &dd, GGML_GLU_OP_SWIGLU, -inf, inf, -inf, inf, ids.data(), R, T,
+                                             rows.data(), &mask);
+        };
+        auto collect = [&](void * node, uint64_t mask, std::vector<float> & result) {
+            std::vector<float *> outs(R);
+            int                  n = 0;
+            for (int i = 0; i < R; ++i) {
+                if (mask & (1ULL << i)) {
+                    outs[n++] = result.data() + K * i;
+                }
+            }
+            return node && ggml_moe_cache.fused_dispatch(node) && ggml_moe_cache.collect(node, n, outs.data(), K);
+        };
+        auto stop = [](void * s) {
+            ggml_moe_cache.session_leave(s);
+            ggml_moe_cache.session_destroy(s);
+        };
+        auto counter = [&](const char * field) {
+            const auto text = capture.get();
+            const auto pos  = text.rfind(field);
+            GGML_ASSERT(pos != std::string::npos);
+            return strtoll(text.c_str() + pos + strlen(field), nullptr, 10);
+        };
+        for (int round = 0; round < 3; ++round) {
+            routes(1 + 10 * round);
+            auto s = start();
+            for (int j = 0; j < topk; ++j) {
+                warm(ids[j]);
+            }
+            uint64_t mask = 0;
+            auto     node = plan(mask);
+            GGML_ASSERT(mask == ((1ULL << R) - 1) && collect(node, mask, ref));
+            ggml_moe_cache.end(node);
+            stop(s);
+            {
+                s = start();
+                warm(0);
+                long long before_boundary = 0;
+                if (boundary && pinned) {
+                    // Four 32-expert sources create a partial pool. Dropping the
+                    // unrelated fourth leaves 96 entries: fewer than physical
+                    // slots, but MORE than persistent slots after reservation.
+                    const auto slots = counter("pool[0]: type=q2_0 expert=450 KiB slots=");
+                    GGML_ASSERT(slots >= 96 && slots <= 98);
+                    mask = 0;
+                    node = plan(mask);
+                    GGML_ASSERT(collect(node, mask, out));
+                    ggml_moe_cache.end(node);
+                    before_boundary = counter("stream-stage-experts=");
+                    ggml_moe_cache.invalidate(dummy->data, ggml_nbytes(dummy));
+                }
+                mask              = 0;
+                node              = plan(mask);
+                uint64_t required = resident;
+                if (pinned) {
+                    for (int e = 0; e < 4; ++e) {
+                        for (int t = 0; t < T; ++t) {
+                            required |= 1ULL << (t * topk + (e == 0 ? 0 : e + 1));
+                        }
+                    }
+                }
+                // Normal async admission may add rows; staging must add its promised rows.
+                bool           pass       = node && (mask & required) == required;
+                const uint64_t first_mask = mask;
+                if (!pinned) {
+                    pass &= mask == resident;
+                }
+                uint64_t busy_mask = 0;
+                auto     busy      = plan(busy_mask);
+                pass &= !busy && !busy_mask;
+                if (busy) {
+                    ggml_moe_cache.end(busy);
+                }
+                pass &= collect(node, mask, out);
+                if (boundary && pinned) {
+                    const bool continued = counter("stream-stage-experts=") > before_boundary;
+                    printf("cache-stream-stage-boundary: partial=%d\n", continued);
+                    pass &= continued;
+                }
+                for (int i = 0; i < R; ++i) {
+                    if (mask & (1ULL << i)) {
+                        pass &= std::memcmp(ref.data() + i * K, out.data() + i * K, K * sizeof(float)) == 0;
+                    }
+                }
+                if (node) {
+                    ggml_moe_cache.end(node);
+                }
+                // Cancellation both before and after dispatch must leave scratch reusable.
+                for (bool dispatch : { false, true }) {
+                    uint64_t cancel_mask = 0;
+                    auto     cancel      = plan(cancel_mask);
+                    pass &= cancel != nullptr;
+                    if (cancel && dispatch) {
+                        pass &= ggml_moe_cache.fused_dispatch(cancel) != 0;
+                    }
+                    if (cancel) {
+                        ggml_moe_cache.end(cancel);
+                    }
+                }
+                mask = 0;
+                node = plan(mask);
+                pass &= collect(node, mask, out);
+                for (int i = 0; i < R; ++i) {
+                    if (mask & (1ULL << i)) {
+                        pass &= std::memcmp(ref.data() + i * K, out.data() + i * K, K * sizeof(float)) == 0;
+                    }
+                }
+                if (node) {
+                    ggml_moe_cache.end(node);
+                }
+                // Drop all ordinary residents; swap expert order so the same reserved
+                // scratch slots must receive different weight bytes on their next use.
+                for (auto w : { up, gate, down }) {
+                    ggml_moe_cache.invalidate(w->data, ggml_nbytes(w));
+                }
+                warm(0);
+                for (int t = 0; t < T; ++t) {
+                    std::swap(ids[topk * t], ids[topk * t + 2]);
+                }
+                mask = 0;
+                node = plan(mask);
+                pass &= node && (mask & required) == required;
+                std::atomic<bool> started{ false }, done{ false };
+                std::thread       invalidator;
+                if (node) {
+                    pass &= ggml_moe_cache.fused_dispatch(node) != 0;
+                    invalidator = std::thread([&] {
+                        started.store(true);
+                        ggml_moe_cache.invalidate(down->data, ggml_nbytes(down));
+                        done.store(true);
+                    });
+                    while (!started.load()) {
+                        std::this_thread::yield();
+                    }
+                    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+                    pass &= !done.load();
+                }
+                pass &= collect(node, mask, out);
+                for (int i = 0; i < R; ++i) {
+                    if (mask & (1ULL << i)) {
+                        const int old = i % topk == 0 ? i + 2 : (i % topk == 2 ? i - 2 : i);
+                        pass &= std::memcmp(ref.data() + old * K, out.data() + i * K, K * sizeof(float)) == 0;
+                    }
+                }
+                if (node) {
+                    ggml_moe_cache.end(node);
+                }
+                if (invalidator.joinable()) {
+                    invalidator.join();
+                }
+                pass &= done.load();
+                for (int t = 0; t < T; ++t) {
+                    std::swap(ids[topk * t], ids[topk * t + 2]);
+                }
+                printf("cache-stream-stage: pinned=%d tokens=%d round=%d first=%llx final=%llx exact=%d\n", pinned, T,
+                       round, (unsigned long long) first_mask, (unsigned long long) mask, pass);
+                fflush(stdout);
+                ok &= pass;
+                stop(s);
+            }
+        }
+        for (const char * fail : { "dispatch", "collect" }) {
+            routes(1);
+            auto s = start(fail);
+            warm(0);
+            uint64_t mask = 0;
+            auto     node = plan(mask);
+            std::fill(out.begin(), out.end(), -123.f);
+            bool pass = node && !collect(node, mask, out);
+            pass &= std::all_of(out.begin(), out.end(), [](float x) { return x == -123.f; });
+            if (node) {
+                ggml_moe_cache.end(node);
+            }
+            printf("cache-stream-stage-failure: pinned=%d tokens=%d failure=%s untouched=%d\n", pinned, T, fail, pass);
+            fflush(stdout);
+            ok &= pass;
+            stop(s);
+        }
+        ggml_backend_buffer_free(buffer);
+        ggml_free(ctx);
+    }
+    return ok;
+}
+
+static bool run_stream_staging(ggml_backend_dev_t device,
+                               ggml_backend_t     gpu,
+                               ggml_backend_t     cpu,
+                               log_capture &      capture) {
+    configure_cache(nullptr);
+    ggml_moe_cache_config      config = {};
+    ggml_moe_cache_device_caps caps   = {};
+    if (!ggml_moe_cache.query_config(0, 4, &config) || !ggml_moe_cache.query_device(device, &config, &caps)) {
+        return false;
+    }
+    if (caps.compute_capability != 1200) {
+        printf("cache-stream-stage: SKIP (requires consumer SM120)\n");
+        return true;
+    }
+    bool ok = true;
+    for (int tokens : { 2, 3, 4 }) {
+        for (const char * down : { "0", "1", static_cast<const char *>(nullptr) }) {
+            ok &= run_stream_staging_case(device, gpu, cpu, capture, tokens, down, false);
+        }
+    }
+    ok &= run_stream_staging_case(device, gpu, cpu, capture, 4, nullptr, true);
+    return ok;
+}
+
 int main(int argc, char ** argv) {
     const bool profile_writer = argc == 6 && std::strcmp(argv[1], "--profile-writer") == 0;
     const bool host_buffer = argc == 2 && std::strcmp(argv[1], "--host-buffer") == 0;
@@ -4611,6 +4914,7 @@ int main(int argc, char ** argv) {
     ok &= run_shared_budget(cuda, cpu, capture);
     ok &= run_route_override(cuda_device, cuda, cpu, capture);
     ok &= run_admission_policy(cuda, cpu, capture);
+    ok &= run_stream_staging(cuda_device, cuda, cpu, capture);
 
     if (flat_hits_expected) {
         uint64_t factor_1 = 0;

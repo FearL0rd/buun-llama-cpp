@@ -80,6 +80,8 @@ static constexpr int    moe_cache_pool_slots_min              = 64;
 static constexpr size_t moe_cache_slab_bytes_auto_min         = 1ull << 30;
 static constexpr int    moe_cache_node_rows_max               = 64;
 static constexpr int    moe_cache_expert_parallel_max         = 8;
+static constexpr int    moe_cache_stream_stage_max            = 4;
+static constexpr int    moe_cache_stream_stage_slots_max      = 3 * moe_cache_stream_stage_max;
 static constexpr size_t moe_cache_overlap_bytes_per_token     = 8u << 20;
 
 enum class moe_cache_slot_state : uint8_t {
@@ -129,6 +131,9 @@ struct moe_cache_pool {
     std::unordered_map<moe_cache_key, int, moe_cache_key_hash> map;
     int lru_head = -1;
     int lru_tail = -1;
+    // Compute-stream scratch remains accounted in the slab, outside the resident LRU.
+    int stream_stage_slots[moe_cache_stream_stage_slots_max] = {};
+    int n_stream_stage_slots = 0;
 };
 
 struct moe_cache_shape {
@@ -145,6 +150,7 @@ struct moe_cache_seen_tensor {
     size_t expert_size = 0;
     int wtype = -1;
     int64_t n_expert = 0;
+    int stream_stage_registered = -1;
 };
 
 struct moe_cache_job {
@@ -187,7 +193,7 @@ struct moe_cache_config {
     bool serial_fill = true;
     bool serial_fill_explicit = false;
     bool force_dedicated_mmv = false;
-    bool force_dedicated_down_mmv = false;
+    int dedicated_down_mmv = -1; // auto, generic (0), or dedicated (1)
     int overlap_cpu_rows = -1;
     bool overlap_cpu_rows_explicit = false;
     int expert_parallel = 0;
@@ -291,6 +297,7 @@ struct moe_cache_device {
     long long full_fused_nodes = 0;
     long long dedicated_down_mmv_dispatches = 0;
     long long nodes = 0;
+    long long stream_stage_experts = 0;
     long long collect_calls = 0;
     // Dispatch mutex contention that turned a potential cache hit into a
     // complete CPU fallback (try_to_lock failed). Measured first so a bounded
@@ -376,6 +383,9 @@ struct moe_cache_node {
     int32_t gate_slots[moe_cache_node_rows_max];
     int32_t down_slots[moe_cache_node_rows_max];
     const float * hit_acts[moe_cache_node_rows_max];
+    int n_stream_stage_copies = 0;
+    const void * stream_stage_sources[moe_cache_stream_stage_slots_max] = {};
+    int stream_stage_slots[moe_cache_stream_stage_slots_max] = {};
 };
 
 static std::mutex g_registry_mu;
@@ -694,7 +704,7 @@ static moe_cache_config moe_cache_read_config() {
         config.force_dedicated_mmv = value != 0;
     }
     if (moe_cache_env_i64("GGML_CUDA_MOE_CACHE_DOWN_DEDICATED_MMV", 0, 1, value)) {
-        config.force_dedicated_down_mmv = value != 0;
+        config.dedicated_down_mmv = (int)value;
     }
     if (moe_cache_env_i64("GGML_CUDA_MOE_CACHE_OVERLAP_CPU_ROWS", 0, 8, value)) {
         config.overlap_cpu_rows = (int)value;
@@ -1910,7 +1920,7 @@ static int moe_cache_discover_pool(
 
     if (pool >= 0) {
         device.pools[pool]->covers_all_entries =
-            (uint64_t)device.pools[pool]->n_slots >= shape->n_entries;
+            (uint64_t)(device.pools[pool]->n_slots - device.pools[pool]->n_stream_stage_slots) >= shape->n_entries;
         return pool;
     }
 
@@ -1947,6 +1957,9 @@ static void moe_cache_log_stats(moe_cache_device & device) {
             device.full_fused_rows, device.full_fused_nodes,
             device.dedicated_down_mmv_dispatches,
             device.contention_bypasses);
+    if (device.stream_stage_experts) {
+        MOE_CACHE_LOG("[moe-cache] CUDA%d stream-stage-experts=%lld\n", device.physical, device.stream_stage_experts);
+    }
 }
 
 static void moe_cache_log_configuration(moe_cache_session & session) {
@@ -1977,7 +1990,8 @@ static void moe_cache_log_configuration(moe_cache_session & session) {
             overlap_cpu_rows.c_str(),
             session.config.serial_fill ? "serial" : "parallel",
             session.config.expert_parallel,
-            session.config.force_dedicated_down_mmv ? "dedicated" : "generic");
+            session.config.dedicated_down_mmv < 0 ? "auto" :
+            session.config.dedicated_down_mmv ? "dedicated" : "generic");
 }
 
 static void * moe_cache_session_create(
@@ -3131,8 +3145,14 @@ static int moe_cache_dispatch_internal(
     }
 
     (void)cudaGetLastError();
-    bool ok =
-        moe_cache_cuda_ok(device, cudaMemcpyAsync(
+    bool ok = true;
+    for (int i = 0; i < node->n_stream_stage_copies && ok; ++i) {
+        ok = moe_cache_cuda_ok(device, cudaMemcpyAsync(
+                pool.slab + (size_t)node->stream_stage_slots[i]*pool.expert_size,
+                node->stream_stage_sources[i], pool.expert_size,
+                cudaMemcpyHostToDevice, device.compute_stream), "stream expert staging", true);
+    }
+    ok = ok && moe_cache_cuda_ok(device, cudaMemcpyAsync(
                 device.d_input, device.h_input, input_bytes,
                 cudaMemcpyHostToDevice, device.compute_stream), "input upload", true);
     if (ok && !exl3) {
@@ -3183,12 +3203,18 @@ static int moe_cache_dispatch_internal(
     ggml_cuda_moe_cache_mmv_path down_mmv_path =
         ggml_cuda_moe_cache_mmv_path::generic;
     if (ok && full) {
+        // The short Q2 down projection benefits from the dedicated MMV on
+        // consumer Blackwell. Leave unmeasured shapes and architectures alone.
+        const bool dedicated_down = session.config.dedicated_down_mmv >= 0
+            ? session.config.dedicated_down_mmv != 0
+            : ggml_cuda_info().devices[device.logical].cc == GGML_CUDA_CC_BLACKWELL &&
+              down_pool->wtype == GGML_TYPE_Q2_0 && n_out == 640 && node->n_out == 2560;
         down_mmv_path = ggml_cuda_moe_cache_mmv(
                 down_pool->slab, (ggml_type)down_pool->wtype,
                 (const char *)device.d_act_q8, d_ids + 2 * n_hits,
                 nullptr, device.d_out, n_out, node->n_out,
                 down_pool->n_slots, (int64_t)down_pool->expert_size,
-                n_hits, n_hits, session.config.force_dedicated_down_mmv,
+                n_hits, n_hits, dedicated_down,
                 device.compute_stream);
         ok = moe_cache_cuda_ok(
                 device, cudaPeekAtLastError(), "down expert matvec launch", true);
@@ -3410,6 +3436,46 @@ static void moe_cache_end(void * opaque) {
     }
 }
 
+// Called under session.mu and the device dispatch lock. Retire a few unpinned
+// resident slots once; they remain accounted in the slab but are never LRU keys.
+static bool moe_cache_stream_stage_reserve(moe_cache_device & device, moe_cache_pool & pool, int count) {
+    if (pool.covers_all_entries || count > moe_cache_stream_stage_slots_max || pool.n_slots < 2*count) return false;
+    while (pool.n_stream_stage_slots < count) {
+        int slot = -1;
+        if (!pool.free_slots.empty()) {
+            slot = pool.free_slots.back();
+            pool.free_slots.pop_back();
+        } else {
+            slot = pool.lru_head;
+            while (slot >= 0 && pool.slots[slot].readers != 0) slot = pool.slots[slot].next;
+            if (slot < 0) return false;
+            moe_cache_slot_reset(pool, slot, false);
+            device.evictions++;
+        }
+        pool.stream_stage_slots[pool.n_stream_stage_slots++] = slot;
+    }
+    return true;
+}
+
+static bool moe_cache_stream_stage_source(moe_cache_device & device, const void * base) {
+#if !defined(GGML_USE_HIP)
+    auto found = device.seen_tensors.find(base);
+    if (found != device.seen_tensors.end() && found->second.stream_stage_registered >= 0)
+        return found->second.stream_stage_registered != 0;
+    // Partial pools stop extending the census; absence there does not imply a
+    // pageable source (including a source rediscovered after invalidation).
+    cudaPointerAttributes attributes = {};
+    const cudaError_t error = cudaPointerGetAttributes(&attributes, base);
+    const bool registered = error == cudaSuccess && attributes.type == cudaMemoryTypeHost;
+    if (error != cudaSuccess) (void)cudaGetLastError();
+    if (found != device.seen_tensors.end()) found->second.stream_stage_registered = registered;
+    return registered;
+#else
+    (void)device; (void)base;
+    return false;
+#endif
+}
+
 static void * moe_cache_fused_plan_expert_parallel(
         moe_cache_session & session,
         const ggml_moe_cache_tensor_desc * up,
@@ -3418,8 +3484,8 @@ static void * moe_cache_fused_plan_expert_parallel(
         int layer, int glu_op, float up_min, float up_max,
         float gate_min, float gate_max,
         const int32_t * ids, int n_ids, int64_t n_tokens,
-        const float * const * act_rows, uint64_t * hit_mask) {
-    if (!down || session.devices.size() < 2) {
+        const float * const * act_rows, uint64_t * hit_mask, int stage_experts = 0) {
+    if (!down || session.devices.empty()) {
         return nullptr;
     }
 
@@ -3473,12 +3539,16 @@ static void * moe_cache_fused_plan_expert_parallel(
         int rows[moe_cache_node_rows_max];
         int n_rows = 0;
         int n_hits = 0;
+        int n_stage_rows = 0;
         int up_slots[moe_cache_node_rows_max];
         int gate_slots[moe_cache_node_rows_max];
         int down_slots[moe_cache_node_rows_max];
         const float * acts[moe_cache_node_rows_max];
         moe_cache_pin pins[3 * moe_cache_node_rows_max];
         int n_pins = 0;
+        int n_stage_copies = 0;
+        const void * stage_sources[moe_cache_stream_stage_slots_max] = {};
+        int stage_slots[moe_cache_stream_stage_slots_max] = {};
         std::unique_lock<std::mutex> dispatch_lock;
         moe_cache_node * child = nullptr;
     };
@@ -3539,7 +3609,7 @@ static void * moe_cache_fused_plan_expert_parallel(
             result.down_pool_index = down_pool;
         }
     }
-    if (routes.size() < 2) {
+    if (routes.empty()) {
         return nullptr;
     }
 
@@ -3691,6 +3761,49 @@ static void * moe_cache_fused_plan_expert_parallel(
                 }
                 mask |= UINT64_C(1) << row;
             }
+            if (stage_experts > 0 && routes.size() == 1 && n_tokens >= 2 && n_tokens <= 4 &&
+                current.pair_pool == current.down_pool && up->type == GGML_TYPE_Q2_0 &&
+                down->type == up->type && up->expert_size == down->expert_size && up->expert_size <= 512*1024 &&
+                !current.pair_pool->covers_all_entries &&
+                moe_cache_stream_stage_source(*current.device, up->data) &&
+                moe_cache_stream_stage_source(*current.device, gate->data) &&
+                moe_cache_stream_stage_source(*current.device, down->data)) {
+                for (int staged = 0; staged < stage_experts; ++staged) {
+                    int best = -1, best_rows = 1;
+                    for (int r = 0; r < n_ids; ++r) {
+                        if (mask & (UINT64_C(1) << r)) continue;
+                        int count = 0;
+                        for (int j = 0; j < n_ids; ++j)
+                            count += ids[j] == ids[r] && !(mask & (UINT64_C(1) << j));
+                        if (count > best_rows) {best = ids[r]; best_rows = count;}
+                    }
+                    if (best < 0 || !moe_cache_stream_stage_reserve(
+                            *current.device, *current.pair_pool, 3*(staged+1))) break;
+                    const int * slots = current.pair_pool->stream_stage_slots + 3*staged;
+                    const void * bases[] = {up->data, gate->data, down->data};
+                    for (int k = 0; k < 3; ++k) {
+                        const int copy = current.n_stage_copies++;
+                        current.stage_sources[copy] = (const char *)bases[k] + (size_t)best*up->expert_size;
+                        current.stage_slots[copy] = slots[k];
+                    }
+                    for (int r = 0; r < n_ids; ++r) {
+                        if (ids[r] != best || (mask & (UINT64_C(1) << r))) continue;
+                        const int hit = current.n_hits++;
+                        current.n_stage_rows++;
+                        current.rows[hit] = r;
+                        current.up_slots[hit] = slots[0];
+                        current.gate_slots[hit] = slots[1];
+                        current.down_slots[hit] = slots[2];
+                        current.acts[hit] = act_rows[r];
+                        for (int k = 0; k < 3; ++k) {
+                            current.pair_pool->slots[slots[k]].readers++;
+                            current.pins[current.n_pins++] = {current.pair_pool, slots[k]};
+                        }
+                        mask |= UINT64_C(1) << r;
+                    }
+                    current.device->stream_stage_experts++;
+                }
+            }
         }
     }
     if (wake_worker) {
@@ -3788,6 +3901,11 @@ static void * moe_cache_fused_plan_expert_parallel(
         child->gate_min = gate_min;
         child->gate_max = gate_max;
         child->dispatch_lock = std::move(current.dispatch_lock);
+        child->n_stream_stage_copies = current.n_stage_copies;
+        for (int i = 0; i < current.n_stage_copies; ++i) {
+            child->stream_stage_sources[i] = current.stage_sources[i];
+            child->stream_stage_slots[i] = current.stage_slots[i];
+        }
         for (int local = 0; local < current.n_hits; local++) {
             child->row_indices[local] = hit_ranks[current.rows[local]];
             child->up_slots[local] = current.up_slots[local];
@@ -3811,7 +3929,8 @@ static void * moe_cache_fused_plan_expert_parallel(
                 child->pins[child->n_pins++] = current.pins[index];
             }
             current.n_pins = 0;
-            current.device->hits += 3 * current.n_hits;
+            // Staged misses execute on the GPU but are not resident cache hits.
+            current.device->hits += 3 * (current.n_hits - current.n_stage_rows);
             current.device->nodes++;
             current.device->fused_attempts++;
         }
@@ -3921,11 +4040,29 @@ static void * moe_cache_fused_plan(
         return nullptr;
     }
 
-    if (expert_parallel && down) {
+    bool stream_stage = false;
+#if !defined(GGML_USE_HIP)
+    // Measured for small speculative Q2 batches on consumer Blackwell. Use the
+    // same full-FFN planner for resident and transient experts, without changing
+    // the existing multi-device routing or larger prompt-processing batches.
+    stream_stage = down && session->devices.size() == 1 && n_tokens <= 4 &&
+        up->type == GGML_TYPE_Q2_0 && down->type == up->type &&
+        up->expert_size == down->expert_size && up->expert_size <= 512*1024 &&
+        ggml_cuda_info().devices[session->devices.front()->logical].cc == GGML_CUDA_CC_BLACKWELL;
+#endif
+    if (down && (expert_parallel || stream_stage)) {
+        if (!expert_parallel) {
+            std::lock_guard<std::mutex> lock(session->mu);
+            const auto & device = *session->devices.front();
+            const int up_index = moe_cache_find_pool(device, up->expert_size, up->type);
+            const int down_index = moe_cache_find_pool(device, down->expert_size, down->type);
+            if (up_index < 0 || down_index < 0 ||
+                !device.pools[up_index]->slab || !device.pools[down_index]->slab) return nullptr;
+        }
         return moe_cache_fused_plan_expert_parallel(
                 *session, up, gate, down, up_layer, glu_op,
                 up_min, up_max, gate_min, gate_max,
-                ids, n_ids, n_tokens, act_rows, hit_mask);
+                ids, n_ids, n_tokens, act_rows, hit_mask, stream_stage ? moe_cache_stream_stage_max : 0);
     }
 
     const bool profile_enabled = !session->config.profile_path.empty();
@@ -4385,7 +4522,8 @@ static void moe_cache_invalidate_session(
                         shape.n_tensors = std::max<int64_t>(shape.n_tensors - 1, 0);
                         if (shape.pool >= 0 && shape.pool < (int)device.pools.size()) {
                             device.pools[shape.pool]->covers_all_entries =
-                                (uint64_t)device.pools[shape.pool]->n_slots >= shape.n_entries;
+                                (uint64_t)(device.pools[shape.pool]->n_slots -
+                                    device.pools[shape.pool]->n_stream_stage_slots) >= shape.n_entries;
                         }
                         if (shape.n_tensors == 0 && shape.pool < 0) {
                             shape.finished = false;
