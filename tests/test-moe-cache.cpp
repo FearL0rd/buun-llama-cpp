@@ -745,7 +745,7 @@ static void poison_graph(test_graph & graph) {
     }
 }
 
-// Force the CPU miss and failed-collect routes independently of GPU admission.
+// Exercise CPU misses and collection success/failure independently of GPU admission.
 // Repeated experts exercise the IQ panel path as well as ordinary vec-dot work.
 static bool run_fused_cpu_fallbacks(ggml_backend_t cpu) {
     const auto saved_api = ggml_moe_cache;
@@ -753,11 +753,14 @@ static bool run_fused_cpu_fallbacks(ggml_backend_t cpu) {
     static int fused_calls;
     static int full_calls;
     static bool fail_dispatch;
+    static bool fail_collect;
+    static bool pair_only;
+    static const std::vector<float> * collect_reference;
     static int end_calls;
     static int collect_calls;
     bool ok = true;
     for (ggml_type type : { GGML_TYPE_Q2_0, GGML_TYPE_MXFP4, GGML_TYPE_Q4_K, GGML_TYPE_IQ2_XXS }) {
-        for (int tokens : { 1, 4, 8, 16 }) {
+        for (int tokens : { 1, 2, 3, 4, 8, 16 }) {
             ggml_context * ctx = ggml_init({ 8*ggml_tensor_overhead(), nullptr, true });
             GGML_ASSERT(ctx);
             constexpr int width = 256;
@@ -798,43 +801,67 @@ static bool run_fused_cpu_fallbacks(ggml_backend_t cpu) {
             ok &= ggml_backend_graph_compute(cpu, graph.graph) == GGML_STATUS_SUCCESS;
             std::vector<float> reference(ggml_nelements(graph.out));
             ggml_backend_tensor_get(graph.out, reference.data(), 0, reference.size()*sizeof(float));
+            const ggml_tensor * glu = graph.out->src[1];
+            std::vector<float> glu_reference(ggml_nelements(glu));
+            ggml_backend_tensor_get(glu, glu_reference.data(), 0, glu_reference.size()*sizeof(float));
             ggml_moe_cache.fused_dispatch = [](void *) { return fail_dispatch ? 0 : 1; };
             ggml_moe_cache.fused_plan = [](
                     const ggml_moe_cache_tensor_desc *, const ggml_moe_cache_tensor_desc *,
                     const ggml_moe_cache_tensor_desc * down, int, float, float, float, float,
                     const int32_t *, int rows, int64_t, const float * const *, uint64_t * mask) -> void * {
+                if (pair_only && down) {
+                    return nullptr;
+                }
                 ++fused_calls;
                 full_calls += down != nullptr;
                 const uint64_t valid = rows == 64 ? UINT64_MAX : (UINT64_C(1) << rows) - 1;
                 *mask = forced_mask & valid;
                 return &forced_mask;
             };
-            ggml_moe_cache.collect = [](void *, int hits, float * const *, int64_t) {
+            ggml_moe_cache.collect = [](void *, int hits, float * const * dst, int64_t width) {
                 ++collect_calls;
-                return hits == 0 ? 1 : 0;
+                if (fail_collect) {
+                    return hits == 0 ? 1 : 0;
+                }
+                int copied = 0;
+                const size_t rows = collect_reference->size()/width;
+                for (size_t row = 0; row < rows; ++row) {
+                    if (forced_mask & (UINT64_C(1) << row)) {
+                        GGML_ASSERT(copied < hits);
+                        std::memcpy(dst[copied++], collect_reference->data() + row*width, width*sizeof(float));
+                    }
+                }
+                return copied == hits ? 1 : 0;
             };
             ggml_moe_cache.end = [](void *) { ++end_calls; };
-            for (bool failed : { false, true }) {
-                fail_dispatch = failed;
-                for (uint64_t mask : { UINT64_C(0), UINT64_MAX, UINT64_C(0xf0f0f0f0f0f0f0f0) }) {
-                    forced_mask = mask;
-                    fused_calls = full_calls = end_calls = collect_calls = 0;
-                    // Reference execution populated the intermediates too. Poison
-                    // every computed tensor so omitted up/gate/GLU work cannot pass.
-                    poison_graph(graph);
-                    std::vector<float> actual(reference.size());
-                    ok &= ggml_backend_graph_compute(cpu, graph.graph) == GGML_STATUS_SUCCESS;
-                    ggml_backend_tensor_get(graph.out, actual.data(), 0, actual.size()*sizeof(float));
-                    // Mixed hits can move an expert below the IQ panel's batch cutoff.
-                    const bool match = compare_output(reference, actual, 1e-10);
-                    const bool cell_ok = match && fused_calls > 0 && full_calls > 0 &&
-                        end_calls == fused_calls && (failed ? collect_calls == 0 : collect_calls == fused_calls);
-                    printf("cache-fused-cpu-%s-tokens%d-mask%llx-dispatch-fail%d: %s\n", ggml_type_name(type),
-                            tokens, (unsigned long long)mask, failed, cell_ok ? "OK" : "FAIL");
-                    ok &= cell_ok;
+            for (bool partial : { false, true }) {
+                pair_only = partial;
+                collect_reference = partial ? &glu_reference : &reference;
+                for (int failure : { 0, 1, 2 }) {
+                    fail_dispatch = failure == 1;
+                    fail_collect = failure == 2;
+                    for (uint64_t mask : { UINT64_C(0), UINT64_MAX, UINT64_C(0xf0f0f0f0f0f0f0f0) }) {
+                        forced_mask = mask;
+                        fused_calls = full_calls = end_calls = collect_calls = 0;
+                        // Reference execution populated the intermediates too. Poison
+                        // every computed tensor so omitted up/gate/GLU work cannot pass.
+                        poison_graph(graph);
+                        std::vector<float> actual(reference.size());
+                        ok &= ggml_backend_graph_compute(cpu, graph.graph) == GGML_STATUS_SUCCESS;
+                        ggml_backend_tensor_get(graph.out, actual.data(), 0, actual.size()*sizeof(float));
+                        // Mixed hits can move an expert below the IQ panel's batch cutoff.
+                        const bool match = compare_output(reference, actual, 1e-10);
+                        const bool cell_ok = match && fused_calls > 0 &&
+                            (partial ? full_calls == 0 : full_calls > 0) && end_calls == fused_calls &&
+                            (fail_dispatch ? collect_calls == 0 : collect_calls == fused_calls);
+                        printf("cache-fused-cpu-%s-tokens%d-mask%llx-pair%d-failure%d: %s\n", ggml_type_name(type),
+                                tokens, (unsigned long long)mask, partial, failure, cell_ok ? "OK" : "FAIL");
+                        ok &= cell_ok;
+                    }
                 }
             }
             fail_dispatch = false;
+            pair_only = false;
             const auto forced_api = ggml_moe_cache;
             for (bool window_pair : { false, true }) {
                 ggml_tensor * glu = graph.out->src[1];
@@ -3983,7 +4010,7 @@ int main(int argc, char ** argv) {
     // Profile writer subprocesses must reach their rendezvous promptly. They
     // exercise profile I/O, not the parent's complete CPU fallback matrix.
     if (!profile_writer) {
-        for (int threads : { 1, 2, 4 }) {
+        for (int threads : { 1, 2, 4, 6 }) {
             if (set_n_threads) set_n_threads(cpu, threads);
             printf("cache-fused-cpu-fallbacks: threads=%d\n", threads);
             if (!run_fused_cpu_fallbacks(cpu)) {
