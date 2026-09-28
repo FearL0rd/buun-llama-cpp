@@ -4169,9 +4169,9 @@ static int test_backends(const llm_arch target_arch, const size_t seed, const in
                                     compute_devices.end());
                             }
 
-                            // A dry fit still owns one logical Meta device, so its estimated
-                            // compute row must remain Meta instead of being expanded into child
-                            // devices that the fitter cannot associate with the model.
+                            // Dry estimates, like live accounting, must charge the mirrored
+                            // Meta workspace to every physical child. The fitter folds these
+                            // rows into the target's balanced-equivalent budget.
                             if (arch == LLM_ARCH_QWEN35 && dc.devs.size() > 1) {
                                 llama_model_params estimate_model_params = llama_model_default_params();
                                 estimate_model_params.progress_callback = silent_model_load_progress;
@@ -4193,16 +4193,20 @@ static int test_backends(const llm_arch target_arch, const size_t seed, const in
                                 llama_context_ptr estimate_ctx(llama_init_from_model(
                                     estimate_model.get(), estimate_ctx_params));
                                 GGML_ASSERT(estimate_ctx != nullptr);
-                                size_t non_host_compute_rows = 0;
+                                std::vector<ggml_backend_dev_t> unmatched_compute = dc.devs;
                                 for (const auto & [buft, row] :
                                         llama_get_memory_breakdown(estimate_ctx.get())) {
                                     if (row.compute == 0 || ggml_backend_buft_is_host(buft)) {
                                         continue;
                                     }
-                                    ++non_host_compute_rows;
-                                    GGML_ASSERT(ggml_backend_buft_is_meta(buft));
+                                    GGML_ASSERT(!ggml_backend_buft_is_meta(buft));
+                                    const auto device = ggml_backend_buft_get_device(buft);
+                                    const auto it = std::find(
+                                        unmatched_compute.begin(), unmatched_compute.end(), device);
+                                    GGML_ASSERT(it != unmatched_compute.end());
+                                    unmatched_compute.erase(it);
                                 }
-                                GGML_ASSERT(non_host_compute_rows == 1);
+                                GGML_ASSERT(unmatched_compute.empty());
                             }
 
                             // Pool discovery has a separate physical-backend contract from

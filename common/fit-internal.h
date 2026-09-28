@@ -24,6 +24,26 @@ inline bool common_fit_same_devices(
     return true;
 }
 
+// Extra-model probes construct their own Meta wrappers. An equivalent wrapper
+// already reports balanced-equivalent bytes; a draft pinned to one child must
+// instead charge its entire allocation on every member of the target's balanced
+// budget. Averaging a CUDA1-only draft across CUDA0/CUDA1 would hide an OOM.
+// Zero means the extra is outside this target's device authority.
+inline size_t common_fit_extra_device_scale(ggml_backend_dev_t target, ggml_backend_dev_t extra) {
+    if (common_fit_same_devices({target}, {extra})) {
+        return 1;
+    }
+    if (ggml_backend_dev_is_meta(target) && !ggml_backend_dev_is_meta(extra)) {
+        const size_t count = ggml_backend_meta_dev_n_devs(target);
+        for (size_t i = 0; i < count; ++i) {
+            if (ggml_backend_meta_dev_simple_dev(target, i) == extra) {
+                return count;
+            }
+        }
+    }
+    return 0;
+}
+
 // Tensor fit uses a balanced-equivalent aggregate. Ordinary child-device
 // buffers (KV, compute, etc.) are separate from the Meta allocation. Charge
 // each component at its largest child footprint, not an unsafe average.

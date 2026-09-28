@@ -7030,9 +7030,9 @@ llama_memory_breakdown llama_context::memory_breakdown() const {
         for (size_t i = 0; i < backends.size(); ++i) {
             ggml_backend_t             backend = backends[i].get();
             ggml_backend_buffer_type_t buft    = ggml_backend_sched_get_buffer_type(sched.get(), backend);
-            // Fit owns the estimated Meta row as one logical model device.
-            // Physical expansion is only valid once child allocations exist.
-            ret[buft].compute += backend_buf_exp_size[i];
+            // The reservation estimate is also per child: Meta allocates this
+            // workspace size on every GPU, even though no buffers exist yet.
+            add_compute(buft, backend_buf_exp_size[i]);
         }
     } else {
         for (const auto & backend_ptr : backends) {
