@@ -72,8 +72,10 @@ void ggml_moe_cache_register(const void * owner) {
 #define MOE_CACHE_LOG(...) GGML_LOG_INFO(__VA_ARGS__)
 
 static constexpr int    moe_cache_cc_forced_min               = 700;
+static constexpr int    moe_cache_cc_turing                   = 750;
 static constexpr int    moe_cache_cc_ampere                   = 800;
 static constexpr size_t moe_cache_expert_bytes_ampere_min     = 512u << 10;
+static constexpr size_t moe_cache_expert_bytes_turing_min     = 256u << 10;
 static constexpr size_t moe_cache_expert_bytes_pre_ampere_min = 1u << 20;
 static constexpr int    moe_cache_batch_max                   = 10;
 static constexpr int    moe_cache_pool_slots_min              = 64;
@@ -608,9 +610,15 @@ static int moe_cache_min_compute_capability() {
 }
 
 static size_t moe_cache_default_min_expert_bytes(int compute_capability) {
-    return compute_capability >= moe_cache_cc_ampere
-        ? moe_cache_expert_bytes_ampere_min
-        : moe_cache_expert_bytes_pre_ampere_min;
+    if (compute_capability >= moe_cache_cc_ampere) {
+        return moe_cache_expert_bytes_ampere_min;
+    }
+    // The old 1 MiB floor excluded every APEX expert (412--900 KiB).
+    // SM75 serving measurements favor caching these in both split modes.
+    if (compute_capability >= moe_cache_cc_turing) {
+        return moe_cache_expert_bytes_turing_min;
+    }
+    return moe_cache_expert_bytes_pre_ampere_min;
 }
 
 static void moe_cache_apply_mode_defaults(moe_cache_config & config) {
@@ -2049,7 +2057,7 @@ static void * moe_cache_session_create(
         session->config = std::move(config);
 
         std::unordered_set<int> seen_devices;
-        size_t default_min_expert_bytes = moe_cache_expert_bytes_ampere_min;
+        size_t default_min_expert_bytes = 0;
         int minimum_capability = INT_MAX;
         const auto add_backend = [&](ggml_backend_t backend) {
             if (!backend || !ggml_backend_is_cuda(backend) ||
