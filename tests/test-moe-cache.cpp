@@ -4389,6 +4389,101 @@ static bool run_stream_staging(ggml_backend_dev_t device,
     return ok;
 }
 
+static bool run_prefill_copy(ggml_backend_dev_t dev, ggml_backend_t gpu, ggml_backend_t cpu) {
+    configure_cache(nullptr);
+    ggml_moe_cache_config config = {};
+    ggml_moe_cache_device_caps caps = {};
+    if (!ggml_moe_cache.query_config(0, 4, &config) || !ggml_moe_cache.query_device(dev, &config, &caps)) return false;
+    if (caps.compute_capability != 1200) {
+        printf("cache-prefill-copy: SKIP (requires consumer SM120)\n");
+        return true;
+    }
+    if (!ggml_moe_cache.prefill_copy) return false;
+    bool all_ok = true;
+    for (bool pinned : {false, true}) {
+        bool ok = true;
+        const auto check = [&](bool passed, const char * label) {
+            if (!passed) fprintf(stderr, "cache-prefill-copy: pinned=%d %s FAIL\n", int(pinned), label);
+            ok &= passed;
+        };
+        auto host_ctx = ggml_init({2 * ggml_tensor_overhead(), nullptr, true});
+        auto gpu_ctx = ggml_init({2 * ggml_tensor_overhead(), nullptr, true});
+        // The provider requires at least 64 resident slots. Exercise all masks
+        // of the first eight experts; the rest also verify untouched storage.
+        auto source = ggml_new_tensor_3d(host_ctx, GGML_TYPE_Q2_0, 256, 128, 64);
+        auto destination = ggml_dup_tensor(gpu_ctx, source);
+        ggml_set_name(source, "blk.0.ffn_up_exps.weight");
+        auto host_buft = pinned ? ggml_backend_dev_host_buffer_type(dev) : ggml_backend_cpu_buffer_type();
+        auto host_buffer = ggml_backend_alloc_ctx_tensors_from_buft(host_ctx, host_buft);
+        auto gpu_buffer = ggml_backend_alloc_ctx_tensors(gpu_ctx, gpu);
+        GGML_ASSERT(host_buffer && gpu_buffer);
+        ggml_backend_buffer_set_usage(host_buffer, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+        const size_t bytes = ggml_nbytes(source), expert = source->nb[2];
+        std::vector<uint8_t> input(bytes), expected(bytes), actual(bytes), sentinel(bytes, 0xa5);
+        // Copy-only test: cover every byte value, without interpreting weights.
+        for (size_t i = 0; i < bytes; ++i) input[i] = uint8_t(i * 37 + (i / expert) * 83);
+        ggml_backend_tensor_set(source, input.data(), 0, bytes);
+        void * session = create_direct_session(gpu, cpu);
+        GGML_ASSERT(session);
+        ggml_moe_cache.session_enter(session);
+        bool ready = true;
+        // Physical resident order intentionally differs from destination order.
+        for (int e : {2, 0, 3, 1}) ready &= wait_for_direct_resident(source, e);
+        check(ready, "resident warmup");
+        for (uint32_t mask = 0; ready && mask < 256; ++mask) {
+            ggml_backend_tensor_set(destination, sentinel.data(), 0, bytes);
+            const uint32_t selected[2] = {mask, 0};
+            const bool copied = ggml_moe_cache.prefill_copy(session, gpu, source, destination, selected, 2);
+            const bool wanted = (mask & 15) != 0;
+            expected = sentinel;
+            if (wanted) {
+                for (int e = 0; e < 8; ++e) {
+                    if (!(mask & (1u << e))) continue;
+                    std::memcpy(expected.data() + e * expert, input.data() + e * expert, expert);
+                    if (!(mask & (1u << (e + 1))))
+                        std::memcpy(expected.data() + (e + 1) * expert, input.data() + (e + 1) * expert, 512);
+                }
+            }
+            ggml_backend_tensor_get(destination, actual.data(), 0, bytes);
+            if (copied != wanted || actual != expected) {
+                fprintf(stderr, "cache-prefill-copy: pinned=%d mask=%u copied=%d expected=%d FAIL\n",
+                    int(pinned), mask, int(copied), int(wanted));
+                ok = false;
+                break;
+            }
+        }
+        const uint32_t mask[2] = {15, 0};
+        ggml_backend_tensor_set(destination, sentinel.data(), 0, bytes);
+        check(!ggml_moe_cache.prefill_copy(nullptr, gpu, source, destination, mask, 2), "null session");
+        check(!ggml_moe_cache.prefill_copy(session, gpu, source, destination, mask, 1), "short bitset");
+        check(!ggml_moe_cache.prefill_copy(session, cpu, source, destination, mask, 2), "CPU backend");
+        auto unaligned = *destination;
+        unaligned.data = (char *) destination->data + 1;
+        check(!ggml_moe_cache.prefill_copy(session, gpu, source, &unaligned, mask, 2), "unaligned destination");
+        auto unsupported = *source;
+        unsupported.type = GGML_TYPE_Q4_0;
+        check(!ggml_moe_cache.prefill_copy(session, gpu, &unsupported, destination, mask, 2), "unsupported type");
+        ggml_moe_cache.session_leave(session);
+        check(!ggml_moe_cache.prefill_copy(session, gpu, source, destination, mask, 2), "outside scope");
+        ggml_moe_cache.session_enter(session);
+        input[0] ^= 0xff;
+        ggml_backend_tensor_set(source, input.data(), 0, bytes);
+        check(!ggml_moe_cache.prefill_copy(session, gpu, source, destination, mask, 2), "invalidated source");
+        ggml_backend_tensor_get(destination, actual.data(), 0, bytes);
+        check(actual == sentinel, "untouched refusals");
+        ggml_moe_cache.session_leave(session);
+        ggml_moe_cache.session_destroy(session);
+        ggml_backend_buffer_free(gpu_buffer);
+        ggml_backend_buffer_free(host_buffer);
+        ggml_free(gpu_ctx);
+        ggml_free(host_ctx);
+        printf("cache-prefill-copy: pinned=%d masks=256 exact-padding untouched-refusals invalidation %s\n",
+            int(pinned), ok ? "OK" : "FAIL");
+        all_ok &= ok;
+    }
+    return all_ok;
+}
+
 int main(int argc, char ** argv) {
     const bool profile_writer = argc == 6 && std::strcmp(argv[1], "--profile-writer") == 0;
     const bool host_buffer = argc == 2 && std::strcmp(argv[1], "--host-buffer") == 0;
@@ -4915,6 +5010,7 @@ int main(int argc, char ** argv) {
     ok &= run_route_override(cuda_device, cuda, cpu, capture);
     ok &= run_admission_policy(cuda, cpu, capture);
     ok &= run_stream_staging(cuda_device, cuda, cpu, capture);
+    ok &= run_prefill_copy(cuda_device, cuda, cpu);
 
     if (flat_hits_expected) {
         uint64_t factor_1 = 0;

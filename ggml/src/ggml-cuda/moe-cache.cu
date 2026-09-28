@@ -2277,6 +2277,92 @@ static void moe_cache_session_destroy(void * opaque) {
     delete session;
 }
 
+struct moe_cache_pp_copy_refs {
+    uint32_t packed[512]; // destination expert in high16, resident slot in low16
+};
+
+static __global__ void moe_cache_pp_gather(
+        const uint4 * slab, uint4 * destination, size_t vectors_per_expert,
+        moe_cache_pp_copy_refs refs) {
+    const uint32_t ref = refs.packed[blockIdx.y];
+    const uint4 * src = slab + size_t(ref & 65535u) * vectors_per_expert;
+    uint4 * dst = destination + size_t(ref >> 16) * vectors_per_expert;
+    for (size_t i = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+            i < vectors_per_expert; i += size_t(gridDim.x) * blockDim.x) dst[i] = src[i];
+}
+
+static int moe_cache_prefill_copy(void * opaque, void * backend_opaque,
+        const ggml_tensor * source, ggml_tensor * destination, const uint32_t * selected, size_t n_words) {
+    if (!opaque) return false;
+    auto backend = (ggml_backend_t) backend_opaque;
+    if (!backend || !ggml_backend_is_cuda(backend) ||
+            source->type != GGML_TYPE_Q2_0 || destination->type != source->type ||
+            !ggml_is_contiguous(source) || !ggml_is_contiguous(destination) ||
+            !ggml_are_same_shape(source, destination) || source->ne[3] != 1 ||
+            source->ne[2] > 512 || source->ne[2] < 1 || !selected ||
+            n_words < size_t((source->ne[2] + 31) / 32)) return false;
+    auto * ctx = (ggml_backend_cuda_context *) backend->context;
+    // Performance-qualified on SM120 and canonical Q2_0 cache bytes only.
+    // In particular, do not copy opaque/repacked expert formats this way.
+    if (ggml_cuda_info().devices[ctx->device].cc != GGML_CUDA_CC_BLACKWELL) return false;
+    const auto buffer = destination->view_src ? destination->view_src->buffer : destination->buffer;
+    if (!buffer || buffer->buft != ggml_backend_cuda_buffer_type(ctx->device)) return false;
+    const size_t expert_size = source->nb[2];
+    if (!expert_size || expert_size % sizeof(uint4) || uintptr_t(destination->data) % alignof(uint4)) return false;
+
+    auto & session = *(moe_cache_session *) opaque;
+    std::unique_lock<std::mutex> lock(session.mu);
+    if (session.stopping || session.dormant || session.active_scopes == 0 || session.devices.size() != 1) return false;
+    auto & device = *session.devices[0];
+    if (device.dead || device.logical != ctx->device) return false;
+    const int pool_index = moe_cache_find_pool(device, expert_size, source->type);
+    if (pool_index < 0) return false;
+    const auto & pool = *device.pools[pool_index];
+    if (!pool.slab) return false;
+
+    const int n_expert = source->ne[2];
+    const auto used = [&](int e) { return (selected[e / 32] >> (e % 32)) & 1u; };
+    bool resident[512] = {};
+    moe_cache_pp_copy_refs refs = {};
+    int hits = 0;
+    for (int e = 0; e < n_expert; ++e) {
+        if (!used(e)) continue;
+        const auto found = pool.map.find({source->data, e});
+        if (found != pool.map.end() && pool.slots[found->second].state == moe_cache_slot_state::valid) {
+            if (found->second > 65535) return false;
+            resident[e] = true;
+            refs.packed[hits++] = (uint32_t(e) << 16) | uint32_t(found->second);
+        }
+    }
+    if (!hits) return false;
+
+    ggml_cuda_set_device(ctx->device);
+    const size_t vectors = expert_size / sizeof(uint4);
+    const unsigned blocks = std::min<size_t>(32, (vectors + 255) / 256);
+    moe_cache_pp_gather<<<dim3(blocks, hits), 256, 0, ctx->stream()>>>(
+        (const uint4 *) pool.slab, (uint4 *) destination->data, vectors, refs);
+    CUDA_CHECK(cudaGetLastError());
+    for (int e = 0; e < n_expert;) {
+        if (!used(e)) { ++e; continue; }
+        int end = e + 1;
+        while (end < n_expert && used(end) && resident[end] == resident[e]) ++end;
+        // Preserve the ordinary copy's 512B pad only at selected-run boundaries.
+        // A cache/host transition inside a selected run does not need padding.
+        const size_t padding = end < n_expert && !used(end) ? std::min<size_t>(expert_size, 512) : 0;
+        const size_t offset = size_t(resident[e] ? end : e) * expert_size;
+        const size_t bytes = (resident[e] ? 0 : size_t(end - e) * expert_size) + padding;
+        if (bytes) {
+            CUDA_CHECK(cudaMemcpyAsync((char *) destination->data + offset,
+                (const char *) source->data + offset, bytes, cudaMemcpyHostToDevice, ctx->stream()));
+        }
+        e = end;
+    }
+    // Keep cached sources valid until the gather finishes. No admission, LRU
+    // changes, additional resident allocation, or altered matmul arithmetic.
+    CUDA_CHECK(cudaStreamSynchronize(ctx->stream()));
+    return true;
+}
+
 static void moe_cache_session_enter(void * opaque) {
     if (g_session_suppressed > 0) {
         g_session_suppressed++;
@@ -4633,6 +4719,7 @@ void ggml_moe_cache_register(const void * owner) {
     ggml_moe_cache.session_destroy = moe_cache_session_destroy;
     ggml_moe_cache.session_enter = moe_cache_session_enter;
     ggml_moe_cache.session_leave = moe_cache_session_leave;
+    ggml_moe_cache.prefill_copy = moe_cache_prefill_copy;
     ggml_moe_cache.begin = moe_cache_begin;
     ggml_moe_cache.plan = moe_cache_plan;
     ggml_moe_cache.dispatch = moe_cache_dispatch;

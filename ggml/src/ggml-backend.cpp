@@ -1824,6 +1824,12 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         prev_ids_tensor = ids_tensor;
                     }
 
+                    if (ggml_moe_cache.prefill_copy && ids_tensor->ne[1] > 16 &&
+                            ggml_moe_cache.prefill_copy(sched->moe_cache_session, split_backend,
+                                input, input_cpy, used_ids.data(), used_ids.size())) {
+                        continue;
+                    }
+
                     // group consecutive experts and copy them together
                     auto copy_experts = [&](int32_t first_id, int32_t last_id) {
                         const size_t expert_offset = first_id * expert_size;
