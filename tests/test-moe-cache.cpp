@@ -4158,9 +4158,13 @@ static bool run_stream_staging_case(ggml_backend_dev_t dev,
                 }
             }
         };
-        auto start = [&](const char * fail = nullptr) {
+        auto start = [&](const char * fail = nullptr, const char * profile = nullptr) {
             configure_cache(fail, "4", "1", boundary ? "46" : "40", dedicated_down);
-            void * s = create_direct_session(gpu, cpu);
+            ggml_moe_cache_config config = {};
+            GGML_ASSERT(ggml_moe_cache.query_config(0, 4, &config));
+            config.profile_path = profile;
+            void * backends[] = { gpu, cpu };
+            void * s = ggml_moe_cache.session_create(backends, 2, &config);
             GGML_ASSERT(s);
             ggml_moe_cache.session_enter(s);
             if (dummy) {
@@ -4341,6 +4345,53 @@ static bool run_stream_staging_case(ggml_backend_dev_t dev,
                 ok &= pass;
                 stop(s);
             }
+        }
+        if (pinned && T == 2 && !dedicated_down && !boundary) {
+            const auto nonce = std::chrono::high_resolution_clock::now().time_since_epoch().count();
+            const auto path = std::filesystem::temp_directory_path() /
+                ("llama-moe-staging-profile-" + std::to_string(nonce));
+            const auto profile = path.string();
+            auto s = start(nullptr, profile.c_str());
+            warm(E - 1);
+            stop(s);
+
+            s = start(nullptr, profile.c_str());
+            routes(1); // The recorded hot expert is not requested in this batch.
+            uint64_t mask = 0;
+            auto node = plan(mask);
+            bool pass = node && mask && collect(node, mask, out);
+            if (node) ggml_moe_cache.end(node);
+
+            // Probe residency without an ordinary plan: planning the hot expert
+            // would itself seed the profile and hide a missing fused-path seed.
+            auto copy_buffer = ggml_backend_alloc_buffer(gpu, ggml_nbytes(up));
+            GGML_ASSERT(copy_buffer);
+            const uint32_t selected[2] = { 0, UINT32_C(1) << 31 };
+            for (auto w : { up, gate, down }) {
+                ggml_tensor dst = *w;
+                dst.buffer = copy_buffer;
+                dst.data = ggml_backend_buffer_get_base(copy_buffer);
+                bool copied = false;
+                for (int attempt = 0; attempt < 100 && !copied; ++attempt) {
+                    copied = ggml_moe_cache.prefill_copy(s, gpu, w, &dst, selected, 2);
+                    if (!copied) std::this_thread::sleep_for(std::chrono::milliseconds(10));
+                }
+                pass &= copied;
+                if (copied) {
+                    const size_t bytes = ggml_nbytes(w) / E;
+                    std::vector<uint8_t> actual(bytes), expected(bytes);
+                    ggml_backend_tensor_get(&dst, actual.data(), (E - 1) * bytes, bytes);
+                    ggml_backend_tensor_get(w, expected.data(), (E - 1) * bytes, bytes);
+                    pass &= actual == expected;
+                }
+            }
+            ggml_backend_buffer_free(copy_buffer);
+            stop(s);
+            std::error_code ec;
+            std::filesystem::remove(path, ec);
+            std::filesystem::remove(profile + ".lock", ec);
+            printf("cache-stream-stage-profile: unrequested-hot-experts %s\n", pass ? "OK" : "FAIL");
+            ok &= pass;
         }
         for (const char * fail : { "dispatch", "collect" }) {
             routes(1);

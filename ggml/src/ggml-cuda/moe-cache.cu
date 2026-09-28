@@ -3807,6 +3807,19 @@ static void * moe_cache_fused_plan_expert_parallel(
                     session, profile_key, ids, n_ids, up->n_expert);
         }
         for (route & current : routes) {
+            // The single-device staging route replaces the ordinary fused plan,
+            // including its profile-driven prefetch. Keep EP placement unchanged.
+            if (session.devices.size() == 1 && !session.profile_heat.empty()) {
+                moe_cache_profile_seed_locked(
+                        session, *current.device, *current.pair_pool, current.pair_pool_index,
+                        up->data, profile_keys[0], up->expert_size, up->n_expert, wake_worker);
+                moe_cache_profile_seed_locked(
+                        session, *current.device, *current.pair_pool, current.pair_pool_index,
+                        gate->data, profile_keys[1], gate->expert_size, gate->n_expert, wake_worker);
+                moe_cache_profile_seed_locked(
+                        session, *current.device, *current.down_pool, current.down_pool_index,
+                        down->data, profile_keys[2], down->expert_size, down->n_expert, wake_worker);
+            }
             int inserts_left = session.config.inserts_per_plan;
             for (int local = 0; local < current.n_rows; local++) {
                 const int row = current.rows[local];

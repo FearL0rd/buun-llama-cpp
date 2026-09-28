@@ -11776,6 +11776,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // Consumer Blackwell routes wide Q5 heads through MMQ at widths 2..6.
+    // Include both eligible edges and the neighboring fallback widths.
+    for (int64_t n : { 1, 2, 6, 7 }) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q5_K, GGML_TYPE_F32, 32768, n, 512, {1, 1}, {1, 1}));
+    }
+
     // The SYCL backend picks between one and two output rows per subgroup by row count when there
     // are two destination columns (Q4_K_MMVQ_ROW_PAIR_MIN_NROWS in ggml-sycl/mmvq.cpp). Cover both
     // sides of that boundary, including an odd row count above it for the row-pair tail.
