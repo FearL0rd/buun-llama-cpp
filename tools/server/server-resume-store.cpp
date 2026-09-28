@@ -16,7 +16,17 @@
 #include <set>
 #include <stdexcept>
 
-#if !defined(_WIN32)
+#if defined(_WIN32)
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#include <aclapi.h>
+#include <sddl.h>
+#else
 #include <fcntl.h>
 #include <sys/file.h>
 #include <sys/stat.h>
@@ -595,118 +605,440 @@ static std::vector<const server_resume_object_record *> manifest_objects(const s
     return out;
 }
 
-#if defined(_WIN32)
-
-std::unique_ptr<server_resume_store> server_resume_store::open(
-        const std::string &, const std::string &, server_resume_reason & reason, std::string & error, bool) {
-    reason = server_resume_reason::store_unwritable;
-    error  = "the resume store is not implemented on this platform";
-    return nullptr;
-}
-
-server_resume_store::~server_resume_store() = default;
-
-std::vector<server_resume_entry> server_resume_store::list() const { return {}; }
-
-server_resume_reason server_resume_store::read_manifest(const std::string &, server_resume_manifest &, std::string &) const {
-    return server_resume_reason::io_error;
-}
-
-server_resume_reason server_resume_store::read_object(
-        const std::string &, const server_resume_object_record &, std::vector<uint8_t> &, std::string &) const {
-    return server_resume_reason::io_error;
-}
-
-server_resume_reason server_resume_store::write_object(
-        const std::string &, server_resume_object_record &, const uint8_t *, size_t, std::string &) {
-    return server_resume_reason::io_error;
-}
-
-server_resume_reason server_resume_store::write_object_stream(
-        const std::string &, server_resume_object_record &, const std::function<bool(const put_fn &)> &, std::string &) {
-    return server_resume_reason::io_error;
-}
-
-server_resume_reason server_resume_store::read_object_stream(
-        const std::string &, const server_resume_object_record &, const std::function<bool(const get_fn &)> &, std::string &) const {
-    return server_resume_reason::io_error;
-}
-
-server_resume_reason server_resume_store::commit(const std::string &, const server_resume_manifest &, std::string &) {
-    return server_resume_reason::io_error;
-}
-
-void server_resume_store::sweep(const std::string &, const server_resume_manifest &) const {}
-
-server_resume_reason server_resume_store::uncommit(const std::string &, std::string &) {
-    return server_resume_reason::io_error;
-}
-
-void server_resume_store::remove_entry(const std::string &) const {}
-std::set<std::string> server_resume_store::victims(const std::string &, size_t, size_t, const std::set<std::string> &, const std::set<std::string> &) const { return {}; }
-void server_resume_store::prune(const std::string &, size_t, size_t, const std::set<std::string> &, const std::set<std::string> &) const {}
-uint64_t server_resume_store::free_bytes() const { return 0; }
-
-std::string server_resume_store::keep_value(const std::string &, const std::string &, std::string &) { return {}; }
-
-server_resume_reason server_resume_store::export_entry(const std::string &, const std::string &, uint64_t &, std::string &) const {
-    return server_resume_reason::io_error;
-}
-
-server_resume_reason server_resume_store::take_entry(const std::string &, std::string &) {
-    return server_resume_reason::io_error;
-}
-
-server_resume_reason server_resume_store::export_taken(const std::string &, const std::string &, uint64_t &, std::string &) const {
-    return server_resume_reason::io_error;
-}
-
-server_resume_reason server_resume_store::import_entry(
-        const std::string &, std::string &, server_resume_manifest &, uint64_t &, std::string &) {
-    return server_resume_reason::io_error;
-}
-
-bool server_resume_store::is_entry_file(const std::string &) { return false; }
-
-#else
-
-struct fd_guard {
-    int fd = -1;
-
-    explicit fd_guard(int fd) : fd(fd) {}
-    ~fd_guard() { reset(); }
-
-    fd_guard(const fd_guard &) = delete;
-    fd_guard & operator=(const fd_guard &) = delete;
-
-    void reset() {
-        if (fd >= 0) {
-            close(fd);
-            fd = -1;
-        }
-    }
-};
-
-// An imported entry file: its manifest and where each object's header is. The descriptor keeps
-// the file that was verified even if the path is replaced meanwhile.
-struct server_resume_store::mounted_entry {
-    std::string                     path;
-    fd_guard                        file{-1};
-    server_resume_manifest          manifest;
-    std::map<std::string, uint64_t> offsets; // by object name
-};
-
-const server_resume_store::mounted_entry * server_resume_store::mounted(const std::string & id) const {
-    const auto it = mounts.find(id);
-    return it == mounts.end() ? nullptr : it->second.get();
-}
-
 static server_resume_reason reason_from_errno(int err) {
-    return err == ENOSPC || err == EDQUOT ? server_resume_reason::no_space : server_resume_reason::io_error;
+#if defined(EDQUOT)
+    if (err == EDQUOT) {
+        return server_resume_reason::no_space;
+    }
+#endif
+    return err == ENOSPC ? server_resume_reason::no_space : server_resume_reason::io_error;
 }
 
 static std::string errno_text(const char * what, const std::string & path, int err) {
     return std::string(what) + " " + path + ": " + std::strerror(err);
+}
+
+//
+// the platform: a file is a descriptor on POSIX and a handle on Windows. A call that fails leaves
+// its cause in errno
+//
+
+#if defined(_WIN32)
+
+using file_t = HANDLE;
+static const file_t no_file = INVALID_HANDLE_VALUE;
+
+static void set_errno_from_win(DWORD err) {
+    switch (err) {
+        case ERROR_FILE_NOT_FOUND:
+        case ERROR_PATH_NOT_FOUND:
+        case ERROR_INVALID_DRIVE:        errno = ENOENT;      break;
+        case ERROR_DISK_FULL:
+        case ERROR_HANDLE_DISK_FULL:
+        case ERROR_DISK_QUOTA_EXCEEDED:  errno = ENOSPC;      break;
+        case ERROR_FILE_EXISTS:
+        case ERROR_ALREADY_EXISTS:       errno = EEXIST;      break;
+        case ERROR_ACCESS_DENIED:
+        case ERROR_SHARING_VIOLATION:    errno = EACCES;      break;
+        case ERROR_LOCK_VIOLATION:       errno = EWOULDBLOCK; break;
+        default:                         errno = EIO;         break;
+    }
+}
+
+static void set_errno_from_win() {
+    set_errno_from_win(GetLastError());
+}
+
+// absolute, in the form that lifts the length limit on paths
+static std::wstring wide(const std::string & path) {
+    std::error_code ec;
+    fs::path p = fs::absolute(fs::u8path(path), ec);
+    if (ec) {
+        p = fs::u8path(path);
+    }
+    const std::wstring w = p.lexically_normal().make_preferred().wstring();
+    if (w.rfind(L"\\\\?\\", 0) == 0) {
+        return w;
+    }
+    if (w.rfind(L"\\\\", 0) == 0) {
+        return L"\\\\?\\UNC\\" + w.substr(2);
+    }
+    return w.size() >= 2 && w[1] == L':' ? L"\\\\?\\" + w : w;
+}
+
+// every file is shared for deletion, so a file that is open can still be replaced, as on POSIX
+static file_t open_file(const std::string & path, DWORD access, DWORD disposition, bool nofollow) {
+    const HANDLE h = CreateFileW(wide(path).c_str(), access, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        nullptr, disposition, FILE_ATTRIBUTE_NORMAL | (nofollow ? FILE_FLAG_OPEN_REPARSE_POINT : 0), nullptr);
+    if (h == INVALID_HANDLE_VALUE) {
+        set_errno_from_win();
+        return h;
+    }
+    BY_HANDLE_FILE_INFORMATION info;
+    if (nofollow && (!GetFileInformationByHandle(h, &info) || (info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT))) {
+        CloseHandle(h);
+        errno = ELOOP;
+        return INVALID_HANDLE_VALUE;
+    }
+    return h;
+}
+
+static file_t open_read(const std::string & path, bool nofollow) {
+    return open_file(path, GENERIC_READ, OPEN_EXISTING, nofollow);
+}
+
+static file_t create_new(const std::string & path) {
+    return open_file(path, GENERIC_WRITE, CREATE_NEW, true);
+}
+
+static file_t open_lock(const std::string & path) {
+    return open_file(path, GENERIC_READ | GENERIC_WRITE, OPEN_ALWAYS, true);
+}
+
+static void close_file(file_t f) {
+    CloseHandle(f);
+}
+
+// a byte far past the text of the file: a lock on Windows keeps others from reading what it covers
+static bool lock_exclusive(file_t f) {
+    OVERLAPPED at = {};
+    at.OffsetHigh = 0x7fffffff;
+    if (!LockFileEx(f, LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY, 0, 1, 0, &at)) {
+        set_errno_from_win();
+        return false;
+    }
+    return true;
+}
+
+static constexpr size_t io_max = 1u << 30;
+
+static int64_t read_some(file_t f, uint8_t * data, size_t size) {
+    DWORD n = 0;
+    if (!ReadFile(f, data, (DWORD) std::min(size, io_max), &n, nullptr)) {
+        set_errno_from_win();
+        return -1;
+    }
+    return n;
+}
+
+static int64_t write_some(file_t f, const uint8_t * data, size_t size) {
+    DWORD n = 0;
+    if (!WriteFile(f, data, (DWORD) std::min(size, io_max), &n, nullptr)) {
+        set_errno_from_win();
+        return -1;
+    }
+    return n;
+}
+
+// these move the file position, unlike pread() and pwrite()
+static int64_t pread_some(file_t f, uint8_t * data, size_t size, uint64_t offset) {
+    OVERLAPPED at = {};
+    at.Offset     = (DWORD) offset;
+    at.OffsetHigh = (DWORD) (offset >> 32);
+    DWORD n = 0;
+    if (!ReadFile(f, data, (DWORD) std::min(size, io_max), &n, &at)) {
+        const DWORD err = GetLastError();
+        if (err == ERROR_HANDLE_EOF) {
+            return 0;
+        }
+        set_errno_from_win(err);
+        return -1;
+    }
+    return n;
+}
+
+static int64_t pwrite_some(file_t f, const uint8_t * data, size_t size, uint64_t offset) {
+    OVERLAPPED at = {};
+    at.Offset     = (DWORD) offset;
+    at.OffsetHigh = (DWORD) (offset >> 32);
+    DWORD n = 0;
+    if (!WriteFile(f, data, (DWORD) std::min(size, io_max), &n, &at)) {
+        set_errno_from_win();
+        return -1;
+    }
+    return n;
+}
+
+static bool sync_file(file_t f) {
+    if (!FlushFileBuffers(f)) {
+        set_errno_from_win();
+        return false;
+    }
+    return true;
+}
+
+static bool sync_data(file_t f) {
+    return sync_file(f);
+}
+
+static bool regular_size(file_t f, uint64_t & size) {
+    BY_HANDLE_FILE_INFORMATION info;
+    if (!GetFileInformationByHandle(f, &info)) {
+        set_errno_from_win();
+        return false;
+    }
+    size = ((uint64_t) info.nFileSizeHigh << 32) | info.nFileSizeLow;
+    return !(info.dwFileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT));
+}
+
+static bool rewind_file(file_t f) {
+    return SetFilePointerEx(f, LARGE_INTEGER{}, nullptr, FILE_BEGIN) != 0;
+}
+
+static bool truncate_file(file_t f) {
+    return rewind_file(f) && SetEndOfFile(f) != 0;
+}
+
+static bool remove_file(const std::string & path) {
+    if (!DeleteFileW(wide(path).c_str())) {
+        set_errno_from_win();
+        return false;
+    }
+    return true;
+}
+
+// Over what is at `to`, even a file that is open, as rename() does: the POSIX semantics of NTFS,
+// else a plain replace on file systems without them
+static bool rename_path(const std::string & from, const std::string & to) {
+    const std::wstring source = wide(from);
+    const std::wstring target = wide(to);
+
+    const HANDLE h = CreateFileW(source.c_str(), DELETE | SYNCHRONIZE, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        nullptr, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
+    if (h != INVALID_HANDLE_VALUE) {
+        // FILE_RENAME_INFO in its FileRenameInfoEx form, with flags in place of ReplaceIfExists
+        struct rename_info {
+            DWORD  flags;
+            HANDLE root;
+            DWORD  length;
+            WCHAR  name[1];
+        };
+        constexpr DWORD replace_if_exists = 0x1;
+        constexpr DWORD posix_semantics   = 0x2;
+        constexpr auto  rename_info_ex    = (FILE_INFO_BY_HANDLE_CLASS) 22;
+
+        std::vector<uint8_t> buffer(sizeof(rename_info) + target.size() * sizeof(WCHAR));
+        auto * info   = (rename_info *) buffer.data();
+        info->flags   = replace_if_exists | posix_semantics;
+        info->root    = nullptr;
+        info->length  = (DWORD) (target.size() * sizeof(WCHAR));
+        std::memcpy(info->name, target.c_str(), info->length);
+        const bool renamed = SetFileInformationByHandle(h, rename_info_ex, info, (DWORD) buffer.size()) != 0;
+        CloseHandle(h);
+        if (renamed) {
+            return true;
+        }
+    }
+    constexpr DWORD replace = MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH;
+    if (MoveFileExW(source.c_str(), target.c_str(), replace)) {
+        return true;
+    }
+    if (GetLastError() != ERROR_ACCESS_DENIED) {
+        set_errno_from_win();
+        return false;
+    }
+    // a target still open cannot be replaced there, but it can be renamed: set it aside, move in,
+    // and delete it, which completes once its readers close it
+    const std::wstring aside = wide(to + ".old-" + server_resume_store::new_entry_id());
+    if (!MoveFileExW(target.c_str(), aside.c_str(), MOVEFILE_WRITE_THROUGH)) {
+        set_errno_from_win(ERROR_ACCESS_DENIED);
+        return false;
+    }
+    if (!MoveFileExW(source.c_str(), target.c_str(), replace)) {
+        set_errno_from_win();
+        const int e = errno;
+        MoveFileExW(aside.c_str(), target.c_str(), MOVEFILE_WRITE_THROUGH);
+        errno = e;
+        return false;
+    }
+    DeleteFileW(aside.c_str());
+    return true;
+}
+
+static bool path_exists(const std::string & path) {
+    return GetFileAttributesW(wide(path).c_str()) != INVALID_FILE_ATTRIBUTES;
+}
+
+static std::vector<uint8_t> token_info(TOKEN_INFORMATION_CLASS what) {
+    std::vector<uint8_t> info;
+    HANDLE token;
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token)) {
+        return info;
+    }
+    DWORD size = 0;
+    GetTokenInformation(token, what, nullptr, 0, &size);
+    info.resize(size);
+    if (size == 0 || !GetTokenInformation(token, what, info.data(), size, &size)) {
+        info.clear();
+    }
+    CloseHandle(token);
+    return info;
+}
+
+// A directory whose access list admits this user alone, inherited by all it holds. An existing one
+// must be ours: its owner is this user, or whom this user's token makes owner (an administrator's
+// group). Its access list is left as it is, since a change would be carried down to every file
+static bool make_private_dir(const std::string & path, std::string & error) {
+    const std::wstring w     = wide(path);
+    const auto         user  = token_info(TokenUser);
+    const auto         owner = token_info(TokenOwner);
+    LPWSTR             sid   = nullptr;
+    if (user.empty() || owner.empty() || !ConvertSidToStringSidW(((const TOKEN_USER *) user.data())->User.Sid, &sid)) {
+        error = "cannot read the user of this process";
+        return false;
+    }
+    const std::wstring sddl = std::wstring(L"D:P(A;OICI;FA;;;") + sid + L")";
+    LocalFree(sid);
+
+    PSECURITY_DESCRIPTOR sd = nullptr;
+    if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(sddl.c_str(), SDDL_REVISION_1, &sd, nullptr)) {
+        set_errno_from_win();
+        error = errno_text("cannot describe access to", path, errno);
+        return false;
+    }
+    SECURITY_ATTRIBUTES sa = { sizeof(sa), sd, FALSE };
+    const bool  created = CreateDirectoryW(w.c_str(), &sa) != 0;
+    const DWORD err     = GetLastError();
+    LocalFree(sd);
+    if (!created && err != ERROR_ALREADY_EXISTS) {
+        set_errno_from_win(err);
+        error = errno_text("cannot create", path, errno);
+        return false;
+    }
+
+    const DWORD          attributes = GetFileAttributesW(w.c_str());
+    PSID                 dir_owner  = nullptr;
+    PSECURITY_DESCRIPTOR dir_sd     = nullptr;
+    const bool ours = attributes != INVALID_FILE_ATTRIBUTES && (attributes & FILE_ATTRIBUTE_DIRECTORY) &&
+        !(attributes & FILE_ATTRIBUTE_REPARSE_POINT) &&
+        GetNamedSecurityInfoW(w.c_str(), SE_FILE_OBJECT, OWNER_SECURITY_INFORMATION, &dir_owner, nullptr, nullptr,
+                              nullptr, &dir_sd) == ERROR_SUCCESS &&
+        (EqualSid(dir_owner, ((const TOKEN_USER *) user.data())->User.Sid) ||
+         EqualSid(dir_owner, ((const TOKEN_OWNER *) owner.data())->Owner));
+    LocalFree(dir_sd);
+    if (!ours) {
+        error = path + " is not a directory of this user";
+        return false;
+    }
+    return true;
+}
+
+// NTFS journals what a directory holds, and a directory cannot be flushed: what is left is to
+// report one that is gone
+static bool sync_dir(const std::string & path) {
+    if (GetFileAttributesW(wide(path).c_str()) == INVALID_FILE_ATTRIBUTES) {
+        set_errno_from_win();
+        return false;
+    }
+    return true;
+}
+
+static uint64_t free_bytes_at(const std::string & path) {
+    ULARGE_INTEGER available;
+    return GetDiskFreeSpaceExW((wide(path) + L"\\").c_str(), &available, nullptr, nullptr) ? available.QuadPart : 0;
+}
+
+static long long process_id() {
+    return (long long) GetCurrentProcessId();
+}
+
+#else
+
+using file_t = int;
+static constexpr file_t no_file = -1;
+
+static file_t open_read(const std::string & path, bool nofollow) {
+    return ::open(path.c_str(), O_RDONLY | O_CLOEXEC | (nofollow ? O_NOFOLLOW : 0));
+}
+
+static file_t create_new(const std::string & path) {
+    return ::open(path.c_str(), O_CREAT | O_EXCL | O_WRONLY | O_CLOEXEC | O_NOFOLLOW, 0600);
+}
+
+static file_t open_lock(const std::string & path) {
+    return ::open(path.c_str(), O_CREAT | O_RDWR | O_CLOEXEC | O_NOFOLLOW, 0600);
+}
+
+static void close_file(file_t f) {
+    close(f);
+}
+
+static bool lock_exclusive(file_t f) {
+    return flock(f, LOCK_EX | LOCK_NB) == 0;
+}
+
+static int64_t read_some(file_t f, uint8_t * data, size_t size) {
+    ssize_t n;
+    do {
+        n = read(f, data, size);
+    } while (n < 0 && errno == EINTR);
+    return n;
+}
+
+static int64_t write_some(file_t f, const uint8_t * data, size_t size) {
+    ssize_t n;
+    do {
+        n = write(f, data, size);
+    } while (n < 0 && errno == EINTR);
+    return n;
+}
+
+static int64_t pread_some(file_t f, uint8_t * data, size_t size, uint64_t offset) {
+    ssize_t n;
+    do {
+        n = pread(f, data, size, (off_t) offset);
+    } while (n < 0 && errno == EINTR);
+    return n;
+}
+
+static int64_t pwrite_some(file_t f, const uint8_t * data, size_t size, uint64_t offset) {
+    ssize_t n;
+    do {
+        n = pwrite(f, data, size, (off_t) offset);
+    } while (n < 0 && errno == EINTR);
+    return n;
+}
+
+static bool sync_file(file_t f) {
+    return fsync(f) == 0;
+}
+
+static bool sync_data(file_t f) {
+#if defined(__APPLE__)
+    return fsync(f) == 0;
+#else
+    return fdatasync(f) == 0;
+#endif
+}
+
+static bool regular_size(file_t f, uint64_t & size) {
+    struct stat st;
+    if (fstat(f, &st) != 0 || !S_ISREG(st.st_mode)) {
+        return false;
+    }
+    size = (uint64_t) st.st_size;
+    return true;
+}
+
+static bool rewind_file(file_t f) {
+    return lseek(f, 0, SEEK_SET) == 0;
+}
+
+static bool truncate_file(file_t f) {
+    return ftruncate(f, 0) == 0;
+}
+
+static bool remove_file(const std::string & path) {
+    return unlink(path.c_str()) == 0;
+}
+
+static bool rename_path(const std::string & from, const std::string & to) {
+    return rename(from.c_str(), to.c_str()) == 0;
+}
+
+static bool path_exists(const std::string & path) {
+    struct stat st;
+    return lstat(path.c_str(), &st) == 0;
 }
 
 // a directory only its owner can enter. an existing one must be ours and is narrowed to 0700
@@ -728,8 +1060,65 @@ static bool make_private_dir(const std::string & path, std::string & error) {
 }
 
 static bool sync_dir(const std::string & path) {
-    fd_guard dir(open(path.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC));
-    return dir.fd >= 0 && fsync(dir.fd) == 0;
+    const int dir = ::open(path.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (dir < 0) {
+        return false;
+    }
+    const bool ok = fsync(dir) == 0;
+    close(dir);
+    return ok;
+}
+
+static uint64_t free_bytes_at(const std::string & path) {
+    struct statvfs vfs;
+    if (statvfs(path.c_str(), &vfs) != 0) {
+        return 0;
+    }
+    return (uint64_t) vfs.f_bavail * vfs.f_frsize;
+}
+
+static long long process_id() {
+    return (long long) getpid();
+}
+
+#endif
+
+struct fd_guard {
+    file_t fd = no_file;
+
+    fd_guard() = default;
+    explicit fd_guard(file_t fd) : fd(fd) {}
+    ~fd_guard() { reset(); }
+
+    fd_guard(const fd_guard &) = delete;
+    fd_guard & operator=(const fd_guard &) = delete;
+
+    bool ok() const { return fd != no_file; }
+
+    void reset() {
+        if (ok()) {
+            close_file(fd);
+            fd = no_file;
+        }
+    }
+};
+
+struct server_resume_store::writer_lock {
+    fd_guard file;
+};
+
+// An imported entry file: its manifest and where each object's header is. The descriptor keeps
+// the file that was verified even if the path is replaced meanwhile.
+struct server_resume_store::mounted_entry {
+    std::string                     path;
+    fd_guard                        file;
+    server_resume_manifest          manifest;
+    std::map<std::string, uint64_t> offsets; // by object name
+};
+
+const server_resume_store::mounted_entry * server_resume_store::mounted(const std::string & id) const {
+    const auto it = mounts.find(id);
+    return it == mounts.end() ? nullptr : it->second.get();
 }
 
 bool server_resume_store::sync_path(const std::string & path) const {
@@ -757,13 +1146,10 @@ struct xxh3_stream {
     uint64_t digest() const { return XXH3_64bits_digest(state); }
 };
 
-static bool write_all(int fd, const uint8_t * data, size_t size) {
+static bool write_all(file_t f, const uint8_t * data, size_t size) {
     while (size > 0) {
-        const ssize_t n = write(fd, data, std::min<size_t>(size, 16u * 1024 * 1024));
+        const int64_t n = write_some(f, data, std::min<size_t>(size, 16u * 1024 * 1024));
         if (n < 0) {
-            if (errno == EINTR) {
-                continue;
-            }
             return false;
         }
         data += n;
@@ -772,17 +1158,40 @@ static bool write_all(int fd, const uint8_t * data, size_t size) {
     return true;
 }
 
-static bool read_all(int fd, uint8_t * data, size_t size) {
+static bool read_all(file_t f, uint8_t * data, size_t size) {
     while (size > 0) {
-        const ssize_t n = read(fd, data, size);
-        if (n < 0 && errno == EINTR) {
-            continue;
-        }
+        const int64_t n = read_some(f, data, size);
         if (n <= 0) {
             return false;
         }
         data += n;
         size -= (size_t) n;
+    }
+    return true;
+}
+
+static bool pread_all(file_t f, uint8_t * data, size_t size, uint64_t offset) {
+    while (size > 0) {
+        const int64_t n = pread_some(f, data, size, offset);
+        if (n <= 0) {
+            return false;
+        }
+        data   += n;
+        size   -= (size_t) n;
+        offset += (uint64_t) n;
+    }
+    return true;
+}
+
+static bool pwrite_all(file_t f, const uint8_t * data, size_t size, uint64_t offset) {
+    while (size > 0) {
+        const int64_t n = pwrite_some(f, data, size, offset);
+        if (n <= 0) {
+            return false;
+        }
+        data   += n;
+        size   -= (size_t) n;
+        offset += (uint64_t) n;
     }
     return true;
 }
@@ -804,12 +1213,12 @@ struct staged_file {
 
     explicit staged_file(const std::string & directory, bool durable = true) :
         directory(directory), path(directory + "/tmp-" + server_resume_store::new_entry_id()), durable(durable),
-        file(open(path.c_str(), O_CREAT | O_EXCL | O_WRONLY | O_CLOEXEC | O_NOFOLLOW, 0600)) {}
+        file(create_new(path)) {}
 
     ~staged_file() {
         file.reset();
         if (!keep) {
-            unlink(path.c_str());
+            remove_file(path);
         }
     }
 
@@ -843,7 +1252,7 @@ struct staged_file {
     bool written(size_t n) {
         unsynced += n;
         if (unsynced == sync_every) {
-            if (durable && fdatasync(file.fd) != 0) {
+            if (durable && !sync_data(file.fd)) {
                 err = errno;
                 return false;
             }
@@ -871,7 +1280,7 @@ struct staged_file {
     // What it can of `size` bytes from where `from` is, copied by the kernel after a flush(): no
     // pass through user memory, and a clone where the file system shares extents. `size` is left
     // at what the caller still has to copy; a failed copy is left to that one to report.
-    bool copy_in_kernel(int from, uint64_t & size) {
+    bool copy_in_kernel(file_t from, uint64_t & size) {
 #if defined(__linux__)
         while (size > 0) {
             const size_t  n    = (size_t) std::min<uint64_t>(size, sync_every - unsynced);
@@ -896,24 +1305,14 @@ struct staged_file {
 
     // over the bytes reserved for it at the start of the file, after a flush
     bool put_header(const uint8_t * header) {
-        for (size_t done = 0; done < HEADER_SIZE; ) {
-            const ssize_t n = pwrite(file.fd, header + done, HEADER_SIZE - done, (off_t) done);
-            if (n < 0 && errno == EINTR) {
-                continue;
-            }
-            if (n <= 0) {
-                return false;
-            }
-            done += (size_t) n;
-        }
-        return true;
+        return pwrite_all(file.fd, header, HEADER_SIZE, 0);
     }
 
     server_resume_reason publish(const std::string & name, const char * fault_point, std::string & error) {
         if (!flush()) {
             return failed("cannot write", error);
         }
-        if (durable && fsync(file.fd) != 0) {
+        if (durable && !sync_file(file.fd)) {
             return failed("cannot sync", error);
         }
         file.reset();
@@ -925,7 +1324,7 @@ struct staged_file {
             return injected;
         }
 
-        if (rename(path.c_str(), (directory + "/" + name).c_str()) != 0) {
+        if (!rename_path(path, directory + "/" + name)) {
             return failed("cannot publish", error);
         }
         keep = true;
@@ -944,12 +1343,17 @@ std::unique_ptr<server_resume_store> server_resume_store::open(
     }
 
     std::string root = cache_root;
+#if defined(_WIN32)
+    // but a drive's root, which without its separator is where that drive's working directory is
+    while (root.size() > 1 && (root.back() == '/' || root.back() == '\\') && !(root.size() == 3 && root[1] == ':')) {
+#else
     while (root.size() > 1 && root.back() == '/') {
+#endif
         root.pop_back();
     }
 
     std::error_code ec;
-    fs::create_directories(root, ec);
+    fs::create_directories(fs::u8path(root), ec);
 
     std::unique_ptr<server_resume_store> store(new server_resume_store());
     store->dir     = root + "/resume/" + family_digest;
@@ -961,59 +1365,57 @@ std::unique_ptr<server_resume_store> server_resume_store::open(
     }
 
     const std::string lock_path = store->dir + "/writer.lock";
-    store->lock_fd = ::open(lock_path.c_str(), O_CREAT | O_RDWR | O_CLOEXEC | O_NOFOLLOW, 0600);
-    if (store->lock_fd < 0) {
+    store->lock.reset(new writer_lock());
+    fd_guard & lock = store->lock->file;
+    lock.fd = open_lock(lock_path);
+    if (!lock.ok()) {
         error = errno_text("cannot open", lock_path, errno);
         return nullptr;
     }
     // the kernel drops the lock with its owner, so a killed server leaves nothing stale behind
-    if (flock(store->lock_fd, LOCK_EX | LOCK_NB) != 0) {
+    if (!lock_exclusive(lock.fd)) {
         reason = errno == EWOULDBLOCK ? server_resume_reason::store_locked : server_resume_reason::store_unwritable;
         error  = errno_text("cannot lock", lock_path, errno);
         return nullptr;
     }
 
     // who holds it, for a person looking at the directory
-    const std::string owner = std::to_string((long long) getpid()) + "\n";
-    if (ftruncate(store->lock_fd, 0) == 0) {
-        (void) !write(store->lock_fd, owner.data(), owner.size());
+    const std::string owner = std::to_string(process_id()) + "\n";
+    if (truncate_file(lock.fd)) {
+        (void) write_all(lock.fd, (const uint8_t *) owner.data(), owner.size());
     }
 
     // entries taken out by a writer that died before exporting them
-    fs::remove_all(store->dir + "/taken", ec);
+    fs::remove_all(fs::u8path(store->dir + "/taken"), ec);
 
     reason = server_resume_reason::ok;
     return store;
 }
 
-server_resume_store::~server_resume_store() {
-    if (lock_fd >= 0) {
-        close(lock_fd);
-    }
-}
+server_resume_store::~server_resume_store() = default;
 
 // the manifest the entry directory commits
 static server_resume_reason read_commit(
         const std::string & directory, server_resume_manifest & manifest, std::string & error) {
     const std::string path = directory + "/commit";
 
-    fd_guard file(::open(path.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW));
-    if (file.fd < 0) {
+    fd_guard file(open_read(path, true));
+    if (!file.ok()) {
         error = errno_text("cannot open", path, errno);
         return errno == ENOENT ? server_resume_reason::object_missing : server_resume_reason::io_error;
     }
 
-    struct stat st;
-    if (fstat(file.fd, &st) != 0 || !S_ISREG(st.st_mode)) {
+    uint64_t size = 0;
+    if (!regular_size(file.fd, size)) {
         error = "cannot stat " + path;
         return server_resume_reason::io_error;
     }
-    if (st.st_size < (off_t) HEADER_SIZE || (uint64_t) st.st_size > server_resume_limits::max_manifest_bytes) {
+    if (size < HEADER_SIZE || size > server_resume_limits::max_manifest_bytes) {
         error = "manifest file size out of bounds";
         return server_resume_reason::manifest_corrupt;
     }
 
-    std::vector<uint8_t> data((size_t) st.st_size);
+    std::vector<uint8_t> data((size_t) size);
     if (!read_all(file.fd, data.data(), data.size())) {
         error = "cannot read " + path;
         return server_resume_reason::io_error;
@@ -1040,7 +1442,7 @@ std::vector<server_resume_entry> server_resume_store::list() const {
 
     std::error_code ec;
     size_t n_seen = 0;
-    for (fs::directory_iterator it(dir + "/entries", ec), end; !ec && it != end; it.increment(ec)) {
+    for (fs::directory_iterator it(fs::u8path(dir + "/entries"), ec), end; !ec && it != end; it.increment(ec)) {
         if (++n_seen > server_resume_limits::max_entries_listed) {
             break;
         }
@@ -1070,25 +1472,9 @@ std::vector<server_resume_entry> server_resume_store::list() const {
     return entries;
 }
 
-static bool pread_all(int fd, uint8_t * data, size_t size, uint64_t offset) {
-    while (size > 0) {
-        const ssize_t n = pread(fd, data, size, (off_t) offset);
-        if (n < 0 && errno == EINTR) {
-            continue;
-        }
-        if (n <= 0) {
-            return false;
-        }
-        data   += n;
-        size   -= (size_t) n;
-        offset += (uint64_t) n;
-    }
-    return true;
-}
-
 // the header of the record's object at `offset` of the file, verified against the record
 static server_resume_reason object_at(
-        int fd, uint64_t offset, const server_resume_object_record & record, const std::string & path,
+        file_t fd, uint64_t offset, const server_resume_object_record & record, const std::string & path,
         std::string & error) {
     uint8_t header[HEADER_SIZE];
     if (!pread_all(fd, header, HEADER_SIZE, offset)) {
@@ -1121,18 +1507,18 @@ static server_resume_reason object_at(
 static server_resume_reason open_object(
         const std::string & path, const server_resume_object_record & record, fd_guard & file, std::string & error) {
     file.reset();
-    file.fd = open(path.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
-    if (file.fd < 0) {
+    file.fd = open_read(path, true);
+    if (!file.ok()) {
         error = errno_text("cannot open", path, errno);
         return errno == ENOENT ? server_resume_reason::object_missing : server_resume_reason::io_error;
     }
 
-    struct stat st;
-    if (fstat(file.fd, &st) != 0 || !S_ISREG(st.st_mode)) {
+    uint64_t size = 0;
+    if (!regular_size(file.fd, size)) {
         error = "cannot stat " + path;
         return server_resume_reason::io_error;
     }
-    if ((uint64_t) st.st_size != HEADER_SIZE + record.bytes) {
+    if (size != HEADER_SIZE + record.bytes) {
         error = "file size differs from the record: " + path;
         return server_resume_reason::object_size_mismatch;
     }
@@ -1162,8 +1548,8 @@ server_resume_reason server_resume_store::read_object_stream(
 
     const auto entry = mounted(id);
     std::string path;
-    fd_guard file(-1);
-    int fd = -1;
+    fd_guard file;
+    file_t fd = no_file;
     uint64_t offset = 0; // of the object's header
     server_resume_reason opened;
     if (entry) {
@@ -1270,8 +1656,7 @@ server_resume_reason server_resume_store::write_object_stream(
     }
 
     const std::string directory = entry_dir(id);
-    struct stat st;
-    const bool is_new = lstat(directory.c_str(), &st) != 0;
+    const bool is_new = !path_exists(directory);
     if (!make_private_dir(directory, error)) {
         return server_resume_reason::store_unwritable;
     }
@@ -1281,7 +1666,7 @@ server_resume_reason server_resume_store::write_object_stream(
     }
 
     staged_file staged(directory, durable);
-    if (staged.file.fd < 0) {
+    if (!staged.file.ok()) {
         return staged.failed("cannot create", error);
     }
 
@@ -1369,7 +1754,7 @@ server_resume_reason server_resume_store::commit(
     }
 
     staged_file staged(directory, durable);
-    if (staged.file.fd < 0) {
+    if (!staged.file.ok()) {
         return staged.failed("cannot create", error);
     }
     if (!staged.put(data.data(), data.size())) {
@@ -1398,7 +1783,7 @@ void server_resume_store::sweep(const std::string & id, const server_resume_mani
 
     std::error_code ec;
     std::vector<fs::path> drop;
-    for (fs::directory_iterator it(entry_dir(id), ec), end; !ec && it != end; it.increment(ec)) {
+    for (fs::directory_iterator it(fs::u8path(entry_dir(id)), ec), end; !ec && it != end; it.increment(ec)) {
         if (!keep.count(it->path().filename().string())) {
             drop.push_back(it->path());
         }
@@ -1422,7 +1807,7 @@ server_resume_reason server_resume_store::uncommit(const std::string & id, std::
         error = "injected fault at uncommit";
         return injected;
     }
-    if (unlink((directory + "/commit").c_str()) != 0 && errno != ENOENT) {
+    if (!remove_file(directory + "/commit") && errno != ENOENT) {
         error = errno_text("cannot remove", directory + "/commit", errno);
         return server_resume_reason::io_error;
     }
@@ -1452,11 +1837,11 @@ void server_resume_store::remove_entry(const std::string & id) const {
     }
     // the manifest first: an interrupted removal must not leave an entry that names missing objects
     const std::string directory = entry_dir(id);
-    unlink((directory + "/commit").c_str());
+    remove_file(directory + "/commit");
     sync_path(directory);
 
     std::error_code ec;
-    fs::remove_all(directory, ec);
+    fs::remove_all(fs::u8path(directory), ec);
 }
 
 // what prune() keeps of the listed entries. The held ones first: the overall bound takes others
@@ -1504,7 +1889,7 @@ void server_resume_store::prune(
     std::error_code ec;
     std::vector<std::string> drop;
     size_t n_seen = 0;
-    for (fs::directory_iterator it(dir + "/entries", ec), end; !ec && it != end; it.increment(ec)) {
+    for (fs::directory_iterator it(fs::u8path(dir + "/entries"), ec), end; !ec && it != end; it.increment(ec)) {
         if (++n_seen > server_resume_limits::max_entries_listed) {
             break;
         }
@@ -1519,11 +1904,7 @@ void server_resume_store::prune(
 }
 
 uint64_t server_resume_store::free_bytes() const {
-    struct statvfs vfs;
-    if (statvfs(dir.c_str(), &vfs) != 0) {
-        return 0;
-    }
-    return (uint64_t) vfs.f_bavail * vfs.f_frsize;
+    return free_bytes_at(dir);
 }
 
 std::string server_resume_store::keep_value(const std::string & name, const std::string & fresh, std::string & error) {
@@ -1538,10 +1919,10 @@ std::string server_resume_store::keep_value(const std::string & name, const std:
 
     const std::string path = dir + "/" + name;
     {
-        fd_guard file(::open(path.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW));
-        char text[MAX_STRING + 1];
-        const ssize_t n = file.fd < 0 ? -1 : read(file.fd, text, sizeof(text));
-        std::string stored(text, (size_t) std::max<ssize_t>(n, 0));
+        fd_guard file(open_read(path, true));
+        uint8_t text[MAX_STRING + 1];
+        const int64_t n = file.ok() ? read_some(file.fd, text, sizeof(text)) : -1;
+        std::string stored((const char *) text, (size_t) std::max<int64_t>(n, 0));
         if (valid(stored)) {
             return stored;
         }
@@ -1552,7 +1933,7 @@ std::string server_resume_store::keep_value(const std::string & name, const std:
     }
 
     staged_file staged(dir);
-    if (staged.file.fd < 0) {
+    if (!staged.file.ok()) {
         staged.failed("cannot create", error);
         return {};
     }
@@ -1570,7 +1951,7 @@ std::string server_resume_store::keep_value(const std::string & name, const std:
 }
 
 // `size` bytes from where `from` is into the staged file
-static bool copy_range(int from, staged_file & to, uint64_t size) {
+static bool copy_range(file_t from, staged_file & to, uint64_t size) {
     if (!to.flush() || !to.copy_in_kernel(from, size)) {
         return false;
     }
@@ -1639,10 +2020,10 @@ static server_resume_reason export_directory(
     put_u64(header + 32, bytes);
     header_seal(header);
 
-    const fs::path target(path);
-    const std::string directory = target.has_parent_path() ? target.parent_path().string() : ".";
+    const fs::path target = fs::u8path(path);
+    const std::string directory = target.has_parent_path() ? target.parent_path().u8string() : ".";
     staged_file staged(directory);
-    if (staged.file.fd < 0) {
+    if (!staged.file.ok()) {
         return staged.failed("cannot create", error);
     }
     if (!staged.put(header, HEADER_SIZE) || !staged.put(encoded.data(), encoded.size())) {
@@ -1650,16 +2031,16 @@ static server_resume_reason export_directory(
     }
     for (const auto * object : objects) {
         const std::string from = entry + "/" + object_name(*object);
-        fd_guard file(-1);
+        fd_guard file;
         reason = open_object(from, *object, file, error);
         if (reason != server_resume_reason::ok) {
             return reason;
         }
-        if (lseek(file.fd, 0, SEEK_SET) != 0 || !copy_range(file.fd, staged, HEADER_SIZE + object->bytes)) {
+        if (!rewind_file(file.fd) || !copy_range(file.fd, staged, HEADER_SIZE + object->bytes)) {
             return copy_failed(staged, from, error);
         }
     }
-    reason = staged.publish(target.filename().string(), "entry_export", error);
+    reason = staged.publish(target.filename().u8string(), "entry_export", error);
     if (reason == server_resume_reason::ok && !sync_dir(directory)) {
         error = "cannot sync " + directory;
         return server_resume_reason::io_error;
@@ -1684,7 +2065,7 @@ server_resume_reason server_resume_store::take_entry(const std::string & id, std
     if (!make_private_dir(dir + "/taken", error)) {
         return server_resume_reason::store_unwritable;
     }
-    if (rename(entry_dir(id).c_str(), (dir + "/taken/" + id).c_str()) != 0) {
+    if (!rename_path(entry_dir(id), dir + "/taken/" + id)) {
         const int e = errno;
         error = errno_text("cannot take", entry_dir(id), e);
         return e == ENOENT ? server_resume_reason::object_missing : reason_from_errno(e);
@@ -1701,7 +2082,7 @@ server_resume_reason server_resume_store::export_taken(
     const std::string taken = dir + "/taken/" + id;
     const auto reason = export_directory(taken, path, bytes, error);
     std::error_code ec;
-    fs::remove_all(taken, ec);
+    fs::remove_all(fs::u8path(taken), ec);
     return reason;
 }
 
@@ -1710,17 +2091,16 @@ server_resume_reason server_resume_store::import_entry(
         std::string & error) {
     id.clear();
     bytes = 0;
-    fd_guard file(::open(path.c_str(), O_RDONLY | O_CLOEXEC));
-    if (file.fd < 0) {
+    fd_guard file(open_read(path, false));
+    if (!file.ok()) {
         error = errno_text("cannot open", path, errno);
         return errno == ENOENT ? server_resume_reason::object_missing : server_resume_reason::io_error;
     }
-    struct stat st;
-    if (fstat(file.fd, &st) != 0 || !S_ISREG(st.st_mode)) {
+    uint64_t size = 0;
+    if (!regular_size(file.fd, size)) {
         error = "cannot stat " + path;
         return server_resume_reason::io_error;
     }
-    const uint64_t size = (uint64_t) st.st_size;
 
     uint8_t header[HEADER_SIZE];
     if (size < HEADER_SIZE || !read_all(file.fd, header, HEADER_SIZE) ||
@@ -1781,9 +2161,7 @@ server_resume_reason server_resume_store::import_entry(
 }
 
 bool server_resume_store::is_entry_file(const std::string & path) {
-    fd_guard file(::open(path.c_str(), O_RDONLY | O_CLOEXEC));
+    fd_guard file(open_read(path, false));
     uint8_t magic[8];
-    return file.fd >= 0 && read_all(file.fd, magic, sizeof(magic)) && std::memcmp(magic, ENTRY_MAGIC, 8) == 0;
+    return file.ok() && read_all(file.fd, magic, sizeof(magic)) && std::memcmp(magic, ENTRY_MAGIC, 8) == 0;
 }
-
-#endif

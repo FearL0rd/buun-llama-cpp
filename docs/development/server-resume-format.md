@@ -331,8 +331,21 @@ the kernel drops the lock with its owner, so a killed server leaves nothing to
 detect. The pid written into the file is for a person looking at the directory.
 A second server runs without persistence and says so. Retention also removes an
 entry whose manifest is damaged; one of an unsupported version is kept, it may
-belong to a newer build. On Windows the store opens as `store_unwritable`
-(encoding and decoding are portable, the durable I/O is POSIX).
+belong to a newer build.
+
+On Windows the same store runs on Win32 calls. Each directory is created with a
+protected access list that admits only the current user, and its files inherit
+it; an existing directory must be owned by that user (or by the owner their
+token assigns, the Administrators group for an elevated administrator) and must
+not be a reparse point. The writer lock is `LockFileEx` on a byte far past the
+pid text, so the text stays readable. Files are opened shared for deletion, and
+a publish renames with NTFS POSIX semantics, so an entry file that is imported
+and open can still be replaced by a later export. File systems without POSIX
+semantics fall back to `MoveFileEx`; when the target there is still open, it is
+renamed aside first and deleted, which completes once its readers close it, so
+for that moment the path holds no file. Files are flushed with `FlushFileBuffers`.
+A directory cannot be flushed on Windows, so the directory sync relies on the
+NTFS journal and only checks that the directory still exists.
 
 ### 4a. Media
 

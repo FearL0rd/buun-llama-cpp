@@ -183,7 +183,8 @@ void server_resume_store_set_fault(server_resume_fault_fn fn) noexcept;
 
 class server_resume_store {
 public:
-    // <cache root>/resume/<family digest>/, directories 0700, files 0600. takes the writer lock of the
+    // <cache root>/resume/<family digest>/, directories 0700, files 0600 (on Windows, directories
+    // whose access list admits only this user, which their files inherit). takes the writer lock of the
     // namespace: a second server gets store_locked and runs without persistence. A store that is not
     // durable syncs nothing: its entries do not outlive the request that wrote them
     static std::unique_ptr<server_resume_store> open(
@@ -286,8 +287,10 @@ private:
     server_resume_store() = default;
 
     std::string dir; // the family namespace
-    int lock_fd = -1;
     bool durable = true;
+
+    struct writer_lock;
+    std::unique_ptr<writer_lock> lock;
 
     // imported entry files, by entry id; export_taken() does not look at them
     struct mounted_entry;

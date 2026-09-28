@@ -15,8 +15,9 @@
 #include <string>
 #include <vector>
 
+#if !defined(_WIN32)
 #include <sys/stat.h>
-#include <unistd.h>
+#endif
 
 namespace fs = std::filesystem;
 
@@ -293,10 +294,13 @@ static size_t n_files(const std::string & directory, const std::string & prefix 
     return n;
 }
 
+// on Windows the directories hold an access list for this user alone, not a mode
+#if !defined(_WIN32)
 static unsigned mode_of(const std::string & path) {
     struct stat st;
     return stat(path.c_str(), &st) == 0 ? st.st_mode & 0777 : 0;
 }
+#endif
 
 // writes the objects of one generation over [p0, p1) and names them in the manifest
 static server_resume_reason add_generation(
@@ -356,10 +360,12 @@ static void test_store(const std::string & root) {
         std::fprintf(stderr, "open: %s\n", error.c_str());
         return;
     }
+#if !defined(_WIN32)
     CHECK(mode_of(root + "/resume") == 0700);
     CHECK(mode_of(store->directory()) == 0700);
     CHECK(mode_of(store->directory() + "/entries") == 0700);
     CHECK(mode_of(store->directory() + "/writer.lock") == 0600);
+#endif
     CHECK(store->free_bytes() > 0);
     CHECK(store->list().empty());
 
@@ -378,9 +384,11 @@ static void test_store(const std::string & root) {
     server_resume_manifest manifest = manifest_of(16, 0);
     manifest.chunks.clear();
     CHECK(add_generation(*store, id, manifest, 0, 16) == server_resume_reason::ok);
+#if !defined(_WIN32)
     CHECK(mode_of(entry_dir) == 0700);
     CHECK(mode_of(entry_dir + "/commit") == 0600);
     CHECK(mode_of(entry_dir + "/c-0-16-1") == 0600);
+#endif
     CHECK(n_files(entry_dir) == 3);
 
     CHECK(add_generation(*store, id, manifest, 16, 32) == server_resume_reason::ok);
@@ -582,9 +590,13 @@ static void test_store(const std::string & root) {
     store.reset();
     fs::remove_all(root + "/resume/" + FAMILY + "/entries");
     fs::create_directories(root + "/elsewhere");
-    fs::create_directory_symlink(root + "/elsewhere", root + "/resume/" + FAMILY + "/entries");
-    CHECK(!server_resume_store::open(root, FAMILY, reason, error));
-    CHECK(reason == server_resume_reason::store_unwritable);
+    // (Windows lets only an administrator or developer mode make one)
+    std::error_code link_error;
+    fs::create_directory_symlink(root + "/elsewhere", root + "/resume/" + FAMILY + "/entries", link_error);
+    if (!link_error) {
+        CHECK(!server_resume_store::open(root, FAMILY, reason, error));
+        CHECK(reason == server_resume_reason::store_unwritable);
+    }
 }
 
 // one streamed object in place of the chunks: never in one buffer, its checksum known at the end

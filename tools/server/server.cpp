@@ -537,7 +537,22 @@ int llama_server(common_params & params, int argc, char ** argv) {
         sigaction(SIGTERM, &sigint_action, NULL);
 #elif defined (_WIN32)
         auto console_ctrl_handler = +[](DWORD ctrl_type) -> BOOL {
-            return (ctrl_type == CTRL_C_EVENT) ? (signal_handler(SIGINT), true) : false;
+            switch (ctrl_type) {
+                case CTRL_C_EVENT:
+                case CTRL_BREAK_EVENT:
+                    signal_handler(SIGINT);
+                    return true;
+                // not CTRL_LOGOFF_EVENT: a server run as a service gets it when any user logs off
+                case CTRL_CLOSE_EVENT:
+                case CTRL_SHUTDOWN_EVENT:
+                    // Windows ends the process once this returns: wait for main to finish the
+                    // shutdown (and the --resume save) instead, until the system's timeout
+                    signal_handler(SIGTERM);
+                    Sleep(INFINITE);
+                    return true;
+                default:
+                    return false;
+            }
         };
         SetConsoleCtrlHandler(reinterpret_cast<PHANDLER_ROUTINE>(console_ctrl_handler), true);
 #endif
