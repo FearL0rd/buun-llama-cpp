@@ -4383,6 +4383,12 @@ static void ggml_moe_cache_fused_collect(struct moe_cache_fused_state * state) {
     state->node = NULL;
 }
 
+static bool ggml_moe_cache_data_overlaps(const struct ggml_tensor * a, const struct ggml_tensor * b) {
+    const uintptr_t ap = (uintptr_t) a->data;
+    const uintptr_t bp = (uintptr_t) b->data;
+    return ap >= bp ? ap - bp < ggml_nbytes(b) : bp - ap < ggml_nbytes(a);
+}
+
 static int ggml_cpu_try_fuse_moe_cache(
         const struct ggml_cgraph * cgraph,
         int node_n,
@@ -4403,6 +4409,15 @@ static int ggml_cpu_try_fuse_moe_cache(
     const struct ggml_tensor * gate_weight = gate->src[0];
     const struct ggml_tensor * acts = up->src[1];
     const struct ggml_tensor * ids = up->src[2];
+    // Failed GPU collection must still be able to recompute from the original
+    // activations. These aliases are legal for the unfused graph, but not for
+    // a fusion that may retry after writing its output.
+    if (ggml_moe_cache_data_overlaps(acts, glu)) {
+        return 0;
+    }
+    if (down && ggml_moe_cache_data_overlaps(acts, down)) {
+        down = NULL;
+    }
     const int n_ids = (int)ids->ne[0];
     const int n_tokens = (int)ids->ne[1];
     const int n_rows = n_ids*n_tokens;
@@ -4533,17 +4548,21 @@ static int ggml_cpu_try_fuse_moe_cache(
     ggml_barrier(params->threadpool);
 
     if (!state->collect_ok) {
+        // Down may reuse up/gate storage with a different row stride. Retrying
+        // just the GPU rows could overwrite already-computed CPU down rows.
+        // Recompute the complete FFN on this rare failure path.
+        const uint64_t retry_mask = state->full ? valid_mask : state->hit_mask;
         ggml_compute_forward_mul_mat_id_impl(
-                &sub_params, up, state->hit_mask, true, false, gate, NULL, NULL);
+                &sub_params, up, retry_mask, true, false, gate, NULL, NULL);
         ggml_barrier(params->threadpool);
         ggml_compute_forward_swiglu_masked(
-                params, gate, up, glu, state->hit_mask,
+                params, gate, up, glu, retry_mask,
                 fusion.clamped, fusion.up_min, fusion.up_max,
                 fusion.gate_min, fusion.gate_max);
         if (state->full) {
             ggml_barrier(params->threadpool);
             ggml_compute_forward_mul_mat_id_impl(
-                    &sub_params, down, state->hit_mask, true, false, NULL, NULL, NULL);
+                    &sub_params, down, retry_mask, true, false, NULL, NULL, NULL);
         }
     }
 

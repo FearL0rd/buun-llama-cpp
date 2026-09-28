@@ -896,6 +896,107 @@ static bool run_fused_cpu_fallbacks(ggml_backend_t cpu) {
     return ok;
 }
 
+// A graph allocator can reuse an expired input/intermediate for a later output.
+// Equal-width, separately allocated tensors do not exercise recovery from these
+// aliases, especially after collect has already written part of its output.
+static bool run_fused_alias_fallbacks(ggml_backend_t cpu) {
+    const auto saved_api = ggml_moe_cache;
+    static uint64_t mask;
+    static int failure, plans, full_plans;
+    static bool full;
+    static std::vector<float> reference, glu_reference;
+    constexpr int width = 256, inner = 64, experts = 4, tokens = 4;
+    auto * ctx = ggml_init({8*ggml_tensor_overhead(), nullptr, true});
+    GGML_ASSERT(ctx);
+    auto * up = ggml_new_tensor_3d(ctx, GGML_TYPE_Q2_0, width, inner, experts);
+    auto * gate = ggml_dup_tensor(ctx, up);
+    auto * down = ggml_new_tensor_3d(ctx, GGML_TYPE_Q2_0, inner, width, experts);
+    auto * acts = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, width, 1, tokens);
+    auto * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, experts, tokens);
+    auto buffer = ggml_backend_alloc_ctx_tensors(ctx, cpu);
+    GGML_ASSERT(buffer);
+    ggml_backend_buffer_set_usage(buffer, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+    int seed = 0;
+    for (auto * weight : {up, gate, down}) {
+        std::vector<float> data(ggml_nelements(weight));
+        for (size_t i = 0; i < data.size(); ++i) data[i] = 0.02f*std::sin(float(i + 37*seed)*0.013f);
+        std::vector<uint8_t> bytes(ggml_nbytes(weight));
+        GGML_ASSERT(ggml_quantize_chunk(weight->type, data.data(), bytes.data(), 0,
+                    weight->ne[1]*experts, weight->ne[0], nullptr) == bytes.size());
+        ggml_backend_tensor_set(weight, bytes.data(), 0, bytes.size());
+        ++seed;
+    }
+    std::vector<float> activation(ggml_nelements(acts));
+    for (size_t i = 0; i < activation.size(); ++i) activation[i] = std::sin(float(i)*0.037f);
+    ggml_backend_tensor_set(acts, activation.data(), 0, ggml_nbytes(acts));
+    std::vector<int32_t> routes(experts*tokens);
+    for (size_t i = 0; i < routes.size(); ++i) routes[i] = i % experts;
+    ggml_backend_tensor_set(ids, routes.data(), 0, ggml_nbytes(ids));
+    auto graph = make_full_fused_graph(cpu, up, gate, down, acts, ids, ffn_clamp::combined);
+    auto * glu = graph.out->src[1];
+    auto * up_node = glu->src[1];
+    auto * gate_node = glu->src[0];
+    ggml_moe_cache = {};
+    GGML_ASSERT(ggml_backend_graph_compute(cpu, graph.graph) == GGML_STATUS_SUCCESS);
+    reference.resize(ggml_nelements(graph.out));
+    glu_reference.resize(ggml_nelements(glu));
+    ggml_backend_tensor_get(graph.out, reference.data(), 0, ggml_nbytes(graph.out));
+    ggml_backend_tensor_get(glu, glu_reference.data(), 0, ggml_nbytes(glu));
+    void * up_data = up_node->data;
+    void * gate_data = gate_node->data;
+    void * acts_data = acts->data;
+    auto acts_buffer = acts->buffer;
+    ggml_moe_cache.fused_plan = [](const ggml_moe_cache_tensor_desc *, const ggml_moe_cache_tensor_desc *,
+            const ggml_moe_cache_tensor_desc * down, int, float, float, float, float,
+            const int32_t *, int, int64_t, const float * const *, uint64_t * hits) -> void * {
+        ++plans;
+        full = down != nullptr;
+        full_plans += full;
+        *hits = mask;
+        return &mask;
+    };
+    ggml_moe_cache.fused_dispatch = [](void *) { return failure == 1 ? 0 : 1; };
+    ggml_moe_cache.collect = [](void *, int hits, float * const * out, int64_t n) {
+        const auto & expected = full ? reference : glu_reference;
+        int copied = 0;
+        for (size_t r = 0; r < expected.size()/n; ++r) {
+            if (!(mask & (UINT64_C(1) << r))) continue;
+            GGML_ASSERT(copied < hits);
+            std::memcpy(out[copied++], expected.data() + r*n, n*sizeof(float));
+            if (failure == 2) return 0;
+        }
+        return copied == hits ? 1 : 0;
+    };
+    ggml_moe_cache.end = [](void *) {};
+    bool ok = true;
+    for (int alias = 0; alias < 5; ++alias) {
+        up_node->data = alias == 1 ? graph.out->data : up_data;
+        gate_node->data = alias == 2 ? graph.out->data : gate_data;
+        acts->data = alias == 3 ? graph.out->data : alias == 4 ? glu->data : acts_data;
+        acts->buffer = alias >= 3 ? graph.buffer : acts_buffer;
+        for (int fail : {0, 1, 2}) for (uint64_t hits : {UINT64_C(0), UINT64_C(0xffff), UINT64_C(0x5555)}) {
+            failure = fail; mask = hits; plans = full_plans = 0;
+            poison_graph(graph);
+            ggml_backend_tensor_set(acts, activation.data(), 0, ggml_nbytes(acts));
+            GGML_ASSERT(ggml_backend_graph_compute(cpu, graph.graph) == GGML_STATUS_SUCCESS);
+            std::vector<float> actual(reference.size());
+            ggml_backend_tensor_get(graph.out, actual.data(), 0, ggml_nbytes(graph.out));
+            const bool cell_ok = std::memcmp(actual.data(), reference.data(), ggml_nbytes(graph.out)) == 0 &&
+                plans == (alias == 4 ? 0 : 1) && full_plans == (alias < 3 ? 1 : 0);
+            printf("cache-fused-alias%d-mask%llx-failure%d: %s\n", alias,
+                    (unsigned long long)mask, fail, cell_ok ? "OK" : "FAIL");
+            ok &= cell_ok;
+        }
+    }
+    up_node->data = up_data; gate_node->data = gate_data;
+    acts->data = acts_data; acts->buffer = acts_buffer;
+    ggml_moe_cache = saved_api;
+    free_graph(graph);
+    ggml_backend_buffer_free(buffer);
+    ggml_free(ctx);
+    return ok;
+}
+
 enum class down_mmv_expectation {
     unchecked,
     generic,
@@ -4013,7 +4114,7 @@ int main(int argc, char ** argv) {
         for (int threads : { 1, 2, 4, 6 }) {
             if (set_n_threads) set_n_threads(cpu, threads);
             printf("cache-fused-cpu-fallbacks: threads=%d\n", threads);
-            if (!run_fused_cpu_fallbacks(cpu)) {
+            if (!run_fused_cpu_fallbacks(cpu) || !run_fused_alias_fallbacks(cpu)) {
                 ggml_backend_free(cpu);
                 return 1;
             }
