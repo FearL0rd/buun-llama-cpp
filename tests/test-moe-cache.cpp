@@ -4161,7 +4161,7 @@ static bool run_stream_staging_case(ggml_backend_dev_t dev,
         auto start = [&](const char * fail = nullptr, const char * profile = nullptr) {
             configure_cache(fail, "4", "1", boundary ? "46" : "40", dedicated_down);
             ggml_moe_cache_config config = {};
-            GGML_ASSERT(ggml_moe_cache.query_config(0, 4, &config));
+            GGML_ASSERT(ggml_moe_cache.query_config(0, 0, &config));
             config.profile_path = profile;
             void * backends[] = { gpu, cpu };
             void * s = ggml_moe_cache.session_create(backends, 2, &config);
