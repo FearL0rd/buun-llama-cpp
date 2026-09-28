@@ -932,8 +932,11 @@ static void common_params_fit_impl(
 
                     bool mapped_device = false;
                     for (size_t id = 0; id < devs.size(); id++) {
-                        if (devs_extra[je] == devs[id]) {
-                            common_fit_add_breakdown(mapped[id], mb_extra);
+                        const size_t scale = common_fit_extra_device_scale(devs[id], devs_extra[je]);
+                        if (scale != 0) {
+                            for (size_t copy = 0; copy < scale; ++copy) {
+                                common_fit_add_breakdown(mapped[id], mb_extra);
+                            }
                             mapped_device = true;
                             break;
                         }
@@ -1534,7 +1537,7 @@ static void common_params_fit_impl(
         // Keep explicit placements and soft mode's minimal-eviction policy intact.
         if (moe_cache && (moe_cache->mode == COMMON_MOE_CACHE_MODE_AUTO ||
                           moe_cache->mode == COMMON_MOE_CACHE_MODE_ON) &&
-                !moe_tensors.empty() && tensor_buft_overrides && !extra &&
+                !moe_tensors.empty() && tensor_buft_overrides &&
                 mparams->n_gpu_layers == default_mparams.n_gpu_layers &&
                 (!mparams->tensor_buft_overrides ||
                  (!mparams->tensor_buft_overrides[0].pattern && !mparams->tensor_buft_overrides[0].buft))) {
@@ -1553,6 +1556,10 @@ static void common_params_fit_impl(
             bool candidate_valid = common_fit_same_devices(candidate_devs, devs) &&
                     candidate_memory.size() == nd + 1;
             if (candidate_valid) {
+                // Shared/borrowed drafts follow this candidate's CPU-expert
+                // placement. Include them before accepting the target or sizing
+                // cache pools, just as in the ordinary layer-split fit path.
+                add_extra_memory(candidate_memory, &candidate);
                 for (size_t id = 0; id < nd; ++id) {
                     if (candidate_memory[id].mb.total() > INT64_MAX ||
                             candidate_memory[id].free - (int64_t)candidate_memory[id].mb.total() < margins[id]) {

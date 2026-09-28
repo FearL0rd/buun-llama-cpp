@@ -54,6 +54,13 @@ int main() {
             const auto b = ggml_backend_meta_device(children, 2, mirrored, &model_b);
             expect(a != b && common_fit_same_devices({a}, {b}),
                     "distinct dry-model Meta handles must match the same ordered inventory");
+            expect(common_fit_extra_device_scale(a, b) == 1,
+                    "a separately loaded tensor draft must retain its balanced-equivalent charge");
+            expect(common_fit_extra_device_scale(a, cpu) == 2,
+                    "a pinned child draft must charge its full footprint on every target shard");
+            expect(common_fit_extra_device_scale(cpu, cpu) == 1 &&
+                    common_fit_extra_device_scale(cpu, a) == 0,
+                    "ordinary device accounting is unchanged and cannot absorb an extra Meta device");
             expect(!common_fit_same_devices({a}, {cpu}) && !common_fit_same_devices({a}, {a, b}),
                     "different device topology must not match");
             const auto gpu = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
@@ -62,6 +69,12 @@ int main() {
                 const auto f = ggml_backend_meta_device(forward, 2, mirrored, &model_a);
                 const auto r = ggml_backend_meta_device(reverse, 2, mirrored, &model_b);
                 expect(!common_fit_same_devices({f}, {r}), "child order is part of fit device identity");
+                expect(common_fit_extra_device_scale(f, gpu) == 2 &&
+                        common_fit_extra_device_scale(r, gpu) == 2,
+                        "a draft pinned to either child must be counted without averaging");
+                expect(common_fit_extra_device_scale(a, gpu) == 0 &&
+                        common_fit_extra_device_scale(cpu, gpu) == 0,
+                        "non-member GPUs must remain outside the target fit authority");
             }
         }
     }
