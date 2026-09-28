@@ -248,6 +248,7 @@ full matrix is in
 | `--slot-save-path PATH` | path to save slot kv cache (default: disabled) |
 | `--resume` | keep the slots' conversations across restarts and sleep: their KV state is saved at shutdown and restored at startup (default: disabled)<br/>(env: LLAMA_ARG_RESUME) |
 | `--resume-path PATH` | directory of the --resume store (default: the llama.cpp cache directory)<br/>(env: LLAMA_ARG_RESUME_PATH) |
+| `--resume-no-host-cache` | --resume for the slots only: the conversations held in the host prompt cache are neither saved nor restored, which keeps shutdown fast. Implies --resume (default: disabled)<br/>(env: LLAMA_ARG_RESUME_NO_HOST_CACHE) |
 | `--media-path PATH` | directory for loading local media files; files can be accessed via file:// URLs using relative paths (default: disabled) |
 | `--models-dir PATH` | directory containing models for the router server (default: disabled)<br/>(env: LLAMA_ARG_MODELS_DIR) |
 | `--models-preset PATH` | path to INI file containing model presets for the router server (default: disabled)<br/>(env: LLAMA_ARG_MODELS_PRESET) |

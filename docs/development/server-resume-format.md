@@ -953,6 +953,11 @@ of its own:
   dense, 353 MB each: about 2.9 s per conversation either way). An image
   covers the cache up to its watermark, so a conversation restored above the
   one it replaced costs up to twice its size on disk.
+- *Off.* `--resume-no-host-cache` (which implies `--resume`) keeps the resume
+  to the slots, for either kind of host cache: no hosted conversation is saved,
+  a slot's conversation is not held in the store for the host cache when it
+  leaves, and at load an entry beyond the slots is `no_free_slot`. The host
+  cache itself runs as usual.
 
 **Needs the artifact store.** The store exists with the VBR host cache. Under
 `--cache-ram 0` a save is `unsupported_artifact` and the server warns at start

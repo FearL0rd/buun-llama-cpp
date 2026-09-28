@@ -4788,6 +4788,15 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_RESUME_PATH"));
     add_opt(common_arg(
+        {"--resume-no-host-cache"},
+        "--resume for the slots only: the conversations held in the host prompt cache are neither saved nor restored, "
+        "which keeps shutdown fast. Implies --resume (default: disabled)",
+        [](common_params & params) {
+            params.resume               = true;
+            params.resume_no_host_cache = true;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_RESUME_NO_HOST_CACHE"));
+    add_opt(common_arg(
         {"--cache-receipt"},
         "attach a cache receipt (keyed chained block-hash divergence hint) to responses (default: disabled)",
         [](common_params & params) {

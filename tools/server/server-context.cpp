@@ -5145,13 +5145,15 @@ private:
         return resume_active() && resume_vbr();
     }
 
-    // a conversation that leaves its slot lives on in a host cache, of either kind
+    // a conversation that leaves its slot lives on in a host cache, of either kind, which the resume
+    // takes in unless it is for the slots only
     bool resume_host_cache() const {
-        return fixed_host_cache_enabled() || resume_vbr_host_cache();
+        return !params_base.resume_no_host_cache && (fixed_host_cache_enabled() || resume_vbr_host_cache());
     }
 
     bool resume_vbr_host_cache() const {
-        return resume_vbr() && params_base.vbr_prompt_cache && prompt_cache && vbr_artifact_store;
+        return !params_base.resume_no_host_cache && resume_vbr() && params_base.vbr_prompt_cache && prompt_cache &&
+               vbr_artifact_store;
     }
 
     // An artifact is bound to the execution identity and the sequence epoch of its capture. Both
