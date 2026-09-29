@@ -544,6 +544,7 @@ private:
     // current physical memory context can represent. Returns zero when unavailable.
     uint32_t effective_reserve_n_seqs(const llama_memory_context_i * mctx) const;
     llm_graph_result * get_gf_res_prev();
+    void invalidate_graph_results();
 
     llm_graph_params graph_params(
                         llm_graph_result * res,

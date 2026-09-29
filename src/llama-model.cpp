@@ -3917,6 +3917,9 @@ llama_rope_type llama_model_rope_type(const llama_model * model) {
         case LLM_ARCH_HY_V4:
             return LLAMA_ROPE_TYPE_NORM;
 
+        case LLM_ARCH_BAILINGMOE3:
+            return model->hparams.use_mrope() ? LLAMA_ROPE_TYPE_MROPE : LLAMA_ROPE_TYPE_NORM;
+
         // the pairs of head values are offset by n_rot/2
         case LLM_ARCH_FALCON:
         case LLM_ARCH_FALCON_H1:

@@ -1079,13 +1079,16 @@ void llama_context::sched_reserve() {
     const bool reuse_sched = !sched_need_reserve && sched &&
         !moe_cache_eligible && !cparams.pipeline_parallel &&
         ggml_backend_sched_get_n_copies(sched.get()) == 1 && sched_max_nodes >= max_nodes;
-    if (reuse_sched && gf_res_prev && gf_res_reserve &&
-        gf_res_prev->get_max_nodes() == (int64_t) max_nodes &&
+    if (reuse_sched && gf_res_reserve &&
+        std::all_of(gf_res_prev.begin(), gf_res_prev.end(), [&](const auto & res) {
+            return !res || res->get_max_nodes() == (int64_t) max_nodes;
+        }) &&
         gf_res_reserve->get_max_nodes() == (int64_t) max_nodes) {
-        gf_res_prev->reset();
+        invalidate_graph_results();
         gf_res_reserve->reset();
     } else {
-        gf_res_prev.reset(new llm_graph_result(max_nodes));
+        for (auto & res : gf_res_prev) { res.reset(); }
+        gf_res_prev_active = nullptr;
         gf_res_reserve.reset(new llm_graph_result(max_nodes));
     }
     if (reuse_sched) {
@@ -1380,12 +1383,7 @@ bool llama_context::memory_update(bool optimize) {
 
         // reset the previous graph results to make sure that they won't be reused
         // TODO: make mctx->apply() report if a graph reserve is needed, then reset graph results only if the memory module reset the scheduler
-        for (auto & res : gf_res_prev) {
-            if (res) {
-                res->reset();
-            }
-        }
-        gf_res_prev_active = nullptr;
+        invalidate_graph_results();
 
         if (!mctx->apply()) {
             LLAMA_LOG_ERROR("%s: failed to apply memory update\n", __func__);
@@ -1942,9 +1940,7 @@ void llama_context::set_dflash_argmax(bool enable) {
     // invalidate graph cache: the tail's presence changes graph topology and the
     // reuse check does not compare cparams (a stale reused graph would keep
     // producing t_logits_argmax and skip the raw logits extraction)
-    if (gf_res_prev) {
-        gf_res_prev->reset();
-    }
+    invalidate_graph_results();
     if (!enable) {
         // drop stale tail results: subsequent decodes will not refill these, and
         // consumers key the GPU-vs-host sampling path on get_logits_argmax()
@@ -1960,9 +1956,7 @@ void llama_context::set_dflash_target_argmax(bool enable) {
         return;
     }
     cparams.dflash_target_argmax = enable;
-    if (gf_res_prev) {
-        gf_res_prev->reset();
-    }
+    invalidate_graph_results();
 }
 
 void llama_context::set_dflash_target_mmq_batch(int32_t n_tokens) {
@@ -1971,9 +1965,7 @@ void llama_context::set_dflash_target_mmq_batch(int32_t n_tokens) {
         return;
     }
     cparams.dflash_target_mmq_batch = n_tokens;
-    if (gf_res_prev) {
-        gf_res_prev->reset();
-    }
+    invalidate_graph_results();
 }
 
 void llama_context::set_dflash_fused_inject(bool enable) {
@@ -2114,14 +2106,14 @@ void llama_context::set_dflash_oneg_inject(ggml_tensor * carry, int32_t n_inject
 void llama_context::set_dflash_topk(int k) {
     cparams.dflash_topk = (k >= 1) ? k : 1;
     // invalidate graph cache since output tensor shape changes with K
-    gf_res_prev->reset();
+    invalidate_graph_results();
 }
 
 void llama_context::set_dflash_block_size(int n) {
     GGML_ASSERT(n == 0 || (n >= 3 && n <= model.hparams.dflash_block_size));
     if (cparams.dflash_block_size != n) {
         cparams.dflash_block_size = n;
-        gf_res_prev->reset();
+        invalidate_graph_results();
     }
 }
 
@@ -2133,7 +2125,7 @@ void llama_context::set_dflash_n_slots(int n) {
     cparams.dflash_n_slots = clamped;
     // drafter graph ctx_len depends on n_slots → force a fresh reserve on next decode
     sched_need_reserve = true;
-    gf_res_prev->reset();
+    invalidate_graph_results();
 }
 
 void llama_context::set_dflash_capture(const int32_t * layer_ids, int32_t n_layers) {
@@ -2329,8 +2321,8 @@ void llama_context::set_tape_recording(bool enable) {
 
     // Tape copies are graph topology, not runtime parameters. A cached graph
     // built for the previous recording state must not survive the toggle.
-    if (graph_changed && gf_res_prev) {
-        gf_res_prev->reset();
+    if (graph_changed) {
+        invalidate_graph_results();
     }
 }
 
@@ -2520,9 +2512,7 @@ void llama_context::set_active_dflash_slot(int slot_idx) {
     cparams.tape_gpu_n_seqs = 1;
     // graph nodes hold references to the previous slot's tape tensors; invalidate
     // so the next decode rebuilds with the new slot's tensors.
-    if (gf_res_prev) {
-        gf_res_prev->reset();
-    }
+    invalidate_graph_results();
 }
 
 ggml_backend_t llama_context::find_gpu_backend() {
@@ -4293,6 +4283,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             return nullptr;
         }
 
+        gf_res_prev_active = res;
     }
 
     // Staged DFlash decodes answer every eval-callback ask with "no" (hiddens are
@@ -4846,8 +4837,8 @@ int llama_context::decode(const llama_batch & batch_inp) {
                 }
 
                 // graph nodes hold references to tape tensors — invalidate if set changed
-                if (seqs_changed && gf_res_prev) {
-                    gf_res_prev->reset();
+                if (seqs_changed) {
+                    invalidate_graph_results();
                 }
             } else if (!dflash_capture->tape_enabled &&
                        (cparams.tape_gpu != nullptr ||
@@ -4860,9 +4851,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
                 for (int s = 0; s < (int) LLAMA_DFLASH_MAX_SLOTS; ++s) {
                     cparams.tape_gpu_seqs[s] = nullptr;
                 }
-                if (gf_res_prev) {
-                    gf_res_prev->reset();
-                }
+                invalidate_graph_results();
             }
 
             // track active slot for single-seq (used by active_tape() in eval callback)
@@ -4889,9 +4878,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
                 ggml_tensor ** stage_want = stage_ok ? dflash_capture->stage_tensors.data() : nullptr;
                 if (stage_want != cparams.capture_stage) {
                     cparams.capture_stage = stage_want;
-                    if (gf_res_prev) {
-                        gf_res_prev->reset();
-                    }
+                    invalidate_graph_results();
                 }
                 if (stage_ok) {
                     dflash_capture->stage_n_tokens = (int) ubatch.n_tokens;
@@ -5574,6 +5561,13 @@ llm_graph_result * llama_context::get_gf_res_prev() {
     return res.get();
 }
 
+void llama_context::invalidate_graph_results() {
+    for (auto & res : gf_res_prev) {
+        if (res) { res->reset(); }
+    }
+    gf_res_prev_active = nullptr;
+}
+
 // pack sampler outputs into as few sequences as possible before using sequences without samplers
 static void ubatch_prepare_reserve(
               llama_ubatch                            & ubatch,
@@ -5680,12 +5674,7 @@ ggml_cgraph * llama_context::graph_reserve(
     ggml_backend_sched_reset(sched.get());
 
     // when the scheduler is reset, we cannot reuse old graphs, so we reset the previous graph results
-    for (auto & res : gf_res_prev) {
-        if (res) {
-            res->reset();
-        }
-    }
-    gf_res_prev_active = nullptr;
+    invalidate_graph_results();
 
     // store the n_outputs as it is, and restore it afterwards
     // TODO: not sure if needed, might simplify in the future by removing this
