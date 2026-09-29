@@ -726,7 +726,6 @@ enum llm_tensor {
     LLM_TENSOR_GEMMA4_DFLASH_HIDDEN_NORM, // dot-form name (gemma4-dflash-draft GGUF)
     LLM_TENSOR_MASKED_EMBD_CENTROIDS,
     LLM_TENSOR_MASKED_EMBD_ORDERING,
-    LLM_TENSOR_HRM_Z_L_INIT,
     LLM_TENSOR_FC,
     LLM_TENSOR_D2T,
     LLM_TENSOR_DSPARK_MARKOV_W1,
@@ -747,7 +746,11 @@ enum llm_tensor {
     LLM_TENSOR_DFLASH_SELECTOR_NEXT = 281,
     LLM_TENSOR_DFLASH_SELECTOR_HIDDEN = 282,
     LLM_TENSOR_FFN_EXP_PROBS_B_VL = 283,
+    LLM_TENSOR_HRM_Z_L_INIT = 284,
 };
+
+static_assert(LLM_TENSOR_DFLASH2_FFN_CONV_PROJ < LLM_TENSOR_DFLASH_ATTN_CONV_BASE,
+              "automatic tensor IDs overlap the fork's explicitly assigned range");
 
 
 enum llm_tensor_layer {
