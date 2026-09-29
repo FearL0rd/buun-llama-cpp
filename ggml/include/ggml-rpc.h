@@ -6,7 +6,9 @@
 extern "C" {
 #endif
 
-#define RPC_PROTO_MAJOR_VERSION    7
+// Fork wire namespace: upstream 7 has different op/type IDs. The high bit
+// prevents either peer from treating the other's tensors as compatible.
+#define RPC_PROTO_MAJOR_VERSION    (0x80 | 7)
 #define RPC_PROTO_MINOR_VERSION    0
 // 6: the fork op enum (tree ops + TURBO_WHT + DSV4_HC_PARAMS) has a different wire
 //    ordering from protocol 5. The HELLO handshake checks major/minor only, so an enum

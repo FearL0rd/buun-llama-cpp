@@ -30,6 +30,7 @@
 #  include <time.h>
 #  ifndef _WIN32
 #    include <poll.h>
+#    include <fcntl.h>
 #  endif
 #  ifdef GGML_RPC_RDMA_APPLE
 #    include "transport-apple.h"
@@ -95,11 +96,20 @@ struct rdma_conn {
     }
 
     ~rdma_conn() {
+        if (qp)  ibv_destroy_qp(qp);
+        // CQ destruction waits for acknowledgements, including notifications
+        // left queued when the TCP peer disconnected before the next wait.
+        if (ch) {
+            struct ibv_cq * event_cq = nullptr;
+            void * event_ctx = nullptr;
+            while (ibv_get_cq_event(ch, &event_cq, &event_ctx) == 0) {
+                ibv_ack_cq_events(event_cq, 1);
+            }
+        }
         if (tx_mr) ibv_dereg_mr(tx_mr);
         if (rx_mr) ibv_dereg_mr(rx_mr);
         free(tx_buf);
         free(rx_buf);
-        if (qp)  ibv_destroy_qp(qp);
         if (scq) ibv_destroy_cq(scq);
         if (rcq) ibv_destroy_cq(rcq);
         if (ch)  ibv_destroy_comp_channel(ch);
@@ -302,6 +312,13 @@ bool socket_t::impl::rdma_probe() {
 
     // without a completion channel rdma_poll() spins all the time, as before
     rdma->ch  = ibv_create_comp_channel(ibctx);
+    if (rdma->ch) {
+        const int flags = fcntl(rdma->ch->fd, F_GETFL);
+        if (flags < 0 || fcntl(rdma->ch->fd, F_SETFL, flags | O_NONBLOCK) < 0) {
+            ibv_destroy_comp_channel(rdma->ch);
+            rdma->ch = nullptr;
+        }
+    }
     rdma->scq = ibv_create_cq(ibctx, 16, nullptr, rdma->ch, 0);
     rdma->rcq = ibv_create_cq(ibctx, RDMA_RX_DEPTH + 4, nullptr, rdma->ch, 0);
     if (!rdma->scq || !rdma->rcq) return false;
@@ -423,7 +440,8 @@ bool socket_t::impl::rdma_wait_event() {
     if (poll(pfds, 2, -1) < 0) {
         return errno == EINTR;
     }
-    if (pfds[1].revents & (POLLHUP | POLLERR | POLLRDHUP)) {
+    if ((pfds[1].revents & (POLLHUP | POLLERR | POLLRDHUP | POLLNVAL)) ||
+        (pfds[0].revents & (POLLHUP | POLLERR | POLLNVAL))) {
         return false;
     }
     if (pfds[0].revents & POLLIN) {

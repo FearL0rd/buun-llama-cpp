@@ -42,7 +42,7 @@ struct rpc_tensor {
     uint32_t type;
     uint64_t buffer;
     uint32_t ne[GGML_MAX_DIMS];
-    uint32_t nb[GGML_MAX_DIMS];
+    uint64_t nb[GGML_MAX_DIMS];
     uint32_t op;
     int32_t  op_params[GGML_MAX_OP_PARAMS / sizeof(int32_t)];
     int32_t  flags;
@@ -650,6 +650,7 @@ static rpc_tensor serialize_tensor(const ggml_tensor * tensor, const std::shared
         result.data   = 0;
     }
     for (uint32_t i = 0; i < GGML_MAX_DIMS; i++) {
+        GGML_ASSERT(tensor->ne[i] >= 0 && uint64_t(tensor->ne[i]) <= UINT32_MAX);
         result.ne[i] = tensor->ne[i];
         result.nb[i] = tensor->nb[i];
     }
@@ -858,9 +859,8 @@ static size_t ggml_backend_rpc_buffer_type_get_alloc_size(ggml_backend_buffer_ty
     if (rpc_get) {
         ggml_backend_rpc_buffer_type_context * buft_ctx = (ggml_backend_rpc_buffer_type_context *)buft->context;
 
-        // the reported size must never be below ggml_nbytes: rpc_tensor stores nb[] as uint32_t,
-        // so a stride over 4 GiB is truncated on the wire and the remote size comes back too small
-        // TODO: change rpc_tensor nb to 64-bit int
+        // Keep the local lower bound even if a remote allocator under-reports.
+        // Fork protocol 135 also carries full 64-bit strides on the wire.
         const size_t min_size = ggml_nbytes(tensor);
 
         // Cache key for calls to read the alloc_size.
@@ -1377,7 +1377,7 @@ bool rpc_server::memset_tensor(const rpc_msg_memset_tensor_req & request) {
 
 ggml_tensor * rpc_server::deserialize_tensor(struct ggml_context * ctx, const rpc_tensor * tensor) {
     // Validate tensor type before using it
-    if (tensor->type >= GGML_TYPE_COUNT) {
+    if (tensor->type >= GGML_TYPE_COUNT || tensor->op >= GGML_OP_COUNT) {
         GGML_LOG_ERROR("[%s] invalid tensor type received: %u\n", __func__, tensor->type);
         return nullptr;
     }
@@ -1398,6 +1398,9 @@ ggml_tensor * rpc_server::deserialize_tensor(struct ggml_context * ctx, const rp
     }
 
     for (uint32_t i = 0; i < GGML_MAX_DIMS; i++) {
+        if (tensor->nb[i] > SIZE_MAX) {
+            return nullptr;
+        }
         result->nb[i] = tensor->nb[i];
     }
     result->buffer = reinterpret_cast<ggml_backend_buffer_t>(tensor->buffer);
