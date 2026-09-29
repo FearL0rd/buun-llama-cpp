@@ -382,7 +382,8 @@ static inline void hvx_argmax_f32(
     float best_val = u_val.fp32[0];
     int32_t best_idx = (int32_t) u_idx.w[0];
     for (int i = 1; i < 32; i++) {
-        if (u_val.fp32[i] > best_val) {
+        if (u_val.fp32[i] > best_val ||
+            (u_val.fp32[i] == best_val && (int32_t) u_idx.w[i] < best_idx)) {
             best_val = u_val.fp32[i];
             best_idx = (int32_t) u_idx.w[i];
         }

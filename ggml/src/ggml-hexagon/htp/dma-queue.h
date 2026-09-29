@@ -141,9 +141,7 @@ void        dma_queue_alias_free(dma_queue_t q);
 
 bool        dma_queue_push_fallback_2d(dma_queue * q, dma_data ddata, size_t dst_stride, size_t src_stride, size_t row_size, size_t nrows);
 bool        dma_queue_push_fallback_contig(dma_queue * q, dma_data ddata, size_t total);
-#if __HVX_ARCH__ < 75
 bool        dma_queue_push_fallback_1d(dma_queue * q, dma_data ddata, size_t dst_stride, size_t src_stride, size_t row_size, size_t nrows);
-#endif
 
 // TODO: technically we don't need these and could use Q6_dmstart/wait/etc instead
 // but those do not seem to always compiler properly.
@@ -421,13 +419,16 @@ static inline bool dma_queue_push(dma_queue *q, dma_data ddata, size_t dst_strid
         return dma_queue_push_fallback_contig(q, ddata, total);
     }
 
-    return dma_queue_push_fallback_2d(q, ddata, dst_stride, src_stride, row_size, nrows);
+    if (row_size <= DMA_MAX_SIZE_24B && src_stride <= DMA_MAX_STRIDE_24B && dst_stride <= DMA_MAX_STRIDE_24B) {
+        return dma_queue_push_fallback_2d(q, ddata, dst_stride, src_stride, row_size, nrows);
+    }
+    return dma_queue_push_fallback_1d(q, ddata, dst_stride, src_stride, row_size, nrows);
 }
 
 #endif
 
 static inline void dma_sync_read(dma_queue * dma_q, void * dst, dma_addr_t src, size_t bytes) {
-    const uint32_t b = (uint32_t) bytes;
+    const size_t b = bytes;
     if (b > 0) {
         dma_queue_push(dma_q, dma_make_data(dst, src), b, b, b, 1);
         dma_queue_pop(dma_q);
@@ -435,7 +436,7 @@ static inline void dma_sync_read(dma_queue * dma_q, void * dst, dma_addr_t src, 
 }
 
 static inline void dma_sync_write(dma_queue * dma_q, dma_addr_t dst, const void * src, size_t bytes) {
-    const uint32_t b = (uint32_t) bytes;
+    const size_t b = bytes;
     if (b > 0) {
         dma_queue_push(dma_q, dma_make_data(dst, src), b, b, b, 1);
         dma_queue_pop(dma_q);

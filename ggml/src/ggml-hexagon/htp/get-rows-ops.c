@@ -274,8 +274,9 @@ static inline struct get_rows_tiled_task get_rows_tiled_calc_task(
     const uint32_t i11 = fastdiv(rem, &kparams->div_ne10);
     const uint32_t i10 = rem - i11 * ne10;
     const dma_addr_t src1_data = octx->src[1]->data + i10*nb10 + i11*nb11 + i12*nb12;
-    const uint32_t i01 = grctx->index_i32 ? *(const int32_t *)(uintptr_t) src1_data : (uint32_t) *(const int64_t *)(uintptr_t) src1_data;
-    assert(i01 < ne01);
+    const int64_t index = grctx->index_i32 ? *(const int32_t *)(uintptr_t) src1_data : *(const int64_t *)(uintptr_t) src1_data;
+    assert(index >= 0 && (uint64_t) index < ne01);
+    const uint32_t i01 = (uint32_t) index;
 
     const uint32_t q02 = fastdiv(i11, &kparams->div_ne02);
     const uint32_t i02 = i11 - q02 * ne02;

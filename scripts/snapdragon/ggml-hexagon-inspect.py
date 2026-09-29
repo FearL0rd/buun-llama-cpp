@@ -997,6 +997,8 @@ def run_swdiv(
         # the last frame with a known line is the call site in the reported function itself
         raw = toolchain.run_tool("hexagon-addr2line", ["-e", str(lib_path), "-a", "-i"] + [f"0x{a:x}" for a in sites])
         for block in re.split(r"\n\s*\n", raw.strip()):
+            if not block.strip():
+                continue
             addr_line, *frames = block.strip().splitlines()
             locs = [m for m in (re.match(r"^(.*?):(\d+)(?::\d+)?$", fr.strip()) for fr in frames) if m]
             chain = [f"{os.path.basename(m.group(1))}:{m.group(2)}" for m in locs if m.group(1) != "??" and m.group(2) != "0"]
@@ -1042,7 +1044,7 @@ def run_swdiv(
 
         # Per-call detail: helper and full inline chain, innermost (the divide itself) first
         if args.inline:
-            helper_w = max(len(re.sub(r"^__hexagon_", "", h)) for _, h, _ in f.swdiv_sites)
+            helper_w = max((len(re.sub(r"^__hexagon_", "", h)) for _, h, _ in f.swdiv_sites), default=0)
             for a, helper, in_loop in f.swdiv_sites:
                 chain = " <- ".join(site_chains.get(a, ["?"]))
                 loop_tag = " [IN-LOOP]" if in_loop else ""

@@ -181,9 +181,9 @@ IM2COL_PATCHEMBED_BODY(im2col_patchembed_f32_thread, float, hvx_copy_f32_uu, hvx
         uint8_t *      dstb_base        = ictx->pe_vtcm_dst + ith * ictx->pe_dst_size_per_thread;                              \
         float *        srcb2[2]         = { (float *) srcb_base, (float *) (srcb_base + ictx->pe_src_row_bytes) };             \
         DST_CTYPE *    dstb2[2]   = { (DST_CTYPE *) dstb_base, (DST_CTYPE *) (dstb_base + ictx->pe_dst_row_bytes) };           \
-        const uint32_t nrows      = N * OH;                                                                                    \
+        const uint32_t nrows      = ictx->pe_row_base + ictx->pe_nrows;                                                        \
         const uint32_t per_thread = ictx->pe_rows_per_thread;                                                                  \
-        const uint32_t row_start  = per_thread * ith;                                                                          \
+        const uint32_t row_start  = ictx->pe_row_base + per_thread * ith;                                                      \
         const uint32_t row_end    = MIN(row_start + per_thread, nrows);                                                        \
         if (row_start >= row_end)                                                                                              \
             return;                                                                                                            \

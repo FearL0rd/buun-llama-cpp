@@ -176,8 +176,6 @@ bool dma_queue_push_fallback_contig(dma_queue * q, dma_data ddata, size_t total)
     return dma_ring_push_single_1d(r0, ddata, /*size=*/ 0);
 }
 
-#if __HVX_ARCH__ < 75
-
 bool dma_queue_push_fallback_1d(dma_queue * q, dma_data ddata, size_t dst_stride, size_t src_stride, size_t row_size, size_t nrows) {
     dma_ring * r0 = q->ring0;
     dma_ring * r1 = q->ring1;
@@ -193,10 +191,14 @@ bool dma_queue_push_fallback_1d(dma_queue * q, dma_data ddata, size_t dst_stride
     dma_addr_t cur_src = ddata.src;
 
     while (rem_rows > 0) {
-        dma_data cur_data = dma_make_data(cur_dst, cur_src);
-        if (!dma_ring_push_single_1d(r1, cur_data, row_size)) {
-            dma_ring_flush(r1);
-            dma_ring_push_single_1d(r1, cur_data, row_size);
+        for (size_t offset = 0; offset < row_size;) {
+            const size_t chunk = MIN(row_size - offset, DMA_SAFE_CHUNK_SIZE);
+            dma_data cur_data = dma_make_data(cur_dst + offset, cur_src + offset);
+            if (!dma_ring_push_single_1d(r1, cur_data, chunk)) {
+                dma_ring_flush(r1);
+                dma_ring_push_single_1d(r1, cur_data, chunk);
+            }
+            offset += chunk;
         }
         cur_dst  += dst_stride;
         cur_src  += src_stride;
@@ -208,5 +210,3 @@ bool dma_queue_push_fallback_1d(dma_queue * q, dma_data ddata, size_t dst_stride
 
     return dma_ring_push_single_1d(r0, ddata, /*size=*/ 0);
 }
-
-#endif

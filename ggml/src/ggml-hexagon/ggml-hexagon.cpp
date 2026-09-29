@@ -2048,6 +2048,20 @@ static void ggml_backend_hexagon_buffer_get_tensor(ggml_backend_buffer_t buffer,
         return;
     }
 
+    const size_t tensor_bytes = ggml_nbytes(tensor);
+    GGML_ASSERT(offset <= tensor_bytes && size <= tensor_bytes - offset);
+    if (size == 0) {
+        return;
+    }
+    if (offset != 0 || size != tensor_bytes) {
+        // Repack readers reconstruct a whole tensor. Never let them write that
+        // payload into the caller's smaller state-read/inspection buffer.
+        std::vector<uint8_t> restored(tensor_bytes);
+        ggml_backend_hexagon_buffer_get_tensor(buffer, tensor, restored.data(), 0, tensor_bytes);
+        memcpy(data, restored.data() + offset, size);
+        return;
+    }
+
     switch (tensor->type) {
         case GGML_TYPE_Q4_0:
             GGML_ASSERT(offset == 0);
@@ -3289,6 +3303,9 @@ struct ggml_hexagon_opbatch {
         const ggml_tensor * cpy_node = node.node;
         const ggml_tensor * cpy_src  = node.src0();
         const ggml_tensor * cpy_dst  = node.dst();
+
+        const auto * cpy_extra = static_cast<const ggml_hexagon_tensor_extra *>(cpy_node->extra);
+        if (!cpy_extra || !(cpy_extra->flags & GGML_HEXAGON_TENSOR_FUSEABLE)) return false;
 
         if (!cpy_src || !cpy_dst || !cpy_dst->data) return false;
         if (gdn_out->type != GGML_TYPE_F32 || cpy_src->type != GGML_TYPE_F32 || cpy_dst->type != GGML_TYPE_F32) return false;
@@ -6762,6 +6779,31 @@ static bool is_mergeable_mul_mat_id_pair(const ggml_tensor * n1, const ggml_tens
     return true;
 }
 
+// Redirecting GDN's state tail is legal only when CPY is its sole observer.
+// Views of the earlier attention output may still be consumed independently.
+static bool ggml_hexagon_gdn_tail_exclusive(const ggml_cgraph * graph, const ggml_tensor * cpy) {
+    const ggml_tensor * tail = cpy->src[0];
+    if (!tail || tail->op != GGML_OP_VIEW || !tail->view_src ||
+        tail->view_src->op != GGML_OP_GATED_DELTA_NET || (tail->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+        return false;
+    }
+    const ggml_tensor * gdn = tail->view_src;
+    for (int i = 0; i < graph->n_nodes; ++i) {
+        const ggml_tensor * use = graph->nodes[i];
+        for (const ggml_tensor * src : use->src) {
+            if (src == tail && use != cpy) {
+                return false;
+            }
+            if (src == gdn && use != tail &&
+                (use->op != GGML_OP_VIEW || use->view_src != gdn ||
+                 use->view_offs > tail->view_offs || ggml_nbytes(use) > tail->view_offs - use->view_offs)) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
 static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, ggml_cgraph * graph) {
     auto sess = static_cast<ggml_hexagon_session *>(backend->context);
 
@@ -6787,6 +6829,8 @@ static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, gg
             extra->flags &= ~GGML_HEXAGON_TENSOR_FUSEABLE;
 
             if (graph->nodes[i]->op == GGML_OP_RMS_NORM && ggml_can_fuse(graph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL })) {
+                extra->flags |= GGML_HEXAGON_TENSOR_FUSEABLE;
+            } else if (graph->nodes[i]->op == GGML_OP_CPY && ggml_hexagon_gdn_tail_exclusive(graph, graph->nodes[i])) {
                 extra->flags |= GGML_HEXAGON_TENSOR_FUSEABLE;
             } else if (graph->nodes[i]->op == GGML_OP_MUL_MAT || graph->nodes[i]->op == GGML_OP_MUL_MAT_ID) {
                 if ((i + 1 < graph->n_nodes && graph->nodes[i + 1]->op == GGML_OP_ADD && ggml_can_fuse(graph, i, { graph->nodes[i]->op, GGML_OP_ADD })) ||
@@ -7624,6 +7668,22 @@ static bool ggml_backend_hexagon_device_supports_op(ggml_backend_dev_t dev, cons
     // reject ops that match the filter
     if (opt_opfilter && std::regex_match(ggml_op_desc(op), *opt_opfilter)) {
         return false;
+    }
+
+    // These DSP routines dereference mapped tensors directly instead of using
+    // DMA. Weight buffers become extended mappings under dma64; decline before
+    // dispatch rather than advertising an op that the DSP will reject.
+    const bool direct_only = op->op == GGML_OP_SUM || op->op == GGML_OP_ARGMAX ||
+        op->op == GGML_OP_ARGSORT || op->op == GGML_OP_TOP_K ||
+        (op->op == GGML_OP_CPY && (op->type == GGML_TYPE_I32 || op->src[0]->type == GGML_TYPE_I32));
+    if (opt_dma64 && direct_only) {
+        const auto extended_weight = [](const ggml_tensor * t) {
+            return t && t->buffer && ggml_backend_buffer_get_usage(t->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS;
+        };
+        if (extended_weight(op)) return false;
+        for (const ggml_tensor * src : op->src) {
+            if (extended_weight(src)) return false;
+        }
     }
 
     bool supp = false;

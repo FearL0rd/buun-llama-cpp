@@ -292,9 +292,9 @@ static inline bool htp_gdn_hmx_solve_layout(
             return true;
         }
     }
-    if (pipeline) {
-        return htp_gdn_hmx_solve_layout(layout_out, S_v, chunk_size, total_rows, vtcm_budget, n_threads, false, n_heads_batch_out);
-    }
+    // The chunk executor prefetches the next input before consuming the current
+    // one. A single-buffer layout aliases those DMA destinations; use HVX when
+    // no double-buffered HMX layout fits.
     return false;
 }
 
