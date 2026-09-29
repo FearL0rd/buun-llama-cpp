@@ -813,6 +813,7 @@ class Gemma4Model(Gemma3Model):
 @ModelBase.register("Gemma4DSparkModel")
 class Gemma4DSparkModel(DFlashModel):
     model_arch = gguf.MODEL_ARCH.DFLASH
+    _uses_gemma4_dspark_backbone = True
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -861,6 +862,8 @@ class Gemma4DSparkModel(DFlashModel):
         self.gguf_writer.add_embedding_scale(self.hparams["hidden_size"] ** 0.5)
         self.gguf_writer.add_attention_scale(1.0)
         self.gguf_writer.add_hidden_act("gelu_pytorch_tanh")
+        self.gguf_writer.add_bool("dflash.attention.k_eq_v", True)
+        self.gguf_writer.add_bool("dflash.tie_word_embeddings", self.hparams.get("tie_word_embeddings") is True)
 
         self.gguf_writer.add_sample_from_anchor(self.hparams.get("sample_from_anchor", True))
         target_layers = self.dflash_config.get("target_layer_ids", self.hparams.get("target_layer_ids"))

@@ -685,6 +685,7 @@ class Qwen3_5MoeTextModel(_Qwen35MRopeMixin, _LinearAttentionVReorderBase):
 class DFlashModel(Qwen3Model):
     model_arch = gguf.MODEL_ARCH.DFLASH
     _uses_fork_dflash2_schema = False
+    _uses_gemma4_dspark_backbone = False
 
     def __init__(self, *args, **kwargs):
         # z-lab's gemma4 DFlash drafters reuse the "DFlashDraftModel" HF arch and
@@ -695,7 +696,7 @@ class DFlashModel(Qwen3Model):
         if hparams is None:
             dir_model = args[0] if args else kwargs["dir_model"]
             hparams = ModelBase.load_hparams(dir_model, False)
-        if hparams.get("final_logit_softcapping") is not None:
+        if hparams.get("final_logit_softcapping") is not None and not self._uses_gemma4_dspark_backbone:
             self.model_arch = gguf.MODEL_ARCH.GEMMA4_DFLASH_DRAFT
         super().__init__(*args, **kwargs)
 

@@ -226,6 +226,8 @@ struct llama_hparams {
     // mis-detected as DFlash by the server's block_size>0 auto-detect. DFlash's
     // load_arch_hparams sets the real value (16, or from GGUF).
     uint32_t dflash_block_size        = 0;
+    bool     dflash_shared_kv         = false;
+    bool     dflash_tied_output       = false;
     uint32_t dflash_mask_token_id     = 0;
     uint32_t dflash_n_target_features = 25600;
     uint32_t dflash_n_target_layers   = 0;

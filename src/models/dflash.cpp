@@ -284,6 +284,9 @@ void llama_model_dflash::load_arch_hparams(llama_model_loader & ml) {
 
     ml.get_key(LLM_KV_EMBEDDING_SCALE, hparams.f_embedding_scale, false);
     ml.get_key(LLM_KV_ATTENTION_SCALE, hparams.f_attention_scale, false);
+    // Missing tensors alone must not change old drafts' target-sharing contract.
+    ml.get_key("dflash.attention.k_eq_v", hparams.dflash_shared_kv, false);
+    ml.get_key("dflash.tie_word_embeddings", hparams.dflash_tied_output, false);
 
     hparams.llm_ffn_op = LLM_FFN_SILU;
     std::string hidden_act;
@@ -512,7 +515,10 @@ void llama_model_dflash::load_arch_tensors(llama_model_loader &) {
     // optional: reduced-vocab drafts ship their own lm head, full-vocab drafts can share the target's via ctx_other
     // a draft with its own embeddings + head references no target tensors and can run on devices the target does not use (e.g. -devd with a tensor-split target)
     output   = create_tensor(tn(LLM_TENSOR_OUTPUT,     "weight"), { n_embd, n_vocab_draft }, TENSOR_NOT_REQUIRED);
-    if (output == nullptr && tok_embd != nullptr) {
+    if (output == nullptr && hparams.dflash_tied_output) {
+        if (!tok_embd || n_vocab_draft != n_vocab) {
+            throw std::runtime_error("tied DFlash output requires full-vocabulary draft embeddings");
+        }
         output = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), { n_embd, n_vocab_draft }, TENSOR_DUPLICATED);
     }
 
@@ -573,7 +579,11 @@ void llama_model_dflash::load_arch_tensors(llama_model_loader &) {
 
         layer.wq = create_tensor(tn(LLM_TENSOR_ATTN_Q,   "weight", i), { n_embd, n_embd_head_k * n_head }, 0);
         layer.wk = create_tensor(tn(LLM_TENSOR_ATTN_K,   "weight", i), { n_embd, n_embd_k_gqa }, 0);
-        layer.wv = create_tensor(tn(LLM_TENSOR_ATTN_V,   "weight", i), { n_embd, n_embd_v_gqa }, TENSOR_NOT_REQUIRED);
+        layer.wv = create_tensor(tn(LLM_TENSOR_ATTN_V,   "weight", i), { n_embd, n_embd_v_gqa },
+                hparams.dflash_shared_kv ? TENSOR_NOT_REQUIRED : 0);
+        if (hparams.dflash_shared_kv && layer.wv) {
+            throw std::runtime_error("DFlash k_eq_v metadata conflicts with a separate V projection");
+        }
         layer.wo = create_tensor(tn(LLM_TENSOR_ATTN_OUT, "weight", i), { n_embd_head_k * n_head, n_embd }, 0);
 
         layer.attn_q_norm = create_tensor(tn(LLM_TENSOR_ATTN_Q_NORM, "weight", i), { n_embd_head_k }, 0);
@@ -605,21 +615,6 @@ void llama_model_dflash::load_arch_tensors(llama_model_loader &) {
                     { n_embd, n_coeff }, 0);
         }
     }
-}
-
-std::unique_ptr<llm_graph_context> llama_model_dflash::build_arch_graph(const llm_graph_params & params) const {
-    switch (params.gtype) {
-        case LLM_GRAPH_TYPE_ENCODER:
-            return std::make_unique<graph<true>>(*this, params);
-        case LLM_GRAPH_TYPE_DEFAULT:
-        case LLM_GRAPH_TYPE_DECODER:
-            if (hparams.dsv4_hc_mult > 0) {
-                return std::make_unique<graph_dsv4>(*this, params);
-            }
-            return std::make_unique<graph<false>>(*this, params);
-        default:
-            GGML_ABORT("invalid graph type: %d", (int) params.gtype);
-    };
 }
 
 template <>
@@ -957,12 +952,12 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
     int sections[4];
     std::copy(std::begin(hparams.rope_sections), std::begin(hparams.rope_sections) + 4, sections);
 
-    auto build_rope = [&](ggml_tensor * cur, ggml_tensor * pos) {
+    auto build_rope = [&](ggml_tensor * cur, ggml_tensor * pos, int il) {
         return rope_type == GGML_ROPE_TYPE_MROPE
             ? ggml_rope_multi(ctx0, cur, pos, nullptr,
                     n_rot, sections, rope_type, n_ctx_orig, freq_base, freq_scale,
                     ext_factor, attn_factor, beta_fast, beta_slow)
-            : ggml_rope_ext(ctx0, cur, pos, model.layers[0].rope_freqs,
+            : ggml_rope_ext(ctx0, cur, pos, model.layers[il].rope_freqs,
                     n_rot, rope_type, n_ctx_orig, freq_base, freq_scale,
                     ext_factor, attn_factor, beta_fast, beta_slow);
     };
@@ -975,7 +970,8 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
             const auto & layer = model.layers[il];
 
             ggml_tensor * Kcur = build_lora_mm(layer.wk, inp_g, layer.wk_s, layer.wk_in_s);
-            ggml_tensor * Vcur = build_lora_mm(layer.wv, inp_g, layer.wv_s, layer.wv_in_s);
+            const bool shared_kv = hparams.dflash_shared_kv;
+            ggml_tensor * Vcur = shared_kv ? Kcur : build_lora_mm(layer.wv, inp_g, layer.wv_s, layer.wv_in_s);
 
             Kcur = ggml_reshape_3d(ctx0, Kcur, n_embd_head, n_head_kv, n_tokens);
             Vcur = ggml_reshape_3d(ctx0, Vcur, n_embd_head, n_head_kv, n_tokens);
@@ -984,7 +980,7 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
             if (shared_kv) {
                 Vcur = ggml_rms_norm(ctx0, Vcur, hparams.f_norm_rms_eps);
             }
-            Kcur = build_rope(Kcur, inp_pos);
+            Kcur = build_rope(Kcur, inp_pos, il);
             cb(Kcur, "Kcur_injected", il);
             cb(Vcur, "Vcur_injected", il);
 
@@ -1063,6 +1059,9 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
         ? ggml_view_1d(ctx0, inp->tokens, n_tokens - n_inj, size_t(n_inj) * inp->tokens->nb[0])
         : inp->tokens;
     ggml_tensor * inpL = build_get_rows_embd(tok_embd, noise_tokens);
+    if (hparams.f_embedding_scale != 0.0f) {
+        inpL = ggml_scale(ctx0, inpL, hparams.f_embedding_scale);
+    }
     cb(inpL, "inp_noise_embd", -1);
 
     res->add_input(std::move(inp));
@@ -1089,18 +1088,19 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
         }
         ggml_tensor * Kcur;
         ggml_tensor * Vcur;
+        const bool shared_kv = hparams.dflash_shared_kv;
         if (inp_g) {
             // K/V rows [0, n_inj) come from the encoder output (injection), the rest
             // from the noise tokens — per-row math matches both standalone graphs
             Kcur = ggml_concat(ctx0,
                     build_lora_mm(layer.wk, inp_g, layer.wk_s, layer.wk_in_s),
                     build_lora_mm(layer.wk, attn_inp, layer.wk_s, layer.wk_in_s), 1);
-            Vcur = ggml_concat(ctx0,
+            Vcur = shared_kv ? Kcur : ggml_concat(ctx0,
                     build_lora_mm(layer.wv, inp_g, layer.wv_s, layer.wv_in_s),
                     build_lora_mm(layer.wv, attn_inp, layer.wv_s, layer.wv_in_s), 1);
         } else {
             Kcur = build_lora_mm(layer.wk, attn_inp, layer.wk_s, layer.wk_in_s);
-            Vcur = build_lora_mm(layer.wv, attn_inp, layer.wv_s, layer.wv_in_s);
+            Vcur = shared_kv ? Kcur : build_lora_mm(layer.wv, attn_inp, layer.wv_s, layer.wv_in_s);
         }
 
         Qcur = ggml_reshape_3d(ctx0, Qcur, n_embd_head, n_head,    n_tokens);
@@ -1113,8 +1113,8 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
             Vcur = ggml_rms_norm(ctx0, Vcur, hparams.f_norm_rms_eps);
         }
 
-        Qcur = build_rope(Qcur, inp_pos);
-        Kcur = build_rope(Kcur, inp_pos);
+        Qcur = build_rope(Qcur, inp_pos, il);
+        Kcur = build_rope(Kcur, inp_pos, il);
         cb(Qcur, "Qcur", il);
         cb(Kcur, "Kcur", il);
         cb(Vcur, "Vcur", il);
@@ -1161,7 +1161,7 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
                 layer.ffn_gate, NULL, layer.ffn_gate_s,
                 layer.ffn_down, NULL, layer.ffn_down_s,
                 NULL,
-                LLM_FFN_SILU, LLM_FFN_PAR, il,
+                hparams.llm_ffn_op, LLM_FFN_PAR, il,
                 layer.ffn_up_in_s, layer.ffn_gate_in_s, layer.ffn_down_in_s);
         cb(cur, "ffn_out", il);
 
@@ -1464,6 +1464,6 @@ std::unique_ptr<llm_graph_context> llama_model_dflash::build_arch_graph(const ll
             }
             return std::make_unique<graph<false>>(*this, params);
         default:
-            GGML_ABORT("invalid graph type");
+            GGML_ABORT("invalid graph type: %d", (int) params.gtype);
     };
 }
