@@ -36,15 +36,30 @@ def test_causal_embeddings_do_not_restore_chat_or_prior_embedding():
     server.n_slots = 1
     server.server_embeddings = True
     server.server_slots = True
+    server.server_metrics = True
     server.pooling = 'last'
     server.start()
     prompt = "Once upon a time, there was a small house near the forest."
+    cold = server.make_request("POST", "/v1/embeddings", data={"input": prompt})
+    assert cold.status_code == 200
+
+    def prompt_counters():
+        res = server.make_request("GET", "/metrics")
+        assert res.status_code == 200
+        return {
+            name: float(value) for name, value in
+            (line.split() for line in res.body.splitlines()
+             if line.startswith(("llamacpp:prompt_tokens_total ",
+                                 "llamacpp:prompt_tokens_cached_total ")))
+        }
+
     chat = server.make_request("POST", "/completion", data={
         "prompt": prompt, "n_predict": 1, "cache_prompt": True,
     })
     assert chat.status_code == 200
     outputs = []
     for _ in range(2):
+        before = prompt_counters()
         res = server.make_request("POST", "/v1/embeddings", data={
             "input": prompt, "cache_prompt": True,
         })
@@ -53,8 +68,14 @@ def test_causal_embeddings_do_not_restore_chat_or_prior_embedding():
         slots = server.make_request("GET", "/slots")
         assert slots.status_code == 200
         assert slots.body[0]['n_prompt_tokens_cache'] == 0
-        assert slots.body[0]['n_prompt_tokens_processed'] > 1
-    assert outputs[0] == outputs[1]
+        # Stateless release clears per-slot stats. Global counters still record
+        # actual decode work, so a full replay cannot pass as a one-token hit.
+        after = prompt_counters()
+        processed = after['llamacpp:prompt_tokens_total'] - before['llamacpp:prompt_tokens_total']
+        assert processed == res.body['usage']['prompt_tokens']
+        assert processed > 1
+        assert after['llamacpp:prompt_tokens_cached_total'] == before['llamacpp:prompt_tokens_cached_total']
+    assert outputs[0] == outputs[1] == cold.body['data'][0]['embedding']
 
 
 def test_embedding_multiple():
