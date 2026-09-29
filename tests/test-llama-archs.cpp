@@ -522,6 +522,9 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
     ms.add_kv(LLM_KV_KDA_SAFE_GATE,             true);
     ms.add_kv(LLM_KV_KDA_GATE_LOWER_BOUND,      -5.0f);
     if (arch == LLM_ARCH_BAILINGMOE3) {
+        // Exercise the ordinary text trunk without a NextN sidecar. Its graph
+        // must still use the token/output selection path, not MTP-only inputs.
+        ms.add_kv(LLM_KV_NEXTN_PREDICT_LAYERS, uint32_t(0));
         ms.add_kv(LLM_KV_SWIGLU_CLAMP_EXP,   std::vector<float>({0.0f, 4.0f}));
         ms.add_kv(LLM_KV_SWIGLU_CLAMP_SHEXP, std::vector<float>({0.0f, 5.0f}));
     }

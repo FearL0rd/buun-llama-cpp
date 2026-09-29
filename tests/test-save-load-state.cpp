@@ -1549,7 +1549,7 @@ struct test_suite {
     std::vector<test_status> results;
 
     bool all_passed() const {
-        return std::all_of(results.begin(), results.end(), [](test_status s) { return s == test_status::PASS; });
+        return !results.empty() && std::all_of(results.begin(), results.end(), [](test_status s) { return s == test_status::PASS; });
     }
 };
 
@@ -1562,8 +1562,7 @@ static std::vector<const char *> test_names = {
     "trim", "cp_h_s", "cp_d_s", "rt", "range", "rf",
 };
 
-// Run the full save/load test suite (tests 1-11) for a single model.
-// Returns true if all tests pass, false otherwise.
+// Run the full save/load test suite (tests 1-12) for a single model.
 static test_suite run_save_load_tests_for_model(const std::string & model_path, const struct common_params & base_params) {
     test_suite suite;
     struct common_params params = base_params;
@@ -1575,6 +1574,7 @@ static test_suite run_save_load_tests_for_model(const std::string & model_path, 
     if (model == nullptr) {
         LOG_ERR("%s: failed to init model '%s'\n", __func__, model_path.c_str());
         suite.results.assign(test_names.size(), test_status::SKIP);
+        suite.results.front() = test_status::FAIL;
         return suite;
     }
 
