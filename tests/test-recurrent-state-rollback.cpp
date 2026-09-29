@@ -1389,6 +1389,12 @@ static int run_model(int argc, char ** argv) {
         fprintf(stderr, "%s : failed to init contexts\n", __func__);
         return 1;
     }
+    // Hybrid is broader than the recurrent-plane owner exercised below. DS4's
+    // compressor state, for example, has its own cache and serialization tests.
+    if (get_recurrent(ctx_test.get()) == nullptr) {
+        fprintf(stderr, "%s : skipping memory without recurrent rollback planes\n", __func__);
+        return 77;
+    }
     {
         auto prefix_ref = make_ctx(params, model, 3);
         if (!prefix_ref || !test_share_attn_prefix(ctx_parallel.get(), prefix_ref.get(), tokens, n_vocab)) {
@@ -1677,15 +1683,30 @@ static int run_model(int argc, char ** argv) {
     // A live logical sequence may occupy a high physical cell. Shrinking must
     // refuse atomically instead of truncating that recurrent state while leaving
     // the attention half reusable.
+    // Match placement and graph capacity in the no-shrink control. Comparing a
+    // high cell in a three-sequence graph to cell zero in a single-sequence graph
+    // also measures layout-dependent arithmetic, not just failure atomicity.
+    auto high_ref = make_ctx(params, model, 3);
+    if (!high_ref) {
+        return 1;
+    }
+    auto high_ref_mem = llama_get_memory(high_ref.get());
     llama_memory_clear(mem_parallel, true);
-    llama_memory_clear(llama_get_memory(ctx_ref.get()), true);
+    llama_memory_clear(high_ref_mem, true);
     if (!llama_memory_recurrent_expand(mem_parallel, 3) ||
+        !llama_memory_recurrent_expand(high_ref_mem, 3) ||
         !decode_range(ctx_parallel.get(), tokens, 0, 1, 1) ||
         !decode_range(ctx_parallel.get(), tokens, 0, 1, 2) ||
         !decode_range(ctx_parallel.get(), tokens, 0, 1, 0) ||
-        !decode_range(ctx_ref.get(), tokens, 0, 1, 0) ||
+        !decode_range(high_ref.get(), tokens, 0, 1, 1) ||
+        !decode_range(high_ref.get(), tokens, 0, 1, 2) ||
+        !decode_range(high_ref.get(), tokens, 0, 1, 0) ||
         !llama_memory_seq_rm(mem_parallel, 1, -1, -1) ||
-        !llama_memory_seq_rm(mem_parallel, 2, -1, -1)) {
+        !llama_memory_seq_rm(mem_parallel, 2, -1, -1) ||
+        !llama_memory_seq_rm(high_ref_mem, 1, -1, -1) ||
+        !llama_memory_seq_rm(high_ref_mem, 2, -1, -1) ||
+        !logits_equal(copy_logits(ctx_parallel.get(), n_vocab), copy_logits(high_ref.get(), n_vocab),
+                "high-cell no-shrink control", 0.0f)) {
         fprintf(stderr, "%s : high-cell shrink setup failed\n", __func__);
         return 1;
     }
@@ -1709,9 +1730,9 @@ static int run_model(int argc, char ** argv) {
         !get_recurrent_epoch(recurrent_parallel, high_epoch_after) ||
         high_epoch_after != high_epoch_before ||
         !decode_range(ctx_parallel.get(), tokens, 1, 1, 0) ||
-        !decode_range(ctx_ref.get(), tokens, 1, 1, 0) ||
-        !logits_equal(copy_logits(ctx_parallel.get(), n_vocab), copy_logits(ctx_ref.get(), n_vocab),
-                "post-refused-high-cell-shrink continuation")) {
+        !decode_range(high_ref.get(), tokens, 1, 1, 0) ||
+        !logits_equal(copy_logits(ctx_parallel.get(), n_vocab), copy_logits(high_ref.get(), n_vocab),
+                "post-refused-high-cell-shrink continuation", 0.0f)) {
         fprintf(stderr, "%s : high-cell shrink was not failure-atomic\n", __func__);
         return 1;
     }

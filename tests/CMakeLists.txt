@@ -416,7 +416,9 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
         test-llama-archs
         NAME test-generate-models
         LABEL main
-        ARGS -o "${MODEL_DIR}"
+        # Preserve the pre-sync state fixtures' weight scale and make failures
+        # reproducible. Architecture operator tests retain their broader default.
+        ARGS -o "${MODEL_DIR}" -s 1234 -d 0.01
     )
     set_tests_properties(test-generate-models PROPERTIES
         FIXTURES_SETUP generate-models
@@ -504,8 +506,15 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
             LABEL main
             ARGS -m "${MODEL_DIR}/${MODEL}.gguf" --cache-pattern-fill)
         set_tests_properties(test-recurrent-state-pattern-${MODEL} PROPERTIES
-            FIXTURES_REQUIRED generate-models)
+            FIXTURES_REQUIRED generate-models SKIP_RETURN_CODE 77)
     endforeach()
+
+    set_tests_properties(
+        test-recurrent-state-rollback
+        test-recurrent-state-rollback-nemotron-h
+        test-recurrent-state-rollback-dsv4
+        test-recurrent-state-rollback-kimi-k3
+        PROPERTIES SKIP_RETURN_CODE 77)
 
     # Test state save/load functionality across all architectures, using the generated dummy models
     llama_test(
