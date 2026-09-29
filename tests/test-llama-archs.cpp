@@ -140,6 +140,10 @@ struct tensor_data_params {
     float  stdev;
 };
 
+static bool arch_matches(const std::string & filter, llm_arch arch) {
+    return filter.empty() || std::regex_search(llm_arch_name(arch), std::regex(filter));
+}
+
 static void set_tensor_data(struct ggml_tensor * tensor, void * userdata) {
     const tensor_data_params & params = *(const tensor_data_params *) userdata;
     size_t seed = params.seed;
@@ -427,7 +431,9 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
     ms.add_kv(LLM_KV_ROPE_DIMENSION_SECTIONS,
             arch == LLM_ARCH_QWEN4EXP
                 ? std::vector<uint32_t>({11, 11, 10, 0})
-                : std::vector<uint32_t>({n_embd_head/4, n_embd_head/4, n_embd_head/4, n_embd_head/4}));
+                : arch == LLM_ARCH_BAILINGMOE3
+                    ? std::vector<uint32_t>({8, 12, 12, 0})
+                    : std::vector<uint32_t>({n_embd_head/4, n_embd_head/4, n_embd_head/4, n_embd_head/4}));
 
     if (arch == LLM_ARCH_HY_V4) {
         ms.add_kv(LLM_KV_HYPER_CONNECTION_COUNT,     uint32_t(4));
@@ -578,7 +584,7 @@ static bool devices_support_vbr_vmm(const std::vector<ggml_backend_dev_t> & devi
 static std::pair<llama_model_ptr, llama_context_ptr> get_model_and_ctx(
         struct gguf_context * gguf_ctx, FILE * file, const size_t seed, const std::vector<ggml_backend_dev_t> & devs,
         const llama_split_mode split_mode = LLAMA_SPLIT_MODE_LAYER, bool encode = false,
-        ggml_backend_sched_eval_callback cb_eval = nullptr, void * cb_eval_user_data = nullptr) {
+        ggml_backend_sched_eval_callback cb_eval = nullptr, void * cb_eval_user_data = nullptr, float stdev = 0.01f) {
     GGML_ASSERT((gguf_ctx == nullptr) != (file == nullptr));
     llama_model_params model_params = llama_model_default_params();
     model_params.progress_callback = silent_model_load_progress;
@@ -652,7 +658,7 @@ static void test_bonsai_loader(const size_t seed) {
         mp.devices = devices.data();
         mp.n_gpu_layers = n_gpu;
         mp.progress_callback = silent_model_load_progress;
-        size_t tmp = seed;
+        tensor_data_params tmp = { seed, 0.01f };
         llama_model_ptr real(llama_model_init_from_user(meta.get(), set_tensor_data, &tmp, mp));
         GGML_ASSERT(real);
         test_bonsai_mapped_load(real.get(), meta.get(), mp);
@@ -738,7 +744,7 @@ static void test_qwen4_ple_recurrent_resize(const size_t seed) {
     model_params.progress_callback = silent_model_load_progress;
     ggml_backend_dev_t cpu_devices[] = { nullptr };
     model_params.devices = cpu_devices;
-    size_t tmp = seed;
+    tensor_data_params tmp = { seed, 0.01f };
     llama_model_ptr model(llama_model_init_from_user(gguf.get(), set_tensor_data, &tmp, model_params));
     GGML_ASSERT(model != nullptr);
 
@@ -954,7 +960,7 @@ static void test_qwen4_qsa_layout_cpu(llama_model * model, size_t seed) {
         model_params.progress_callback = silent_model_load_progress;
         ggml_backend_dev_t cpu_devices[] = { nullptr };
         model_params.devices = cpu_devices;
-        size_t tmp = seed;
+        tensor_data_params tmp = { seed, 0.01f };
         return llama_model_ptr(llama_model_init_from_user(
                 gguf.get(), set_tensor_data, &tmp, model_params));
     };
@@ -970,7 +976,7 @@ static void test_qwen4_qsa_layout_cpu(llama_model * model, size_t seed) {
         model_params.progress_callback = silent_model_load_progress;
         ggml_backend_dev_t cpu_devices[] = { nullptr };
         model_params.devices = cpu_devices;
-        size_t tmp = seed;
+        tensor_data_params tmp = { seed, 0.01f };
         llama_model_ptr invalid(llama_model_init_from_user(
                 gguf.get(), set_tensor_data, &tmp, model_params));
         GGML_ASSERT(invalid == nullptr);
@@ -1092,7 +1098,7 @@ static void test_qwen4_qsa_layout_cpu(llama_model * model, size_t seed) {
             true, 1, 1, 1, 1, (uint32_t) query_pos.size(), &token, nullptr, mutable_query_pos.data(),
             &n_seq_id, &seq_ids, &seq, nullptr, &output, {},
         };
-        qsa.set_input_qsa(cell_blk, blk_cells, blk_pos, bias, &query, ratio, blk_bias);
+        qsa.set_input_qsa(cell_blk, blk_cells, blk_pos, bias, &query, ratio, blk_bias, true);
 
         layout_result result {
             n_kv, n_blocks,
@@ -1825,7 +1831,7 @@ static void test_qwen4_vbr_cuda(const size_t seed) {
     model_params.progress_callback = silent_model_load_progress;
     std::array<ggml_backend_dev_t, 2> devices = { vbr_device, nullptr };
     model_params.devices = devices.data();
-    size_t model_seed = seed;
+    tensor_data_params model_seed = { seed, 0.01f };
     llama_model_ptr model(llama_model_init_from_user(
         gguf_ctx.get(), set_tensor_data, &model_seed, model_params));
     GGML_ASSERT(model != nullptr);
@@ -3000,7 +3006,7 @@ static file_ptr make_qwen35_mtp_sidecar(const ggml_type d2t_type, const size_t s
     ggml_backend_dev_t cpu_devices[] = { nullptr };
     source_params.devices = cpu_devices;
 
-    size_t tmp = seed;
+    tensor_data_params tmp = { seed, 0.01f };
     llama_model_ptr source(llama_model_init_from_user(
             source_gguf.get(), set_tensor_data, &tmp, source_params));
     if (!source) {
@@ -3262,7 +3268,7 @@ static file_ptr make_qwen4_mtp_sidecar(
     ggml_backend_dev_t cpu_devices[] = { nullptr };
     source_params.devices = cpu_devices;
 
-    size_t tmp = seed;
+    tensor_data_params tmp = { seed, 0.01f };
     llama_model_ptr source(llama_model_init_from_user(
             source_gguf.get(), set_tensor_data, &tmp, source_params));
     if (!source) {
@@ -3357,7 +3363,7 @@ static file_ptr make_qwen4_mtp_combined(
     ggml_backend_dev_t cpu_devices[] = { nullptr };
     source_params.devices = cpu_devices;
 
-    size_t tmp = seed;
+    tensor_data_params tmp = { seed, 0.01f };
     llama_model_ptr source(llama_model_init_from_user(
             source_gguf.get(), set_tensor_data, &tmp, source_params));
     GGML_ASSERT(source != nullptr);
@@ -3481,7 +3487,7 @@ static void test_qwen4_mtp_sidecar_contract(const size_t seed) {
         multi_params.load_mtp = true;
         ggml_backend_dev_t cpu_devices[] = { nullptr };
         multi_params.devices = cpu_devices;
-        size_t multi_seed = seed;
+        tensor_data_params multi_seed = { seed, 0.01f };
         llama_model_ptr multi_model(llama_model_init_from_user(
                 multi_gguf.get(), set_tensor_data, &multi_seed, multi_params));
         GGML_ASSERT(multi_model == nullptr);
@@ -3970,7 +3976,7 @@ static bool arch_tensor_split_supported(const llm_arch arch) {
     return true;
 }
 
-static int save_models(const llm_arch target_arch, const size_t seed, const int verbosity, const std::string & dir) {
+static int save_models(const std::string & arch_filter, const size_t seed, const float stdev, const int verbosity, const std::string & dir) {
     struct user_data_t {
         struct {
             ggml_log_callback callback;
@@ -4018,7 +4024,7 @@ static int save_models(const llm_arch target_arch, const size_t seed, const int 
                 continue;
             }
             gguf_context_ptr gguf_ctx = get_gguf_ctx(arch, moe);
-            auto model_and_ctx = get_model_and_ctx(gguf_ctx.get(), nullptr, seed, stdev, {});
+            auto model_and_ctx = get_model_and_ctx(gguf_ctx.get(), nullptr, seed, {}, LLAMA_SPLIT_MODE_LAYER, false, nullptr, nullptr, stdev);
             const std::string path = dir + "/" + llm_arch_name(arch) + (moe ? "-moe.gguf" : "-dense.gguf");
             LOG_INF("%s: Saving %s model (%s) to %s...\n", __func__, llm_arch_name(arch), moe ? "MoE" : "dense", path.c_str());
             llama_model_save_to_file(model_and_ctx.first.get(), path.c_str());
@@ -4150,11 +4156,13 @@ static int test_backends(const std::string & arch_filter, const size_t seed, con
                 std::string status_nmse      = "\033[1;33mSKIP\033[0m";
                 std::string status_roundtrip = "\033[1;33mSKIP\033[0m";
                 char nmse_str[12] = {0};
+                bool test_executed = false;
+                bool test_ok = true;
                 bool skip = !arch_supported(arch) || (dc.split_mode == LLAMA_SPLIT_MODE_TENSOR &&
                         (dc.devs.empty() || !arch_tensor_split_supported(arch)));
                 if (!skip) {
                     if (logits_cpu.empty()) {
-                        model_and_ctx_cpu = get_model_and_ctx(gguf_ctx.get(), nullptr, seed, {}, LLAMA_SPLIT_MODE_LAYER, encode);
+                        model_and_ctx_cpu = get_model_and_ctx(gguf_ctx.get(), nullptr, seed, {}, LLAMA_SPLIT_MODE_LAYER, encode, nullptr, nullptr, stdev);
                         assert(model_and_ctx_cpu.first->supports_classic_vbr() ==
                                (arch == LLM_ARCH_BAILINGMOE3));
                         if (arch == LLM_ARCH_BAILINGMOE3) {
@@ -4170,7 +4178,7 @@ static int test_backends(const std::string & arch_filter, const size_t seed, con
                         logits_cpu = get_logits(model_and_ctx_cpu.first.get(), model_and_ctx_cpu.second.get(), tokens, encode);
                     }
                     if (dc.split_mode != LLAMA_SPLIT_MODE_TENSOR || llm_arch_supports_sm_tensor(arch)) {
-                        model_and_ctx_dev = get_model_and_ctx(gguf_ctx.get(), nullptr, seed, dc.devs, dc.split_mode, encode);
+                        model_and_ctx_dev = get_model_and_ctx(gguf_ctx.get(), nullptr, seed, dc.devs, dc.split_mode, encode, nullptr, nullptr, stdev);
                         if (dc.split_mode == LLAMA_SPLIT_MODE_TENSOR &&
                             (arch == LLM_ARCH_QWEN3NEXT || arch == LLM_ARCH_QWEN35 ||
                              arch == LLM_ARCH_QWEN35MOE || arch == LLM_ARCH_QWEN4EXP)) {
@@ -4238,7 +4246,7 @@ static int test_backends(const std::string & arch_filter, const size_t seed, con
                                 std::vector<ggml_backend_dev_t> estimate_devices = dc.devs;
                                 estimate_devices.push_back(nullptr);
                                 estimate_model_params.devices = estimate_devices.data();
-                                size_t estimate_seed = seed;
+                                tensor_data_params estimate_seed = { seed, stdev };
                                 llama_model_ptr estimate_model(llama_model_init_from_user(
                                     gguf_ctx.get(), set_tensor_data, &estimate_seed,
                                     estimate_model_params));
@@ -4306,12 +4314,13 @@ static int test_backends(const std::string & arch_filter, const size_t seed, con
                                 GGML_ASSERT(unmatched.empty());
                             }
                         }
+                        test_executed = true;
                         logits_dev = get_logits(model_and_ctx_dev.first.get(), model_and_ctx_dev.second.get(), tokens, encode);
                         const double nmse_val = nmse(logits_cpu, logits_dev);
                         snprintf(nmse_str, sizeof(nmse_str), "(%.2e)", nmse_val);
                         status_nmse = "\033[1;32mOK\033[0m";
                         if (!(nmse_val <= 1e-4)) {
-                            all_ok = false;
+                            test_ok = false;
                             status_nmse = "\033[1;31mFAIL\033[0m";
                         }
                     }
@@ -4320,6 +4329,7 @@ static int test_backends(const std::string & arch_filter, const size_t seed, con
                     // FIXME: when adding a tensor to a gguf_context a copy is made, this changes the pointer which the meta backend
                     //     in turn uses to map the tensors to their simple equivalents - this is fundamentally incompatible
                     if (file && llama_model_saver_supports_arch(arch) && dc.split_mode != LLAMA_SPLIT_MODE_TENSOR) {
+                        test_executed = true;
                         GGML_ASSERT(model_and_ctx_dev.first && model_and_ctx_dev.second);
                         llama_model_saver ms = llama_model_saver(model_and_ctx_dev.first.get());
                         ms.add_kv_from_model();
@@ -4334,7 +4344,7 @@ static int test_backends(const std::string & arch_filter, const size_t seed, con
                         ms.save(file.get());
                         rewind(file.get());
 
-                        auto model_and_ctx_roundtrip = get_model_and_ctx(nullptr, file.get(), seed, dc.devs, dc.split_mode, encode);
+                        auto model_and_ctx_roundtrip = get_model_and_ctx(nullptr, file.get(), seed, dc.devs, dc.split_mode, encode, nullptr, nullptr, stdev);
                         const std::vector<float> logits_roundtrip = get_logits(
                             model_and_ctx_roundtrip.first.get(), model_and_ctx_roundtrip.second.get(), tokens, encode);
                         status_roundtrip = "\033[1;32mOK\033[0m";
@@ -4372,7 +4382,7 @@ static int test_backends(const std::string & arch_filter, const size_t seed, con
     }
 
     llama_log_set(ud.log_old.callback, ud.log_old.user_data);
-    return all_ok ? 0 : 1;
+    return all_ok && n_tests > 0 ? 0 : 1;
 }
 
 int main(int argc, char ** argv) {
@@ -4460,7 +4470,7 @@ int main(int argc, char ** argv) {
             return 1;
         }
     }
-    if (stdev <= 0.0f) {
+    if (!(stdev > 0.0f) || !std::isfinite(stdev)) {
         LOG_ERR("%s: stdev must be > 0\n", __func__);
         return 1;
     }
@@ -4472,23 +4482,23 @@ int main(int argc, char ** argv) {
         if (!out.empty()) {
             return save_models(arch_filter, seed, stdev, verbosity, out);
         }
-        if (arch == LLM_ARCH_UNKNOWN || arch == LLM_ARCH_LLAMA) {
+        if (arch_matches(arch_filter, LLM_ARCH_LLAMA)) {
             test_bonsai_loader(seed);
         }
-        if (arch == LLM_ARCH_UNKNOWN || arch == LLM_ARCH_QWEN35) {
+        if (arch_matches(arch_filter, LLM_ARCH_QWEN35)) {
             test_qwen35_mtp_fused_qkv(seed, LLM_ARCH_QWEN35);
             test_qwen35_mtp_d2t_contract(seed);
         }
-        if (arch == LLM_ARCH_UNKNOWN || arch == LLM_ARCH_QWEN35MOE) {
+        if (arch_matches(arch_filter, LLM_ARCH_QWEN35MOE)) {
             test_qwen35_mtp_fused_qkv(seed, LLM_ARCH_QWEN35MOE);
         }
-        if (arch == LLM_ARCH_UNKNOWN || arch == LLM_ARCH_QWEN4EXP) {
+        if (arch_matches(arch_filter, LLM_ARCH_QWEN4EXP)) {
             test_qwen4_ple_recurrent_resize(seed);
             test_qwen4_indexed_cache_admission(seed);
             test_qwen4_vbr_cuda(seed);
             test_qwen4_mtp_sidecar_contract(seed);
         }
-        return test_backends(arch, seed, verbosity);
+        return test_backends(arch_filter, seed, stdev, verbosity, target_backend);
     } catch (const std::exception & err) {
         fprintf(stderr, "encountered runtime error: %s\n", err.what());
         return -1;

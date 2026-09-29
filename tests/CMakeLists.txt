@@ -489,6 +489,14 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     )
     set_tests_properties(test-recurrent-state-rollback PROPERTIES FIXTURES_REQUIRED generate-models)
 
+    llama_test(
+        test-recurrent-state-rollback
+        NAME test-recurrent-state-rollback-all-models
+        LABEL main
+        ARGS --models "${MODEL_DIR}" --fit off)
+    set_tests_properties(test-recurrent-state-rollback-all-models PROPERTIES
+        FIXTURES_REQUIRED generate-models)
+
     foreach (MODEL qwen35-dense nemotron_h-dense deepseek4-moe kimi-k3-moe)
         llama_test(
             test-recurrent-state-rollback

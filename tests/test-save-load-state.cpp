@@ -44,12 +44,15 @@ static double nmse(const std::vector<float> & a, const std::vector<float> & b) {
     for (size_t i = 0; i < a.size(); i++) {
         const float a_i = a[i];
         const float b_i = b[i];
-
-        mse_a_b += (double) (a_i - b_i) * (a_i - b_i);
+        if (!std::isfinite(a_i) || !std::isfinite(b_i)) {
+            return std::numeric_limits<double>::infinity();
+        }
+        const double d = double(a_i) - b_i;
+        mse_a_b += d * d;
         mse_a_0 += (double) a_i * a_i;
     }
 
-    return mse_a_b / mse_a_0;
+    return mse_a_0 == 0.0 ? (mse_a_b == 0.0 ? 0.0 : std::numeric_limits<double>::infinity()) : mse_a_b / mse_a_0;
 }
 
 struct generation_result {
@@ -141,7 +144,7 @@ static bool generate_tokens_compare(
 
         const double nmse_val = nmse(expected.logits[i], logits);
         LOG_TRC("%s: step %d nmse = %.6e\n", __func__, i, nmse_val);
-        if (nmse_val > NMSE_THRESHOLD) {
+        if (!(nmse_val <= NMSE_THRESHOLD)) {
             LOG_ERR("\n%s: error: NMSE at step %d is %.6e (threshold %.1e)\n", __func__, i, nmse_val, NMSE_THRESHOLD);
             return false;
         }
@@ -1366,12 +1369,203 @@ static bool test_state_range(struct llama_model * model, const struct common_par
 }
 
 
+// overwrite the tensor data with 0xff bytes (NaN when read as f16/f32), so that the restore fails
+static bool corrupt_state(std::vector<uint8_t> & data) {
+    if (data.size() < 3*4096) {
+        LOG_ERR("%s: state of %zu bytes is too small to corrupt\n", __func__, data.size());
+        return false;
+    }
+
+    std::fill(data.begin() + 4096, data.end() - data.size()/4, 0xff);
+    return true;
+}
+
+
+// Test 12: state restore failure
+// a failed restore must leave the sequence empty and must not change the logits of other sequences
+static bool test_state_restore_failure(struct llama_model * model, const struct common_params & params, const llama_tokens & tokens) {
+    auto params_ctx = common_context_params_to_llama(params);
+    params_ctx.n_ctx      = 256;
+    params_ctx.n_seq_max  = 4;
+    params_ctx.kv_unified = true;
+
+    // without flash attention, corrupted data left behind by the restore shows up as NaN logits on the other sequences
+    params_ctx.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_DISABLED;
+
+    auto ctx = llama_context_ptr{llama_init_from_model(model, params_ctx)};
+    if (!ctx) {
+        LOG_ERR("%s: failed to create context\n", __func__);
+        return false;
+    }
+
+    LOGV(LOG_LEVEL_INFO, "\n=== Test 12: state restore failure ===\n");
+
+    llama_memory_t mem = llama_get_memory(ctx.get());
+    if (mem == nullptr) {
+        LOGV(LOG_LEVEL_INFO, "PASS (model has no memory)\n");
+        return true;
+    }
+
+    const auto decode = [&](const llama_tokens & inp, llama_seq_id seq_id, std::vector<float> * logits_out) {
+        llama_batch_ptr batch(inp.size(), 0, 1);
+        for (size_t i = 0; i < inp.size(); ++i) {
+            common_batch_add(batch.get(), inp[i], i, { seq_id }, i == inp.size() - 1);
+        }
+
+        if (llama_decode(ctx.get(), batch.get())) {
+            LOG_ERR("%s: failed to decode on sequence %d\n", __func__, seq_id);
+            return false;
+        }
+
+        if (logits_out && !get_current_logits(ctx.get(), *logits_out)) {
+            LOG_ERR("%s: failed to get logits\n", __func__);
+            return false;
+        }
+
+        return true;
+    };
+
+    const llama_tokens tokens_save  (tokens.begin(), tokens.begin() + std::min<size_t>(24, tokens.size()));
+    const llama_tokens tokens_verify(tokens.end() - std::min<size_t>(8, tokens.size()), tokens.end());
+
+    // the registered tests share a working directory, so the state file is named after the model
+    const std::string path = "state-restore-failure." + std::filesystem::path(params.model.path).filename().string() + ".tmp.bin";
+
+    llama_memory_clear(mem, true);
+
+    std::vector<float> baseline;
+    if (!decode(tokens_verify, 1, &baseline)) {
+        return false;
+    }
+
+    const std::vector<std::pair<const char *, std::function<bool()>>> cases = {
+        { "buffer", [&]() {
+            std::vector<uint8_t> state(llama_state_seq_get_size(ctx.get(), 0));
+            GGML_ASSERT(llama_state_seq_get_data(ctx.get(), state.data(), state.size(), 0) == state.size());
+            llama_memory_seq_rm(mem, 0, -1, -1);
+
+            if (!corrupt_state(state)) {
+                return false;
+            }
+
+            return llama_state_seq_set_data(ctx.get(), state.data(), state.size(), 0) == 0;
+        }},
+        { "file", [&]() {
+            GGML_ASSERT(llama_state_seq_save_file(ctx.get(), path.c_str(), 0, tokens_save.data(), tokens_save.size()) > 0);
+            llama_memory_seq_rm(mem, 0, -1, -1);
+
+            std::vector<uint8_t> data;
+            {
+                std::ifstream f(path, std::ios::binary);
+                data.assign(std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>());
+            }
+
+            if (!corrupt_state(data)) {
+                std::remove(path.c_str());
+                return false;
+            }
+
+            {
+                std::ofstream f(path, std::ios::binary);
+                f.write((const char *) data.data(), data.size());
+            }
+
+            llama_tokens tokens_out(tokens_save.size());
+            size_t n_token_count = 0;
+            const size_t nread = llama_state_seq_load_file(ctx.get(), path.c_str(), 0, tokens_out.data(), tokens_out.size(), &n_token_count);
+            std::remove(path.c_str());
+
+            return nread == 0;
+        }},
+    };
+
+    for (const auto & [name, restore_failed] : cases) {
+        llama_memory_clear(mem, true);
+
+        if (!decode(tokens_save, 0, nullptr)) {
+            return false;
+        }
+
+        // Keep a live neighbour sharing the source prefix across the failure.
+        // A cold decode alone would miss erased memberships.
+        llama_memory_seq_cp(mem, 0, 2, -1, -1);
+        const auto neighbour = [&]() {
+            std::vector<uint8_t> bytes(llama_state_seq_get_size(ctx.get(), 2));
+            if (bytes.empty() || llama_state_seq_get_data(ctx.get(), bytes.data(), bytes.size(), 2) != bytes.size()) {
+                return std::vector<uint8_t>{};
+            }
+            return bytes;
+        };
+        const auto before = neighbour();
+        if (before.empty()) {
+            return false;
+        }
+
+        if (!restore_failed()) {
+            LOG_ERR("%s: %s: restoring a corrupted state did not fail\n", __func__, name);
+            return false;
+        }
+
+        if (before != neighbour()) {
+            LOG_ERR("%s: %s: failed restore changed a live neighbour\n", __func__, name);
+            return false;
+        }
+        llama_memory_seq_rm(mem, 2, -1, -1);
+
+        if (llama_memory_seq_pos_max(mem, 0) != -1) {
+            LOG_ERR("%s: %s: sequence not empty after failed restore\n", __func__, name);
+            return false;
+        }
+
+        std::vector<float> logits;
+        if (!decode(tokens_verify, 1, &logits)) {
+            return false;
+        }
+
+        float  diff_max = 0.0f;
+        size_t n_nan    = 0;
+        for (size_t i = 0; i < logits.size(); ++i) {
+            if (!std::isfinite(logits[i]) || !std::isfinite(baseline[i])) {
+                n_nan++;
+            } else {
+                diff_max = std::max(diff_max, std::fabs(logits[i] - baseline[i]));
+            }
+        }
+
+        if (n_nan > 0 || diff_max > 1e-6f) {
+            LOG_ERR("%s: %s: logits changed after failed restore (max diff = %g, nan = %zu)\n", __func__, name, diff_max, n_nan);
+            return false;
+        }
+
+        LOG_TRC("%s: %s: logits match (max diff = %g)\n", __func__, name, diff_max);
+    }
+
+    LOGV(LOG_LEVEL_INFO, "\nPASS\n");
+    return true;
+}
+
+
+struct test_suite {
+    std::vector<test_status> results;
+
+    bool all_passed() const {
+        return std::all_of(results.begin(), results.end(), [](test_status s) { return s == test_status::PASS; });
+    }
+};
+
+
 // --range-only: run test 11 alone, it needs no generation baseline
 static bool g_range_only = false;
 
+static std::vector<const char *> test_names = {
+    "baseline", "seq_rm", "state_load", "cp_h", "cp_d", "integrity",
+    "trim", "cp_h_s", "cp_d_s", "rt", "range", "rf",
+};
+
 // Run the full save/load test suite (tests 1-11) for a single model.
 // Returns true if all tests pass, false otherwise.
-static bool run_save_load_tests_for_model(const std::string & model_path, const struct common_params & base_params) {
+static test_suite run_save_load_tests_for_model(const std::string & model_path, const struct common_params & base_params) {
+    test_suite suite;
     struct common_params params = base_params;
     params.model.path = model_path;
 
@@ -1412,7 +1606,8 @@ static bool run_save_load_tests_for_model(const std::string & model_path, const 
     LOG_INF("%s: the input prompt is %d tokens\n", __func__, (int)tokens.size());
 
     if (g_range_only) {
-        return test_state_range(model, params, tokens);
+        suite.results.push_back(test_state_range(model, params, tokens) ? test_status::PASS : test_status::FAIL);
+        return suite;
     }
 
     // Test 1: baseline (saves state to disk)
@@ -1439,36 +1634,25 @@ static bool run_save_load_tests_for_model(const std::string & model_path, const 
     }
 
     // Test 6: checksummed sequence file envelope and staged loading
-    if (!test_seq_file_integrity(model, params, tokens)) {
-        return false;
-    }
+    suite.results.push_back(test_seq_file_integrity(model, params, tokens) ? test_status::PASS : test_status::FAIL);
 
     // Test 7: non-hybrid attention trim equivalence
-    if (!test_attn_trim_nonhybrid(model, params, tokens)) {
-        return false;
-    }
+    suite.results.push_back(test_attn_trim_nonhybrid(model, params, tokens) ? test_status::PASS : test_status::FAIL);
 
     // Test 8: seq copy (host, scatter)
-    if (!test_seq_cp_scatter(model, params, tokens, 8, false)) {
-        return false;
-    }
+    suite.results.push_back(test_seq_cp_scatter(model, params, tokens, 8, false) ? test_status::PASS : test_status::FAIL);
 
     // Test 9: seq copy (device, scatter)
-    if (!test_seq_cp_scatter(model, params, tokens, 9, true)) {
-        return false;
-    }
+    suite.results.push_back(test_seq_cp_scatter(model, params, tokens, 9, true) ? test_status::PASS : test_status::FAIL);
 
     // Test 10: state blob round-trip
-    if (!test_state_roundtrip(model, params, tokens)) {
-        return false;
-    }
+    suite.results.push_back(test_state_roundtrip(model, params, tokens) ? test_status::PASS : test_status::FAIL);
 
     // Test 11: position-range blobs
-    if (!test_state_range(model, params, tokens)) {
-        return false;
-    }
+    suite.results.push_back(test_state_range(model, params, tokens) ? test_status::PASS : test_status::FAIL);
+    suite.results.push_back(test_state_restore_failure(model, params, tokens) ? test_status::PASS : test_status::FAIL);
 
-    LOG("\nAll tests passed.\n");
+    LOG("\n%s\n", suite.all_passed() ? "All tests passed." : "Some tests failed or were skipped.");
 
     return suite;
 }
@@ -1507,6 +1691,7 @@ int main(int argc, char ** argv) {
             i++;
         } else if (strcmp(argv[i], "--range-only") == 0) {
             g_range_only = true;
+            test_names = { "range" };
         } else {
             filtered_argv.push_back(argv[i]);
         }

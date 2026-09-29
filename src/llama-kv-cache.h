@@ -1742,6 +1742,7 @@ private:
     bool state_read_meta(llama_io_read_i & io, uint32_t strm, uint32_t cell_count,       slot_info & sinfo, llama_seq_id dest_seq_id = -1, const slot_info * sinfo_in = nullptr, const state_append_t * append = nullptr);
     // sinfo holds the first n_place cells of the blob, the rows of the others are read and dropped
     bool state_read_data(llama_io_read_i & io, uint32_t strm, uint32_t cell_count, const slot_info & sinfo, uint32_t n_place);
+    void state_clear_data(uint32_t strm, const slot_info & sinfo);
 };
 
 class llama_kv_cache_context : public llama_memory_context_i {

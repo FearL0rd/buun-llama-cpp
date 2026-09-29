@@ -13136,17 +13136,22 @@ void llama_kv_cache::state_append_range(llama_io_read_i & io, llama_seq_id seq_i
 
     slot_info sinfo;
 
-    bool res = state_read_meta(io, strm, cell_count, sinfo, seq_id, nullptr, &append);
-    res = res && vbr_vmm_try_map_import();
-
+    bool mapped = false;
+    bool res = false;
     try {
-        res = res && state_read_data(io, strm, cell_count, sinfo, append.n_keep);
+        res = state_read_meta(io, strm, cell_count, sinfo, seq_id, nullptr, &append);
+        mapped = res && vbr_vmm_try_map_import();
+        res = mapped && state_read_data(io, strm, cell_count, sinfo, append.n_keep);
     } catch (...) {
         res = false;
     }
 
     if (!res) {
+        io.discard();
         seq_rm(seq_id, p0, -1);
+        if (mapped) {
+            state_clear_data(strm, sinfo);
+        }
         throw std::runtime_error("failed to append kv cache range");
     }
 
@@ -13164,7 +13169,7 @@ void llama_kv_cache::state_read_sinfo(
            llama_seq_id   seq_id,
   llama_state_seq_flags   flags,
       slot_info_vec_t *   sinfos_out,
-const slot_info_vec_t *   sinfos_in) {
+const slot_info_vec_t *   sinfos_in) try {
     // Imports are provenance-bearing: recovery is reserved before the first read so a
     // partial-import unwind autorecords and the boundary drain quarantines + invalidates.
     vbr_mutation_op mutation_op(this, vbr_operation_kind::state_import,
@@ -13219,23 +13224,29 @@ const slot_info_vec_t *   sinfos_in) {
 
         slot_info sinfo;
 
-        bool res = true;
-        res = res && state_read_meta(
-                io, strm, cell_count, sinfo, seq_id,
-                sinfos_in ? &(*sinfos_in)[s] : nullptr);
-        // neither branch has grown the VMM physical backing yet: the whole-cache one positions
-        // cells directly, the per-sequence one goes through apply_ubatch(commit = false), which
-        // skips the mapping — state_read_data would write into unmapped VA
-        res = res && vbr_vmm_try_map_import();
-
+        bool res = false;
+        bool mapped = false;
         try {
-            res = res && state_read_data(io, strm, cell_count, sinfo, cell_count);
+            res = state_read_meta(io, strm, cell_count, sinfo, seq_id,
+                    sinfos_in ? &(*sinfos_in)[s] : nullptr);
+            // Both metadata paths place cells without committing physical VMM pages.
+            mapped = res && vbr_vmm_try_map_import();
+            res = mapped && state_read_data(io, strm, cell_count, sinfo, cell_count);
         } catch (...) {
             res = false;
         }
 
         if (!res) {
-            state_clear(seq_id, strm, sinfo);
+            io.discard();
+            if (seq_id == -1) {
+                clear(true);
+            } else {
+                seq_rm(seq_id, -1, -1);
+                // A failed VMM map cannot have written data and must not be zeroed.
+                if (mapped) {
+                    state_clear_data(strm, sinfo);
+                }
+            }
             throw std::runtime_error("failed to restore kv cache");
         }
 
@@ -13257,6 +13268,18 @@ const slot_info_vec_t *   sinfos_in) {
                 vbr_operation_class::state_api);
         vbr_ownership_rebuild();
     }
+}
+
+catch (...) {
+    // Also cover malformed stream headers or metadata, before/after individual
+    // stream payloads. Never let a deferred reader flush a rejected import.
+    io.discard();
+    if (seq_id == -1) {
+        clear(true);
+    } else {
+        seq_rm(seq_id, -1, -1);
+    }
+    throw;
 }
 
 // The one spelling of "update the index for every sequence that owns a cell".
@@ -13451,12 +13474,16 @@ bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32
 
     if (dest_seq_id != -1) {
         // single sequence
+        const uint32_t n_place = append ? append->n_keep : cell_count;
+        if (n_place > cells.size()) {
+            LLAMA_LOG_ERROR("%s: not enough cells in kv cache\n", __func__);
+            return false;
+        }
         if (!append) {
             seq_rm(dest_seq_id, -1, -1);
         }
 
         // cells past n_place are parsed and dropped
-        const uint32_t n_place = append ? append->n_keep : cell_count;
 
         llama_batch_allocr balloc(hparams.n_pos_per_embd());
 
@@ -13861,18 +13888,22 @@ void llama_kv_cache::state_clear(llama_seq_id seq_id) {
         }
     }
 
-    state_clear(seq_id, strm, sinfo);
+    seq_rm(seq_id, -1, -1);
+    state_clear_data(strm, sinfo);
 }
 
 // the cleared ranges mirror the write pattern of state_read_data() - keep both in sync
-void llama_kv_cache::state_clear(llama_seq_id seq_id, uint32_t strm, const slot_info & sinfo) {
-    if (seq_id == -1) {
-        clear(true);
-        return;
+void llama_kv_cache::state_clear_data(uint32_t strm, const slot_info & attempted) {
+    // A mirrored or shared placement may still belong to another sequence. Only
+    // unowned rows may be scrubbed, including on a failed range append.
+    slot_info sinfo = attempted;
+    if (!sinfo.empty()) {
+        auto & rows = sinfo.idxs[0];
+        const auto & cells = v_cells[strm];
+        rows.erase(std::remove_if(rows.begin(), rows.end(), [&](uint32_t row) {
+            return !cells.is_empty(row);
+        }), rows.end());
     }
-
-    seq_rm(seq_id, -1, -1);
-
     // zero the K/V data of the failed restore attempt - the attention can still read the data of free cells
     if (sinfo.empty() || sinfo.size() == 0) {
         return;

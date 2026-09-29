@@ -1108,9 +1108,9 @@ static bool test_multi_seq_split_replay(const common_params & params, llama_mode
         return false;
     }
 
-    // both contexts decode identical batches, so the logits should match;
-    // random dummy models can still drift up to ~1.7e-5, so the bound is 1e-4
-    constexpr float nmse_eps = 1e-4f;
+    // Identical replay shapes from exact states retain the fork's strict gate.
+    // NMSE is additional diagnostic context, not permission to relax rollback.
+    constexpr float eps = 1e-7f;
 
     float    diff_max  = 0.0f;
     uint32_t seq_first = 0;
@@ -1151,7 +1151,7 @@ static bool test_multi_seq_split_replay(const common_params & params, llama_mode
         return false;
     }
 
-    LOG_INF("%s: multi-seq split replay matched (max diff %g, nmse %g)\n", __func__, (double) diff_max, nmse_val);
+    fprintf(stderr, "%s: multi-seq split replay matched (max diff %g, nmse %g)\n", __func__, (double) diff_max, nmse_val);
 
     // seq-1-only decodes must be independent of seq 0's content: diverge seq 0
     // in ctx_ref only, then compare identical seq-1-only continuations bitwise
@@ -1206,7 +1206,7 @@ static bool test_multi_seq_split_replay(const common_params & params, llama_mode
         return false;
     }
 
-    fprintf(stderr, "%s : seq-1-only decode independent of seq 0 (max diff %g)\n", __func__, (double) diff_tail);
+    fprintf(stderr, "%s : seq-1-only decode independent of seq 0 (max diff %g, nmse %g)\n", __func__, (double) diff_tail, nmse_tail);
     return true;
 }
 
@@ -1243,15 +1243,13 @@ static bool test_indexed_hybrid_tree_collection(const llama_model & model) {
     return true;
 }
 
-int main(int argc, char ** argv) {
+static int run_model(int argc, char ** argv) {
     std::setlocale(LC_NUMERIC, "C");
     set_resize_test_fault(false);
 
     common_params params;
     params.sampling.seed = 1234;
     params.n_predict = 1;
-
-    common_init();
 
     std::vector<std::string> parser_args(argv, argv + argc);
     const auto fill_arg = std::find(parser_args.begin(), parser_args.end(), "--cache-pattern-fill");
@@ -1318,7 +1316,7 @@ int main(int argc, char ** argv) {
     // must remain distinct from the logical multi-sequence graph capacity.
     params.kv_unified = true;
 
-    ggml_backend_load_all();
+    llama_backend_init();
 
     if (shared_swa_only) {
         auto mparams = common_model_params_to_llama(params);
@@ -1374,7 +1372,7 @@ int main(int argc, char ** argv) {
 
     if (!llama_model_is_recurrent(model) && !llama_model_is_hybrid(model)) {
         fprintf(stderr, "%s : skipping for non-recurrent model\n", __func__);
-        return 0;
+        return 77;
     }
 
     const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model));
@@ -1428,13 +1426,10 @@ int main(int argc, char ** argv) {
             return 1;
         }
     }
-    filtered_argv.push_back(nullptr);
-    const int fargc = (int)filtered_argv.size() - 1;
-
     auto * recurrent = get_recurrent(ctx_test.get());
     if (recurrent == nullptr || recurrent->n_rs_seq < 3) {
         fprintf(stderr, "%s : skipping because recurrent rollback depth is less than 3\n", __func__);
-        return 0;
+        return 77;
     }
     const uint32_t n_rs_seq = recurrent->n_rs_seq;
 
@@ -1864,4 +1859,66 @@ int main(int argc, char ** argv) {
 
     fprintf(stderr, "%s : recurrent rollback-plane validity checks passed\n", __func__);
     return 0;
+}
+
+int main(int argc, char ** argv) {
+    common_init();
+    std::string models_dir;
+    std::vector<std::string> args;
+    args.emplace_back(argv[0]);
+    for (int i = 1; i < argc; ++i) {
+        if (std::strcmp(argv[i], "--models") == 0) {
+            if (++i == argc) {
+                fprintf(stderr, "--models requires a directory\n");
+                return 1;
+            }
+            models_dir = argv[i];
+        } else {
+            args.emplace_back(argv[i]);
+        }
+    }
+    const auto run = [](std::vector<std::string> & values) {
+        std::vector<char *> pointers;
+        for (auto & value : values) {
+            pointers.push_back(value.data());
+        }
+        pointers.push_back(nullptr);
+        return run_model(int(values.size()), pointers.data());
+    };
+    if (models_dir.empty()) {
+        return run(args);
+    }
+    try {
+        std::vector<std::string> models;
+        for (const auto & entry : std::filesystem::directory_iterator(models_dir)) {
+            if (entry.is_regular_file() && entry.path().extension() == ".gguf") {
+                models.push_back(entry.path().string());
+            }
+        }
+        std::sort(models.begin(), models.end());
+        size_t passed = 0, skipped = 0, failed = 0;
+        for (const auto & model : models) {
+            auto model_args = args;
+            model_args.insert(model_args.end(), { "-m", model });
+            int rc = 1;
+            try {
+                rc = run(model_args);
+            } catch (const std::exception & err) {
+                fprintf(stderr, "%s: %s\n", model.c_str(), err.what());
+            }
+            if (rc == 0) {
+                ++passed;
+            } else if (rc == 77) {
+                ++skipped;
+            } else {
+                ++failed;
+            }
+            fprintf(stderr, "%s: %s\n", model.c_str(), rc == 0 ? "PASS" : rc == 77 ? "SKIP" : "FAIL");
+        }
+        fprintf(stderr, "Rollback suite: %zu passed, %zu skipped, %zu failed\n", passed, skipped, failed);
+        return passed > 0 && failed == 0 ? 0 : 1;
+    } catch (const std::exception & err) {
+        fprintf(stderr, "Cannot enumerate models: %s\n", err.what());
+        return 1;
+    }
 }

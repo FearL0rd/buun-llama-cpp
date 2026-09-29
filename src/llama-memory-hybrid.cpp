@@ -1,4 +1,5 @@
 #include "llama-memory-hybrid.h"
+#include "llama-io.h"
 
 #include "llama-impl.h"
 #include "llama-model.h"
@@ -280,6 +281,7 @@ void llama_memory_hybrid::state_read(llama_io_read_i & io, llama_seq_id seq_id, 
     try {
         mem_recr->state_read(io, seq_id, flags);
     } catch (...) {
+        io.discard();
         // the attention part is already restored - undo it
         if (read_attn) {
             mem_attn->state_clear(seq_id);

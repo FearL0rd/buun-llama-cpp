@@ -1,4 +1,5 @@
 #include "llama-kv-cache-dsa.h"
+#include "llama-io.h"
 
 #include "llama-impl.h"
 #include "llama-batch.h"
@@ -172,6 +173,7 @@ void llama_kv_cache_dsa::state_read(llama_io_read_i & io, llama_seq_id seq_id, l
     try {
         kv_lid->state_read(io, seq_id, flags);
     } catch (...) {
+        io.discard();
         // the MLA part is already restored - undo it, so that a failed restore leaves nothing behind
         kv_mla->state_clear(seq_id);
 

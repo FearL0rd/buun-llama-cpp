@@ -6456,6 +6456,7 @@ size_t llama_context::state_seq_read_data_stream(
         }
         return state_seq_read_data(io, seq_id, flags);
     } catch (const std::exception & err) {
+        io.discard();
         LLAMA_LOG_ERROR("%s: error loading state: %s\n", __func__, err.what());
         return 0;
     }
@@ -6565,6 +6566,7 @@ size_t llama_context::state_seq_append_data(llama_seq_id seq_id, const uint8_t *
 
         return io.n_bytes();
     } catch (const std::exception & err) {
+        io.discard();
         LLAMA_LOG_ERROR("%s: error appending state range [%d, %d): %s\n", __func__, p0, p1, err.what());
         return 0;
     }

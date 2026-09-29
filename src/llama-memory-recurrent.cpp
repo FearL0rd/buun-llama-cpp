@@ -2154,22 +2154,21 @@ void llama_memory_recurrent::state_read(llama_io_read_i & io, llama_seq_id seq_i
     uint32_t cell_count;
     io.read(&cell_count, sizeof(cell_count));
 
-    bool res = true;
-
     // save the head of the restored cells - could be needed to clear the state
     // the head is valid only when state_read_meta() succeeded
-    const bool meta_read = state_read_meta(io, cell_count, seq_id);
-    const uint32_t cell_head = head;
-
-    res = res && meta_read;
-
+    bool res = false;
+    bool meta_read = false;
+    uint32_t cell_head = 0;
     try {
-        res = res && state_read_data(io, cell_count);
+        meta_read = state_read_meta(io, cell_count, seq_id);
+        cell_head = head;
+        res = meta_read && state_read_data(io, cell_count);
     } catch (...) {
         res = false;
     }
 
     if (!res) {
+        io.discard();
         state_clear(seq_id, cell_head, meta_read ? cell_count : 0);
         throw std::runtime_error("failed to restore kv cache");
     }
