@@ -917,6 +917,7 @@ static void test_dflash_selector_family_contract() {
     GGML_ASSERT(tn(LLM_TENSOR_DFLASH2_FFN_CONV_BASE, 0).str() == "blk.0.ffn_conv.base");
     GGML_ASSERT(tn(LLM_TENSOR_DFLASH2_FFN_CONV_PROJ, "weight", 0).str() == "blk.0.ffn_conv.proj.weight");
     GGML_ASSERT(tn(LLM_TENSOR_SSM_G, 0).str() == "blk.0.ssm_g");
+    GGML_ASSERT(tn(LLM_TENSOR_HRM_Z_L_INIT).str() == "hrm.z_l_init");
 
     GGML_ASSERT(llm_dflash_selector_family_from_identity(false, false, false) == family::none);
     GGML_ASSERT(llm_dflash_selector_family_from_identity(true,  false, false) == family::unidentified);
