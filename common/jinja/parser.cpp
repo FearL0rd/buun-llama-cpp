@@ -432,7 +432,8 @@ private:
             if (is(token::open_paren)) {
                 test_id = parse_call_expression(std::move(test_id));
             } else if (is(token::numeric_literal) || is(token::string_literal) || is(token::open_curly_bracket) || is(token::open_square_bracket) ||
-                    (is(token::identifier) && !is_identifier("and") && !is_identifier("or") && !is_identifier("else"))) {
+                    is(token::additive_binary_operator) ||
+                    (is(token::identifier) && !is_identifier("and") && !is_identifier("or") && !is_identifier("else") && !is_identifier("if"))) {
                 size_t call_pos = current;
                 statements args;
                 args.push_back(parse_unary_expression());

@@ -1230,6 +1230,16 @@ static void test_tests(testing & t) {
         "yes"
     );
 
+    test_template(t, "sameas large integer identity",
+        "{% set y = x %}{{ x is sameas(x) }} {{ x is sameas(y) }} {{ x is sameas(1000) }}",
+        {{"x", 1000}}, "True True False");
+    test_template(t, "sameas bool is not integer",
+        "{{ true is sameas(1) }} {{ false is sameas(0) }}", json::object(), "False False");
+    test_template(t, "signed test arguments",
+        "{{ -4 is lt -3 }} {{ 4 is gt +3 }}", json::object(), "True True");
+    test_template(t, "test before conditional",
+        "{{ x is integer if enabled else false }}", {{"x", 1000}, {"enabled", true}}, "True");
+
     test_template(t, "is sameas ref object",
         "{% set y = x.y %}{{ 'yes' if x.y is sameas(y) and x.y is not sameas(x.z) }}",
         {{"x", {{"y", {{"z", 1}}}, {"z", {{"z", 1}}}}}},

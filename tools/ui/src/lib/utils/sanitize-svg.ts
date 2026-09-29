@@ -2,12 +2,24 @@ import { SVG } from '$lib/constants';
 import DOMPurify from 'dompurify';
 
 /**
- * animate and set can retarget href or xlink:href to a javascript: uri through
- * to, from, by or values, none of which DOMPurify checks as a uri. Dropping
- * attributeName in that case leaves the animation inert.
+ * SMIL values bypass ordinary attribute URI checks. Only permit geometry,
+ * opacity and color targets, never URI/style/event targets. Paint servers are
+ * excluded from animation values as well. Static SVG attributes still go
+ * through DOMPurify's ordinary policy.
  */
-DOMPurify.addHook('uponSanitizeAttribute', (_node, data) => {
-	if (data.attrName === 'attributename' && /href$/i.test(data.attrValue.trim())) {
+const animationTargets = new Set([
+	'x', 'y', 'x1', 'x2', 'y1', 'y2', 'cx', 'cy', 'r', 'rx', 'ry',
+	'width', 'height', 'd', 'points', 'transform', 'opacity', 'fill-opacity',
+	'stroke-opacity', 'stroke-width', 'stroke-dasharray', 'stroke-dashoffset',
+	'fill', 'stroke', 'color', 'stop-color', 'stop-opacity'
+]);
+
+DOMPurify.addHook('uponSanitizeAttribute', (node, data) => {
+	if (!['animate', 'set', 'animatetransform', 'animatemotion'].includes(node.nodeName.toLowerCase())) return;
+	if (data.attrName === 'attributename' && !animationTargets.has(data.attrValue.trim().toLowerCase())) {
+		data.keepAttr = false;
+	}
+	if (['to', 'from', 'by', 'values'].includes(data.attrName) && /url\s*\(|[\\:]/i.test(data.attrValue)) {
 		data.keepAttr = false;
 	}
 });

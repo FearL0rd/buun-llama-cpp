@@ -30,11 +30,10 @@ export const SVG = {
 	/**
 	 * DOMPurify config for untrusted svg coming from model output.
 	 *
-	 * foreignObject and script stay forbidden unconditionally, they are the only
-	 * inline svg vectors that execute arbitrary html or js. Everything else is
-	 * allowed for maximum rendering compatibility: href and xlink:href stay so
+	 * foreignObject and script stay forbidden unconditionally. href and xlink:href stay so
 	 * use, image, a and animateMotion work, and DOMPurify still neutralizes
-	 * javascript: and data: uri schemes natively. External resource refs are
+	 * unsafe URI schemes natively. sanitizeSvg additionally restricts SMIL
+	 * animation targets, whose values bypass ordinary attribute checks. External resource refs are
 	 * allowed by design on a local first tool, the user browser fetches them.
 	 *
 	 * The sanitized svg is always mounted inside a shadow root (see svg-shadow),

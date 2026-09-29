@@ -547,7 +547,9 @@ const func_builtins & global_builtins() {
             auto b = args.get_pos(1);
             bool res = false;
             if (!is_val<value_undefined>(a) && !is_val<value_undefined>(b)) {
-                if (is_val<value_none>(a) && is_val<value_none>(b)) {
+                if (a == b) {
+                    res = true;
+                } else if (is_val<value_none>(a) && is_val<value_none>(b)) {
                     res = true;
                 } else if (is_val<value_bool>(a) && is_val<value_bool>(b)) {
                     if (a->as_bool() == b->as_bool()) {
@@ -559,8 +561,6 @@ const func_builtins & global_builtins() {
                     if (x >= -5 && x <= 256 && x == b->as_int()) {
                         res = true;
                     }
-                } else if (a == b) {
-                    res = true;
                 }
             }
             return mk_val<value_bool>(res);
