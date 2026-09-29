@@ -359,6 +359,14 @@ bool ggml_sycl_op_fwht(ggml_backend_sycl_context & ctx, const ggml_tensor * src,
     float *         dst_d  = (float *) dst->data;
     dpct::queue_ptr stream = ctx.stream();
 
+    if (n >= 1024 && (n & (n - 1)) == 0) {
+        const auto dev = stream->get_device();
+        if (dev.get_info<sycl::info::device::max_work_group_size>() < 256 ||
+            dev.get_info<sycl::info::device::local_mem_size>() < size_t(n) * sizeof(float)) {
+            return false;
+        }
+    }
+
     const float scale = 1.0f / std::sqrt((float) n);
 
     switch (n) {

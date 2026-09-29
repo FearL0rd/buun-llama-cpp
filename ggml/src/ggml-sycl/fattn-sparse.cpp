@@ -125,7 +125,7 @@ static bool sparse_fa_applicable(const ggml_tensor * dst, int64_t & n_kv_g_out) 
     }
 
     const int32_t n_kv_max = ggml_get_op_params_i32(dst, 4);
-    if (n_kv_max <= 0) {
+    if (n_kv_max <= 0 || sparse_fa_margin() < 0 || K->ne[1] > INT32_MAX) {
         return false;
     }
 
@@ -138,13 +138,13 @@ static bool sparse_fa_applicable(const ggml_tensor * dst, int64_t & n_kv_g_out) 
     }
 
     // single-token decode only; prefill amortises the scan already
-    if (Q->ne[1] != 1) {
+    if (Q->ne[1] != 1 || Q->ne[3] != 1 || V->ne[1] != K->ne[1]) {
         return false;
     }
     if (K->ne[3] != 1 || V->ne[3] != 1 || mask->ne[2] != 1 || mask->ne[3] != 1) {
         return false;
     }
-    if (mask->type != GGML_TYPE_F16 || mask->ne[0] < K->ne[1]) {
+    if (mask->type != GGML_TYPE_F16 || mask->nb[0] != sizeof(sycl::half) || mask->ne[0] < K->ne[1]) {
         return false;
     }
     if (K->ne[2] != V->ne[2]) {
@@ -207,6 +207,15 @@ bool ggml_sycl_flash_attn_ext_sparse(ggml_backend_sycl_context & ctx, ggml_tenso
     sparse_fa_compact_mask(stream, (const sycl::half *) mask->data,
                            d_idx, d_cnt, n_kv, n_kv_g);
 
+    // The producer supplies a bound, but never silently truncate attention if
+    // it is exceeded. This optional path must fall back before reading indices.
+    int32_t h_cnt = 0;
+    SYCL_CHECK(CHECK_TRY_ERROR(stream->memcpy(&h_cnt, d_cnt, sizeof(int32_t))));
+    SYCL_CHECK(CHECK_TRY_ERROR(stream->wait()));
+    if (h_cnt > n_kv_g) {
+        return false;
+    }
+
     sparse_fa_gather_rows(stream, (const uint8_t *) K->data, d_K, d_idx, d_cnt,
                           k_row, K->nb[1], K->nb[2], n_kv_g, n_head_k);
 
@@ -218,9 +227,6 @@ bool ggml_sycl_flash_attn_ext_sparse(ggml_backend_sycl_context & ctx, ggml_tenso
                           mask->nb[1] / sizeof(sycl::half));
 
     if (sparse_fa_debug()) {
-        int32_t h_cnt = 0;
-        SYCL_CHECK(CHECK_TRY_ERROR(stream->memcpy(&h_cnt, d_cnt, sizeof(int32_t))));
-        SYCL_CHECK(CHECK_TRY_ERROR(stream->wait()));
         fprintf(stderr, "[FA-SPARSE] n_kv=%lld n_kv_max=%d n_kv_g=%lld finite=%d%s\n",
                 (long long) n_kv, ggml_get_op_params_i32(dst, 4),
                 (long long) n_kv_g, (int) h_cnt,

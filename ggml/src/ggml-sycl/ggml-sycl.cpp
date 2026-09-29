@@ -6112,7 +6112,9 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
         // qwen35 GDN l2 norms are emitted as rms_norm + scalar scale (models.h
         // build_gdn_l2_norm), which the rms_norm+mul fusion above cannot match
         if (node->op == GGML_OP_RMS_NORM &&
-            ggml_sycl_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_SCALE }, {})) {
+            ggml_sycl_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_SCALE }, {}) &&
+            ggml_get_op_params_f32(cgraph->nodes[i + 1], 0) >= 0.0f &&
+            ggml_get_op_params_f32(cgraph->nodes[i + 1], 1) == 0.0f) {
             ggml_sycl_op_rms_norm_scale_fused(*sycl_ctx, node, cgraph->nodes[i + 1]);
             i++;
             continue;
@@ -6537,11 +6539,14 @@ static bool do_ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, cons
                 }
             }
         case GGML_OP_GET_ROWS_BACK:
-            // return true;
              return op->type == GGML_TYPE_F32 &&
                  (op->src[0]->type == GGML_TYPE_F32 || op->src[0]->type == GGML_TYPE_F16) &&
                  op->src[1]->type == GGML_TYPE_I32 &&
-                 op->ne[2] == 1 && op->ne[3] == 1;
+                 op->ne[2] == 1 && op->ne[3] == 1 && ggml_is_contiguous(op) &&
+                 op->src[0]->ne[2] == 1 && op->src[0]->ne[3] == 1 &&
+                 op->src[1]->ne[2] == 1 && op->src[1]->ne[3] == 1 &&
+                 op->src[0]->nb[0] == ggml_type_size(op->src[0]->type) &&
+                 op->src[1]->nb[0] == sizeof(int32_t);
          case GGML_OP_SET:
                return (op->type == GGML_TYPE_F32) &&
                       (op->src[0] && op->src[1]) &&
