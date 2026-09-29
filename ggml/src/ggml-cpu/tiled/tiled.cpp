@@ -647,6 +647,19 @@ static bool ggml_tiled_min_batch(int64_t rows) {
     return rows >= 8 || ggml_tiled_matmul_forced();
 }
 
+static bool ggml_tiled_mmid_enabled(enum ggml_type type) {
+#if !defined(__AVX512VNNI__)
+    // AVX2 routed Q4_K/Q6_K loses ~12% Flash-Next PP; projection sweeps are
+    // mostly slower at 8..128 rows/expert. Preserve vec-dot until requalified.
+    // Dense GEMM and VNNI keep tiled dispatch; FORCE still allows diagnostics.
+    if (type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q6_K) {
+        return ggml_tiled_matmul_forced();
+    }
+#endif
+    UNUSED(type);
+    return true;
+}
+
 // per-thread workspace slot size (0 when tiled is disabled or unsupported on this arch)
 static size_t ggml_tiled_ws_size(void) {
     if (!ggml_tiled_matmul_enabled()) {
@@ -656,6 +669,9 @@ static size_t ggml_tiled_ws_size(void) {
 }
 
 size_t ggml_tiled_wdata_size(int n_tasks, struct ggml_tensor * dst) {
+    if (dst->op == GGML_OP_MUL_MAT_ID && !ggml_tiled_mmid_enabled(dst->src[0]->type)) {
+        return 0;
+    }
     if (! ggml_tiled_supported(dst->src[0], dst->src[1])) {
         return 0; // unsupported, don't allocate
     }
@@ -1236,6 +1252,9 @@ bool ggml_compute_forward_mul_mat_id_tiled(
         const int32_t *                    expert_rows,
         char *                             scratch) {
     if (params->use_ref) {
+        return false;
+    }
+    if (!ggml_tiled_mmid_enabled(dst->src[0]->type)) {
         return false;
     }
     if (!ggml_tiled_supported(dst->src[0], dst->src[1])) {
