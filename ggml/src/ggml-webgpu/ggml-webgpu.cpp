@@ -3271,8 +3271,24 @@ static bool ggml_webgpu_can_fuse_gdn_cache(const struct ggml_cgraph * cgraph, in
 
     // src must be this gdn's snapshot tail (contiguous, at the tail offset)
     if (cpy_src->op != GGML_OP_VIEW || cpy_src->view_src != gdn || cpy_src->view_offs != tail_off ||
-        !ggml_is_contiguous(cpy_src)) {
+        !ggml_is_contiguous(cpy_src) || (cpy_src->flags & GGML_TENSOR_FLAG_OUTPUT)) {
         return false;
+    }
+
+    // The fused shader does not populate the original snapshot tail. A tape,
+    // checkpoint, or second view must never observe those unwritten bytes.
+    for (int j = node_idx + 1; j < cgraph->n_nodes; ++j) {
+        const ggml_tensor * use = cgraph->nodes[j];
+        for (const ggml_tensor * src : use->src) {
+            if (src == cpy_src && use != cpy) {
+                return false;
+            }
+            if (src == gdn && use != cpy_src &&
+                (use->op != GGML_OP_VIEW || use->view_src != gdn ||
+                 use->view_offs > tail_off || ggml_nbytes(use) > tail_off - use->view_offs)) {
+                return false;
+            }
+        }
     }
 
     // dst is the [D, n_seqs, n_written] cache view; require nb[1] == D (the per-seq stride the kernel
