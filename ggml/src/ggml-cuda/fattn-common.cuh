@@ -1912,7 +1912,8 @@ static __global__ void flash_attn_combine_results(
 }
 
 void ggml_cuda_flash_attn_ext_compact_mask(
-        const ggml_tensor * mask, int32_t * indices, int32_t n_kv_max, cudaStream_t stream);
+        const ggml_tensor * mask, int32_t * indices, int32_t * counts,
+        int32_t n_queries, int32_t ncols1, int32_t n_kv_max, cudaStream_t stream);
 
 template <int DV, int ncols1, int ncols2>
 void launch_fattn(

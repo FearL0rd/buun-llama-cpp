@@ -260,12 +260,12 @@ static void ggml_cuda_mul_mat_q_impl(
             ne02, ne12, s02, s12, s2,
             ne03, ne13, s03, s13, s3,
             ne1, ne1};
-        ggml_cuda_mul_mat_q_switch_type(ctx, args, stream);
+        ggml_cuda_mul_mat_q_switch_type(ctx, args, stream, prec_src1);
         if (src0_pair) {
             mmq_args pair_args = args;
             pair_args.x   = static_cast<const char *>(src0_pair->data);
             pair_args.dst = static_cast<float *>(dst_pair->data);
-            ggml_cuda_mul_mat_q_switch_type(ctx, pair_args, stream);
+            ggml_cuda_mul_mat_q_switch_type(ctx, pair_args, stream, prec_src1);
         }
         return;
     }
