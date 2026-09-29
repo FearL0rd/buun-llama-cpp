@@ -545,21 +545,22 @@ void block_b_to_shmem(block_b_prefetch blk, uint buf_ib, uint ks, uint loadr, bo
 
 #ifdef MUL_MAT_ID
 #define B_IB_CALC                                                                               \
-            const u16vec2 row_idx = row_ids[buf_ib];                                            \
+            const u16vec2 row_idx = row_ids[min(buf_ib, _ne1 - ic * BN - 1)];                  \
             const uint ib = pos_b_ib + row_idx.y * p.batch_stride_b / BK                        \
                           + (row_idx.x % p.ne11) * p.stride_b / BK;
 #else
 #define B_IB_CALC                                                                               \
-            const uint ib = pos_b_ib + buf_ib * p.stride_b / BK;
+            const uint ib = pos_b_ib + min(buf_ib, p.N - ic * BN - 1) * p.stride_b / BK;
 #endif
 
 #define PREFETCH_BLOCK(blk)                                                                     \
     [[unroll]] for (uint li = 0; li < A_LOADS; li++) {                                          \
         const uint buf_ib = loadc_a + li * loadstride_a;                                        \
         if (buf_ib < BM) {                                                                      \
-            const uint ib = pos_a_ib + buf_ib * p.stride_a / BK;                                \
+            const uint ib = pos_a_ib + min(buf_ib, p.M - ir * BM - 1) * p.stride_a / BK;        \
             [[unroll]] for (uint ks = 0; ks < BK_STEP; ks++) {                                  \
-                pre_a[li * BK_STEP + ks] = block_a_load(ib + ks, loadr_a);                      \
+                const uint ib_k = ((blk) + ks * BK < end_k) ? ib + ks : ib;                    \
+                pre_a[li * BK_STEP + ks] = block_a_load(ib_k, loadr_a);                         \
             }                                                                                   \
         }                                                                                       \
     }                                                                                           \

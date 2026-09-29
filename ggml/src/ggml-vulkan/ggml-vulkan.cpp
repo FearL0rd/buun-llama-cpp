@@ -8174,7 +8174,21 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
     bool xe_fa_supported_platform =
         (ctx->device.get()->architecture == INTEL_XE2 && ctx->device.get()->properties.deviceID != 0xFD80 && ctx->device.get()->properties.deviceID != 0xFD81) ||
         (ctx->device.get()->architecture == INTEL_XE1 && ctx->device.get()->coopmat_support && ctx->device.get()->uma);
-    bool xe_fa_supported_usage = neq0 % 32 == 0 && nev0 % 16 == 0 && q->nb[1] > q->nb[2] && k->nb[1] > k->nb[2] && v->nb[1] > v->nb[2] && mask != nullptr;
+    // The Xe shaders use packed Q/head rows and whole 256-cell PV tiles. They
+    // do not implement ALiBi, softcap, broadcast masks or ragged decode batches.
+    // Keep those shapes on the generic attention path instead of relying on
+    // allocation padding or silently dropping numerical parameters.
+    const bool xe_fa_supported_usage = neq1 == 1 && neq0 % 32 == 0 && nev0 % 16 == 0 &&
+        KV % 256 == 0 && qk_ratio <= 16 && (qk_ratio & (qk_ratio - 1)) == 0 &&
+        max_bias == 0.0f && logit_softcap == 0.0f &&
+        q->nb[0] == sizeof(float) && q->nb[2] == neq0 * sizeof(float) &&
+        q->nb[1] == neq0 * neq2 * sizeof(float) &&
+        k->nb[0] == sizeof(ggml_fp16_t) && v->nb[0] == sizeof(ggml_fp16_t) &&
+        k->nb[1] > k->nb[2] && v->nb[1] > v->nb[2] &&
+        k->ne[3] == neq3 && v->ne[3] == neq3 && k->ne[2] == v->ne[2] &&
+        mask != nullptr && mask->ne[0] == KV && mask->ne[2] == 1 && mask->ne[3] == neq3 &&
+        mask->nb[0] == sizeof(ggml_fp16_t) && mask->nb[1] == KV * sizeof(ggml_fp16_t) &&
+        ggml_is_contiguous(dst);
     bool xe_fa_supported_dtype = q->type == GGML_TYPE_F32 && k->type == GGML_TYPE_F16 && v->type == GGML_TYPE_F16 && (mask != nullptr && mask->type == GGML_TYPE_F16);
     std::pair<vk_pipeline, vk_pipeline> xe_fa_pipeline_dual_phases = { nullptr , nullptr };
     vk_pipeline xe_fa_pipeline = nullptr;
@@ -16535,4 +16549,3 @@ void ggml_vk_debug_label::begin(vk_context & ctx, const std::string & name) {
     subctx->debug_labels.push_back(name);
     ggml_vk_cmd_label_begin(subctx->s->buffer->buf, subctx->debug_labels.back().c_str());
 }
-
