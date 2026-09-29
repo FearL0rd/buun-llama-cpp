@@ -2392,6 +2392,8 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         }
     }
 
+    prec_policy.load(ml, *this);
+
     ml.init_mappings(params.mmap_prefetch, use_mlock ? &pimpl->mlock_mmaps : nullptr,
                      params.progress_callback, params.progress_callback_user_data);
     pimpl->mappings.reserve(ml.mappings.size());
@@ -4001,6 +4003,7 @@ llama_rope_type llama_model_rope_type(const llama_model * model) {
         case LLM_ARCH_MELLUM:
         case LLM_ARCH_MAPLE:
         case LLM_ARCH_SPARK2_5:
+        case LLM_ARCH_HRM_TEXT:
             return LLAMA_ROPE_TYPE_NEOX;
 
         case LLM_ARCH_DFLASH:

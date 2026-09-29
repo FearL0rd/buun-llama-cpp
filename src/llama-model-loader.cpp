@@ -1060,6 +1060,15 @@ llama_model_loader::llama_model_loader(
             throw std::runtime_error(format("%s: failed to load model from file pointer", __func__));
         }
 
+        // An embedded GGUF's data offset is absolute in the borrowed file.
+        // Native tensor sources have their own region/alignment checks.
+        const size_t tensor_align = ggml_backend_buft_get_alignment(ggml_backend_cpu_buffer_type());
+        if (use_mmap && gguf_get_data_offset(metadata) % tensor_align != 0) {
+            ggml_free(ctx);
+            throw std::runtime_error(format("%s: GGUF data section at file offset %zu is not %zu byte aligned, cannot mmap",
+                __func__, gguf_get_data_offset(metadata), tensor_align));
+        }
+
         resolve_model_architecture(*this);
 
         files.emplace_back(new llama_file(file));

@@ -1094,6 +1094,11 @@ class ModelBase:
         logger.info(f"Repacked {new_name} with shape [{len(experts)}, {shape[0]}, {shape[1]}] and quantization NVFP4")
         self.gguf_writer.add_tensor(new_name, merged, raw_dtype=gguf.GGMLQuantizationType.NVFP4)
         self._tag_prec_a4(merged_name, new_name)
+        # A single stacked op has one activation precision. Any expert needing
+        # A8 vetoes A4 for the stack; looking up only its synthetic name loses
+        # per-expert module overrides.
+        for expert_id, _ in experts:
+            self._tag_prec_a4(f"model.layers.{bid}.mlp.experts.{expert_id}.{proj_type}.weight", new_name)
 
         scales.sort(key=lambda x: x[0])
         self._write_scales_tensor(new_name.replace(".weight", ".scale"), [s[1] for s in scales])

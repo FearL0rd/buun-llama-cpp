@@ -2188,6 +2188,33 @@ int main(int argc, char ** argv) try {
                 "generic BPE tokenizer metadata is wrong");
         gguf_free(metadata);
 
+        const llama_safetensors_tokenizer_json byte_level = {{"type", "ByteLevel"}};
+        const llama_safetensors_tokenizer_json template_processing = {
+            {"type", "TemplateProcessing"},
+            {"single", {
+                {{"SpecialToken", {{"id", "a"}}}},
+                {{"Sequence", {{"id", "A"}}}},
+                {{"SpecialToken", {{"id", "b"}}}},
+            }},
+        };
+        for (const auto & processors : {
+                llama_safetensors_tokenizer_json::array({byte_level}),
+                llama_safetensors_tokenizer_json::array({byte_level, template_processing}),
+                llama_safetensors_tokenizer_json::array({template_processing, byte_level})}) {
+            auto processed = tokenizer;
+            processed["post_processor"] = {{"type", "Sequence"}, {"processors", processors}};
+            llama_safetensors_metadata_sink processed_sink;
+            // Deliberately oppose the template/default to catch precedence bugs.
+            const bool expected = processors.size() > 1;
+            llama_safetensors_bpe_policy policy{"fixture", 4, 0, 1, std::nullopt};
+            policy.add_bos_token = !expected;
+            llama_safetensors_emit_bpe_tokenizer(processed_sink, processed, policy, std::nullopt);
+            gguf_context_ptr result(processed_sink.release());
+            require(gguf_get_val_bool(result.get(), gguf_find_key(result.get(), "tokenizer.ggml.add_bos_token")) == expected &&
+                    gguf_get_val_bool(result.get(), gguf_find_key(result.get(), "tokenizer.ggml.add_eos_token")) == expected,
+                    "post-processor special-token precedence differs from GGUF conversion");
+        }
+
         std::vector<uint8_t> spm;
         const auto append_piece = [&](std::string_view token, float score, uint8_t type) {
             std::vector<uint8_t> piece = { 0x0a, static_cast<uint8_t>(token.size()) };

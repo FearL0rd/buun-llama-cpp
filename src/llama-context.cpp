@@ -5806,6 +5806,7 @@ llm_graph_params llama_context::graph_params(
         /*.tree_parent_ids         =*/ tree_bufs.active ? tree_bufs.parent_ids_gpu : nullptr,
         /*.tree_ssm_intermediates  =*/ tree_bufs.active ? &tree_bufs.ssm_intermediates : nullptr,
         /*.tree_n_recurrent_layers =*/ (int)tree_bufs.ssm_intermediates.size(),
+        /*.prec_policy =*/ &model.prec_policy,
         /*.samplers    =*/ sampling.samplers,
         /*.n_outputs   =*/ n_outputs,
         /*.cb          =*/ graph_get_cb(),

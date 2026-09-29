@@ -73,6 +73,12 @@ struct llama_hparams {
     uint32_t n_layer_all;
     uint32_t n_layer_nextn = 0;
 
+    // HRM's physical H/L stacks repeat across distinct cache slots.
+    uint32_t n_hrm_layers_per_stack = 0;
+    uint32_t n_hrm_h_cycles = 0;
+    uint32_t n_hrm_l_cycles = 0;
+    bool hrm_prefix_lm = false;
+
     // Registry key for the baked KV affine means. Zero means this model has no calibrated table.
     int turbo_meansub_id = 0;
     // granite-switch: index of the single-head "router" KV layer that encodes

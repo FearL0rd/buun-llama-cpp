@@ -1843,6 +1843,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     tree_parent_ids           (params.tree_parent_ids),
     tree_ssm_intermediates    (params.tree_ssm_intermediates),
     tree_n_recurrent_layers   (params.tree_n_recurrent_layers),
+    prec_policy      (params.prec_policy),
     samplers         (params.samplers),
     cb_func          (params.cb),
     res              (params.res),
