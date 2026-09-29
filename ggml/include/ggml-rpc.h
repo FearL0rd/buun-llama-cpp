@@ -6,7 +6,7 @@
 extern "C" {
 #endif
 
-#define RPC_PROTO_MAJOR_VERSION    6
+#define RPC_PROTO_MAJOR_VERSION    7
 #define RPC_PROTO_MINOR_VERSION    0
 // 6: the fork op enum (tree ops + TURBO_WHT + DSV4_HC_PARAMS) has a different wire
 //    ordering from protocol 5. The HELLO handshake checks major/minor only, so an enum

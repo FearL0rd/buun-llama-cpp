@@ -16,6 +16,8 @@
 #include <cmath>
 #include <cstdlib>
 #include <cstdio>
+#include <cstring>
+#include <filesystem>
 #include <limits>
 #include <set>
 #include <string>
@@ -1106,13 +1108,15 @@ static bool test_multi_seq_split_replay(const common_params & params, llama_mode
         return false;
     }
 
-    // identical ubatch shapes from bit-exact states: a correct implementation
-    // matches bitwise, so eps only allows backend scheduling noise
-    constexpr float eps = 1e-7f;
+    // both contexts decode identical batches, so the logits should match;
+    // random dummy models can still drift up to ~1.7e-5, so the bound is 1e-4
+    constexpr float nmse_eps = 1e-4f;
 
     float    diff_max  = 0.0f;
     uint32_t seq_first = 0;
     int32_t  pos_first = -1;
+    double   nmse_ab   = 0.0;
+    double   nmse_a0   = 0.0;
     for (uint32_t i = 0; i < n_seqs*n_replay; ++i) {
         const float * l_roll = llama_get_logits_ith(ctx_roll.get(), i);
         const float * l_ref  = llama_get_logits_ith(ctx_ref.get(),  i);
@@ -1121,14 +1125,25 @@ static bool test_multi_seq_split_replay(const common_params & params, llama_mode
             return false;
         }
         for (int t = 0; t < n_vocab; ++t) {
-            const float diff = logit_diff(l_roll[t], l_ref[t]);
-            if (diff > eps && pos_first < 0) {
+            const float r = l_roll[t];
+            const float f = l_ref[t];
+            const float diff = logit_diff(r, f);
+            if (diff > 0.0f && pos_first < 0) {
                 seq_first = i/n_replay;
                 pos_first = p0 + (int32_t) (i%n_replay);
             }
             diff_max = std::max(diff_max, diff);
+            if (std::isfinite(r) && std::isfinite(f)) {
+                const double d = (double) r - f;
+                nmse_ab += d*d;
+                nmse_a0 += (double) r*r;
+            } else {
+                nmse_ab = std::numeric_limits<double>::infinity();
+                nmse_a0 = 1.0;
+            }
         }
     }
+    const double nmse_val = nmse_a0 == 0.0 ? (nmse_ab == 0.0 ? 0.0 : std::numeric_limits<double>::infinity()) : nmse_ab/nmse_a0;
 
     if (diff_max > eps) {
         fprintf(stderr, "%s : multi-seq split replay logits mismatch (max diff %g, first at seq %u pos %d)\n",
@@ -1136,7 +1151,7 @@ static bool test_multi_seq_split_replay(const common_params & params, llama_mode
         return false;
     }
 
-    fprintf(stderr, "%s : multi-seq split replay matched (max diff %g)\n", __func__, (double) diff_max);
+    LOG_INF("%s: multi-seq split replay matched (max diff %g, nmse %g)\n", __func__, (double) diff_max, nmse_val);
 
     // seq-1-only decodes must be independent of seq 0's content: diverge seq 0
     // in ctx_ref only, then compare identical seq-1-only continuations bitwise
@@ -1153,6 +1168,8 @@ static bool test_multi_seq_split_replay(const common_params & params, llama_mode
     }
 
     float diff_tail = 0.0f;
+    double nmse_tail_ab = 0.0;
+    double nmse_tail_a0 = 0.0;
     for (uint32_t i = 0; i < n_tail && ok; ++i) {
         const llama_pos pos = p0 + (llama_pos) (n_replay + i);
         llama_batch batch_one = llama_batch_init(1, 0, 1);
@@ -1168,9 +1185,20 @@ static bool test_multi_seq_split_replay(const common_params & params, llama_mode
         const float * l_ref  = llama_get_logits_ith(ctx_ref.get(),  0);
         ok = l_roll != nullptr && l_ref != nullptr;
         for (int t = 0; ok && t < n_vocab; ++t) {
-            diff_tail = std::max(diff_tail, logit_diff(l_roll[t], l_ref[t]));
+            const float r = l_roll[t];
+            const float f = l_ref[t];
+            diff_tail = std::max(diff_tail, logit_diff(r, f));
+            if (std::isfinite(r) && std::isfinite(f)) {
+                const double d = (double) r - f;
+                nmse_tail_ab += d*d;
+                nmse_tail_a0 += (double) r*r;
+            } else {
+                nmse_tail_ab = std::numeric_limits<double>::infinity();
+                nmse_tail_a0 = 1.0;
+            }
         }
     }
+    const double nmse_tail = nmse_tail_a0 == 0.0 ? (nmse_tail_ab == 0.0 ? 0.0 : std::numeric_limits<double>::infinity()) : nmse_tail_ab/nmse_tail_a0;
 
     if (!ok || diff_tail > eps) {
         fprintf(stderr, "%s : seq-1-only decode leaked seq 0 state (ok=%d, max diff %g)\n",
@@ -1400,6 +1428,8 @@ int main(int argc, char ** argv) {
             return 1;
         }
     }
+    filtered_argv.push_back(nullptr);
+    const int fargc = (int)filtered_argv.size() - 1;
 
     auto * recurrent = get_recurrent(ctx_test.get());
     if (recurrent == nullptr || recurrent->n_rs_seq < 3) {

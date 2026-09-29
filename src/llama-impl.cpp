@@ -1,8 +1,10 @@
 #include "llama-impl.h"
 
+#include "ggml-backend.h"
 #include "gguf.h"
 #include "llama.h"
 
+#include <algorithm>
 #include <cinttypes>
 #include <climits>
 #include <cstdarg>
