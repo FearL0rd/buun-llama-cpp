@@ -150,14 +150,14 @@ int llama_server(common_params & params, int argc, char ** argv) {
     if (params.cache_plan_preflight &&
         (is_router_server ||
          !server_cache_plan_preflight_exposure_allowed(
-             params.hostname, params.api_keys.size()))) {
+             params.hostnames, params.api_keys.size()))) {
         SRV_ERR("%s", "--cache-plan-preflight requires a single-model, trusted-local, single-principal server\n");
         return 1;
     }
     if (params.cache_control_api &&
         (is_router_server ||
          !server_cache_plan_preflight_exposure_allowed(
-             params.hostname, params.api_keys.size()))) {
+             params.hostnames, params.api_keys.size()))) {
         SRV_ERR("%s", "--cache-control-api requires a single-model, trusted-local, single-principal server\n");
         return 1;
     }

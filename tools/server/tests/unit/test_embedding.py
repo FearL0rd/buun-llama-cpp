@@ -30,6 +30,33 @@ def test_embedding_single():
     assert abs(sum([x ** 2 for x in res.body['data'][0]['embedding']]) - 1) < EPSILON
 
 
+def test_causal_embeddings_do_not_restore_chat_or_prior_embedding():
+    global server
+    server = ServerPreset.tinyllama2()
+    server.n_slots = 1
+    server.server_embeddings = True
+    server.server_slots = True
+    server.pooling = 'last'
+    server.start()
+    prompt = "Once upon a time, there was a small house near the forest."
+    chat = server.make_request("POST", "/completion", data={
+        "prompt": prompt, "n_predict": 1, "cache_prompt": True,
+    })
+    assert chat.status_code == 200
+    outputs = []
+    for _ in range(2):
+        res = server.make_request("POST", "/v1/embeddings", data={
+            "input": prompt, "cache_prompt": True,
+        })
+        assert res.status_code == 200
+        outputs.append(res.body['data'][0]['embedding'])
+        slots = server.make_request("GET", "/slots")
+        assert slots.status_code == 200
+        assert slots.body[0]['n_prompt_tokens_cache'] == 0
+        assert slots.body[0]['n_prompt_tokens_processed'] > 1
+    assert outputs[0] == outputs[1]
+
+
 def test_embedding_multiple():
     global server
     server.pooling = 'last'
