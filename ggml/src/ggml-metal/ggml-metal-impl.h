@@ -117,6 +117,11 @@
 #define FC_UPSCALE                     1500
 #define FC_GATED_DELTA_NET             1600
 #define FC_TURBO_WHT                   1700
+#define FC_TOPK_MOE                    1800
+#define FC_MOE_REDUCE                  1900
+#define FC_NORM                        2000
+#define FC_DSV4_HC                     2100
+#define FC_PAD                         2200
 
 // op-specific constants
 #define OP_FLASH_ATTN_EXT_NQPSG 8
