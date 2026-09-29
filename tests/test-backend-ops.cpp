@@ -4742,6 +4742,7 @@ struct test_dsv4_hc_post : public test_dsv4_hc {
     const int64_t n_tokens;
     const bool    identity;
     const bool    gated;
+    const int64_t n_hc;
 
     std::string op_desc(ggml_tensor * t) override {
         GGML_UNUSED(t);
@@ -4749,16 +4750,18 @@ struct test_dsv4_hc_post : public test_dsv4_hc {
     }
 
     std::string vars() override {
-        return VARS_TO_STR4(n_embd, n_tokens, identity, gated);
+        return VARS_TO_STR5(n_embd, n_tokens, identity, gated, n_hc);
     }
 
     // gated: post = 2*sigmoid(post/hc), as qwen4exp builds it, so backends can fuse the chain
     bool run_whole_graph() override { return gated; }
 
-    test_dsv4_hc_post(int64_t n_embd = 31, int64_t n_tokens = 17, bool identity = false, bool gated = false)
-        : n_embd(n_embd), n_tokens(n_tokens), identity(identity), gated(gated) {}
+    test_dsv4_hc_post(int64_t n_embd = 31, int64_t n_tokens = 17, bool identity = false, bool gated = false,
+                     int64_t n_hc = 4)
+        : n_embd(n_embd), n_tokens(n_tokens), identity(identity), gated(gated), n_hc(n_hc) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t hc = n_hc;
         ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tokens);
         ggml_set_name(x, "x");
 
@@ -10963,6 +10966,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_dsv4_hc_post(31, 17, true, true));
     test_cases.emplace_back(new test_dsv4_hc_post(2560, 21, true, true));
     test_cases.emplace_back(new test_dsv4_hc_post(31, 17, false, true));
+    for (int64_t n_hc : {1, 3, 5, 65}) {
+        test_cases.emplace_back(new test_dsv4_hc_post(31, 17, true, true, n_hc));
+        test_cases.emplace_back(new test_dsv4_hc_post(31, 17, false, false, n_hc));
+    }
 
     for (ggml_type base_type : {GGML_TYPE_F16, GGML_TYPE_F32}) {
         test_cases.emplace_back(new test_dflash2_conv(base_type, 80,  8, 16,  8, 0));

@@ -803,19 +803,22 @@ public:
             uint32_t ratio,
             uint32_t top_k,
             bool blk_bias,
-            bool selection_required) :
-        mctx(mctx), ratio(ratio), top_k(top_k), blk_bias(blk_bias), selection_required(selection_required) {}
+            bool selection_required,
+            bool causal_attn) :
+        mctx(mctx), ratio(ratio), top_k(top_k), blk_bias(blk_bias), selection_required(selection_required),
+        causal_attn(causal_attn) {}
     virtual ~llm_graph_input_qsa() = default;
 
     void set_input(const llama_ubatch * ubatch) override {
         mctx->get_idx()->set_input_k_idxs(k_idxs, ubatch);
         if (selection_required) {
-            mctx->set_input_qsa(cell_blk, blk_cells, blk_pos, bias, ubatch, ratio, blk_bias);
+            mctx->set_input_qsa(cell_blk, blk_cells, blk_pos, bias, ubatch, ratio, blk_bias, causal_attn);
         }
     }
 
     bool can_reuse(const llm_graph_params & params) override {
         mctx = static_cast<const llama_memory_hybrid_idx_context *>(params.mctx);
+        causal_attn = params.cparams.causal_attn;
 
         const auto * idx = mctx->get_idx();
         if (idx == nullptr) {
@@ -862,6 +865,7 @@ public:
     // the per-cell half of the bias is the attention mask, so only the per-block half is uploaded
     const bool blk_bias;
     const bool selection_required;
+    bool causal_attn;
 };
 
 ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
@@ -911,7 +915,8 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
                 (uint32_t) r,
                 hparams.indexer_top_k,
                 blk_bias,
-                selection_required);
+                selection_required,
+                cparams.causal_attn);
 
         qsa->k_idxs    = mctx_idx->build_input_k_idxs(ctx0, ubatch);
         if (selection_required) {
