@@ -543,6 +543,7 @@ private:
     // Choose a synthetic reserve shape that both the configured context and the
     // current physical memory context can represent. Returns zero when unavailable.
     uint32_t effective_reserve_n_seqs(const llama_memory_context_i * mctx) const;
+    llm_graph_result * get_gf_res_prev();
 
     llm_graph_params graph_params(
                         llm_graph_result * res,
@@ -675,6 +676,7 @@ private:
 
     // one-time Hadamard transform-coverage check on the first built graph
     bool hadamard_verified = false;
+    llm_graph_result * gf_res_prev_active = nullptr;
 
     // host buffer for the model output (logits and embeddings)
     ggml_backend_buffer_ptr buf_output;

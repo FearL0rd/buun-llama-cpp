@@ -101,6 +101,18 @@ struct llama_batch_ext {
     std::vector<token> tokens;
     std::vector<float> embd;
 
+    // Reusable metadata view for the shared legacy decode/allocator path. The
+    // extended API owns its embeddings; already ordered rows need no second copy.
+    bool get_batch(llama_batch & batch) const;
+
+    mutable std::vector<llama_token> flat_token;
+    mutable std::vector<float> flat_embd;
+    mutable std::vector<llama_pos> flat_pos;
+    mutable std::vector<int32_t> flat_n_seq_id;
+    mutable std::vector<llama_seq_id> flat_seq_id_data;
+    mutable std::vector<llama_seq_id *> flat_seq_id;
+    mutable std::vector<int8_t> flat_output;
+
     llama_batch_ext(llama_context * ctx);
 
     // build without a llama_context, used by tests
@@ -136,6 +148,16 @@ public:
             const llama_batch_ext & batch_inp,
             const llama_vocab & vocab,
             bool output_all);
+
+    // Keep borrowed legacy batches on the established zero-copy input path.
+    bool init(
+            const llama_batch & batch_inp,
+            const llama_vocab & vocab,
+            const llama_memory_i * memory,
+            uint32_t n_embd,
+            uint32_t n_seq_max,
+            bool output_all,
+            bool token_ids_validated = false);
 
     const llama_batch & get_batch() const;
 
@@ -191,9 +213,7 @@ private:
     uint32_t n_seq_max;
     uint32_t n_outputs;
 
-    std::vector<llama_token>    token_vec;    // owned token IDs built from llama_batch_ext
-    std::vector<float>          embd_vec;     // owned embeddings built from llama_batch_ext
-    std::vector<llama_seq_id>   seq_id_data;  // flat storage for seq_id pointers below
+    std::vector<llama_seq_id>   seq_id_0 = { 0 };
 
     std::vector<llama_pos>      pos;
     std::vector<int32_t>        n_seq_id;
@@ -239,5 +259,5 @@ struct llama_batch_compat {
 
     // fill an existing llama_batch_ext from a llama_batch (old API)
     // note: this is called directly by the tests, skipping llama_context creation
-    static void init(llama_batch_ext & batch_ext, const llama_batch & batch_inp, size_t n_embd_row = 0);
+    static bool init(llama_batch_ext & batch_ext, const llama_batch & batch_inp, size_t n_embd_row = 0);
 };

@@ -10,6 +10,7 @@
 
 #include <cstdlib>
 #include <initializer_list>
+#include <limits>
 #include <map>
 #include <string>
 #include <utility>
@@ -1042,6 +1043,71 @@ static void test_mtp_embd_width(testing & t) {
     });
 }
 
+static void test_sync_bridge(testing & t) {
+    t.test("out_of_order_embedding_rows", [&](testing & t) {
+        batch_builder bb;
+        const float a[] = { 1, 2 }, b[] = { 3, 4 };
+        const auto i = bb.b.add_token(0), j = bb.b.add_token(0);
+        t.assert_true(bb.b.set_token_embd(j, { b, 1, 2 }));
+        t.assert_true(bb.b.set_token_embd(i, { a, 1, 2 }));
+        llama_batch view = {};
+        t.assert_true(bb.b.get_batch(view));
+        t.assert_equal(1.0f, view.embd[0]);
+        t.assert_equal(2.0f, view.embd[1]);
+        t.assert_equal(3.0f, view.embd[2]);
+        t.assert_equal(4.0f, view.embd[3]);
+    });
+    t.test("failed_add_is_atomic", [&](testing & t) {
+        batch_builder bb;
+        const float row[] = { 1, 2 };
+        t.assert_equal(-2, llama_batch_ext_add_token(&bb.b, 0, 123));
+        t.assert_equal((size_t) 0, bb.b.tokens.size());
+        t.assert_equal(-2, llama_batch_ext_add_embd(&bb.b, 0,
+                { row, std::numeric_limits<size_t>::max(), 2 }));
+        t.assert_equal((size_t) 0, bb.b.tokens.size());
+        t.assert_equal((size_t) 0, bb.b.n_embd);
+        t.assert_equal(0, llama_batch_ext_add_embd(&bb.b, 0, { row, 1, 2 }));
+    });
+    t.test("legacy_shared_sequence_positions", [&](testing & t) {
+        batch_builder bb;
+        float rows[] = { 1, 2, 3, 4 };
+        int32_t counts[] = { 2, 1 };
+        llama_seq_id both[] = { 0, 1 }, second[] = { 1 };
+        llama_seq_id * ids[] = { both, second };
+        llama_batch legacy = {};
+        legacy.n_tokens = 2;
+        legacy.embd = rows;
+        legacy.n_seq_id = counts;
+        legacy.seq_id = ids;
+        t.assert_true(llama_batch_compat::init(bb.b, legacy));
+        t.assert_equal(0, bb.b.tokens[0].pos[0]);
+        t.assert_equal(1, bb.b.tokens[1].pos[0]);
+        second[0] = -1;
+        t.assert_true(!llama_batch_compat::init(bb.b, legacy));
+        t.assert_equal((size_t) 0, bb.b.tokens.size());
+    });
+    t.test("ordered_rows_and_legacy_keep_borrowed_view", [&](testing & t) {
+        batch_builder bb;
+        const float row[] = { 1, 2 };
+        t.assert_equal(0, llama_batch_ext_add_embd(&bb.b, 0, { row, 1, 2 }));
+        llama_batch view = {};
+        t.assert_true(bb.b.get_batch(view));
+        t.assert_true(view.embd == bb.b.embd.data());
+        llama_vocab vocab;
+        llama_batch_allocr alloc(1);
+        t.assert_true(alloc.init(view, vocab, nullptr, 2, 4, false));
+        t.assert_true(alloc.get_batch().embd == view.embd);
+    });
+    t.test("unified_staging_id_domain", [&](testing & t) {
+        batch_builder bb(2, nullptr, LLAMA_MAX_SEQ);
+        const float row[] = { 1, 2 };
+        t.assert_equal(0, llama_batch_ext_add_embd(&bb.b, LLAMA_MAX_SEQ - 1, { row, 1, 2 }));
+        llama_batch view = {};
+        t.assert_true(bb.b.get_batch(view));
+        t.assert_equal(LLAMA_MAX_SEQ - 1, view.seq_id[0][0]);
+    });
+}
+
 int main(int argc, char ** argv) {
     testing t;
 
@@ -1064,6 +1130,7 @@ int main(int argc, char ** argv) {
     t.test("keep_tail",      test_keep_tail);
     t.test("mrope",          test_mrope);
     t.test("mtp_embd_width", test_mtp_embd_width);
+    t.test("sync_bridge",    test_sync_bridge);
 
     return t.summary();
 }

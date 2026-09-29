@@ -2546,7 +2546,7 @@ int32_t common_batch::add(llama_token id, llama_pos pos, llama_seq_id seq_id, bo
     if (output) {
         llama_batch_ext_set_output_logits(batch.get(), idx, true);
     }
-    tokens.push_back({ id, { pos, 0, 0, 0 }, seq_id, output, { nullptr, 0, 0 } });
+    tokens.push_back({ id, { pos, 0, 0, 0 }, seq_id, output, { nullptr, 0, 0 }, { seq_id } });
     return idx;
 }
 
@@ -2554,8 +2554,23 @@ bool common_batch::set_output(int32_t idx, bool value) {
     if (idx < 0 || idx >= (int32_t) tokens.size()) {
         return false;
     }
+    if (!llama_batch_ext_set_output_logits(batch.get(), idx, value)) {
+        return false;
+    }
     tokens[idx].output = value;
-    return llama_batch_ext_set_output_logits(batch.get(), idx, value);
+    return true;
+}
+
+bool common_batch::add_seq(int32_t idx, llama_seq_id seq_id) {
+    if (idx < 0 || idx >= (int32_t) tokens.size() ||
+            !llama_batch_ext_add_seq(batch.get(), idx, seq_id)) {
+        return false;
+    }
+    auto & ids = tokens[idx].seq_ids;
+    if (std::find(ids.begin(), ids.end(), seq_id) == ids.end()) {
+        ids.push_back(seq_id);
+    }
+    return true;
 }
 
 bool common_batch::set_embd(int32_t idx, llama_embd embd) {
@@ -2578,7 +2593,7 @@ int32_t common_batch::add_embd(llama_embd embd, const llama_pos * pos, llama_seq
     if (output) {
         llama_batch_ext_set_output_logits(batch.get(), idx, true);
     }
-    token t = { LLAMA_TOKEN_NULL, { 0, 0, 0, 0 }, seq_id, output, embd };
+    token t = { LLAMA_TOKEN_NULL, { 0, 0, 0, 0 }, seq_id, output, embd, { seq_id } };
     for (int32_t j = 0; j < n_pos; ++j) {
         t.pos[j] = pos[j];
     }
@@ -2596,21 +2611,19 @@ common_batch common_batch_from_llama_batch(llama_context * ctx, const llama_batc
 
     // positions continue from the memory when none are given
     auto * mem = llama_get_memory(ctx);
-    std::vector<llama_pos> pos_next(llama_n_seq_max(ctx));
-    for (llama_seq_id s = 0; s < (llama_seq_id) pos_next.size(); ++s) {
-        pos_next[s] = llama_memory_seq_pos_max(mem, s) + 1;
-    }
+    std::map<llama_seq_id, llama_pos> pos_next;
 
     for (int32_t i = 0; i < batch.n_tokens; ++i) {
-        const int32_t      n_sid  = batch.n_seq_id ? batch.n_seq_id[i]  : 1;
+        const int32_t      n_sid  = batch.seq_id && batch.n_seq_id ? batch.n_seq_id[i] : 1;
+        if (n_sid <= 0 || (batch.seq_id && !batch.seq_id[i])) {
+            GGML_ABORT("%s: invalid sequence set at token %d\n", __func__, i);
+        }
         const llama_seq_id seq_id = batch.seq_id   ? batch.seq_id[i][0] : 0;
 
         llama_pos pos[GGML_MROPE_SECTIONS] = { 0, 0, 0, 0 };
-        if (!batch.pos) {
-            pos[0] = pos_next[seq_id]++;
-        } else if (has_token) {
+        if (batch.pos && has_token) {
             pos[0] = batch.pos[i];
-        } else {
+        } else if (batch.pos) {
             // embedding batch: section-major layout pos[j*n_tokens + i]
             for (int32_t j = 0; j < res.n_pos; ++j) {
                 pos[j] = batch.pos[j * batch.n_tokens + i];
@@ -2625,14 +2638,29 @@ common_batch common_batch_from_llama_batch(llama_context * ctx, const llama_batc
         if (has_token) {
             idx = res.add(batch.token[i], pos[0], seq_id, output);
             if (has_embd) {
-                res.set_embd(idx, embd);
+                if (!res.set_embd(idx, embd)) {
+                    GGML_ABORT("%s: incompatible embedding at token %d\n", __func__, i);
+                }
             }
         } else {
             idx = res.add_embd(embd, pos, seq_id, output);
         }
 
         for (int32_t s = 1; s < n_sid; ++s) {
-            llama_batch_ext_add_seq(res.get(), idx, batch.seq_id[i][s]);
+            if (!res.add_seq(idx, batch.seq_id[i][s])) {
+                GGML_ABORT("%s: invalid secondary sequence at token %d\n", __func__, i);
+            }
+        }
+        if (!batch.pos) {
+            // Query memory only after the batch API has validated the IDs. The
+            // ID domain can exceed llama_n_seq_max() when KV is unified.
+            auto found = pos_next.find(seq_id);
+            pos[0] = found == pos_next.end() ? llama_memory_seq_pos_max(mem, seq_id) + 1 : found->second;
+            for (llama_seq_id id : res.tokens[idx].seq_ids) {
+                pos_next[id] = pos[0] + 1;
+            }
+            res.tokens[idx].pos[0] = pos[0];
+            GGML_ASSERT(llama_batch_ext_set_pos(res.get(), idx, pos));
         }
     }
 

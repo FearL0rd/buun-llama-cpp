@@ -1145,8 +1145,10 @@ void llama_context::sched_reserve() {
     const bool     reserve_all_outputs = cparams.logits_all || cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP || cparams.embeddings || cparams.pooling_type != LLAMA_POOLING_TYPE_NONE;
     const uint32_t n_outputs_pp = std::min(reserve_all_outputs ? n_tokens : n_seqs, cparams.n_outputs_max);
 
-    int n_splits_pp = -1;
-    int n_nodes_pp  = -1;
+    int n_splits_pp        = -1;
+    int n_nodes_pp         = -1;
+    int n_inputs_pp        = -1;
+    int n_input_tensors_pp = -1;
 
     int n_splits_tg        = -1;
     int n_nodes_tg         = -1;
@@ -4342,17 +4344,12 @@ int llama_context::encode(const llama_batch & batch_inp) {
 
     const auto & hparams = model.hparams;
 
-    if (batch_inp.n_embd > 0 && batch_inp.n_embd != hparams.n_embd_inp_enc()) {
-        LLAMA_LOG_ERROR("%s: embd row width %zu does not match the encoder input %u\n",
-                __func__, batch_inp.n_embd, hparams.n_embd_inp_enc());
-        return -1;
-    }
-
     // eagle3/DFlash: features as encoder input, and non-draft paths fall back to model's input dim
+    const int64_t n_embd = hparams.n_embd_inp_enc();
     const int64_t n_vocab = model.vocab.n_tokens();
 
-    // note: during encode, we always output all tokens and skip position continuity checks (output_all=true)
-    if (!balloc->init(batch_inp, model.vocab, true)) {
+    // note: during encode, we always pass the full sequence starting from pos = 0
+    if (!balloc->init(batch_inp, model.vocab, nullptr, n_embd, cparams.kv_unified ? LLAMA_MAX_SEQ : cparams.n_seq_max, true)) {
         LLAMA_LOG_ERROR("%s: failed to initialize batch\n", __func__);
         return -1;
     }
@@ -4627,14 +4624,8 @@ int llama_context::decode(const llama_batch & batch_inp) {
         return encode(batch_inp);
     }
 
-    if (batch_inp.tokens.empty()) {
+    if (batch_inp.n_tokens == 0) {
         LLAMA_LOG_ERROR("%s: n_tokens == 0\n", __func__);
-        return -1;
-    }
-
-    if (batch_inp.n_embd > 0 && batch_inp.n_embd != batch_inp.n_embd_inp) {
-        LLAMA_LOG_ERROR("%s: embd row width %zu does not match the decoder input %zu\n",
-                __func__, batch_inp.n_embd, batch_inp.n_embd_inp);
         return -1;
     }
 
@@ -4655,17 +4646,20 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
     const uint32_t n_seq_max = cparams.kv_unified ? LLAMA_MAX_SEQ : cparams.n_seq_max;
 
-    // TODO: avoid this workaround in the future
-    // embedding contexts output every token even when no token is explicitly marked as output
-    if (has_samplers) {
+    // embedding contexts output every token even when batch.logits is not set
+    if (has_samplers && (output_all || batch_inp.logits)) {
         std::vector<int32_t> seq_output_count(n_seq_max, 0);
 
-        for (const auto & tok : batch_inp.tokens) {
-            if (!output_all && !tok.output) {
+        for (int32_t i = 0; i < batch_inp.n_tokens; ++i) {
+            if (!output_all && batch_inp.logits[i] == 0) {
                 continue;
             }
 
-            for (auto seq_id : tok.seq_ids) {
+            const int ns = batch_inp.n_seq_id ? batch_inp.n_seq_id[i] : 1;
+
+            for (int32_t s = 0; s < ns; ++s) {
+                const llama_seq_id seq_id = batch_inp.seq_id ? batch_inp.seq_id[i][s] : 0;
+
                 if (seq_id < 0 || (uint32_t) seq_id >= n_seq_max) {
                     continue;
                 }
@@ -4683,7 +4677,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
         }
     }
 
-    if (!balloc->init(batch_inp, vocab, output_all)) {
+    if (!balloc->init(batch_inp, vocab, memory.get(), n_embd, n_seq_max, output_all)) {
         LLAMA_LOG_ERROR("%s: failed to initialize batch\n", __func__);
         return -1;
     }
@@ -8937,16 +8931,35 @@ size_t llama_state_seq_load_file(llama_context * ctx, const char * filepath, lla
     }
 }
 
-// compat: llama_batch -> llama_batch_ext -> encode/decode
-
-int llama_context::encode(const llama_batch & batch_inp) {
-    llama_batch_compat compat(this, batch_inp, model.hparams.n_embd_inp_enc());
-    return encode(*compat.batch_ext);
+// Both public APIs enter the same decode/state owner. Legacy callers keep
+// borrowing their original arrays; extended batches materialize metadata once.
+int llama_context::encode(const llama_batch_ext & batch_inp) {
+    if ((batch_inp.n_embd > 0 && batch_inp.n_embd != model.hparams.n_embd_inp_enc()) ||
+            batch_inp.n_vocab != (llama_token) model.vocab.n_tokens() ||
+            batch_inp.n_pos_per_embd != model.hparams.n_pos_per_embd() ||
+            batch_inp.tokens.size() > cparams.n_batch) {
+        LLAMA_LOG_ERROR("%s: incompatible extended batch\n", __func__);
+        return -1;
+    }
+    llama_batch batch = {};
+    return batch_inp.get_batch(batch) ? encode(batch) : -1;
 }
 
-int llama_context::decode(const llama_batch & batch_inp) {
-    llama_batch_compat compat(this, batch_inp);
-    return decode(*compat.batch_ext);
+int llama_context::decode(const llama_batch_ext & batch_inp) {
+    if (!memory) {
+        return encode(batch_inp);
+    }
+    const size_t n_embd = cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP ? model.hparams.n_embd_out() :
+        cparams.dflash_fused_inject ? model.hparams.n_embd_inp_enc() : model.hparams.n_embd_inp();
+    if ((batch_inp.n_embd > 0 && batch_inp.n_embd != n_embd) ||
+            batch_inp.n_vocab != (llama_token) model.vocab.n_tokens() ||
+            batch_inp.n_pos_per_embd != model.hparams.n_pos_per_embd() ||
+            batch_inp.tokens.size() > cparams.n_batch) {
+        LLAMA_LOG_ERROR("%s: incompatible extended batch\n", __func__);
+        return -1;
+    }
+    llama_batch batch = {};
+    return batch_inp.get_batch(batch) ? decode(batch) : -1;
 }
 
 ///

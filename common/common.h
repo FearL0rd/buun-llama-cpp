@@ -10,6 +10,7 @@
 #include "llama.h"
 
 #include <array>
+#include <filesystem>
 #include <list>
 #include <set>
 #include <sstream>
@@ -1405,6 +1406,7 @@ struct common_batch {
         llama_seq_id seq_id;
         bool         output;
         llama_embd   embd; // non-owning view of the data passed to add_embd()/set_embd(), data == NULL if none
+        std::vector<llama_seq_id> seq_ids; // full membership; seq_id above remains the primary ID
     };
 
     std::vector<token> tokens; // mirror of the entries, tokens[i] describes batch index i
@@ -1427,6 +1429,7 @@ struct common_batch {
     int32_t add(llama_token id, llama_pos pos, llama_seq_id seq_id, bool output);
 
     bool set_output(int32_t idx, bool value);
+    bool add_seq(int32_t idx, llama_seq_id seq_id);
 
     // attach a token embedding to the entry at idx, can only be set once per entry
     bool set_embd(int32_t idx, llama_embd embd);

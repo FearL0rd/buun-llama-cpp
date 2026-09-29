@@ -35,6 +35,7 @@ struct llama_hadamard_transform {
 using llama_hadamard_rotations = std::unordered_map<const ggml_tensor *, llama_hadamard_transform>;
 
 struct llama_cparams;
+struct llama_prec_policy;
 struct llama_layer;
 struct llama_tree_mask;
 
