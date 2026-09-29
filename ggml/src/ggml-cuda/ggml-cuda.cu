@@ -5451,13 +5451,17 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
         const ggml_tensor * rms_norm = cgraph->nodes[node_idx];
         const ggml_tensor * scale    = cgraph->nodes[node_idx+1];
 
-        GGML_ASSERT(rms_norm->src[0]->type == GGML_TYPE_F32);
-        GGML_ASSERT(rms_norm->type == GGML_TYPE_F32);
+        if (rms_norm->src[0]->type != GGML_TYPE_F32 || rms_norm->type != GGML_TYPE_F32 ||
+                !ggml_is_contiguous_rows(rms_norm->src[0]) || !ggml_is_contiguous(scale)) {
+            return false;
+        }
 
         float bias;
         memcpy(&bias, (const float *) scale->op_params + 1, sizeof(float));
 
-        return bias == 0.0f && scale->type == GGML_TYPE_F32;
+        const int output = node_idx + 1;
+        return bias == 0.0f && scale->type == GGML_TYPE_F32 &&
+            ggml_cuda_check_fusion_memory_ranges(cgraph, node_idx, 2, &output, 1);
     }
 
     if (ops.size() == 2 && ops.begin()[0] == GGML_OP_SSM_CONV && ops.begin()[1] == GGML_OP_UNARY
@@ -9519,7 +9523,9 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                    ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op->src[1]) && ggml_is_contiguous(op);
         case GGML_OP_CONV_2D_DW:
             return (op->src[0]->type == GGML_TYPE_F16 || op->src[0]->type == GGML_TYPE_F32) &&
-                   op->src[1]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32;
+                   op->src[1]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 &&
+                   ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op) &&
+                   (ggml_is_contiguous(op->src[1]) || ggml_is_contiguous_channels(op->src[1]));
         case GGML_OP_CONV_TRANSPOSE_2D:
         case GGML_OP_POOL_1D:
         case GGML_OP_POOL_2D:

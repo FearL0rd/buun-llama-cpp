@@ -823,6 +823,20 @@ void ggml_cuda_op_rms_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     }
 }
 
+void ggml_cuda_op_rms_norm_scale_fused(ggml_backend_cuda_context & ctx, ggml_tensor * dst, ggml_tensor * scale_tensor) {
+    const ggml_tensor * src0 = dst->src[0];
+    GGML_ASSERT(src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32);
+    GGML_ASSERT(scale_tensor->type == GGML_TYPE_F32 && ggml_is_contiguous(scale_tensor));
+    GGML_ASSERT(src0->nb[0] == sizeof(float));
+    const float eps = ggml_get_op_params_f32(dst, 0);
+    const float scale = ggml_get_op_params_f32(scale_tensor, 0);
+    GGML_ASSERT(eps >= 0.0f && ggml_get_op_params_f32(scale_tensor, 1) == 0.0f);
+    rms_norm_f32_cuda<true>((const float *) src0->data, (float *) scale_tensor->data,
+        src0->ne[0], src0->ne[1], src0->ne[2], src0->ne[3],
+        src0->nb[1]/sizeof(float), src0->nb[2]/sizeof(float), src0->nb[3]/sizeof(float),
+        eps, ctx.stream(), scale);
+}
+
 void ggml_cuda_op_rms_norm_fused(
         ggml_backend_cuda_context & ctx,
         ggml_tensor * dst,

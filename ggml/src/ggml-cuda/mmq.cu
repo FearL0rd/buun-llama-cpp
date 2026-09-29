@@ -6,6 +6,7 @@
 
 #include <cstdint>
 #include <cstdlib>
+#include <cctype>
 
 static void ggml_cuda_mul_mat_q_switch_type(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream, const ggml_prec prec_src1) {
     switch (args.type_x) {
@@ -105,6 +106,31 @@ static void ggml_cuda_mul_mat_q_switch_type(ggml_backend_cuda_context & ctx, con
             GGML_ABORT("fatal error");
             break;
     }
+}
+
+static ggml_prec ggml_cuda_mmq_get_prec_src1(const ggml_tensor * src0, const ggml_tensor * dst, int cc) {
+    static const ggml_prec override_prec = [] {
+        const char * env = std::getenv("GGML_CUDA_MMQ_PREC");
+        if (!env) {
+            return GGML_PREC_UNDEFINED;
+        }
+        std::string value(env);
+        for (char & c : value) {
+            c = std::tolower(static_cast<unsigned char>(c));
+        }
+        if (value == "q4") { return GGML_PREC_Q4; }
+        if (value == "q8") { return GGML_PREC_Q8; }
+        if (value != "auto") {
+            GGML_LOG_WARN("GGML_CUDA_MMQ_PREC: unknown value '%s'; using graph precision\n", env);
+        }
+        return GGML_PREC_UNDEFINED;
+    }();
+    const ggml_prec prec = override_prec != GGML_PREC_UNDEFINED ? override_prec :
+        static_cast<ggml_prec>(ggml_get_op_params_i32(dst, 3));
+    GGML_ASSERT(prec == GGML_PREC_UNDEFINED || prec == GGML_PREC_Q8 || prec == GGML_PREC_Q4);
+    const bool can_use_q4 = (src0->type == GGML_TYPE_NVFP4 || src0->type == GGML_TYPE_MXFP4) &&
+        blackwell_mma_available(cc);
+    return prec == GGML_PREC_Q8 || !can_use_q4 ? GGML_PREC_Q8 : GGML_PREC_Q4;
 }
 
 static void ggml_cuda_mul_mat_q_impl(
@@ -329,13 +355,13 @@ static void ggml_cuda_mul_mat_q_impl(
         ne03, ne13, s03, s13, s3,
         ne12, ncols_opt};
 
-    ggml_cuda_mul_mat_q_switch_type(ctx, args, stream);
+    ggml_cuda_mul_mat_q_switch_type(ctx, args, stream, prec_src1);
 
     if (src0_pair) {
         mmq_args pair_args = args;
         pair_args.x   = (const char *) src0_pair->data;
         pair_args.dst = (float *) dst_pair->data;
-        ggml_cuda_mul_mat_q_switch_type(ctx, pair_args, stream);
+        ggml_cuda_mul_mat_q_switch_type(ctx, pair_args, stream, prec_src1);
     }
 }
 
@@ -348,6 +374,13 @@ void ggml_cuda_mul_mat_q(
 void ggml_cuda_mul_mat_q_pair(
         ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src0_pair,
         const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst, ggml_tensor * dst_pair) {
+    const int cc = ggml_cuda_info().devices[ctx.device].cc;
+    if (ggml_cuda_mmq_get_prec_src1(src0, dst, cc) != ggml_cuda_mmq_get_prec_src1(src0_pair, dst_pair, cc)) {
+        // Shared activation preparation cannot represent two different policies.
+        ggml_cuda_mul_mat_q_impl(ctx, src0, nullptr, src1, ids, dst, nullptr);
+        ggml_cuda_mul_mat_q_impl(ctx, src0_pair, nullptr, src1, ids, dst_pair, nullptr);
+        return;
+    }
     ggml_cuda_mul_mat_q_impl(ctx, src0, src0_pair, src1, ids, dst, dst_pair);
 }
 

@@ -198,7 +198,8 @@ __global__ void __launch_bounds__(d_state, 1)
 
 #pragma unroll
     for (int j = 0; j < c_factor; j++) {
-        state[j] = s0_warp[WARP_SIZE * j + lane];
+        const int state_idx = WARP_SIZE * j + lane;
+        state[j] = state_idx < d_state ? s0_warp[state_idx] : 0.0f;
     }
 
     for (int64_t i = 0; i < n_tok; i++) {
@@ -211,8 +212,12 @@ __global__ void __launch_bounds__(d_state, 1)
         const float x_dt = x_warp[i * stride_x] * dt_soft_plus;
 #pragma unroll
         for (int j = 0; j < c_factor; j++) {
-            const float B_val = B_warp[i * stride_B + WARP_SIZE * j + lane];
-            const float C_val = C_warp[i * stride_C + WARP_SIZE * j + lane];
+            const int state_idx = WARP_SIZE * j + lane;
+            if (state_idx >= d_state) {
+                continue;
+            }
+            const float B_val = B_warp[i * stride_B + state_idx];
+            const float C_val = C_warp[i * stride_C + state_idx];
             state[j] = (state[j] * dA) + (B_val * x_dt);
             state_sum += state[j] * C_val;
         }
@@ -230,7 +235,9 @@ __global__ void __launch_bounds__(d_state, 1)
             float * s_snapshot_warp = (float *) ((char *) dst + s_off + (slot * gridDim.y + seq_idx) * src0_nb3 + head_idx * src0_nb2 + head_off * d_state);
 #pragma unroll
             for (int j = 0; j < c_factor; j++) {
-                s_snapshot_warp[WARP_SIZE * j + lane] = state[j];
+                if (WARP_SIZE * j + lane < d_state) {
+                    s_snapshot_warp[WARP_SIZE * j + lane] = state[j];
+                }
             }
         }
     }
@@ -238,7 +245,9 @@ __global__ void __launch_bounds__(d_state, 1)
     // write back the state
 #pragma unroll
     for (int j = 0; j < c_factor; j++) {
-        s_warp[WARP_SIZE * j + lane] = state[j];
+        if (WARP_SIZE * j + lane < d_state) {
+            s_warp[WARP_SIZE * j + lane] = state[j];
+        }
     }
 }
 
@@ -253,12 +262,12 @@ static void ssm_scan_f32_cuda(const float * src0, const float * src1, const floa
     if (src3_nb1 == sizeof(float)) {
         // Mamba-2
         if (d_state == 96) {
-            constexpr int threads   = 96;
+            constexpr int threads   = ((96 + WARP_SIZE - 1)/WARP_SIZE)*WARP_SIZE;
             constexpr int num_warps = threads/WARP_SIZE;
 
             const dim3 blocks((n_head * head_dim + (num_warps - 1)) / num_warps, n_seq, 1);
             const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(blocks, threads, 0, stream);
-            ggml_cuda_kernel_launch(ssm_scan_f32_group<96/WARP_SIZE, 96>, launch_params,
+            ggml_cuda_kernel_launch(ssm_scan_f32_group<num_warps, 96>, launch_params,
                     src0, src1, src2, src3, src4, src5, src6, dst,
                     src0_nb2, src0_nb3, src1_nb2, src1_nb3, src2_nb1, src2_nb2, src3_nb1,
                     src4_nb2, src4_nb3, src5_nb2, src5_nb3, s_off, n_head, head_dim, n_group, n_tok, K);
