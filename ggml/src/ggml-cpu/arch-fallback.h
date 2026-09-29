@@ -81,7 +81,7 @@
 #define ggml_gemm_mxfp4_8x8_q8_0_generic ggml_gemm_mxfp4_8x8_q8_0
 #define ggml_gemm_q8_0_4x4_q8_0_generic ggml_gemm_q8_0_4x4_q8_0
 #define ggml_gemm_q8_0_4x8_q8_0_generic ggml_gemm_q8_0_4x8_q8_0
-#elif defined(__aarch64__) || defined(__arm__) || defined(_M_ARM) || defined(_M_ARM64)
+#elif defined(__aarch64__) || defined(__arm__) || defined(_M_ARM) || defined(_M_ARM64) || defined(_M_ARM64EC)
 // repack.cpp (q4_1 8x8 has x86 kernels only so far)
 #define ggml_gemv_q4_1_8x8_q8_0_generic ggml_gemv_q4_1_8x8_q8_0
 #define ggml_gemm_q4_1_8x8_q8_0_generic ggml_gemm_q4_1_8x8_q8_0

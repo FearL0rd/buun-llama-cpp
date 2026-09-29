@@ -193,13 +193,14 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
                 endmacro()
 
                 if (GGML_ARM_MSVC)
-                    # drop volatile
-                    check_arm_feature(dotprod DOTPROD     "#include <arm_neon.h>\nint main() { int8x16_t _a = vdupq_n_s8(0), _b = vdupq_n_s8(0); int32x4_t _s = vdupq_n_s32(0); _s = vdotq_s32(_s, _a, _b); return 0; }")
-                    check_arm_feature(i8mm    MATMUL_INT8 "#include <arm_neon.h>\nint main() { int8x16_t _a = vdupq_n_s8(0), _b = vdupq_n_s8(0); int32x4_t _s = vdupq_n_s32(0); _s = vmmlaq_s32(_s, _a, _b); return 0; }")
-                    check_arm_feature(sve     SVE         "#include <arm_sve.h>\nint main() { const svbool_t pg = svptrue_b8(); const svint8_t a = svdup_n_s8(0), b = svdup_n_s8(0); svint32_t s = svdup_n_s32(0); s = svdot_s32(s, a, b); (void) pg; (void) s; return 0; }")
+                    # Scalar volatile inputs/results prevent optimized-away feature probes
+                    # without requiring MSVC to copy volatile NEON vector objects.
+                    check_arm_feature(dotprod DOTPROD     "#include <arm_neon.h>\nint main() { volatile int8_t a = 1, b = 2; const int32x4_t s = vdotq_s32(vdupq_n_s32(0), vdupq_n_s8(a), vdupq_n_s8(b)); volatile int32_t result = vgetq_lane_s32(s, 0); (void) result; return 0; }")
+                    check_arm_feature(i8mm    MATMUL_INT8 "#include <arm_neon.h>\nint main() { volatile int8_t a = 1, b = 2; const int32x4_t s = vmmlaq_s32(vdupq_n_s32(0), vdupq_n_s8(a), vdupq_n_s8(b)); volatile int32_t result = vgetq_lane_s32(s, 0); (void) result; return 0; }")
+                    check_arm_feature(sve     SVE         "#include <arm_sve.h>\nint main() { volatile int8_t a = 1, b = 2; const svint32_t s = svdot_s32(svdup_n_s32(0), svdup_n_s8(a), svdup_n_s8(b)); volatile int32_t result = svlastb_s32(svptrue_b32(), s); (void) result; return 0; }")
                     # FMA is mandatory on ARMv8-A but MSVC never defines __ARM_FEATURE_FMA,
                     # so probe it like the others and forward the define
-                    check_arm_feature(fma     FMA         "#include <arm_neon.h>\nint main() { float32x4_t _a = vdupq_n_f32(0), _b = vdupq_n_f32(0), _c = vdupq_n_f32(0); _a = vfmaq_f32(_a, _b, _c); return 0; }")
+                    check_arm_feature(fma     FMA         "#include <arm_neon.h>\nint main() { volatile float a = 1, b = 2, c = 3; const float32x4_t s = vfmaq_f32(vdupq_n_f32(a), vdupq_n_f32(b), vdupq_n_f32(c)); volatile float result = vgetq_lane_f32(s, 0); (void) result; return 0; }")
                 else()
                     check_arm_feature(dotprod DOTPROD     "#include <arm_neon.h>\nint main() { int8x16_t _a, _b; volatile int32x4_t _s = vdotq_s32(_s, _a, _b); return 0; }")
                     check_arm_feature(i8mm    MATMUL_INT8 "#include <arm_neon.h>\nint main() { int8x16_t _a, _b; volatile int32x4_t _s = vmmlaq_s32(_s, _a, _b); return 0; }")

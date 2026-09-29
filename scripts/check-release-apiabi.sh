@@ -76,7 +76,15 @@ if [[ -n "${COMPARE_TAG}" ]]; then
         exit 1
     fi
 else
-    PREV_TAG=$(git -C "$REPO_ROOT" tag --sort=-v:refname | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | head -n 1 || true)
+    if [[ -n "${GITHUB_REPOSITORY:-}" && "${GITHUB_REPOSITORY}" != "ggml-org/llama.cpp" ]]; then
+        # Forks also fetch upstream tags. Only this repository's published
+        # releases establish its ABI baseline; --tag remains an explicit override.
+        PREV_TAG=$(gh release list --repo "$GITHUB_REPOSITORY" --limit 100 \
+            --json tagName,isPrerelease,isDraft \
+            --jq '[.[] | select(.isPrerelease == false and .isDraft == false) | .tagName | select(test("^v[0-9]+\\.[0-9]+\\.[0-9]+$"))] | sort_by(ltrimstr("v") | split(".") | map(tonumber)) | last // ""')
+    else
+        PREV_TAG=$(git -C "$REPO_ROOT" tag --sort=-v:refname | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | head -n 1 || true)
+    fi
     if [[ -z "${PREV_TAG}" ]]; then
         echo "Warning: no previous release tag found - skipping API/ABI check"
         exit 0

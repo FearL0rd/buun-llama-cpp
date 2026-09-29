@@ -13,6 +13,16 @@ option(GGML_CUDA_HC_GROUPED_RMS_TEST_INSTRUMENTATION
 option(GGML_CUDA_MOE_CACHE_FLAT_HITS_TEST_INSTRUMENTATION
        "Enable test-only MoE cache flattened-hit dispatch counters" OFF)
 
+# ARM64EC uses the x64 ABI, so it needs x64 rather than ARM64 import libraries.
+string(TOLOWER "${CMAKE_GENERATOR_PLATFORM}" GGML_CUDA_PLATFORM_LWR)
+if (MSVC AND GGML_CUDA_PLATFORM_LWR STREQUAL "arm64ec")
+    find_library(CUDA_CUDART
+        NAMES cudart
+        HINTS ${CUDAToolkit_ROOT} ENV CUDA_PATH
+        PATH_SUFFIXES lib/x64
+    )
+endif()
+
 find_package(CUDAToolkit)
 
 if (CUDAToolkit_FOUND)
