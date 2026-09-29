@@ -88,6 +88,16 @@ uint32_t llama_crc32(const uint8_t * data, size_t n) {
     return c ^ 0xFFFFFFFFu;
 }
 
+void llama_clear_tensor_data(ggml_tensor * t, size_t offset, size_t size) {
+    static const std::vector<uint8_t> zeros(1024*1024, 0);
+
+    // Some backends implement set_tensor but not tensor_memset. Use bounded
+    // writes, also allowing the meta backend to map the requested shard ranges.
+    for (size_t ofs = 0; ofs < size; ofs += zeros.size()) {
+        ggml_backend_tensor_set(t, zeros.data(), offset + ofs, std::min(size - ofs, zeros.size()));
+    }
+}
+
 void replace_all(std::string & s, const std::string & search, const std::string & replace) {
     if (search.empty()) {
         return;
