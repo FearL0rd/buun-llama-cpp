@@ -343,10 +343,12 @@ static common_moe_cache_params common_moe_cache_from_bench_mode(const std::strin
 }
 
 static std::string parse_repack_mode(const std::string & value) {
+    if (value == "0") { return "off"; }
+    if (value == "1") { return "on"; }
     if (value == "auto" || value == "on" || value == "off") {
         return value;
     }
-    throw std::invalid_argument("expected auto, on, or off");
+    throw std::invalid_argument("expected auto, on, off, 0, or 1");
 }
 
 static bool get_effective_repack(const std::string & cache_mode, const std::string & repack_mode) {
@@ -452,7 +454,7 @@ struct cmd_params {
     std::vector<int>                 n_gpu_layers;
     std::vector<int>                 n_cpu_moe;
     std::vector<std::string>         moe_cache;
-    std::string                      repack;
+    std::vector<std::string>         repack;
     std::vector<llama_split_mode>    split_mode;
     std::vector<llama_load_mode>     load_mode;
     std::vector<llama_lazy_mode>     lazy_mode;
@@ -466,7 +468,6 @@ struct cmd_params {
     std::vector<bool>                embeddings;
     std::vector<bool>                no_op_offload;
     std::vector<bool>                no_host;
-    std::vector<bool>                repack;
     std::vector<size_t>              fit_params_target;
     std::vector<uint32_t>            fit_params_min_ctx;
     bool                             vbr = false; // arm dynamic VBR and its decode-time degrade controller
@@ -516,7 +517,7 @@ static const cmd_params cmd_params_defaults = {
     /* n_gpu_layers         */ { -1 },
     /* n_cpu_moe            */ { 0 },
     /* moe_cache            */ { "auto" },
-    /* repack               */ "auto",
+    /* repack               */ { "auto" },
     /* split_mode           */ { LLAMA_SPLIT_MODE_LAYER },
     /* load_mode            */ { LLAMA_LOAD_MODE_AUTO },
     /* lazy_mode            */ { LLAMA_LAZY_MODE_AUTO },
@@ -530,7 +531,6 @@ static const cmd_params cmd_params_defaults = {
     /* embeddings           */ { false },
     /* no_op_offload        */ { false },
     /* no_host              */ { false },
-    /* repack               */ { llama_model_default_params().use_extra_bufts },
     /* fit_params_target    */ { 0 },
     /* fit_params_min_ctx   */ { 0 },
     /* vbr                  */ false,
@@ -614,7 +614,7 @@ static void print_usage(int /* argc */, char ** argv) {
     printf("  -ncmoe, --n-cpu-moe <n>                           (default: %s)\n", join(cmd_params_defaults.n_cpu_moe, ",").c_str());
     printf("  --moe-cache <auto|on|soft|off|0|MiB>                   (default: %s)\n", join(cmd_params_defaults.moe_cache, ",").c_str());
     printf("                                                    on and fixed budgets disable weight repacking\n");
-    printf("  --repack <auto|on|off>                            weight repacking policy (default: %s)\n", cmd_params_defaults.repack.c_str());
+    printf("  --repack <auto|on|off|0|1>                        weight repacking policies (default: %s)\n", join(cmd_params_defaults.repack, ",").c_str());
     printf("  -nr, --no-repack                                  equivalent to --repack off\n");
     printf("  --[no-]moe-cache-profile                         persist expert heatmap (default: on)\n");
     printf("  -sm, --split-mode <none|layer|row|tensor>         (default: %s)\n", join(transform_to_str(cmd_params_defaults.split_mode, split_mode_str), ",").c_str());
@@ -633,7 +633,6 @@ static void print_usage(int /* argc */, char ** argv) {
     printf("                                                    (default: disabled)\n");
     printf("  -nopo, --no-op-offload <0|1>                      (default: 0)\n");
     printf("  --no-host <0|1>                                   (default: %s)\n", join(cmd_params_defaults.no_host, ",").c_str());
-    printf("  --repack <0|1>                                    (default: %s)\n", join(cmd_params_defaults.repack, ",").c_str());
     printf("\n");
     printf(
         "Multiple values can be given for list-valued parameters by separating them with ','\n"
@@ -998,10 +997,15 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
                     invalid_param = true;
                     break;
                 }
-                params.repack = parse_repack_mode(argv[i]);
+                if (!params.repack_explicit) {
+                    params.repack.clear();
+                }
+                for (const auto & mode : string_split<std::string>(argv[i], split_delim)) {
+                    params.repack.push_back(parse_repack_mode(mode));
+                }
                 params.repack_explicit = true;
             } else if (arg == "-nr" || arg == "--no-repack") {
-                params.repack = "off";
+                params.repack = { "off" };
                 params.repack_explicit = true;
             } else if (arg == "--moe-cache-profile") {
                 params.moe_cache_profile = true;
@@ -1240,13 +1244,6 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
                 }
                 auto p = string_split<bool>(argv[i], split_delim);
                 params.no_host.insert(params.no_host.end(), p.begin(), p.end());
-            } else if (arg == "--repack") {
-                if (++i >= argc) {
-                    invalid_param = true;
-                    break;
-                }
-                auto p = string_split<bool>(argv[i], split_delim);
-                params.repack.insert(params.repack.end(), p.begin(), p.end());
             } else if (arg == "-ts" || arg == "--tensor-split") {
                 if (++i >= argc) {
                     invalid_param = true;
@@ -1551,7 +1548,9 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
     }
     for (const auto & cache_mode : params.moe_cache) {
         try {
-            (void) get_effective_repack(cache_mode, params.repack);
+            for (const auto & repack_mode : params.repack) {
+                (void) get_effective_repack(cache_mode, repack_mode);
+            }
         } catch (const std::invalid_argument & e) {
             fprintf(stderr, "error: %s\n", e.what());
             exit(1);
@@ -1592,7 +1591,6 @@ struct cmd_params_instance {
     bool               embeddings;
     bool               no_op_offload;
     bool               no_host;
-    bool               repack;
     size_t             fit_target;
     uint32_t           fit_min_ctx;
     bool               vbr;
@@ -1620,7 +1618,6 @@ struct cmd_params_instance {
         mparams.tensor_split  = tensor_split.data();
         mparams.use_extra_bufts = repack;
         mparams.no_host       = no_host;
-        mparams.use_extra_bufts = repack;
 
         if (n_cpu_moe <= 0) {
             if (tensor_buft_overrides.empty()) {
@@ -1762,7 +1759,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .n_gpu_layers          = */ nl,
                 /* .n_cpu_moe             = */ ncmoe,
                 /* .moe_cache             = */ mc,
-                /* .repack                = */ get_effective_repack(mc, params.repack),
+                /* .repack                = */ get_effective_repack(mc, rpk),
                 /* .split_mode            = */ sm,
                 /* .load_mode             = */ lm,
                 /* .lazy_mode             = */ lzm,
@@ -1776,7 +1773,6 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .embeddings            = */ embd,
                 /* .no_op_offload         = */ nopo,
                 /* .no_host               = */ noh,
-                /* .repack                = */ rpk,
                 /* .fit_target            = */ fpt,
                 /* .fit_min_ctx           = */ fpc,
                 /* .vbr                   = */ vbr.active,
@@ -1813,7 +1809,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .n_gpu_layers          = */ nl,
                 /* .n_cpu_moe             = */ ncmoe,
                 /* .moe_cache             = */ mc,
-                /* .repack                = */ get_effective_repack(mc, params.repack),
+                /* .repack                = */ get_effective_repack(mc, rpk),
                 /* .split_mode            = */ sm,
                 /* .load_mode             = */ lm,
                 /* .lazy_mode             = */ lzm,
@@ -1827,7 +1823,6 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .embeddings            = */ embd,
                 /* .no_op_offload         = */ nopo,
                 /* .no_host               = */ noh,
-                /* .repack                = */ rpk,
                 /* .fit_target            = */ fpt,
                 /* .fit_min_ctx           = */ fpc,
                 /* .vbr                   = */ vbr.active,
@@ -1864,7 +1859,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .n_gpu_layers          = */ nl,
                 /* .n_cpu_moe             = */ ncmoe,
                 /* .moe_cache             = */ mc,
-                /* .repack                = */ get_effective_repack(mc, params.repack),
+                /* .repack                = */ get_effective_repack(mc, rpk),
                 /* .split_mode            = */ sm,
                 /* .load_mode             = */ lm,
                 /* .lazy_mode             = */ lzm,
@@ -1878,7 +1873,6 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .embeddings            = */ embd,
                 /* .no_op_offload         = */ nopo,
                 /* .no_host               = */ noh,
-                /* .repack                = */ rpk,
                 /* .fit_target            = */ fpt,
                 /* .fit_min_ctx           = */ fpc,
                 /* .vbr                   = */ vbr.active,
@@ -1944,7 +1938,6 @@ struct test {
     bool                     embeddings;
     bool                     no_op_offload;
     bool                     no_host;
-    bool                     repack;
     size_t                   fit_target;
     uint32_t                 fit_min_ctx;
     int                      n_prompt;
@@ -2193,7 +2186,6 @@ struct test {
                                             std::to_string(embeddings),
                                             std::to_string(no_op_offload),
                                             std::to_string(no_host),
-                                            std::to_string(repack),
                                             std::to_string(fit_target),
                                             std::to_string(fit_min_ctx),
                                             std::to_string(n_prompt),

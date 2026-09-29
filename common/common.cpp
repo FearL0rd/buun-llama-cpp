@@ -1021,7 +1021,7 @@ bool fs_create_directory_with_parents(const std::string & path) {
 }
 
 bool fs_is_directory(const std::string & path) {
-    std::filesystem::path dir(path);
+    const auto dir = std::filesystem::u8path(path);
     return std::filesystem::exists(dir) && std::filesystem::is_directory(dir);
 }
 
