@@ -118,7 +118,8 @@ constant bool FC_pad_circular [[function_constant(FC_PAD + 0)]];
 
 // circular means on a torus, so the coordinates wrap around
 static inline int32_t wrap_around(int32_t coord, int32_t size) {
-    return (coord + size) % size;
+    const int32_t rem = coord % size;
+    return rem < 0 ? rem + size : rem;
 }
 
 kernel void kernel_pad_f32(

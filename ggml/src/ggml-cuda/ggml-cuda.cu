@@ -9009,6 +9009,9 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             {
                 struct ggml_tensor * a = op->src[0];
                 struct ggml_tensor * b = op->src[1];
+                if (op->op == GGML_OP_MUL_MAT_ID && ggml_get_op_params_i32(op, 3) == GGML_PREC_F32) {
+                    return false;
+                }
                 if (ggml_cuda_is_exl3(a->type)) {
 #if defined(GGML_USE_HIP)
                     // The shared EXL3 executor uses 32-lane transforms. Wave64

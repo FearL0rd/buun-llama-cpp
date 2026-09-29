@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstring>
+#include <limits>
 #include <set>
 #include <string>
 #include <vector>
@@ -108,7 +109,7 @@ static bool ggml_metal_fusion_check_norm(
 
         const ggml_tensor * scale = nodes[1];
         if (scale->op != GGML_OP_SCALE || scale->src[0] != nodes[0] || scale->src[1] ||
-            scale->type != GGML_TYPE_F32) {
+            scale->type != GGML_TYPE_F32 || ggml_get_op_params_f32(scale, 1) != 0.0f) {
             return false;
         }
 
@@ -400,6 +401,11 @@ static bool ggml_metal_fusion_check_topk_moe(
     const ggml_tensor * out            = gf->nodes[raw_end];
     const ggml_tensor * logits         = softmax->src[0];
 
+    if (ggml_get_op_params_i32(argsort, 0) != GGML_SORT_ORDER_DESC ||
+        (with_scale && ggml_get_op_params_f32(out, 1) != 0.0f)) {
+        return false;
+    }
+
     // the fused kernel implements plain softmax only
     float scale   = 1.0f;
     float max_bias = 0.0f;
@@ -447,6 +453,11 @@ static bool ggml_metal_fusion_check_topk_moe(
         const ggml_tensor * clamp            = gf->nodes[raw_start + 7];
         const ggml_tensor * div              = gf->nodes[raw_start + 8];
         const ggml_tensor * out_reshaped     = gf->nodes[raw_start + 9];
+
+        // The fused kernel applies only the lower clamp, not a finite upper cap.
+        if (!(ggml_get_op_params_f32(clamp, 1) >= std::numeric_limits<float>::max())) {
+            return false;
+        }
 
         if (weights_reshaped->src[0] != get_rows || sum_rows->src[0] != weights_reshaped ||
             clamp->src[0] != sum_rows || div->src[0] != weights_reshaped || div->src[1] != clamp ||
