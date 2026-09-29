@@ -25,9 +25,10 @@ void llama_model_mimo2::load_arch_hparams(llama_model_loader & ml) {
 void llama_model_mimo2::load_arch_tensors(llama_model_loader & ml) {
     LLAMA_LOAD_LOCALS;
 
-    const bool mtp_only = (hparams.n_layer_nextn > 0) && (ml.get_weight("blk.0.attn_norm.weight") == nullptr);
+    const bool mtp_only = (hparams.n_layer_nextn > 0) && !ml.has_tensor("blk.0.attn_norm.weight");
     const std::string mtp_probe = "blk." + std::to_string(n_layer) + ".nextn.eh_proj.weight";
     const bool trunk_only = (hparams.n_layer_nextn > 0) && !ml.has_tensor(mtp_probe.c_str());
+    const int trunk_flags = mtp_only ? TENSOR_NOT_REQUIRED : 0;
     int mtp_flags         = trunk_only ? TENSOR_NOT_REQUIRED : 0;
 
     if (!ml.load_mtp) {
