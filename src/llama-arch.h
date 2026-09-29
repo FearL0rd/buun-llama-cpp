@@ -746,12 +746,12 @@ enum llm_tensor {
     LLM_TENSOR_DFLASH_SELECTOR_NEXT = 281,
     LLM_TENSOR_DFLASH_SELECTOR_HIDDEN = 282,
     LLM_TENSOR_FFN_EXP_PROBS_B_VL = 283,
-    LLM_TENSOR_HRM_Z_L_INIT = 285,
+    LLM_TENSOR_HRM_Z_L_INIT = 289,
 };
 
 static_assert(LLM_TENSOR_DFLASH2_FFN_CONV_PROJ < LLM_TENSOR_DFLASH_ATTN_CONV_BASE,
               "automatic tensor IDs overlap the fork's explicitly assigned range");
-static_assert(LLM_TENSOR_HRM_Z_L_INIT > LLM_TENSOR_SSM_G,
+static_assert(LLM_TENSOR_HRM_Z_L_INIT > LLM_TENSOR_FFN_ROUTED_DOWN,
               "new tensor IDs must also follow explicit IDs declared earlier");
 
 
