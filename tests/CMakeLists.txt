@@ -590,6 +590,9 @@ llama_build_and_test(test-model-resolution.cpp)
 add_executable(test-moe-metadata test-moe-metadata.cpp)
 target_link_libraries(test-moe-metadata PRIVATE llama)
 llama_test(test-moe-metadata)
+add_executable(test-model-qkv-split test-model-qkv-split.cpp)
+target_link_libraries(test-model-qkv-split PRIVATE llama)
+llama_test(test-model-qkv-split)
 # the test serves its repos from an httplib server, and the library links it privately
 target_link_libraries(test-model-resolution PRIVATE cpp-httplib)
 

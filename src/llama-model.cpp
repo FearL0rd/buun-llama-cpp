@@ -410,6 +410,9 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
     }
     const bool is_dsv4 = ud->model->arch == LLM_ARCH_DEEPSEEK4 ||
         (ud->model->arch == LLM_ARCH_DFLASH && hparams.dsv4_hc_mult > 0);
+    const bool is_qwen_hybrid = ud->model->arch == LLM_ARCH_QWEN3NEXT ||
+        ud->model->arch == LLM_ARCH_QWEN35 || ud->model->arch == LLM_ARCH_QWEN35MOE ||
+        ud->model->arch == LLM_ARCH_QWEN4EXP;
 
     static const std::regex pattern_q_weight        ("blk\\.\\d*\\.attn_q.weight");
     static const std::regex pattern_kv_weight       ("blk\\.\\d*\\.attn_(k|v).weight");
@@ -745,17 +748,26 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
                  std::regex_match(tensor_name, pattern_ffn_gate_up_exps_any) || std::regex_match(tensor_name, pattern_ffn_down_exps_any))) {
             return {{tensor->ne[2], 1}};
         }
+        if ((!hparams.is_recr(il) || !is_qwen_hybrid) &&
+                (std::regex_match(tensor_name, pattern_qkv_weight) ||
+                 std::regex_match(tensor_name, pattern_qkv_scale) ||
+                 std::regex_match(tensor_name, pattern_qkv_bias))) {
+            int64_t q_rows = hparams.n_head(il) * hparams.n_embd_head_k(il);
+            const int64_t k_rows = hparams.n_embd_k_gqa(il);
+            const int64_t v_rows = hparams.n_embd_v_gqa(il);
+            // Native sidecars can have an ungated Q projection even when the
+            // target architecture normally interleaves a gate with each Q head.
+            if (is_qwen_hybrid && tensor->ne[axis] == 2*q_rows + k_rows + v_rows) {
+                q_rows *= 2;
+            }
+            GGML_ASSERT(tensor->ne[axis] == q_rows + k_rows + v_rows);
+            if (k_rows == v_rows) {
+                return {{q_rows, 1}, {k_rows, 2}};
+            }
+            return {{q_rows, 1}, {k_rows, 1}, {v_rows, 1}};
+        }
         if (ud->model->arch == LLM_ARCH_QWEN3NEXT || ud->model->arch == LLM_ARCH_QWEN35 || ud->model->arch == LLM_ARCH_QWEN35MOE ||
                 ud->model->arch == LLM_ARCH_QWEN4EXP) {
-
-            // fused full attention layers with Q gate tensors that need n_embd doubled:
-            if (!hparams.is_recr(il) && (std::regex_match(tensor_name, pattern_qkv_weight) || std::regex_match(tensor_name, pattern_qkv_bias))) {
-                const int64_t n_embd      = hparams.n_head(il) * hparams.n_embd_head_k(il) * 2;
-                const int64_t n_embd_gqa  = hparams.n_embd_v_gqa(il);
-                GGML_ASSERT(hparams.n_embd_k_gqa(il) == n_embd_gqa);
-                GGML_ASSERT(tensor->ne[axis] == n_embd + 2*n_embd_gqa);
-                return {{n_embd, 1}, {n_embd_gqa, 2}};
-            }
 
             const int64_t head_k_dim = hparams.ssm_d_state;
             const int64_t head_v_dim = hparams.ssm_d_state;
@@ -764,25 +776,6 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             const int64_t key_dim    = head_k_dim * n_k_heads;
             const int64_t value_dim  = head_v_dim * n_v_heads;
 
-            // Full-attention layers of the hybrid stack: native checkpoints fuse q, k, v (and the q gate)
-            // into attn_qkv. Split by KV-head groups so every device keeps whole GQA groups:
-            // q (with its per-head gate interleaved, when present), k and v as separate segments so the
-            // granularity rule keeps whole GQA groups per device.
-            if (!hparams.is_recr(il) &&
-                    (std::regex_match(tensor_name, pattern_qkv_weight) || std::regex_match(tensor_name, pattern_qkv_scale))) {
-                const int64_t q_rows  = hparams.n_embd_head_k(il) * hparams.n_head(il);
-                const int64_t kv_rows = hparams.n_embd_head_k(il) * hparams.n_head_kv(il);
-                if (tensor->ne[axis] == q_rows + 2*kv_rows) {
-                    return {{q_rows, 1}, {kv_rows, 2}};
-                }
-                if (tensor->ne[axis] == 2*q_rows + 2*kv_rows) {
-                    // gated attention: q and its gate are interleaved per head inside the first block
-                    return {{2*q_rows, 1}, {kv_rows, 2}};
-                }
-                LLAMA_LOG_ERROR("%s: tensor split: %s ne=[%" PRId64 ",%" PRId64 "] axis=%d: not a q/k/v(/gate) fusion of %" PRId64 "-row groups\n",
-                        __func__, tensor_name.c_str(), tensor->ne[0], tensor->ne[1], axis, kv_rows);
-                GGML_ABORT("tensor split: unexpected fused attention qkv row count");
-            }
 
             // both Qwen 3 Next and Qwen 3.5 support n_v_heads > n_k_heads but the broadcasting pattern is different:
             //   - Qwen 3 Next: [k0_v0, k0_v1, k1_v2, k1_v3] (this is the default split pattern)
@@ -858,14 +851,6 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             return {{tensor->ne[axis], 1}};
         }
 
-        if (std::regex_match(tensor_name, pattern_qkv_weight) || std::regex_match(tensor_name, pattern_qkv_scale) ||
-                std::regex_match(tensor_name, pattern_qkv_bias)) {
-            const int64_t n_embd      = hparams.n_embd;
-            const int64_t n_embd_gqa  = hparams.n_embd_v_gqa(il);
-            GGML_ASSERT(hparams.n_embd_k_gqa() == n_embd_gqa);
-            GGML_ASSERT(tensor->ne[axis] == n_embd + 2*n_embd_gqa);
-            return {{n_embd, 1}, {n_embd_gqa, 2}};
-        }
         if (std::regex_match(tensor_name, pattern_ffn_up_weight) || std::regex_match(tensor_name, pattern_ffn_up_bias)) {
             const int64_t n_ff = hparams.n_ff(il);
             // some models such as Phi 3 have fused up + gate tensors named "up" tensors, which need to be segmented
@@ -996,10 +981,14 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             }
             if (std::regex_match(tensor_name, pattern_qkv_weight) || std::regex_match(tensor_name, pattern_qkv_scale) ||
                     std::regex_match(tensor_name, pattern_qkv_bias)) {
-                GGML_ASSERT(segments.size() == 2);
+                GGML_ASSERT(segments.size() == 2 || segments.size() == 3);
                 // a q block twice the head size carries the per-head q gate interleaved: double the granularity
                 const bool gated_q = segments[0].first == 2 * (int64_t) hparams.n_head(il) * hparams.n_embd_head_k(il);
-                return {gated_q ? std::lcm(2*n_embd_q, blck_size_perf) : granularity_q, granularity_kv};
+                const int64_t q_granularity = gated_q ? std::lcm(2*n_embd_q, blck_size_perf) : granularity_q;
+                if (segments.size() == 3) {
+                    return {q_granularity, granularity_kv, granularity_v};
+                }
+                return {q_granularity, granularity_kv};
             }
         }
 
