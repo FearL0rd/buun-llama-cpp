@@ -2463,9 +2463,13 @@ static void ggml_compute_forward_mul_mat_id_impl(
     // published by thread 0 before the row barrier
     int * t0_reserved = (int *) atomic_current_chunk[n_as];
 
-    // Tiled matmul (see tiled.h); per-thread work buffers, 0 bytes when disabled. The
-    // reservation is unconditional, the per expert eligibility is decided at dispatch time
-    char * tiled_scratch = incr_ptr_aligned(&wdata_cur, ggml_tiled_wdata_size(nth, dst), 64);
+    // The panel fallback and tiled path are mutually exclusive for each expert.
+    const bool iqp = !params->use_ref && ggml_cpu_iqp_supports_mul_mat_id(dst);
+    const size_t panel_size = ggml_cpu_iqp_supports_mul_mat_id(dst)
+        ? nth * ggml_cpu_iqp_scratch_size(dst) : 0;
+    char * tiled_scratch = incr_ptr_aligned(&wdata_cur,
+        MAX(panel_size, ggml_tiled_wdata_size(nth, dst)), 64);
+    void * iqp_panels = tiled_scratch;
 
     GGML_ASSERT(params->wsize >= (size_t)((char *) wdata_cur - (char *) params->wdata));
 
@@ -2609,11 +2613,26 @@ static void ggml_compute_forward_mul_mat_id_impl(
     // workers of the chunk schedule; thread 0 drops out while it serves the GPU
     const int nw = reserved ? nth - 1 : nth;
     const int iw = reserved ? ith - 1 : ith;
+    // Expert tiled kernels have only thread-private scratch and no barriers.
+    // Partition over the CPU workers, excluding the GPU dispatch worker.
+    struct ggml_compute_params tiled_params = *params;
+    tiled_params.nth = nw;
+    tiled_params.ith = iw;
 
     for (int cur_a = 0; cur_a < n_as && iw >= 0; ++cur_a) {
         const int64_t cne1 = matrix_row_counts[cur_a];
 
         if (cne1 == 0) {
+            continue;
+        }
+
+        if (ggml_compute_forward_mul_mat_id_tiled(&tiled_params, dst, cur_a, cne1,
+                (const int32_t *) &MMID_MATRIX_ROW(cur_a, 0), tiled_scratch)) {
+            if (paired_dst) {
+                const bool computed = ggml_compute_forward_mul_mat_id_tiled(&tiled_params, paired_dst,
+                    cur_a, cne1, (const int32_t *) &MMID_MATRIX_ROW(cur_a, 0), tiled_scratch);
+                GGML_ASSERT(computed);
+            }
             continue;
         }
 
@@ -3943,10 +3962,9 @@ struct ggml_cplan ggml_graph_plan(
                         cur += n_as*ids->ne[0]*ids->ne[1]*sizeof(struct mmid_row_mapping) + sizeof(int64_t);
                         // atomic_current_chunk + shared schedule line
                         cur += CACHE_LINE_SIZE*(n_as + 1) + CACHE_LINE_SIZE;
-                        // the IQ panel path needs one scratch panel per thread on top of that
-                        if (ggml_cpu_iqp_supports_mul_mat_id(node)) {
-                            cur += n_tasks * ggml_cpu_iqp_scratch_size(node) + 64;
-                        }
+                        const size_t panel_size = ggml_cpu_iqp_supports_mul_mat_id(node)
+                            ? n_tasks * ggml_cpu_iqp_scratch_size(node) : 0;
+                        cur += MAX(panel_size, ggml_tiled_wdata_size(n_tasks, node)) + 64;
                     } break;
                 case GGML_OP_OUT_PROD:
                     {
@@ -4258,6 +4276,7 @@ static bool ggml_moe_cache_can_fuse(
         ggml_mmid_window_n_local(fusion->gate) != 0 ||
         ggml_cpu_iqp_supports_mul_mat_id(fusion->up) !=
             ggml_cpu_iqp_supports_mul_mat_id(fusion->gate) ||
+        ggml_tiled_wdata_size(1, fusion->up) != ggml_tiled_wdata_size(1, fusion->gate) ||
         fusion->up->type != GGML_TYPE_F32 ||
         fusion->gate->type != GGML_TYPE_F32 ||
         fusion->glu->type != GGML_TYPE_F32 ||

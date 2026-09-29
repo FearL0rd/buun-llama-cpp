@@ -612,6 +612,15 @@ static bool ggml_tiled_supported(const struct ggml_tensor * src0,
     if (src0->extra != NULL) {
         return false;
     }
+    if (src1->type != GGML_TYPE_F32 && src1->type != GGML_TYPE_Q8_K) {
+        return false;
+    }
+    if (src1->type == GGML_TYPE_Q8_K && !ggml_is_contiguous(src1)) {
+        return false;
+    }
+    if (src1->type == GGML_TYPE_F32 && src1->nb[0] != sizeof(float)) {
+        return false;
+    }
     // Supported quant types for src0
     switch (src0->type) {
         case GGML_TYPE_Q6_K:
@@ -631,17 +640,12 @@ static bool ggml_tiled_supported(const struct ggml_tensor * src0,
         default:
             return false;
     }
-    if (src1->type != GGML_TYPE_F32 && src1->type != GGML_TYPE_Q8_K) {
-        return false;
-    }
-
-    if (src1->type == GGML_TYPE_Q8_K && !ggml_is_contiguous(src1)) {
-        // We can handle noncontiguous floats because we're repacking to q8_k anyways
-        return false;
-    }
-    return true;
 }
 #endif
+
+static bool ggml_tiled_min_batch(int64_t rows) {
+    return rows >= 8 || ggml_tiled_matmul_forced();
+}
 
 // per-thread workspace slot size (0 when tiled is disabled or unsupported on this arch)
 static size_t ggml_tiled_ws_size(void) {
@@ -654,6 +658,11 @@ static size_t ggml_tiled_ws_size(void) {
 size_t ggml_tiled_wdata_size(int n_tasks, struct ggml_tensor * dst) {
     if (! ggml_tiled_supported(dst->src[0], dst->src[1])) {
         return 0; // unsupported, don't allocate
+    }
+    const int64_t rows = dst->op == GGML_OP_MUL_MAT_ID
+        ? ggml_nelements(dst->src[2]) : dst->src[1]->ne[1];
+    if (!ggml_tiled_min_batch(rows)) {
+        return 0;
     }
     return 64 + n_tasks * ggml_tiled_ws_size();  // 64 for alignment plus one 512KB slot per thread
 }
@@ -1197,11 +1206,6 @@ static bool ggml_tiled_matmul_type_dispatch(const struct ggml_compute_params * p
         default:
             return false;
     }
-}
-
-static bool ggml_tiled_min_batch(int64_t rows) {
-    //  Profitable at rows >= 8, take even when unprofitable if we're forced
-    return rows >= 8 || ggml_tiled_matmul_forced();
 }
 
 // tiled K-quant matmul; returns true if the op was computed here,

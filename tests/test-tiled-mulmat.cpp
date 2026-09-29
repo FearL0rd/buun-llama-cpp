@@ -3,7 +3,7 @@
 #include "ggml.h"
 
 #include <time.h>
-#include <math.h>
+#include <cmath>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -29,6 +29,10 @@ static void compare_f32(const float * ref, const float * out, int64_t n, float *
     *max_err = 0.0f;
     double sum_sq_err = 0.0;
     for (int64_t i = 0; i < n; ++i) {
+        if (!std::isfinite(ref[i]) || !std::isfinite(out[i])) {
+            *max_err = *rms_err = INFINITY;
+            return;
+        }
         float err = fabsf(ref[i] - out[i]);
         if (err > *max_err) {
             *max_err = err;
@@ -36,6 +40,10 @@ static void compare_f32(const float * ref, const float * out, int64_t n, float *
         sum_sq_err += (double)err * err;
     }
     *rms_err = sqrt(sum_sq_err / n);
+}
+
+static void compute_checked(ggml_backend_t backend, ggml_cgraph * graph) {
+    GGML_ASSERT(ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS);
 }
 
 // Fill from a flat row-major f32 source: rows * cols floats.
@@ -113,10 +121,10 @@ static void test_matmul(ggml_backend_t backend, int64_t M, int64_t N, int64_t K,
     fill_tensor(src0, src0_ref, K, N, quant_type);
 
     cpu_set_use_ref(backend, true);
-    ggml_backend_graph_compute(backend, gf);
+    compute_checked(backend, gf);
     ggml_backend_tensor_get(dst, dst_out, 0, ggml_nbytes(dst));
     cpu_set_use_ref(backend, false);
-    ggml_backend_graph_compute(backend, gf);
+    compute_checked(backend, gf);
     ggml_backend_tensor_get(dst, dst_tiled, 0, ggml_nbytes(dst));
 
     // std vs tiled: identical quantized inputs, so any large difference here is a bug in the tiled kernel
@@ -189,10 +197,10 @@ static void test_matmul_highdim(ggml_backend_t backend, int64_t M, int64_t N, in
     // reference = stock path (use_ref keeps the op off the tiled hook), tiled
     // = the gated path; same weights, same op, run twice into separate buffers
     cpu_set_use_ref(backend, true);
-    ggml_backend_graph_compute(backend, gf);
+    compute_checked(backend, gf);
     ggml_backend_tensor_get(dst, dst_std, 0, ggml_nbytes(dst));
     cpu_set_use_ref(backend, false);
-    ggml_backend_graph_compute(backend, gf);
+    compute_checked(backend, gf);
     ggml_backend_tensor_get(dst, dst_tiled, 0, ggml_nbytes(dst));
 
     // max |dst|: scale for the quantization tolerance
@@ -293,10 +301,10 @@ static void test_mul_mat_id(ggml_backend_t backend, int64_t K, int64_t R, int64_
     ggml_backend_tensor_set(ids_t, ids, 0, ggml_nbytes(ids_t));
 
     cpu_set_use_ref(backend, true);
-    ggml_backend_graph_compute(backend, gf);
+    compute_checked(backend, gf);
     ggml_backend_tensor_get(dst, dst_ref, 0, ggml_nbytes(dst));
     cpu_set_use_ref(backend, false);
-    ggml_backend_graph_compute(backend, gf);
+    compute_checked(backend, gf);
     ggml_backend_tensor_get(dst, dst_tiled, 0, ggml_nbytes(dst));
 
     // same quantized inputs, so a large difference is a bug in the tiled path
@@ -336,13 +344,13 @@ static double time_graph_compute(ggml_backend_t backend, struct ggml_cgraph * gf
     LARGE_INTEGER freq, t0, t1;
     QueryPerformanceFrequency(&freq);
     QueryPerformanceCounter(&t0);
-    ggml_backend_graph_compute(backend, gf);
+    compute_checked(backend, gf);
     QueryPerformanceCounter(&t1);
     return (double) (t1.QuadPart - t0.QuadPart) / (double) freq.QuadPart;
 #else
     struct timespec t0, t1;
     clock_gettime(CLOCK_MONOTONIC, &t0);
-    ggml_backend_graph_compute(backend, gf);
+    compute_checked(backend, gf);
     clock_gettime(CLOCK_MONOTONIC, &t1);
     return (t1.tv_sec - t0.tv_sec) + (t1.tv_nsec - t0.tv_nsec) / 1e9;
 #endif
@@ -461,14 +469,14 @@ static bench_row bench_three_way(ggml_backend_t backend, int64_t M, int64_t N, i
     float * out_tiled  = (float *) malloc(M * K * sizeof(float));
     float * out_repack = (float *) malloc(M * K * sizeof(float));
     cpu_set_use_ref(backend, true);
-    ggml_backend_graph_compute(backend, gf);
+    compute_checked(backend, gf);
     ggml_backend_tensor_get(dst, out_ref, 0, ggml_nbytes(dst));
     cpu_set_use_ref(backend, false);
-    ggml_backend_graph_compute(backend, gf);
+    compute_checked(backend, gf);
     ggml_backend_tensor_get(dst, out_tiled, 0, ggml_nbytes(dst));
     compare_f32(out_ref, out_tiled, M * K, &row.max_err_tiled, &row.rmse_tiled);
     if (row.have_repack) {
-        ggml_backend_graph_compute(backend, gf_repack);
+        compute_checked(backend, gf_repack);
         ggml_backend_tensor_get(dst_repack, out_repack, 0, ggml_nbytes(dst_repack));
         compare_f32(out_ref, out_repack, M * K, &row.max_err_repack, &row.rmse_repack);
     }
@@ -601,14 +609,14 @@ static bench_row_mmid bench_mul_mat_id(ggml_backend_t backend, int64_t K, int64_
     float * out_tiled  = (float *) malloc(R * k * batch * sizeof(float));
     float * out_repack = (float *) malloc(R * k * batch * sizeof(float));
     cpu_set_use_ref(backend, true);
-    ggml_backend_graph_compute(backend, gf);
+    compute_checked(backend, gf);
     ggml_backend_tensor_get(dst, out_ref, 0, ggml_nbytes(dst));
     cpu_set_use_ref(backend, false);
-    ggml_backend_graph_compute(backend, gf);
+    compute_checked(backend, gf);
     ggml_backend_tensor_get(dst, out_tiled, 0, ggml_nbytes(dst));
     compare_f32(out_ref, out_tiled, R * k * batch, &row.max_err_tiled, &row.rmse_tiled);
     if (row.have_repack) {
-        ggml_backend_graph_compute(backend, gf_repack);
+        compute_checked(backend, gf_repack);
         ggml_backend_tensor_get(dst_repack, out_repack, 0, ggml_nbytes(dst_repack));
         compare_f32(out_ref, out_repack, R * k * batch, &row.max_err_repack, &row.rmse_repack);
     }
@@ -651,6 +659,15 @@ static void print_mmid_table(int64_t K, int64_t R, int64_t n_experts, int64_t k,
 }
 
 int main(int argc, char ** argv) {
+    const float finite = 0.0f;
+    const float invalid_values[] = {NAN, INFINITY, -INFINITY};
+    for (float invalid : invalid_values) {
+        float max_err, rms_err;
+        compare_f32(&finite, &invalid, 1, &max_err, &rms_err);
+        GGML_ASSERT(std::isinf(max_err) && std::isinf(rms_err));
+        compare_f32(&invalid, &finite, 1, &max_err, &rms_err);
+        GGML_ASSERT(std::isinf(max_err) && std::isinf(rms_err));
+    }
     bool run_bench = false;
     bool run_fuzz = false;
     for (int i = 1; i < argc; ++i) {
