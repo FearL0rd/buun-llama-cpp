@@ -5,6 +5,7 @@
 #include "llama-sha256.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cstring>
 #include <future>
 #include <limits>
@@ -1184,7 +1185,9 @@ bool placement_valid(
     }
 
     size_t next = 0;
-    std::map<std::pair<uint32_t, llama_seq_id>, std::set<llama_pos>>
+    // M-RoPE media has more cells than temporal positions. Its spatial
+    // coordinates distinguish cells at the same temporal position.
+    std::map<std::pair<uint32_t, llama_seq_id>, std::set<std::array<llama_pos, 3>>>
         logical_positions;
     for (const auto & controller : manifest.generation.controllers) {
         if (!carries_placement(controller)) {
@@ -1226,7 +1229,7 @@ bool placement_valid(
                     cell.logical_position >= manifest.identity.token_count ||
                     (i != 0 && placement.cells[i - 1].physical_cell >=
                                    cell.physical_cell) ||
-                    !source_positions.insert(cell.logical_position).second) {
+                    !source_positions.insert({cell.logical_position, cell.ext_x, cell.ext_y}).second) {
                     return false;
                 }
             }
@@ -1705,10 +1708,13 @@ bool prepared_identity_equal(
     return true;
 }
 
-bool prepare_companion(
+enum class companion_hash_kind { section, payload };
+
+bool prepare_companion_hash(
         uint32_t index,
         const std::vector<vbr_artifact_portable_topology> & topologies,
-        vbr_artifact_companion_payload & companion) {
+        vbr_artifact_companion_payload & companion,
+        companion_hash_kind kind) {
     if (companion.kind >= vbr_artifact_companion_kind::_count ||
         companion.format_version == 0 ||
         !digest_nonzero(companion.build_identity_digest) ||
@@ -1718,10 +1724,10 @@ bool prepare_companion(
         companion.payload.size != companion.payload_bytes) {
         return false;
     }
-    if (!digest_matches_source(
+    if (kind == companion_hash_kind::section) {
+        return digest_matches_source(
             DOMAIN_COMPANION, index, 0, companion.payload,
-            companion.section_checksum)) {
-        return false;
+            companion.section_checksum);
     }
     llama_sha256_writer hash;
     hash.string(DOMAIN_COMPANION, sizeof(DOMAIN_COMPANION) - 1);
@@ -1740,6 +1746,14 @@ bool prepare_companion(
     }
     companion.payload_digest = typed_digest<vbr_payload_digest>(hash);
     return companion.payload_digest.valid();
+}
+
+bool prepare_companion(
+        uint32_t index,
+        const std::vector<vbr_artifact_portable_topology> & topologies,
+        vbr_artifact_companion_payload & companion) {
+    return prepare_companion_hash(index, topologies, companion, companion_hash_kind::section) &&
+           prepare_companion_hash(index, topologies, companion, companion_hash_kind::payload);
 }
 
 bool emit_topology(emitter & out, const vbr_artifact_portable_topology & topology) {
@@ -2044,16 +2058,20 @@ size_t hash_worker_count(size_t count, uint32_t max_workers) {
         { count, max_workers, 8, std::thread::hardware_concurrency() }));
 }
 
-// Worker w takes every workers-th index from w. Futures join even if thread
-// creation or fn throws; no worker may outlive the caller's data.
+// Companions follow attention units and can contain a large recurrent image.
+// Start at that end and let free workers claim more work rather than assigning
+// the companion and a fixed share of units to one worker. Results still land
+// at their canonical indices. Futures join even if thread creation or fn
+// throws; no worker may outlive the caller's data.
 template <typename F>
 void for_each_index_parallel(size_t count, size_t workers, const F & fn) {
+    std::atomic<size_t> next { 0 };
     std::vector<std::future<void>> pending;
     pending.reserve(workers);
     for (size_t w = 0; w < workers; ++w) {
-        pending.push_back(std::async(std::launch::async, [&, w] {
-            for (size_t i = w; i < count; i += workers) {
-                fn(i);
+        pending.push_back(std::async(std::launch::async, [&] {
+            for (size_t i; (i = next.fetch_add(1, std::memory_order_relaxed)) < count;) {
+                fn(count - 1 - i);
             }
         }));
     }
@@ -3380,9 +3398,23 @@ vbr_artifact_status vbr_artifact_prepare(
         } else {
             // Independent units keep canonical ordering and every byte hash;
             // no partial metadata is published.
-            std::vector<vbr_artifact_status> statuses(count);
-            for_each_index_parallel(count, workers, [&](size_t i) {
-                statuses[i] = prepare_one(i);
+            // A recurrent companion can be much larger than any attention
+            // unit. Its independent section and payload digests write distinct
+            // fields, so let the existing worker budget process them separately.
+            // Serial readers retain the original two-pass order above.
+            const size_t jobs = count + package.companions.size();
+            std::vector<vbr_artifact_status> statuses(jobs);
+            for_each_index_parallel(jobs, workers, [&](size_t i) {
+                if (i < package.unit_blobs.size()) {
+                    statuses[i] = prepare_unit(uint32_t(i));
+                    return;
+                }
+                const size_t offset = i - package.unit_blobs.size();
+                statuses[i] = prepare_companion_hash(
+                    uint32_t(offset / 2), package.topologies,
+                    package.companions[offset / 2],
+                    offset % 2 == 0 ? companion_hash_kind::section : companion_hash_kind::payload)
+                    ? vbr_artifact_status::ok : vbr_artifact_status::content_id_mismatch;
             });
             for (const auto status : statuses) {
                 if (status != vbr_artifact_status::ok) {

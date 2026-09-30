@@ -364,7 +364,10 @@ bool vbr_artifact_project_capture_union(
                 }
             }
             manifest_ids.push_back(manifest.manifest_id);
-            std::vector<std::pair<llama_seq_id, llama_pos>> logical_positions;
+            // Media cells may share a temporal position. Uniqueness is per
+            // child/sequence and full temporal/spatial coordinate, as in the
+            // exact artifact validator.
+            std::vector<std::tuple<uint32_t, llama_seq_id, llama_pos, llama_pos, llama_pos>> logical_positions;
             for (const auto & placement : manifest.placements) {
                 if (placement.child_id == UINT32_MAX ||
                     placement.stream_index == UINT32_MAX ||
@@ -394,8 +397,11 @@ bool vbr_artifact_project_capture_union(
                         return false;
                     }
                     logical_positions.push_back({
+                        placement.child_id,
                         placement.source_sequence,
                         cell.logical_position,
+                        cell.ext_x,
+                        cell.ext_y,
                     });
                 }
             }
@@ -776,6 +782,70 @@ void artifact_segment_chain::invalidate_revision() noexcept {
 
 uint64_t artifact_segment_chain::content_revision() const noexcept {
     return impl_ ? revision_ : 0;
+}
+
+bool artifact_segment_chain::prefix_matches(
+        const artifact_segment_chain & prefix) const noexcept {
+    if (!impl_ || !prefix.impl_ || prefix.size() == 0 || prefix.size() > size() ||
+        size() > SIZE_MAX) {
+        return false;
+    }
+    bool equal = true;
+    uint64_t offset = 0;
+    return prefix.impl_->for_each_span(0, prefix.size(), [&](const uint8_t * data, size_t count) {
+        if (!equal) {
+            return;
+        }
+        size_t compared = 0;
+        equal = impl_->for_each_span(offset, count, [&](const uint8_t * current, size_t bytes) {
+            equal = equal && std::memcmp(current, data + compared, bytes) == 0;
+            compared += bytes;
+        }) && equal;
+        offset += count;
+    }) && equal;
+}
+
+std::shared_ptr<const artifact_segment_chain> artifact_segment_chain::with_shared_prefix(
+        const artifact_segment_chain & prefix) const noexcept {
+    if (!prefix_matches(prefix)) {
+        return {};
+    }
+    try {
+        auto result = std::make_shared<artifact_segment_chain>();
+        // No content or authentication change. Only the immutable allocation
+        // owners change, after a byte-for-byte comparison of the entire prefix.
+        *result->impl_ = *impl_;
+        result->revision_ = revision_;
+        auto & out = *result->impl_;
+        out.segments = prefix.impl_->segments;
+        out.segment_ends = prefix.impl_->segment_ends;
+        uint64_t end = prefix.size();
+        uint64_t begin = 0;
+        for (const auto & segment : impl_->segments) {
+            const uint64_t segment_end = begin + segment.length;
+            if (segment_end > end) {
+                // Whole suffix allocations can keep their existing owners.
+                // A boundary slice must be copied so it cannot retain the
+                // duplicate prefix while accounting charges only the suffix.
+                if (end == begin && segment.offset == 0 &&
+                    segment.length == segment.storage->size()) {
+                    out.segments.push_back(segment);
+                } else {
+                    const auto * data = segment.storage->data() + segment.offset + (end - begin);
+                    const size_t count = size_t(segment_end - end);
+                    auto bytes = std::make_shared<const std::vector<uint8_t>>(data, data + count);
+                    out.segments.push_back({ std::move(bytes), 0, count });
+                }
+                end = segment_end;
+                out.segment_ends.push_back(end);
+            }
+            begin = segment_end;
+        }
+        out.max_segment = std::max(out.max_segment, prefix.impl_->max_segment);
+        return result;
+    } catch (...) {
+        return {};
+    }
 }
 
 bool artifact_segment_chain::append(

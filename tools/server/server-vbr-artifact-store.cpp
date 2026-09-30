@@ -1101,6 +1101,15 @@ bool server_vbr_artifact_import_variant_fallback_safe(
     return false;
 }
 
+bool server_vbr_artifact_import_capacity_refused(
+        const server_vbr_artifact_import_output & output) noexcept {
+    return output.status == server_vbr_artifact_import_status::unavailable &&
+        !output.adopt_attempted && output.h2d_bytes == 0 && output.h2d_chunks == 0 &&
+        output.recovery == vbr_adopt_recovery_outcome::not_needed &&
+        (output.destination_status == vbr_import_destination_status::exhausted ||
+         output.occupied_guard_status == vbr_occupied_replacement_guard_status::capacity_unavailable);
+}
+
 bool server_vbr_artifact_reference_index::publish(
         std::string reference,
         std::string tenant_key,

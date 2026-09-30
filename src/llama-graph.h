@@ -35,6 +35,7 @@ struct llama_hadamard_transform {
 using llama_hadamard_rotations = std::unordered_map<const ggml_tensor *, llama_hadamard_transform>;
 
 struct llama_cparams;
+struct llama_prec_policy;
 struct llama_layer;
 struct llama_tree_mask;
 
@@ -892,6 +893,8 @@ struct llm_graph_params {
     const std::vector<ggml_tensor *> * tree_ssm_intermediates = nullptr;
     int tree_n_recurrent_layers = 0;
 
+    const llama_prec_policy * prec_policy = nullptr;
+
     std::map<llama_seq_id, llama_sampler *> samplers;
 
     static bool samplers_equal(
@@ -1172,6 +1175,8 @@ struct llm_graph_context {
     ggml_tensor * tree_parent_ids = nullptr;
     const std::vector<ggml_tensor *> * tree_ssm_intermediates = nullptr;
     int tree_n_recurrent_layers = 0;
+
+    const llama_prec_policy * prec_policy;
 
     std::map<llama_seq_id, llama_sampler *> samplers;
 

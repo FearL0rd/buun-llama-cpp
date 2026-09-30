@@ -2384,7 +2384,7 @@ vbr_adopt_result vbr_adopt_empty_manifest(
         }
         for (const auto & plan : manifest->children()) {
             const uint64_t expected = uint64_t(plan.shards.size())*
-                (occupied_replacement ? manifest->relocation_runs().size()
+                (occupied_replacement ? vbr_occupied_relocation_read_count(manifest->relocation_runs())
                  : prefix_projection ? 1 : plan.authorized_runs.size());
             if (expected == 0 || expected > UINT32_MAX ||
                 transferred_units[{ plan.child_id, plan.logical_unit_id }] !=

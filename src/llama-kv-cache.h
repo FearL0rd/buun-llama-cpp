@@ -438,6 +438,9 @@ public:
           slot_info_vec_t *   sinfos_out,
     const slot_info_vec_t *   sinfos_in);
 
+    // undo a state_read() of seq_id (-1 for the whole cache) that another memory module failed to complete
+    void state_clear(llama_seq_id seq_id);
+
     //
     // graph_build API
     //
@@ -678,7 +681,8 @@ private:
     // the installed rows plus suffix, retaining source_backing independently.
     uint32_t vbr_import_watermark_cells(uint32_t incoming_cells, uint32_t prefix_cells,
                                         uint32_t source_high_water, llama_seq_id destination,
-                                        uint32_t source_backing = 0) const;
+                                        uint32_t source_backing = 0,
+                                        bool recycle_incumbent = false) const;
     struct vbr_import_destination_pricing {
         struct pool_row {
             const ggml_vbr_backend_iface * be = nullptr;
@@ -1752,6 +1756,7 @@ private:
     bool state_read_meta(llama_io_read_i & io, uint32_t strm, uint32_t cell_count,       slot_info & sinfo, llama_seq_id dest_seq_id = -1, const slot_info * sinfo_in = nullptr, const state_append_t * append = nullptr);
     // sinfo holds the first n_place cells of the blob, the rows of the others are read and dropped
     bool state_read_data(llama_io_read_i & io, uint32_t strm, uint32_t cell_count, const slot_info & sinfo, uint32_t n_place);
+    void state_clear_data(uint32_t strm, const slot_info & sinfo);
 };
 
 class llama_kv_cache_context : public llama_memory_context_i {

@@ -1,4 +1,5 @@
 #include "llama-kv-cache-iswa.h"
+#include "llama-io.h"
 
 #include <exception>
 #include <limits>
@@ -774,7 +775,15 @@ void llama_kv_cache_iswa::state_read(llama_io_read_i & io, llama_seq_id seq_id, 
     }
 
     if ((flags & LLAMA_STATE_SEQ_FLAGS_RECURRENT_ONLY) == 0) {
-        kv_swa->state_read(io, seq_id, flags);
+        try {
+            kv_swa->state_read(io, seq_id, flags);
+        } catch (...) {
+            io.discard();
+            if ((flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == 0) {
+                kv_base->state_clear(seq_id);
+            }
+            throw;
+        }
     }
 }
 

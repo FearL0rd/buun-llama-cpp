@@ -957,6 +957,8 @@ private:
     llama_cache_acct_artifact_id destination_artifact_;
     uint64_t incoming_compact_bytes_ = 0;
     size_t incoming_tokens_ = 0;
+    size_t projected_bytes_ = 0;
+    uint64_t competition_epoch_ = 0;
     std::thread::id scheduler_owner_;
     friend struct server_prompt_cache;
 };
@@ -964,6 +966,8 @@ private:
 struct server_prompt_cache_vbr_pressure_citation {
     std::array<llama_cache_acct_artifact_id, 2> artifacts {};
     size_t count = 0;
+    size_t projected_bytes = 0;
+    uint64_t competition_epoch = 0;
 };
 
 enum class server_prompt_cache_vbr_capacity_status : uint8_t {
@@ -1027,6 +1031,31 @@ private:
 };
 
 class server_cache_recovery_pin;
+
+// Scheduler-scoped overlap for an exact host/live exchange. The incoming
+// host stays pinned until import commits; destruction settles ordinary cache
+// limits on success, refusal, or an early launch return. Must not outlive cache.
+class server_prompt_cache_vbr_exchange {
+public:
+    server_prompt_cache_vbr_exchange() = default;
+    ~server_prompt_cache_vbr_exchange();
+    server_prompt_cache_vbr_exchange(const server_prompt_cache_vbr_exchange &) = delete;
+    server_prompt_cache_vbr_exchange & operator=(const server_prompt_cache_vbr_exchange &) = delete;
+    server_prompt_cache_vbr_restore_candidate * candidate() noexcept {
+        return cache_ ? &incoming_ : nullptr;
+    }
+    bool settle() noexcept;
+
+private:
+    server_prompt_cache * cache_ = nullptr;
+    server_prompt_cache_state * source_ = nullptr;
+    const server_prompt_cache_vbr_payload * owner_ = nullptr;
+    server_prompt_cache_vbr_restore_candidate incoming_;
+    bool committed_exact_ = false;
+    int32_t destination_slot_ = -1;
+    std::thread::id scheduler_owner_;
+    friend struct server_prompt_cache;
+};
 
 // Move-only pre-import capability for replacing an occupied live prompt. It
 // owns both durable host pins and the provisional prompt/launch association
@@ -1355,13 +1384,15 @@ struct server_prompt_checkpoint_reuse {
 server_prompt_checkpoint_reuse server_prompt_checkpoint_reuse_geometry(
     const server_tokens & tokens, const common_prompt_checkpoint & checkpoint, llama_pos pos_next);
 
-// Read-only geometry for fixed-state recurrent/hybrid host selection. Dynamic
-// VBR artifacts have their own restore feasibility/representation negotiation.
+// Read-only live/checkpoint reuse geometry. Artifact import feasibility and
+// representation negotiation remain separate from this live-state quote.
 struct server_prompt_cache_reuse_context {
     llama_pos live_pos_min = -1;
     int32_t n_swa = 0;
     bool frontier_required = false;
     std::string execution_identity;
+    llama_memory_vbr_state_data vbr_state = {};
+    bool exact_frontier_logits = false;
 };
 
 size_t server_prompt_cache_reusable_prefix(
@@ -1396,7 +1427,16 @@ private:
     struct active_storage_state;
     std::shared_ptr<active_storage_state> active_storage_;
     void detach_active_storage_accounting() noexcept;
+    server_prompt_cache_vbr_exchange * vbr_exchange_ = nullptr;
+    size_t vbr_exchange_bytes_ = 0;
+    size_t admission_byte_limit() const noexcept;
+    bool finish_vbr_exchange(server_prompt_cache_vbr_exchange & exchange) noexcept;
+    friend class server_prompt_cache_vbr_exchange;
 public:
+
+    bool begin_vbr_exchange(server_prompt_cache_vbr_restore_candidate incoming,
+                           int32_t destination_slot,
+                           server_prompt_cache_vbr_exchange & exchange) noexcept;
 
     std::list<server_prompt_cache_state> states;
     using iterator = std::list<server_prompt_cache_state>::iterator;
@@ -1440,6 +1480,14 @@ public:
         const std::string & execution_identity,
         const std::string & adapter_config_key,
         const server_vbr_artifact_store * projector = nullptr) const noexcept;
+    // Find an exact saved prefix of this execution, not a physical rollback
+    // image. Used to avoid recapturing a checkpoint already held by the cache.
+    llama_cache_acct_artifact_id find_vbr_durable_stem(
+        const server_prompt & prompt,
+        int64_t coverage_tokens,
+        const std::string & execution_identity,
+        const std::string & adapter_config_key,
+        llama_cache_acct_artifact_id required_artifact = {}) const noexcept;
     // Read-only suppression check for an already-durable shorter frontier.
     // The host package must be exact for coverage and the current live prompt
     // must still carry that exact prefix under the same source epoch.
@@ -1567,11 +1615,13 @@ public:
         server_prompt_cache_vbr_restore_candidate & candidate,
         server_prompt & destination,
         common_cache_family_binding & destination_family,
-        int32_t id_slot) noexcept;
+        int32_t id_slot,
+        bool exact_representation = false) noexcept;
 
     // CPU-only preparation for an occupied destination. The incoming
     // candidate must be exact (not a parent projection) and must improve the
-    // live common prefix. Preparation clones all replacement metadata into a
+    // usable live prefix (raw LCP when no scheduler quote is supplied).
+    // Preparation clones all replacement metadata into a
     // private provisional launch association without mutating or retiring the
     // incumbent slot. The occupied importer consumes the ticket through its
     // allocation-free composite KV/prompt/retention publication callback.
@@ -1585,7 +1635,8 @@ public:
         const std::string & adapter_config_key,
         server_prompt_cache_vbr_replacement_ticket & ticket,
         server_prompt_cache_vbr_replacement_diagnostics * diagnostics =
-            nullptr) noexcept;
+            nullptr,
+        size_t reusable_live_prefix = SIZE_MAX) noexcept;
     // The scheduler calls the fallible read half before entering the adopter's
     // no-fail terminal. Publication swaps the already-existing sidecar
     // association and prompt storage without first clearing the incumbent.

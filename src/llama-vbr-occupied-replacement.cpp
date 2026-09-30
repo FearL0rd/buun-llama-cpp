@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <limits>
+#include <tuple>
 #include <utility>
 
 struct vbr_occupied_replacement_guard::map {
@@ -15,6 +16,7 @@ struct vbr_occupied_replacement_guard::map {
     vbr_occupied_replacement_strategy strategy =
         vbr_occupied_replacement_strategy::_count;
     bool incoming_transformed = false;
+    bool recycle_requested = false;
     bool absent_destination = false;
     uint64_t packed_rows_expanded = 0;
     uint64_t incoming_prefix_tokens = 0;
@@ -22,20 +24,51 @@ struct vbr_occupied_replacement_guard::map {
     std::vector<vbr_occupied_replacement_cell> preserved_cells;
 };
 
+size_t vbr_occupied_relocation_read_count(
+        const std::vector<vbr_occupied_replacement_relocation_run> & runs) noexcept {
+    size_t count = 0;
+    uint64_t next = UINT64_MAX;
+    for (const auto & run : runs) {
+        count += run.first_destination_physical_cell != next;
+        next = uint64_t(run.first_destination_physical_cell) + run.cell_count;
+    }
+    return count;
+}
+
+bool vbr_order_placement_cells(
+        const vbr_artifact_stream_placement & placement,
+        std::vector<const vbr_artifact_cell_placement *> & cells) {
+    cells.clear();
+    cells.reserve(placement.cells.size());
+    for (const auto & cell : placement.cells) {
+        if (cell.logical_position < 0 || cell.logical_position >= placement.computation_frontier) {
+            return false;
+        }
+        cells.push_back(&cell);
+    }
+    const auto key = [](const auto * cell) {
+        return std::tie(cell->logical_position, cell->ext_y, cell->ext_x);
+    };
+    const auto less = [&](auto * a, auto * b) { return key(a) < key(b); };
+    if (!std::is_sorted(cells.begin(), cells.end(), less)) {
+        std::sort(cells.begin(), cells.end(), less);
+    }
+    return std::adjacent_find(cells.begin(), cells.end(),
+        [&](auto * a, auto * b) { return key(a) == key(b); }) == cells.end();
+}
+
 bool vbr_projected_packed_rows(
         const vbr_artifact_package_view & incoming,
         const vbr_artifact_stream_placement & placement,
         std::vector<uint64_t> & packed_rows) {
     packed_rows.clear();
     packed_rows.resize(placement.cells.size(), UINT64_MAX);
+    std::vector<const vbr_artifact_cell_placement *> ordered;
+    if (!vbr_order_placement_cells(placement, ordered)) { return false; }
     const auto & proofs = incoming.projected_ranges();
     if (proofs.empty()) {
-        for (const auto & cell : placement.cells) {
-            if (cell.logical_position < 0 || size_t(cell.logical_position) >= packed_rows.size() ||
-                packed_rows[size_t(cell.logical_position)] != UINT64_MAX) {
-                return false;
-            }
-            packed_rows[size_t(cell.logical_position)] = cell.physical_cell;
+        for (size_t i = 0; i < ordered.size(); ++i) {
+            packed_rows[i] = ordered[i]->physical_cell;
         }
         return true;
     }
@@ -43,17 +76,14 @@ bool vbr_projected_packed_rows(
         return false;
     }
 
-    std::vector<const vbr_artifact_cell_placement *> physical;
+    std::vector<std::pair<uint32_t, size_t>> physical;
     physical.reserve(placement.cells.size());
-    for (const auto & cell : placement.cells) {
-        physical.push_back(&cell);
+    for (size_t i = 0; i < ordered.size(); ++i) {
+        physical.push_back({ordered[i]->physical_cell, i});
     }
-    std::sort(physical.begin(), physical.end(), [](const auto * lhs,
-                                                   const auto * rhs) {
-        return lhs->physical_cell < rhs->physical_cell;
-    });
+    std::sort(physical.begin(), physical.end());
     for (size_t i = 1; i < physical.size(); ++i) {
-        if (physical[i-1]->physical_cell == physical[i]->physical_cell) {
+        if (physical[i-1].first == physical[i].first) {
             return false;
         }
     }
@@ -123,9 +153,8 @@ bool vbr_projected_packed_rows(
             size_t cell_index = 0;
             for (const auto & range : canonical_ranges) {
                 for (uint64_t row = 0; row < range.second; ++row) {
-                    const auto logical = physical[cell_index++]->logical_position;
-                    if (logical < 0 || uint64_t(logical) >= packed_rows.size() ||
-                        row > UINT64_MAX-range.first) {
+                    const auto logical = physical[cell_index++].second;
+                    if (row > UINT64_MAX-range.first) {
                         return false;
                     }
                     packed_rows[size_t(logical)] = range.first+row;
@@ -589,6 +618,12 @@ vbr_occupied_replacement_guard_status occupied_guard_validate(
             continue;
         }
         const auto & rd = recovery.units()[i].descriptor;
+        // A clean sink stash needs the ordinary empty-tree importer. It is
+        // unsupported by this row-relocation route, not stale representation
+        // evidence that another capture could repair.
+        if (!occupied_unit_admissible(id) || !occupied_unit_admissible(rd)) {
+            return vbr_occupied_replacement_guard_status::unsupported_layout;
+        }
         if (rd.logical_unit_id != i ||
             !occupied_unit_schedule_equal(id, rd) ||
             !occupied_target_unit_matches(
@@ -612,12 +647,12 @@ vbr_occupied_replacement_guard_status occupied_guard_validate(
     if (incoming.manifest().identity.token_count <= 0 ||
         uint64_t(incoming.manifest().identity.token_count) !=
             parent_incoming_tokens ||
-        incoming.manifest().identity.next_position !=
-            llama_pos(parent_incoming_tokens) ||
+        incoming.manifest().identity.next_position <= 0 ||
+        (prefix_incoming && incoming.manifest().identity.next_position != llama_pos(parent_incoming_tokens)) ||
         incoming_placement.child_id != 0 ||
         incoming_placement.stream_index != 0 ||
         incoming_placement.computation_frontier !=
-            llama_pos(parent_incoming_tokens) ||
+            incoming.manifest().identity.next_position ||
         incoming_placement.cells.size() != parent_incoming_tokens ||
         incoming_tokens == 0 || incoming_tokens > parent_incoming_tokens) {
         return vbr_occupied_replacement_guard_status::frontier_mismatch;
@@ -628,34 +663,22 @@ vbr_occupied_replacement_guard_status occupied_guard_validate(
         recovery_placement = &recovery.manifest().stream_placements.front();
         if (recovery.manifest().identity.token_count <= 0 ||
             uint64_t(recovery.manifest().identity.token_count) != recovery_tokens ||
-            recovery.manifest().identity.next_position != llama_pos(recovery_tokens) ||
+            recovery.manifest().identity.next_position <= 0 ||
             observation.sequence_epoch != recovery.manifest().identity.sequence_epoch ||
             recovery_placement->child_id != 0 ||
             recovery_placement->stream_index != 0 ||
             recovery_placement->source_sequence != observation.destination ||
-            recovery_placement->computation_frontier != llama_pos(recovery_tokens) ||
+            recovery_placement->computation_frontier != recovery.manifest().identity.next_position ||
             recovery_placement->cells.size() != recovery_tokens) {
             return vbr_occupied_replacement_guard_status::frontier_mismatch;
         }
     }
     // Artifacts are sealed in physical-row order. After a slot is restored
     // into free cells and then extended, that order need not be token order.
-    // Index the authenticated placements by logical position without changing
+    // Index the authenticated placements by full coordinates without changing
     // their physical ownership or assuming a contiguous allocation.
-    const auto index_logical = [](const vbr_artifact_stream_placement & placement,
-                                  std::vector<const vbr_artifact_cell_placement *> & index) {
-        index.assign(placement.cells.size(), nullptr);
-        for (const auto & cell : placement.cells) {
-            if (cell.logical_position < 0 || size_t(cell.logical_position) >= index.size() ||
-                index[size_t(cell.logical_position)] != nullptr) {
-                return false;
-            }
-            index[size_t(cell.logical_position)] = &cell;
-        }
-        return true;
-    };
-    if ((!absent && !index_logical(*recovery_placement, recovery_logical)) ||
-        !index_logical(incoming_placement, incoming_logical)) {
+    if ((!absent && !vbr_order_placement_cells(*recovery_placement, recovery_logical)) ||
+        !vbr_order_placement_cells(incoming_placement, incoming_logical)) {
         return vbr_occupied_replacement_guard_status::unsupported_layout;
     }
     // A unified physical cache may contain several independent server slots.
@@ -711,15 +734,23 @@ vbr_occupied_replacement_guard_status occupied_guard_validate(
             return vbr_occupied_replacement_guard_status::destination_present;
         }
         if (live.reference_count != 1 ||
-            live.owner_sequence != observation.destination ||
-            uint64_t(live.logical_position) >= recovery_tokens) {
+            live.owner_sequence != observation.destination) {
             return vbr_occupied_replacement_guard_status::ownership_mismatch;
         }
-        auto & logical = destination_cells[size_t(live.logical_position)];
+        const auto key = std::tie(live.logical_position, live.ext_y, live.ext_x);
+        const auto found = std::lower_bound(recovery_logical.begin(), recovery_logical.end(), key,
+            [](const auto * cell, const auto & value) {
+                return std::tie(cell->logical_position, cell->ext_y, cell->ext_x) < value;
+            });
+        if (found == recovery_logical.end() ||
+            std::tie((*found)->logical_position, (*found)->ext_y, (*found)->ext_x) != key) {
+            return vbr_occupied_replacement_guard_status::ownership_mismatch;
+        }
+        auto & logical = destination_cells[size_t(found - recovery_logical.begin())];
         if (logical != 0) {
             return vbr_occupied_replacement_guard_status::ownership_mismatch;
         }
-        const auto & sealed = *recovery_logical[size_t(live.logical_position)];
+        const auto & sealed = **found;
         if (sealed.physical_cell != live.physical_cell ||
             sealed.ext_x != live.ext_x || sealed.ext_y != live.ext_y) {
             return vbr_occupied_replacement_guard_status::ownership_mismatch;
@@ -741,7 +772,11 @@ vbr_occupied_replacement_guard_status occupied_guard_validate(
     }
 
     const size_t free_cells = observation.cell_capacity-observation.cell_count;
-    const auto strategy = incoming_tokens <= free_cells
+    const auto strategy = map_authority && map_authority->recycle_requested
+        ? (!absent && incoming_tokens <= recovery_tokens
+            ? vbr_occupied_replacement_strategy::recycle_incumbent_cells
+            : vbr_occupied_replacement_strategy::_count)
+        : incoming_tokens <= free_cells
         ? vbr_occupied_replacement_strategy::provisional_free_cells
         : incoming_tokens <= recovery_tokens
             ? vbr_occupied_replacement_strategy::recycle_incumbent_cells
@@ -1083,6 +1118,7 @@ vbr_prepare_occupied_replacement_guard(
         auto shared = std::make_shared<vbr_occupied_replacement_guard::map>();
         shared->incoming_transformed =
             incoming_status != vbr_import_schedule_status::exact;
+        shared->recycle_requested = incoming_authority->destination().recycle_incumbent;
         shared->mappings.reserve(
             incoming.manifest().stream_placements.front().cells.size());
         shared->relocation_runs.reserve(std::min<size_t>(
@@ -1187,6 +1223,7 @@ vbr_prepare_occupied_prefix_replacement_guard(
         shared->incoming_transformed =
             incoming_status != vbr_import_schedule_status::exact;
         shared->incoming_prefix_tokens = prefix_tokens;
+        shared->recycle_requested = authenticated_incoming.destination().recycle_incumbent;
         shared->incoming_prefix_runs = prefix_runs;
         shared->mappings.reserve(size_t(prefix_tokens));
         shared->relocation_runs.reserve(std::min<size_t>(

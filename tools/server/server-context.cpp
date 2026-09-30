@@ -1078,10 +1078,11 @@ static common_speculative_output_limits server_output_limits(const common_params
     // per-seq floor (~64 tokens) — e.g. any follow-up turn that re-processes context.
     // DFlash may only be detected from the draft GGUF after the target context is
     // created (same ordering problem as the verify floor below), so gate on has_dft()
-    // too. output_reserve grows its buffers lazily, so the higher cap costs nothing
-    // until a batch actually requests that many outputs (the pre-cap reservation).
+    // too, except for an explicit MTP sidecar: it uses the same hidden-state
+    // handoff as embedded MTP, not output-all embeddings. Reserving a full-vocab
+    // output for every prompt row can otherwise crowd out the expert cache.
     if (params.speculative.has_type(COMMON_SPECULATIVE_TYPE_DFLASH) ||
-        params.speculative.has_dft()) {
+        (params.speculative.has_dft() && !params.speculative.has_external_mtp_sidecar())) {
         return { (int32_t) params.n_batch, (int32_t) params.n_batch };
     }
 
@@ -1427,6 +1428,19 @@ server_speculative_decode_terminal_resolve(
 
 struct server_slot; // forward declaration
 
+static bool server_task_can_split(const server_task & task, llama_context * ctx) {
+    // Speculative hidden-state output is not an embedding task.
+    if (!task.need_embd()) {
+        return true;
+    }
+    if (!llama_get_memory(ctx)) {
+        return false;
+    }
+    const auto pooling = llama_pooling_type(ctx);
+    return pooling == LLAMA_POOLING_TYPE_LAST ||
+        (pooling == LLAMA_POOLING_TYPE_RANK && llama_get_causal_attn(ctx));
+}
+
 struct server_batch {
     llama_batch batch;
     bool batch_rendered = false;
@@ -1720,6 +1734,7 @@ struct server_slot {
     server_vbr_prompt_cache_support_status vbr_idle_support_status =
         server_vbr_prompt_cache_support_status::supported;
     std::array<uint8_t, 32> vbr_idle_capture_published_identity = {};
+    std::array<uint8_t, 32> vbr_restored_stem_identity = {};
     bool vbr_idle_capture_representation_valid = false;
     // A stem is independently durable but cannot authorize clearing the full
     // live frontier. Bind its retry/completion state to the complete source
@@ -2050,6 +2065,7 @@ struct server_slot {
         vbr_idle_support_status =
             server_vbr_prompt_cache_support_status::supported;
         vbr_idle_capture_published_identity = {};
+        vbr_restored_stem_identity = {};
         vbr_idle_capture_representation_valid = false;
         vbr_idle_stem_source_identity = {};
         vbr_idle_stem_coverage_tokens = 0;
@@ -2721,15 +2737,9 @@ struct server_slot {
         return get_spec() && common_speculative_need_embd_nextn(get_spec());
     }
 
-    // if the context does not have a memory module then all embeddings have to be computed within a single ubatch
-    // also we cannot split if the pooling would require any past tokens
-    // (MTP supports splitting — uses task->need_embd() not need_embd())
     bool can_split() const {
         GGML_ASSERT(task);
-
-        return
-            !task->need_embd() ||
-            (llama_get_memory(ctx_tgt) && llama_pooling_type(ctx_tgt) == LLAMA_POOLING_TYPE_LAST);
+        return server_task_can_split(*task, ctx_tgt);
     }
 
     bool can_batch_with(server_slot & other_slot) const {
@@ -2870,8 +2880,9 @@ struct server_slot {
                     llama_get_memory(ctx_tgt), seq_id_backup, -1, -1);
             }
 
-            // do not keep context of the child slots - the parent's context is enough
-            if (task->is_child()) {
+            // Child state belongs to its parent. Embedding/rerank state is
+            // stateless and must not enter idle retention or resume capture.
+            if (task->is_child() || task->need_embd()) {
                 prompt_clear();
             }
 
@@ -3313,13 +3324,24 @@ static int process_mtmd_chunk(const server_slot & slot, mtmd::batch_ptr & mbatch
                 // Shared block-diffusion DFlash/DSpark use one speculative object and leave
                 // the slot-owned pointer empty. Route image-batch notifications through the
                 // same accessor as text batches.
-                void * cb_data = slot.get_spec();
-                static auto cb = [](llama_batch batch, void * user_data) {
-                    common_speculative * spec = static_cast<common_speculative *>(user_data);
-                    if (!common_speculative_process(spec, batch)) {
-                        return 1;
+                struct callback_data {
+                    common_speculative * spec;
+                    std::vector<int32_t> n_seq_id;
+                    std::vector<llama_seq_id *> seq_id;
+                } cb_data = { slot.get_spec(), {}, {} };
+                static auto cb = [](const mtmd_helper_embd_batch * input, void * user_data) -> int32_t {
+                    auto & data = *static_cast<callback_data *>(user_data);
+                    if (!data.spec) {
+                        return 0;
                     }
-                    return 0;
+                    // Synchronous borrowed view: preserve every M-RoPE axis and
+                    // avoid copying projector output just to notify the drafter.
+                    data.n_seq_id.assign(input->n_tokens, 1);
+                    data.seq_id.assign(input->n_tokens, const_cast<llama_seq_id *>(&input->seq_id));
+                    llama_batch batch = {input->n_tokens, nullptr,
+                        const_cast<float *>(input->embd), const_cast<llama_pos *>(input->pos),
+                        data.n_seq_id.data(), data.seq_id.data(), nullptr};
+                    return common_speculative_process(data.spec, batch) ? 0 : 1;
                 };
 
                 llama_pos new_n_past; // unused for now
@@ -3333,7 +3355,7 @@ static int process_mtmd_chunk(const server_slot & slot, mtmd::batch_ptr & mbatch
                     llama_n_batch(slot.ctx_tgt),
                     &new_n_past,
                     cb,
-                    cb_data
+                    &cb_data
                 );
                 if (res != 0) {
                     SLT_ERR(slot, "failed to decode mtmd chunk, idx = %zu, res = %d\n", idx, res);
@@ -3412,8 +3434,8 @@ bool server_vbr_empty_handoff_lookup_allowed(
 bool server_vbr_empty_handoff_allowed(
         const server_vbr_empty_handoff_gate & gate) noexcept {
     return server_vbr_empty_handoff_lookup_allowed(gate) &&
-        gate.incoming_prefix > gate.incumbent_lcp &&
-        gate.durable_incumbent_prefix > gate.incumbent_lcp &&
+        gate.incoming_prefix > gate.incumbent_reusable &&
+        gate.durable_incumbent_prefix > gate.incumbent_reusable &&
         (!gate.exact_incumbent_durable || gate.occupied_route_refused) &&
         gate.family_matches;
 }
@@ -3611,6 +3633,11 @@ static void server_wire_standalone_retention_metadata(
 }
 
 struct server_context_impl {
+    friend bool server_vbr_media_publish_for_test(const server_tokens & ledger);
+    friend bool server_vbr_restored_stem_for_test(
+        server_prompt_cache &, const server_prompt &,
+        const std::string &, const std::string &, bool);
+    friend bool server_resume_media_placement_for_test(const server_tokens & ledger);
     friend struct server_swa_window_selection_test;
     friend struct server_context;
     friend server_rejected_prompt_preservation_result
@@ -5137,13 +5164,15 @@ private:
         return resume_active() && resume_vbr();
     }
 
-    // a conversation that leaves its slot lives on in a host cache, of either kind
+    // a conversation that leaves its slot lives on in a host cache, of either kind, which the resume
+    // takes in unless it is for the slots only
     bool resume_host_cache() const {
-        return fixed_host_cache_enabled() || resume_vbr_host_cache();
+        return !params_base.resume_no_host_cache && (fixed_host_cache_enabled() || resume_vbr_host_cache());
     }
 
     bool resume_vbr_host_cache() const {
-        return resume_vbr() && params_base.vbr_prompt_cache && prompt_cache && vbr_artifact_store;
+        return !params_base.resume_no_host_cache && resume_vbr() && params_base.vbr_prompt_cache && prompt_cache &&
+               vbr_artifact_store;
     }
 
     // An artifact is bound to the execution identity and the sequence epoch of its capture. Both
@@ -5203,8 +5232,8 @@ private:
         SRV_INF("RESUME %s\n", status.dump().c_str());
     }
 
-    // Under M-RoPE the cells of a media chunk share positions, and a token range names cells by
-    // position. Media is stored only where a chunk of n cells takes n consecutive positions.
+    // M-RoPE media needs position-aware objects rather than the incremental
+    // one-cell-per-position range format.
     bool resume_media_positions_shared() const {
         const auto rope = llama_model_rope_type(model_tgt);
         return rope == LLAMA_ROPE_TYPE_MROPE || rope == LLAMA_ROPE_TYPE_IMROPE ||
@@ -5241,7 +5270,7 @@ private:
             : cp.checkpoint_epoch == 0 && cp.checkpoint_epoch_swa == 0;
         return lineage && !cp.data_tgt.empty() &&
             cp.n_tokens > 0 && cp.n_tokens < n_tokens &&
-            cp.pos_max + 1 == cp.n_tokens &&
+            cp.pos_max + 1 == slot.prompt.tokens.pos_next(size_t(cp.n_tokens)) &&
             !resume_cuts_media(slot.prompt.tokens, size_t(cp.n_tokens)) &&
             checkpoint_frontier_is_current(slot, cp, adapter);
     }
@@ -5779,6 +5808,7 @@ private:
             (slot.t_last_used > 0 ? std::max<int64_t>(0, ggml_time_us() - slot.t_last_used)/1000 : 0);
         next.slot_hint         = slot.id;
         next.producers         = old.producers;
+        next.shared_positions  = slot.prompt.tokens.has_media() && resume_media_positions_shared();
     }
 
     bool resume_ledger_build(
@@ -5803,7 +5833,8 @@ private:
         const int64_t t_start = ggml_time_us();
         const auto & tokens = slot.prompt.tokens;
         const int32_t n_tokens = int32_t(tokens.size());
-        if (tokens.pos_next() != n_tokens || (tokens.has_media() && resume_media_positions_shared())) {
+        if (tokens.pos_next() <= 0 ||
+            (tokens.pos_next() != n_tokens && !tokens.has_media())) {
             return skipped("unsupported_positions");
         }
         if (tokens.has_media()) {
@@ -5813,8 +5844,8 @@ private:
                 return skipped("unsupported_media");
             }
         }
-        if (resume_vbr() && (tokens.has_media() || !vbr_artifact_store)) {
-            return skipped(tokens.has_media() ? "unsupported_media" : "unsupported_artifact");
+        if (resume_vbr() && !vbr_artifact_store) {
+            return skipped("unsupported_artifact");
         }
         {
             std::vector<llama_memory_tree_child> tree;
@@ -5833,7 +5864,7 @@ private:
         auto * mem = llama_get_memory(ctx_tgt);
         const llama_pos pos_min = llama_memory_seq_pos_min(mem, slot.id);
         const llama_pos pos_max = llama_memory_seq_pos_max(mem, slot.id);
-        if (pos_max + 1 != n_tokens) {
+        if (pos_max + 1 != tokens.pos_next()) {
             return skipped("frontier_inconsistent");
         }
         if (!resume_has_partial && pos_min != 0 && llama_model_n_swa(model_tgt) == 0) {
@@ -5877,6 +5908,9 @@ private:
             return group.pool_entry.empty()
                 ? resume_capture_artifact(slot, old, have_old, adapter, adapter_hex, t_start, group)
                 : resume_capture_placement(slot, old, have_old, adapter, adapter_hex, t_start, group);
+        }
+        if (tokens.has_media() && resume_media_positions_shared()) {
+            return resume_capture_sequence(slot, old, have_old, adapter, adapter_hex, t_start);
         }
 
         // The same tokens can stand over another state: a cold refill, another model of the family,
@@ -6143,10 +6177,66 @@ private:
         };
     }
 
+    // Fixed-KV M-RoPE media cannot be represented by consecutive-position
+    // chunks. Store the existing full sequence format, including its explicit
+    // cell coordinates and recurrent state, under a distinct object kind.
+    json resume_capture_sequence(
+            server_slot & slot, const server_resume_manifest & old, bool have_old,
+            const std::string & adapter, const std::string & adapter_hex, int64_t t_start) {
+        const size_t size = llama_state_seq_get_size_ext(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_NONE);
+        if (size == 0) { return resume_skipped("state_rejected"); }
+        if (size > server_resume_limits::max_object_bytes) {
+            return resume_skipped("state_too_large");
+        }
+        const auto ring = resume_ring_tails(slot, adapter, slot.prompt.n_tokens());
+        if (!have_old) { resume_prune(1); }
+        if (resume_store->free_bytes() < size + resume_ring_bytes(ring) + 1024*1024) {
+            return resume_failed(server_resume_reason::no_space, "whole media sequence");
+        }
+        std::vector<uint8_t> data(size);
+        if (llama_state_seq_get_data_ext(ctx_tgt, data.data(), data.size(), slot.id,
+                LLAMA_STATE_SEQ_FLAGS_NONE) != size) {
+            return resume_skipped("state_rejected");
+        }
+        server_resume_manifest next;
+        resume_manifest_head(next, old, slot, adapter_hex);
+        next.retain_producers({});
+        const uint32_t producer = next.producer_index(resume_producer());
+        if (!resume_ledger_build(slot.prompt.tokens, adapter, next.ledger)) {
+            return resume_skipped("ledger_invalid");
+        }
+        const std::string id = have_old ? slot.resume_entry_id : server_resume_store::new_entry_id();
+        server_resume_object_record rec;
+        rec.kind = server_resume_object_kind::sequence;
+        rec.p1 = next.n_tokens;
+        rec.gen = next.generation;
+        rec.producer = producer;
+        rec.prefix_digest = server_resume_prefix_hasher(slot.prompt.tokens).at(size_t(next.n_tokens));
+        std::string error;
+        auto reason = resume_store->write_object(id, rec, data.data(), data.size(), error);
+        std::vector<uint8_t>().swap(data);
+        uint64_t bytes = rec.bytes;
+        next.artifact = rec;
+        if (reason == server_resume_reason::ok) {
+            reason = resume_write_ring_tails(slot, id, next, ring, producer, bytes, error);
+        }
+        if (reason == server_resume_reason::ok) { reason = resume_store->commit(id, next, error); }
+        if (reason != server_resume_reason::ok) {
+            if (!have_old) { resume_store->remove_entry(id); }
+            return resume_failed(reason, error);
+        }
+        resume_store->sweep(id, next);
+        resume_entry_take(slot, id);
+        resume_unslotted.erase(id);
+        return json {{"outcome", "saved"}, {"entry", id}, {"n_tokens", next.n_tokens},
+            {"whole_sequence", true}, {"tail_states", next.tail_states.size()},
+            {"bytes_written", bytes}, {"t_ms", (ggml_time_us() - t_start)/1000.0}};
+    }
+
     // a slot whose rows a save of a dynamic cache can record
     static bool resume_vbr_storable(const server_slot & slot) {
         const auto & tokens = slot.prompt.tokens;
-        return !tokens.empty() && tokens.pos_next() == llama_pos(tokens.size()) && !tokens.has_media() &&
+        return !tokens.empty() && tokens.pos_next() > 0 &&
             slot.state == SLOT_STATE_IDLE && !slot.is_processing() && !slot.hard_lease_blocks_live_prefix();
     }
 
@@ -6478,11 +6568,52 @@ private:
         return at == in.size();
     }
 
+    using resume_row_coordinate = std::array<llama_pos, 3>; // t, y, x (decoder row order)
+
+    static std::vector<resume_row_coordinate> resume_expected_rows(const server_tokens & tokens, bool mrope) {
+        std::vector<mtmd_decoder_pos> coordinates;
+        const auto positions = tokens.prefix_row_positions(tokens.size(), mrope ? &coordinates : nullptr);
+        std::vector<resume_row_coordinate> expected;
+        expected.reserve(positions.size());
+        for (size_t i = 0; i < positions.size(); ++i) {
+            expected.push_back({positions[i], mrope ? llama_pos(coordinates[i].y) : 0,
+                                             mrope ? llama_pos(coordinates[i].x) : 0});
+        }
+        if (!std::is_sorted(expected.begin(), expected.end())) {
+            std::sort(expected.begin(), expected.end());
+        }
+        return expected;
+    }
+
+    static bool resume_placement_rows_match(const vbr_artifact_stream_placement & placement,
+                                            const std::vector<resume_row_coordinate> & expected) {
+        std::vector<const vbr_artifact_cell_placement *> held;
+        if (placement.cells.empty() || placement.cells.size() > expected.size() ||
+            !vbr_order_placement_cells(placement, held)) {
+            return false;
+        }
+        auto suffix = expected.end() - held.size();
+        auto coordinate = expected.begin();
+        for (const auto * cell : held) {
+            // Window reclamation may retain any subset of a masked image's
+            // shared temporal rows, not only its lexicographically last pixels.
+            if (cell->logical_position != (*suffix++)[0]) { return false; }
+            const resume_row_coordinate row{cell->logical_position, cell->ext_y, cell->ext_x};
+            while (coordinate != expected.end() && *coordinate < row) { ++coordinate; }
+            if (coordinate == expected.end() || *coordinate != row) { return false; }
+            ++coordinate;
+        }
+        return true;
+    }
+
     // Whether the placements are the whole of a sequence of `n_tokens`: one for each attention
-    // child of the tree, in its order, with its frontier at the end and one row for each position
-    // of [0, n_tokens), or of a suffix of it for a window child. The import admits fewer rows, as a
+    // child of the tree, in its order, with its frontier at the end and the ledger's row positions,
+    // or a suffix of them for a window child. The import admits fewer rows, as a
     // checkpoint may hold them; a resumed conversation with a hole in it would read as whole.
-    bool resume_placement_whole(const std::vector<vbr_artifact_stream_placement> & placements, int32_t n_tokens) const {
+    bool resume_placement_whole(const std::vector<vbr_artifact_stream_placement> & placements, const server_tokens & tokens) const {
+        const int32_t n_tokens = int32_t(tokens.size());
+        const llama_pos next_position = tokens.pos_next();
+        const auto expected = resume_expected_rows(tokens, resume_media_positions_shared());
         std::vector<llama_memory_tree_child> tree;
         if (!llama_memory_tree_collect(llama_get_memory(ctx_tgt), tree)) {
             return false;
@@ -6496,19 +6627,13 @@ private:
                 return false;
             }
             const auto & placement = placements[i++];
-            if (placement.child_id != node.child_id || placement.computation_frontier != n_tokens ||
+            if (placement.child_id != node.child_id || placement.computation_frontier != next_position ||
                 placement.cells.empty() || placement.cells.size() > size_t(n_tokens) ||
                 (!node.window && placement.cells.size() != size_t(n_tokens))) {
                 return false;
             }
-            const llama_pos first = n_tokens - llama_pos(placement.cells.size());
-            std::vector<bool> held(placement.cells.size(), false);
-            for (const auto & cell : placement.cells) {
-                if (cell.logical_position < first || cell.logical_position >= n_tokens ||
-                    held[cell.logical_position - first]) {
-                    return false;
-                }
-                held[cell.logical_position - first] = true;
+            if (!resume_placement_rows_match(placement, expected)) {
+                return false;
             }
         }
         return i == placements.size();
@@ -6595,7 +6720,7 @@ private:
             tail.kind = server_resume_object_kind::tail_state;
             tail.p0 = n_tokens;
             tail.n_tokens = n_tokens;
-            tail.pos_max = n_tokens - 1;
+            tail.pos_max = tokens.pos_next() - 1;
             // the window rows are placed, so the partial state here is a recurrent one
             tail.pos_min = tail.pos_max;
             tail.role = "frontier";
@@ -7117,6 +7242,10 @@ private:
         if (const char * why = resume_ledger_restore(slot, manifest, adapter, restored)) {
             return skipped(why);
         }
+        if (manifest.whole_sequence()) {
+            if (resume_vbr()) { return skipped("unsupported_artifact"); }
+            return resume_install_sequence(slot, id, manifest, std::move(restored), t_start);
+        }
         if (manifest.artifact || resume_vbr()) {
             // the key keeps the two routes apart; an entry that crosses them anyway is not read
             if (!manifest.artifact || !resume_vbr() || !vbr_artifact_store) {
@@ -7163,15 +7292,13 @@ private:
         } catch (const std::exception &) {
             return skipped("ledger_invalid");
         }
-        if (restored.has_media() && resume_media_positions_shared()) {
-            return skipped("unsupported_positions");
-        }
         const int32_t n_tokens = manifest.n_tokens;
         std::array<uint8_t, 32> token_digest = {};
         if (restored.size() != size_t(n_tokens) ||
             envelope.token_count != uint64_t(n_tokens) ||
-            envelope.next_position != int64_t(n_tokens) ||
-            restored.pos_next() != n_tokens ||
+            envelope.next_position != restored.pos_next() ||
+            manifest.shared_positions != (restored.has_media() && resume_media_positions_shared()) ||
+            (!manifest.shared_positions && restored.pos_next() != n_tokens) ||
             !restored.validate(ctx_tgt) ||
             !restored.retention_token_digest(token_digest) ||
             token_digest != envelope.token_digest) {
@@ -7190,7 +7317,9 @@ private:
             });
             server_resume_prefix_hasher tail_hasher(restored);
             for (const auto & rec : tails) {
-                if (rec.prefix_digest != tail_hasher.at(size_t(rec.pos()))) {
+                if (rec.pos_max + 1 != restored.pos_next(size_t(rec.n_tokens)) ||
+                    resume_cuts_media(restored, size_t(rec.n_tokens)) ||
+                    rec.prefix_digest != tail_hasher.at(size_t(rec.pos()))) {
                     return skipped("ledger_invalid");
                 }
             }
@@ -7200,6 +7329,35 @@ private:
             return skipped("ledger_invalid");
         }
         return nullptr;
+    }
+
+    json resume_install_sequence(
+            server_slot & slot, const std::string & id, const server_resume_manifest & manifest,
+            server_tokens restored, int64_t t_start) {
+        // Whole media images are all-or-nothing. Capacity is in cells, not the
+        // smaller temporal position count. No partial image is installed.
+        if (manifest.n_tokens > slot.n_ctx - 1) { return resume_skipped("context_too_small"); }
+        std::vector<uint8_t> data;
+        std::string error;
+        const auto reason = resume_store->read_object(id, *manifest.artifact, data, error);
+        if (reason != server_resume_reason::ok) { return resume_failed(reason, error); }
+        const size_t bytes = data.size();
+        slot.prompt_clear();
+        if (llama_state_seq_set_data_ext(ctx_tgt, data.data(), data.size(), slot.id,
+                LLAMA_STATE_SEQ_FLAGS_NONE) != data.size() ||
+            llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id) + 1 != restored.pos_next()) {
+            slot.mandatory_recovery_reset(server_cache_destruction_reason::restore_failure);
+            return resume_skipped("state_rejected");
+        }
+        std::vector<uint8_t>().swap(data);
+        resume_establish(slot, std::move(restored));
+        resume_entry_take(slot, id);
+        slot.t_last_used = resume_last_used(manifest);
+        const auto ring = resume_import_ring(slot, id, manifest, manifest.n_tokens);
+        return json {{"outcome", "installed_full"}, {"entry", id}, {"p", manifest.n_tokens},
+            {"n_tokens", manifest.n_tokens}, {"whole_sequence", true},
+            {"checkpoints", ring.n_imported}, {"checkpoints_dropped", ring.n_dropped},
+            {"bytes_read", bytes + ring.bytes_read}, {"t_ms", (ggml_time_us() - t_start)/1000.0}};
     }
 
     // The fixed route of an install: the chunks up to the largest position that fits, and the
@@ -7404,8 +7562,8 @@ private:
     // what keeps a sequence out of an import, whichever object it comes in
     static const char * resume_vbr_inadmissible(
             const server_tokens & tokens, const server_resume_manifest & manifest, const server_slot & slot) {
-        if (tokens.has_media()) {
-            return "unsupported_media";
+        if (tokens.pos_next() <= 0) {
+            return "unsupported_positions";
         }
         return manifest.n_tokens > slot.n_ctx - 1 ? "context_too_small" : nullptr;
     }
@@ -7440,7 +7598,7 @@ private:
         if (reason != server_resume_reason::ok) {
             return resume_failed(reason, error);
         }
-        if (!resume_placement_decode(payload, placements) || !resume_placement_whole(placements, manifest.n_tokens)) {
+        if (!resume_placement_decode(payload, placements) || !resume_placement_whole(placements, co.tokens)) {
             return json {{"outcome", "failed"}, {"reason", "state_rejected"}, {"error", "placement"}};
         }
         return nullptr;
@@ -7454,7 +7612,7 @@ private:
         auto & slot = *co.slot;
         if ((resume_has_partial && llama_state_seq_set_data_ext(
                 ctx_tgt, tail.data(), tail.size(), slot.id, RESUME_PLACED_TAIL_FLAGS) != tail.size()) ||
-            llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id) != manifest.n_tokens - 1) {
+            llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id) != co.tokens.pos_next() - 1) {
             const llama_pos pos_max = llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id);
             slot.mandatory_recovery_reset(server_cache_destruction_reason::restore_failure);
             return json {
@@ -7562,6 +7720,17 @@ private:
             };
         }
 
+        // The token ids alone cannot distinguish two equally sized media chunks.
+        // Bind the artifact to the authenticated ledger before installing any KV.
+        std::string media_identity;
+        const auto & artifact_identity = payload->package().manifest().identity;
+        if (!restored.media_content_identity(restored.size(), media_identity) ||
+            artifact_identity.media_content_identity != media_identity ||
+            artifact_identity.token_count != int64_t(restored.size()) ||
+            artifact_identity.next_position != restored.pos_next()) {
+            return resume_skipped("ledger_invalid");
+        }
+
         // the other conversations of the image, each into an empty slot of its own
         std::vector<resume_co_install *> ready;
         std::vector<vbr_import_co_resident> residents;
@@ -7591,6 +7760,7 @@ private:
             vbr_import_publish_state publish_state;
             publish_state.slot          = &slot;
             publish_state.expect_tokens = &ids;
+            publish_state.expect_ledger = &restored;
             publish_state.expect_epoch  = manifest.sequence_epoch;
 
             auto target = vbr_import_target_for(slot, memory, uint64_t(manifest.n_tokens), adapter);
@@ -9895,10 +10065,11 @@ private:
             auto resolved_dft = make_params_dft();
             auto & params_dft = resolved_dft.params;
 
-            // the helper pins n_outputs_max to the base n_parallel (MTP-path semantics);
-            // this path historically inherited the base value — keep that (0 = derive from
-            // n_batch), a DFlash drafter emits logits for whole blocks
-            params_dft.n_outputs_max = params_base.n_outputs_max;
+            // Preserve the helper's one-output-per-sequence cap for an MTP
+            // sidecar. Other external drafters may emit whole blocks of logits.
+            if (!params_base.speculative.has_external_mtp_sidecar()) {
+                params_dft.n_outputs_max = params_base.n_outputs_max;
+            }
 
             params_dft.n_parallel   = 1;
             params_dft.n_ctx        = params_spec.n_ctx == 0 ? llama_n_ctx_seq(ctx_tgt) : params_spec.n_ctx;
@@ -12630,6 +12801,11 @@ private:
     void prepare_prompt_tokens_for_launch(
             const server_slot & slot,
             server_task & task) {
+        // Stateless outputs require fresh rows, even if a caller explicitly
+        // requested caching. Run before any slot/host/live-prefix selection.
+        if (task.need_embd()) {
+            task.params.cache_prompt = false;
+        }
         if (task.prompt_tokens_prepared) {
             return;
         }
@@ -12764,9 +12940,7 @@ private:
             : llama_n_ubatch(ctx_tgt);
         const bool can_split = prompt_admission_geometry_for_test
             ? prompt_admission_geometry_for_test->can_split
-            : (!task.need_embd() ||
-               (llama_get_memory(ctx_tgt) &&
-                llama_pooling_type(ctx_tgt) == LLAMA_POOLING_TYPE_LAST));
+            : server_task_can_split(task, ctx_tgt);
         switch (server_slot_prompt_admission_check(
                 can_split, task.tokens.size(), n_ubatch, slot.n_ctx)) {
             case server_slot_prompt_admission::batch_too_large:
@@ -12801,6 +12975,17 @@ private:
                 return true;
         }
         GGML_ABORT("invalid slot prompt admission");
+    }
+
+    bool can_reuse_live_frontier_logits(
+            const server_slot & slot, const server_task & task, size_t prefix) const {
+        auto * memory = llama_get_memory(ctx_tgt);
+        return prefix > 0 && prefix == size_t(task.n_tokens()) &&
+            prefix == slot.prompt.tokens.size() &&
+            memory->seq_pos_min(slot.id) >= 0 &&
+            memory->seq_pos_max(slot.id) == slot.prompt.tokens.pos_next(prefix)-1 &&
+            server_slot_exact_prompt_action_resolve(prefix, task.need_sampling(),
+                slot.diff_self_spec, slot.frontier_logits_matches()).use_frontier_logits;
     }
 
     // what every host payload import into a slot shares; the caller adds its publication
@@ -12945,6 +13130,7 @@ private:
         bool ready = false;
         // set by a caller that knows what the artifact has to hold
         const llama_tokens * expect_tokens = nullptr;
+        const server_tokens * expect_ledger = nullptr;
         uint64_t expect_epoch = 0;
     };
 
@@ -12969,8 +13155,16 @@ private:
             // rather than replacing it with a default-constructed one. In particular, has_mtmd
             // is slot configuration, not artifact payload. Prepare its value off-side so the
             // no-fail composite publication remains allocation-free.
-            state->prompt.tokens.has_mtmd = state->slot->prompt.tokens.has_mtmd;
-            state->prompt.tokens.insert(tokens);
+            if (state->expect_ledger) {
+                if (state->expect_ledger->retention_token_ids() != tokens ||
+                    state->expect_ledger->has_mtmd != state->slot->prompt.tokens.has_mtmd) {
+                    return false;
+                }
+                state->prompt.tokens = state->expect_ledger->clone();
+            } else {
+                state->prompt.tokens.has_mtmd = state->slot->prompt.tokens.has_mtmd;
+                state->prompt.tokens.insert(tokens);
+            }
             state->prompt.sequence_epoch = sequence_epoch;
             state->ready = state->prompt.n_tokens() == int(tokens.size());
             return state->ready;
@@ -13046,7 +13240,6 @@ private:
                 slot.prompt.sequence_epoch == 0;
             const bool occupied_candidate =
                 !slot.prompt.tokens.empty() &&
-                !slot.prompt.tokens.has_media() &&
                 slot.prompt.sequence_epoch != 0;
             if (!construction_empty && !occupied_candidate) {
                 return false;
@@ -13103,6 +13296,7 @@ private:
                     common_cache_plan_provider::host_cache_entry);
             };
             llama_memory_i * memory = nullptr;
+            size_t occupied_live_reusable = 0;
             bool cleared_for_empty_handoff = false;
             const bool occupied_prefix_projection =
                 occupied_candidate && candidate.requires_prefix_projection();
@@ -13149,6 +13343,19 @@ private:
                 // useful durable host prefixes. This is the same destructive
                 // rebind the subsequent cold path would perform, moved before
                 // import so failure naturally falls through to cold prefill.
+                server_prompt_cache_reuse_context reuse;
+                reuse.live_pos_min = memory->seq_pos_min(slot.id);
+                reuse.n_swa = n_swa;
+                reuse.frontier_required = slot.frontier_ratchet_flipped;
+                reuse.execution_identity = frontier_execution_identity;
+                reuse.vbr_state = llama_memory_vbr_state(memory, slot.id, 0);
+                const size_t lcp = slot.prompt.tokens.get_common_prefix(task.tokens);
+                reuse.exact_frontier_logits = can_reuse_live_frontier_logits(slot, task, lcp);
+                occupied_live_reusable = server_prompt_cache_reusable_prefix(
+                    slot.prompt, task.tokens, lcp, reuse.live_pos_min, reuse, adapter_identity);
+                if (candidate.prefix_tokens() <= occupied_live_reusable) {
+                    return false;
+                }
                 server_vbr_empty_handoff_gate handoff_gate;
                 handoff_gate.slot_count = slots.size();
                 handoff_gate.incoming_prefix = candidate.prefix_tokens();
@@ -13166,29 +13373,27 @@ private:
                 server_prompt_cache_vbr_restore_candidate durable_incumbent;
                 bool durable_incumbent_prepared = false;
                 if (server_vbr_empty_handoff_lookup_allowed(handoff_gate)) {
-                    handoff_gate.incumbent_lcp =
-                        slot.prompt.tokens.get_common_prefix(task.tokens);
-                    if (candidate.prefix_tokens() >
-                            handoff_gate.incumbent_lcp) {
-                        // The incumbent witness must itself be a sealed host
-                        // frontier. A projection from some longer artifact is
-                        // not recovery authority for destructive handoff.
-                        durable_incumbent_prepared =
-                            prompt_cache->prepare_vbr_restore(
-                                slot.prompt.tokens,
-                                frontier_execution_identity,
-                                adapter_identity, durable_incumbent, false,
-                                &slot.cache_family);
-                        handoff_gate.durable_incumbent_prefix =
-                            durable_incumbent.prefix_tokens();
-                        handoff_gate.exact_incumbent_durable =
-                            durable_incumbent_prepared &&
-                            durable_incumbent.prefix_tokens() ==
-                                uint64_t(slot.prompt.n_tokens());
-                        handoff_gate.family_matches =
-                            durable_incumbent.cache_family() ==
-                                slot.cache_family;
-                    }
+                    // Token overlap is not a reusable frontier when a hybrid
+                    // tree has no matching recurrent checkpoint for a rewind.
+                    handoff_gate.incumbent_reusable = occupied_live_reusable;
+                    // The incumbent witness must itself be a sealed host
+                    // frontier. A projection from some longer artifact is
+                    // not recovery authority for destructive handoff.
+                    durable_incumbent_prepared =
+                        prompt_cache->prepare_vbr_restore(
+                            slot.prompt.tokens,
+                            frontier_execution_identity,
+                            adapter_identity, durable_incumbent, false,
+                            &slot.cache_family);
+                    handoff_gate.durable_incumbent_prefix =
+                        durable_incumbent.prefix_tokens();
+                    handoff_gate.exact_incumbent_durable =
+                        durable_incumbent_prepared &&
+                        durable_incumbent.prefix_tokens() ==
+                            uint64_t(slot.prompt.n_tokens());
+                    handoff_gate.family_matches =
+                        durable_incumbent.cache_family() ==
+                            slot.cache_family;
                 }
                 const bool handoff_eligible = durable_incumbent_prepared &&
                     server_vbr_empty_handoff_allowed(handoff_gate);
@@ -13220,7 +13425,7 @@ private:
                         std::move(candidate), slot.prompt, slot.cache_family,
                         incoming_family, slot.id,
                         frontier_execution_identity, adapter_identity,
-                        ticket, &replacement_diagnostics)) {
+                        ticket, &replacement_diagnostics, occupied_live_reusable)) {
                     vbr_automatic_restore_occupied_fallbacks++;
                     SLT_DBG(
                         slot,
@@ -13325,20 +13530,27 @@ private:
                         int(imported.precision.known), imported.precision.worst_steps,
                         imported.precision.deficit, imported.precision.weight);
                     using guard_status = vbr_occupied_replacement_guard_status;
-                    // A tree the guard cannot replace atomically (iSWA), or a
-                    // cache without room for both conversations, takes the
-                    // empty handoff instead, which it proves durable.
+                    // Unsupported trees/layouts (including a clean sink stash),
+                    // or insufficient room for both conversations, can use the
+                    // independently proven durable empty handoff. A fresh
+                    // recovery capture may itself reveal an unsupported layout.
                     const bool no_route =
-                        imported.occupied_guard_status == guard_status::unsupported_tree;
+                        imported.occupied_guard_status == guard_status::unsupported_tree ||
+                        imported.occupied_guard_status == guard_status::unsupported_layout;
                     const bool no_room =
-                        imported.occupied_guard_status == guard_status::capacity_unavailable;
-                    if (!recovery_refreshed && !quarantined && (no_route || no_room) &&
+                        server_vbr_artifact_import_capacity_refused(imported);
+                    if (!quarantined && (no_route || no_room) &&
                         !vbr_occupied_route_unsupported && !vbr_occupied_route_full) {
                         vbr_occupied_route_unsupported = no_route;
                         vbr_occupied_route_full        = no_room;
                         ticket = {};
                         const bool restored = try_automatic_vbr_restore(
                             slot, task, incoming_family, restored_prefix, true);
+                        // Layout refusal is specific to this live image, not
+                        // a permanent property of the model's memory tree.
+                        if (imported.occupied_guard_status == guard_status::unsupported_layout) {
+                            vbr_occupied_route_unsupported = false;
+                        }
                         vbr_occupied_route_full = false;
                         return restored;
                     }
@@ -13365,10 +13577,10 @@ private:
                     vbr_restore_event_for(slot.id, ticket.incoming_payload());
                 prompt_cache->commit_vbr_occupied_replacement(
                     ticket, slot.prompt, slot.cache_family, slot.id);
-                if (!occupied_prefix_projection &&
-                    (imported.decision == vbr_import_decision::native_import ||
-                     imported.decision == vbr_import_decision::live_rebased)) {
-                    mark_exact_vbr_restore_durable(slot, *memory);
+                if (!occupied_prefix_projection) {
+                    record_vbr_restored_representation(slot, memory->vbr_representation_identity(),
+                        imported.decision == vbr_import_decision::native_import ||
+                        imported.decision == vbr_import_decision::live_rebased);
                 }
                 common_speculative_sequence_transition(
                     slot.get_spec(), slot.id, restore_event);
@@ -13478,6 +13690,14 @@ private:
             const auto make_request = [&]() {
                 auto request = vbr_import_target_for(slot, memory, task.n_tokens(), adapter_identity);
                 request.pack_rows       = pack_rows;
+                // An empty sequence in a live unified pool is not a whole-tree
+                // empty import. Use the same ownership-preserving insertion
+                // contract as slot-file restore, not the global empty check.
+                request.absent_insertion = !candidate.requires_prefix_projection() &&
+                    std::any_of(slots.begin(), slots.end(), [&](const server_slot & other) {
+                        return other.id != slot.id && memory->seq_pos_min(other.id) >= 0;
+                    });
+                request.previously_observed = request.absent_insertion;
                 request.publish_context = &state;
                 request.prepare_publish = [](
                     void * opaque,
@@ -13556,8 +13776,9 @@ private:
             GGML_ASSERT(state.published);
             const uint64_t prefix_tokens = candidate.prefix_tokens();
             const int32_t source_id = candidate.source_id();
+            const bool restored_stem = !candidate.requires_prefix_projection();
             const bool exact_reusable_restore =
-                !candidate.requires_prefix_projection() &&
+                restored_stem &&
                 (imported.decision == vbr_import_decision::native_import ||
                  imported.decision == vbr_import_decision::live_rebased);
             const auto restore_event =
@@ -13566,13 +13787,14 @@ private:
                 slot.cache_family = incoming_family;
             }
             const bool committed = prompt_cache->commit_vbr_restore(
-                candidate, slot.prompt, slot.cache_family, slot.id);
+                candidate, slot.prompt, slot.cache_family, slot.id, exact_reusable_restore);
             GGML_ASSERT(committed);
             if (!committed) {
                 return false;
             }
-            if (exact_reusable_restore) {
-                mark_exact_vbr_restore_durable(slot, *memory);
+            if (restored_stem) {
+                record_vbr_restored_representation(
+                    slot, memory->vbr_representation_identity(), exact_reusable_restore);
             }
             common_speculative_sequence_transition(
                 slot.get_spec(), slot.id, restore_event);
@@ -13648,6 +13870,27 @@ private:
             ? params_base.lora_adapters
             : construct_lora_list(task.params.lora);
 
+        // Bound the first exchange route to an idle single-slot handoff.
+        // Multi-slot, speculative, and persistent owners keep non-consuming
+        // restores until their independent lifetime contracts are supported.
+        // Only the empty-destination commit certifies consumption; an occupied
+        // replacement keeps both owners through its existing rollback terminal.
+        server_prompt_cache_vbr_exchange exchange;
+        server_prompt_cache_vbr_restore_candidate exchange_candidate;
+        if (params_base.vbr_prompt_cache && slots.size() == 1 && !ctx_dft && !slot.can_speculate() &&
+            !resume_keeps_sources_live() && prompt_cache &&
+            vbr_artifact_store && server_vbr_dynamic_active(params_base) &&
+            prompt_cache->limit_size != 0 && !slot.prompt.tokens.empty() &&
+            !slot.prompt.tokens.has_media() && !task.tokens.has_media() &&
+            eligible_vbr_displacement_source(slot, task) &&
+            are_lora_equal(task_loras, slot.lora) && !lora_all_alora(slot.lora) && task.params.cache_prompt &&
+            task.type == SERVER_TASK_TYPE_COMPLETION && !task.is_child() && !task.is_parent() &&
+            prompt_cache->prepare_vbr_restore(task.tokens, frontier_execution_identity,
+                lora_config_identity(slot.lora), exchange_candidate,
+                true, nullptr, vbr_artifact_store.get())) {
+            (void) prompt_cache->begin_vbr_exchange(
+                    std::move(exchange_candidate), slot.id, exchange);
+        }
         preserve_vbr_before_displacement(slot, task);
 
         if (!are_lora_equal(task_loras, slot.lora)) {
@@ -13773,7 +14016,11 @@ private:
             std::make_unique<const server_task>(std::move(task));
         size_t restored_prefix = SIZE_MAX;
         bool automatically_restored = try_automatic_vbr_restore(
-            slot, *launched_task, incoming_family, &restored_prefix);
+            slot, *launched_task, incoming_family, &restored_prefix, false,
+            exchange.candidate());
+        if (exchange.settle()) {
+            slot.vbr_idle_capture_source_reset();
+        }
 
         size_t retained_prefix = restored_prefix != SIZE_MAX
             ? restored_prefix
@@ -14253,7 +14500,7 @@ private:
             res->is_begin = true;
         } else {
             res->content = tkn.text_to_send;
-            res->tokens  = { tkn.tok };
+            res->tokens.assign(1, tkn.tok);
         }
 
         res->n_decoded             = slot.stats.n_gen;
@@ -14940,27 +15187,70 @@ private:
         return published_hash.finish();
     }
 
-    void mark_exact_vbr_restore_durable(
-            server_slot & slot, llama_memory_i & memory) {
+    void record_vbr_restored_representation(
+            server_slot & slot,
+            const llama_memory_vbr_representation_identity & representation, bool exact) {
         std::array<uint8_t, 32> token_digest = {};
+        std::array<uint8_t, 32> prefix_digest = {};
         vbr_artifact_identity_block identity;
         server_vbr_artifact_capture_status status;
         if (!slot.prompt.tokens.retention_token_digest(token_digest) ||
+            !slot.prompt.tokens.retention_token_prefix_digest(
+                size_t(slot.prompt.n_tokens()), prefix_digest) ||
             !build_capture_identity_fields(slot, identity, status)) {
             return;
         }
-        const auto representation = memory.vbr_representation_identity();
         slot.vbr_idle_capture_source_reset();
-        slot.vbr_idle_capture_published_identity =
+        slot.vbr_restored_stem_identity =
             vbr_idle_publication_identity(
-                token_digest, representation.tier_epoch,
+                prefix_digest, representation.tier_epoch,
                 representation.tier_epoch_swa);
+        // A transcoding restore still has a reusable saved prefix, but must
+        // not acquire exact physical recovery authority for the live image.
+        if (!exact) {
+            return;
+        }
+        slot.vbr_idle_capture_published_identity = vbr_idle_publication_identity(
+            token_digest, representation.tier_epoch, representation.tier_epoch_swa);
         slot.vbr_idle_capture_representation_valid = true;
         slot.vbr_idle_capture_attempt_identity =
             vbr_idle_capture_attempt_digest(
                 identity, token_digest, representation.tier_epoch,
                 representation.tier_epoch_swa);
         slot.vbr_idle_capture_terminal = true;
+    }
+
+    static bool reuse_vbr_restored_stem(
+            server_prompt_cache & cache, server_slot & slot,
+            const vbr_artifact_identity_block & checkpoint_identity,
+            const std::array<uint8_t, 32> & prefix_digest,
+            const llama_memory_vbr_representation_identity & representation,
+            const std::array<uint8_t, 32> & full_source_identity,
+            const common_prompt_checkpoint * checkpoint = nullptr) {
+        const auto stem_identity = vbr_idle_publication_identity(
+            prefix_digest, representation.tier_epoch, representation.tier_epoch_swa);
+        const bool local_stem = checkpoint && checkpoint->vbr_host_stem_artifact != 0 &&
+            checkpoint->vbr_host_stem_identity == stem_identity;
+        if (!local_stem && slot.vbr_restored_stem_identity != stem_identity) {
+            return false;
+        }
+        const auto saved_stem = cache.find_vbr_durable_stem(
+            slot.prompt, checkpoint_identity.token_count,
+            checkpoint_identity.execution_identity, checkpoint_identity.adapter_config_identity,
+            local_stem ? llama_cache_acct_artifact_id { checkpoint->vbr_host_stem_artifact }
+                       : llama_cache_acct_artifact_id {});
+        if (saved_stem.v == 0) {
+            return false;
+        }
+        slot.vbr_idle_stem_source_identity = full_source_identity;
+        slot.vbr_idle_stem_coverage_tokens = checkpoint_identity.token_count;
+        slot.vbr_idle_stem_host_artifact = saved_stem;
+        slot.vbr_idle_stem_source_valid = true;
+        slot.vbr_idle_stem_retry = false;
+        if (slot.vbr_reuse_capture_frontier == slot.vbr_idle_stem_coverage_tokens) {
+            slot.vbr_reuse_capture_frontier = 0;
+        }
+        return true;
     }
 
     static bool vbr_idle_retry_immediately(
@@ -14977,6 +15267,13 @@ private:
                 pressure_batch_unsupported && capacity_retry_candidate;
         return !terminal && candidate_count > 1 &&
             (transfer_retry || capacity_retry);
+    }
+
+    static bool vbr_projected_capture_allowed(
+            bool readiness_only, int32_t preserve_slot, size_t slot_count) noexcept {
+        // Projected publication requires an idle source. Prompt-boundary and
+        // background readiness capture retain the exact worker's lifecycle.
+        return !readiness_only && (preserve_slot < 0 || slot_count > 1);
     }
 
     static bool vbr_idle_retry_exact(
@@ -15026,11 +15323,19 @@ private:
             const server_tokens & tokens,
             const std::vector<common_adapter_lora_info> & lora,
             bool speculative_slot) noexcept {
-        // Media and aLoRA still need their own frontier authority. Draft-model
-        // and DFlash state are exact companion payloads in the same adoption
-        // transaction as target KV, so speculative slots are supported.
+        // Media is eligible only at a complete, content-identified frontier.
+        // Draft state remains an exact companion in the target KV transaction.
+        bool unsupported_media = false;
+        if (tokens.has_media()) {
+            try {
+                std::string identity;
+                unsupported_media = !tokens.media_content_identity(tokens.size(), identity);
+            } catch (...) {
+                unsupported_media = true;
+            }
+        }
         return server_vbr_prompt_cache_support_for(
-            false, speculative_slot, tokens.has_media(),
+            false, speculative_slot, unsupported_media,
             lora_all_alora(lora));
     }
 
@@ -15944,6 +16249,16 @@ private:
     // can replace it or expand its shared physical layout. Stateful sources
     // may need both a reusable checkpoint stem and a complete rollback image;
     // at most two waves use the existing publication and safe-clear machinery.
+    bool eligible_vbr_displacement_source(const server_slot & source, const server_task & task) {
+        if (source.state != SLOT_STATE_IDLE || source.is_processing() ||
+            source.hard_lease_blocks_live_prefix() || queue_tasks.has_deferred_for_slot(source.id) ||
+            source.prompt.tokens.size() < SERVER_PROMPT_CACHE_MIN_RETENTION_REUSE_TOKENS) {
+            return false;
+        }
+        const size_t common = source.prompt.tokens.get_common_prefix(task.tokens);
+        return common < source.prompt.tokens.size() - common;
+    }
+
     void preserve_vbr_before_displacement(server_slot & slot, const server_task & task) noexcept {
         if (!params_base.vbr_prompt_cache || !prompt_cache || !vbr_artifact_store ||
             vbr_idle_exact_capture || task.type != SERVER_TASK_TYPE_COMPLETION ||
@@ -15951,13 +16266,7 @@ private:
             return;
         }
         const auto eligible = [&](const server_slot & source) {
-            if (source.state != SLOT_STATE_IDLE || source.is_processing() ||
-                source.hard_lease_blocks_live_prefix() || queue_tasks.has_deferred_for_slot(source.id) ||
-                source.prompt.tokens.size() < SERVER_PROMPT_CACHE_MIN_RETENTION_REUSE_TOKENS) {
-                return false;
-            }
-            const size_t common = source.prompt.tokens.get_common_prefix(task.tokens);
-            return common < source.prompt.tokens.size() - common;
+            return eligible_vbr_displacement_source(source, task);
         };
         server_slot * source = nullptr;
         if (!slot.prompt.tokens.empty()) {
@@ -15986,16 +16295,23 @@ private:
             if (!session) {
                 break;
             }
-            (void) publish_idle_vbr_batch(session, false, source->id, attention_reuse);
-            if (!vbr_idle_exact_capture) {
-                break;
+            const auto previous_exact_retry = source->vbr_idle_exact_retry_identity;
+            size_t completed = publish_idle_vbr_batch(session, false, source->id, attention_reuse);
+            if (!vbr_idle_exact_capture &&
+                source->vbr_idle_exact_retry_identity != previous_exact_retry) {
+                // Retry the rejected projection in this wave. A checkpoint
+                // stem still needs the second wave for full-source recovery;
+                // idle maintenance would run after source replacement.
+                completed += publish_idle_vbr_batch(session, false, source->id, attention_reuse);
             }
-            // No decode or queue yielding while the worker reads live KV.
-            if (vbr_idle_exact_capture->worker.joinable()) {
-                vbr_idle_exact_capture->worker.join();
+            if (vbr_idle_exact_capture) {
+                // No decode or queue yielding while the worker reads live KV.
+                if (vbr_idle_exact_capture->worker.joinable()) {
+                    vbr_idle_exact_capture->worker.join();
+                }
+                completed += finish_idle_exact_vbr_capture(
+                    true, false, wave == 0 ? &attention_reuse : nullptr);
             }
-            const size_t completed = finish_idle_exact_vbr_capture(
-                true, false, wave == 0 ? &attention_reuse : nullptr);
             published += completed;
             if (completed == 0) {
                 break;
@@ -16020,7 +16336,7 @@ private:
 
         struct candidate {
             server_slot * slot = nullptr;
-            const common_prompt_checkpoint * checkpoint = nullptr;
+            common_prompt_checkpoint * checkpoint = nullptr;
             uint64_t manifest_id = 0;
             std::array<uint8_t, 32> attempt_identity = {};
             std::array<uint8_t, 32> full_source_identity = {};
@@ -16426,7 +16742,7 @@ private:
             // excluded here because its PARTIAL_ONLY checkpoint contains
             // tier-sensitive attention bytes rather than a recurrent-only
             // companion.
-            const common_prompt_checkpoint * checkpoint_frontier = nullptr;
+            common_prompt_checkpoint * checkpoint_frontier = nullptr;
             bool checkpoint_candidate_seen = false;
             std::array<uint8_t, 32> attempt_identity =
                 full_source_identity;
@@ -16463,7 +16779,7 @@ private:
                  idle.can_speculate())) {
                 bool demanded_checkpoint_seen = false;
                 const auto consider_checkpoint = [&] (
-                        const common_prompt_checkpoint & checkpoint,
+                        common_prompt_checkpoint & checkpoint,
                         bool demanded) {
                     if (checkpoint_frontier || checkpoint.empty() ||
                         !checkpoint.computation_frontier.valid() ||
@@ -16542,6 +16858,16 @@ private:
                 }
             }
             bool checkpoint_stem = checkpoint_frontier != nullptr;
+
+            // Replaying a restored suffix can select the same saved
+            // checkpoint again. Reuse its host witness only while its restored
+            // representation is unchanged; a retier still gets a fresh capture.
+            // This is not the exact live recovery image for occupied replacement.
+            if (checkpoint_stem && reuse_vbr_restored_stem(
+                    *prompt_cache, idle, manifest.identity, token_identity_digest,
+                    representation, full_source_identity, checkpoint_frontier)) {
+                continue;
+            }
 
             bool stem_retry = false;
             const bool matching_attempt_stem_source =
@@ -16794,12 +17120,19 @@ private:
             candidates.front().slot &&
             candidates.front().slot->vbr_idle_exact_retry_identity ==
                 candidates.front().attempt_identity;
+        // A foreground multi-slot save needs this sequence's attention rows,
+        // not the sibling slots' live layout. Keep its recurrent/draft state
+        // in companions, just as for idle projected capture. Readiness
+        // preparation still uses exact capture, and unsupported
+        // layouts (including a requested exact retry) retain that fallback.
         const bool projected_stateful_capture =
-            preserve_slot < 0 && !readiness_only && stateful_companion_capture &&
+            vbr_projected_capture_allowed(readiness_only, preserve_slot, slots.size()) &&
+            stateful_companion_capture &&
             projected_attention_layout_supported && !exact_layout_retry &&
             candidates.size() == 1 && manifests.size() == 1;
-        const bool exact_companion_capture = preserve_slot >= 0 || readiness_only || exact_layout_retry ||
-            (stateful_companion_capture && !projected_stateful_capture);
+        const bool exact_companion_capture = !projected_stateful_capture &&
+            (preserve_slot >= 0 || readiness_only || exact_layout_retry ||
+             stateful_companion_capture);
         // Bound every capture by configured durable host capacity (and the
         // library's 16 GiB per-wave ceiling), not by a small transport-window
         // constant that would silently truncate long reusable prefixes. The
@@ -17133,12 +17466,22 @@ private:
                 server_prompt_cache_vbr_capacity_status::invalid;
             bool capacity_refused = false;
             uint64_t capacity_retry_manifest_id = 0;
+            int64_t deadline_us = 0;
+
+            bool continue_capture() const noexcept {
+                return session && session->continue_capture() &&
+                    (deadline_us == 0 || ggml_time_us() < deadline_us);
+            }
         } admission_state {
             this, &capture_session, prompt_cache.get(), &candidates,
             &admitted_publications, &capacity_claim,
             has_refresh_candidate, has_fresh_candidate,
             representation.tier_epoch, representation.tier_epoch_swa,
         };
+        if (preserve_slot >= 0) {
+            admission_state.deadline_us = ggml_time_us() +
+                int64_t(VBR_BLOCKING_CAPTURE_DEADLINE_US);
+        }
         server_vbr_projected_capture_admission admission;
         admission.context = &admission_state;
         admission.frontier = candidates.size() == 1 &&
@@ -17158,13 +17501,12 @@ private:
                 const server_vbr_projected_capture_admission::quote & quote)
                 noexcept {
             auto * context = static_cast<idle_admission_context *>(opaque);
-            auto * session = context ? context->session : nullptr;
             if (!context || !context->cache || !context->candidates ||
-                !session || !session->continue_capture()) {
+                !context->continue_capture()) {
                 return false;
             }
             if (context->has_refresh) {
-                return !context->has_fresh && session->continue_capture();
+                return !context->has_fresh && context->continue_capture();
             }
             for (const auto & durable : quote.durable) {
                 auto found = std::find_if(
@@ -17244,14 +17586,13 @@ private:
                     return false;
                 }
             }
-            return session->continue_capture();
+            return context->continue_capture();
         };
         admission.admit = [](
                 void * opaque,
                 const server_vbr_projected_capture_admission::quote & quote)
                 noexcept {
             auto * context = static_cast<idle_admission_context *>(opaque);
-            auto * session = context ? context->session : nullptr;
             // Planning can include controller settlement, projection and
             // recurrent sizing. The store now holds the exact transfer-
             // staging and durable claims plus the persistent ring operation
@@ -17260,8 +17601,7 @@ private:
             // cancel between bounded recurrent writes or attention chunks.
             if (!context || !context->cache || !context->candidates ||
                 !context->admitted ||
-                !context->capacity || !session ||
-                !session->continue_capture()) {
+                !context->capacity || !context->continue_capture()) {
                 return false;
             }
             // Refresh owns a separate in-place transaction. Do not partition
@@ -17269,7 +17609,7 @@ private:
             // this first bounded capacity-claim slice.
             if (context->has_refresh) {
                 return !context->has_fresh &&
-                    session->continue_capture();
+                    context->continue_capture();
             }
             context->admitted->clear();
             for (const auto & durable : quote.durable) {
@@ -17329,7 +17669,7 @@ private:
                 }
                 return false;
             }
-            if (!session->continue_capture()) {
+            if (!context->continue_capture()) {
                 *context->capacity = {};
                 return false;
             }
@@ -17337,8 +17677,7 @@ private:
         };
         admission.continue_capture = [](void * opaque) noexcept {
             auto * context = static_cast<idle_admission_context *>(opaque);
-            auto * session = context ? context->session : nullptr;
-            return session && session->continue_capture();
+            return context && context->continue_capture();
         };
         const bool projected_ok =
             vbr_artifact_store->capture_projected_host_batch(
@@ -17660,6 +17999,16 @@ private:
                 }
                 source.vbr_idle_stem_source_valid = true;
                 source.vbr_idle_stem_retry = false;
+                if (found->checkpoint && representation_stable) {
+                    std::array<uint8_t, 32> prefix_digest = {};
+                    if (source.prompt.tokens.retention_token_prefix_digest(
+                            found->selected_tokens, prefix_digest)) {
+                        found->checkpoint->vbr_host_stem_identity = vbr_idle_publication_identity(
+                            prefix_digest, found->tier_epoch, found->tier_epoch_swa);
+                        found->checkpoint->vbr_host_stem_artifact =
+                            source.vbr_idle_stem_host_artifact.v;
+                    }
+                }
                 source.vbr_idle_capture_attempt_identity =
                     found->attempt_identity;
                 source.vbr_idle_capture_terminal = true;
@@ -19831,7 +20180,9 @@ private:
                             const size_t n_content_lcp =
                                 slot.prompt.tokens.get_common_prefix(input_tokens);
 
-                            if (slot.task->params.cache_prompt) {
+                            const bool is_stateless_task = slot.task->type == SERVER_TASK_TYPE_EMBEDDING || slot.task->type == SERVER_TASK_TYPE_RERANK;
+
+                            if (slot.task->params.cache_prompt && !is_stateless_task) {
                                 // reuse any previously computed tokens that are common with the new prompt
                                 n_past = (int) n_content_lcp;
 
@@ -20050,7 +20401,12 @@ private:
                                     SLT_WRN(slot, "%s\n", st1.str().c_str());
                                 }
 
-                                if (!complete_vbr_import && pos_min >= pos_min_thold) {
+                                // An exact hit with authenticated, position-aligned
+                                // logits needs no rewind just to decode the last
+                                // prompt token again. Use the same proof as selection.
+                                if (!complete_vbr_import &&
+                                    !can_reuse_live_frontier_logits(slot, *slot.task, size_t(n_past)) &&
+                                    pos_min >= pos_min_thold) {
                                     // Current attention-content lineage epoch(s). A recurrent-only
                                     // checkpoint remains valid across a lossless in-place retier, but not
                                     // across occupied-cell reuse, clear/reset, or state adoption. All-zero
@@ -21955,8 +22311,12 @@ private:
             }
         }
 
-        // Ensure causal attention is on for prompt eval (diffusion draft toggles it off)
-        llama_set_causal_attn(ctx_tgt, true);
+        // Diffusion drafting toggles this for generation. Stateless embedding
+        // and rerank tasks must retain the context's configured attention mode.
+        const bool stateless = batch.slot_batched && batch.slot_batched->task->need_embd();
+        if (!stateless) {
+            llama_set_causal_attn(ctx_tgt, true);
+        }
 
         bool has_output = false;
         for (int i = off; i < off + batch_view.n_tokens; ++i) {
@@ -21981,7 +22341,7 @@ private:
 
             t_verify_elapsed = ggml_time_us() - t_verify_start;
 
-            if (ret == 0 && spec) {
+            if (ret == 0 && spec && !stateless) {
                 try {
                     speculative_ok = common_speculative_process(
                         spec.get(), batch_view);
@@ -23457,6 +23817,161 @@ bool server_active_prefix_retention_for_test() {
     return passed;
 }
 
+bool server_resume_media_placement_for_test(const server_tokens & ledger) {
+    const auto expected = server_context_impl::resume_expected_rows(ledger, true);
+    if (expected.size() < 4) { return false; }
+    vbr_artifact_stream_placement placement;
+    placement.computation_frontier = ledger.pos_next();
+    for (size_t i = 0; i < expected.size(); ++i) {
+        const auto & p = expected[i];
+        placement.cells.push_back({uint32_t(i), p[0], p[2], p[1]});
+    }
+    const auto matches = [&]() { return server_context_impl::resume_placement_rows_match(placement, expected); };
+    if (!matches()) { return false; }
+    std::reverse(placement.cells.begin(), placement.cells.end());
+    if (!matches()) { return false; }
+    std::reverse(placement.cells.begin(), placement.cells.end());
+    // Retain temporal counts and physical ownership, but duplicate an image coordinate.
+    size_t i = 1;
+    while (i < placement.cells.size() && placement.cells[i-1].logical_position != placement.cells[i].logical_position) { ++i; }
+    if (i == placement.cells.size()) { return false; }
+    const auto saved = placement.cells[i];
+    placement.cells[i].ext_x = placement.cells[i-1].ext_x;
+    placement.cells[i].ext_y = placement.cells[i-1].ext_y;
+    if (matches()) { return false; }
+    placement.cells[i] = saved;
+    placement.cells[i].ext_x += 100; // distinct, but not a coordinate in the ledger
+    if (matches()) { return false; }
+    placement.cells[i] = saved;
+    placement.cells.erase(placement.cells.begin() + i); // internal hole, not a suffix
+    if (matches()) { return false; }
+    placement.cells = {{0, expected[i-1][0], expected[i-1][2], expected[i-1][1]},
+                       {1, expected.back()[0], expected.back()[2], expected.back()[1]}};
+    if (!matches()) { return false; } // window may retain any pixel at its temporal boundary
+    placement.cells.erase(placement.cells.begin(), placement.cells.end() - 1);
+    return matches(); // legitimate window suffix
+}
+
+bool server_vbr_media_publish_for_test(const server_tokens & ledger) {
+    server_slot slot;
+    slot.prompt.tokens.has_mtmd = ledger.has_mtmd;
+    auto ids = ledger.retention_token_ids();
+    server_context_impl::vbr_import_publish_state state;
+    state.slot = &slot;
+    state.expect_tokens = &ids;
+    state.expect_ledger = &ledger;
+    state.expect_epoch = 7;
+    const auto prepare = [&](uint64_t epoch) {
+        return server_context_impl::vbr_import_prepare_publish(&state, ids, epoch);
+    };
+    // Rejected prepare must leave the destination empty; no partial ledger is published.
+    if (ids.empty() || prepare(8)) { return false; }
+    slot.prompt.tokens.has_mtmd = !ledger.has_mtmd;
+    if (prepare(7)) { return false; }
+    slot.prompt.tokens.has_mtmd = ledger.has_mtmd;
+    ids.push_back(1);
+    if (prepare(7)) { return false; }
+    ids.pop_back();
+    if (!slot.prompt.tokens.empty() || slot.prompt.sequence_epoch != 0 ||
+        !prepare(7) || prepare(7)) { return false; }
+    server_context_impl::vbr_import_publish(&state);
+    return !state.ready && slot.prompt.sequence_epoch == 7 &&
+        slot.prompt.tokens.serialize() == ledger.serialize() &&
+        slot.prompt.tokens.get_common_prefix(ledger) == ledger.size();
+}
+
+bool server_vbr_restored_stem_for_test(
+        server_prompt_cache & cache, const server_prompt & prompt,
+        const std::string & execution, const std::string & adapter, bool available) {
+    server_context_impl context;
+    context.sleeping = true;
+    context.frontier_execution_identity = execution;
+    const llama_memory_vbr_representation_identity representation { 7, 11 };
+    const size_t cache_size = cache.states.size();
+    for (bool exact : { false, true }) {
+        server_slot slot;
+        slot.prompt = prompt.clone();
+        slot.vbr_adapter_config_identity = adapter;
+        slot.vbr_adapter_config_identity_valid = true;
+        // A transcoding restore must retire a previous exact-recovery stamp.
+        slot.vbr_idle_capture_representation_valid = true;
+        slot.vbr_idle_capture_terminal = true;
+        slot.vbr_idle_capture_published_identity.fill(1);
+        context.record_vbr_restored_representation(slot, representation, exact);
+        if (slot.vbr_idle_capture_representation_valid != exact ||
+            slot.vbr_idle_capture_terminal != exact ||
+            (!exact && slot.vbr_idle_capture_published_identity != std::array<uint8_t, 32> {})) {
+            return false;
+        }
+        slot.prompt.tokens.push_back(777);
+        slot.vbr_reuse_capture_frontier = prompt.n_tokens();
+        vbr_artifact_identity_block checkpoint;
+        server_vbr_artifact_capture_status status;
+        std::array<uint8_t, 32> prefix_digest = {}, source_digest = {};
+        if (!context.build_capture_identity_fields(slot, checkpoint, status, prompt.n_tokens()) ||
+            !slot.prompt.tokens.retention_token_prefix_digest(prompt.n_tokens(), prefix_digest) ||
+            !slot.prompt.tokens.retention_token_digest(source_digest)) {
+            return false;
+        }
+        const auto reuse = [&](llama_memory_vbr_representation_identity current) {
+            return context.reuse_vbr_restored_stem(
+                cache, slot, checkpoint, prefix_digest, current, source_digest);
+        };
+        if (reuse({ 8, 11 }) || reuse({ 7, 12 }) || slot.vbr_idle_stem_source_valid ||
+            reuse(representation) != available || cache.states.size() != cache_size ||
+            slot.vbr_idle_capture_representation_valid != exact) {
+            return false;
+        }
+        if (available) {
+            if (!slot.vbr_idle_stem_source_valid || slot.vbr_idle_stem_host_artifact.v == 0 ||
+                slot.vbr_idle_stem_source_identity != source_digest ||
+                slot.vbr_idle_stem_coverage_tokens != uint64_t(prompt.n_tokens()) ||
+                slot.vbr_reuse_capture_frontier != 0 || slot.vbr_idle_stem_retry) {
+                return false;
+            }
+            slot.vbr_reuse_capture_frontier = prompt.n_tokens() + 1;
+            if (!reuse(representation) ||
+                slot.vbr_reuse_capture_frontier != uint64_t(prompt.n_tokens() + 1)) {
+                return false;
+            }
+        } else if (slot.vbr_idle_stem_source_valid ||
+                   slot.vbr_reuse_capture_frontier != uint64_t(prompt.n_tokens())) {
+            return false;
+        }
+        slot.vbr_idle_capture_source_reset();
+        if (reuse(representation) || slot.vbr_idle_stem_source_valid) {
+            return false;
+        }
+        // A locally retained checkpoint has its own publication witness, not
+        // the slot's host-import stamp. Eviction and either tier epoch changing
+        // invalidate reuse; no exact live recovery authority is acquired.
+        common_prompt_checkpoint local;
+        local.vbr_host_stem_identity = context.vbr_idle_publication_identity(
+            prefix_digest, representation.tier_epoch, representation.tier_epoch_swa);
+        const auto artifact = cache.find_vbr_durable_stem(
+            slot.prompt, checkpoint.token_count, execution, adapter);
+        local.vbr_host_stem_artifact = artifact.v != 0 ? artifact.v : UINT64_MAX;
+        const auto reuse_local = [&](llama_memory_vbr_representation_identity current) {
+            return context.reuse_vbr_restored_stem(
+                cache, slot, checkpoint, prefix_digest, current, source_digest, &local);
+        };
+        if (reuse_local({ 8, 11 }) || reuse_local({ 7, 12 }) ||
+            reuse_local(representation) != available ||
+            slot.vbr_idle_capture_representation_valid) {
+            return false;
+        }
+        local.vbr_host_stem_artifact = UINT64_MAX;
+        if (reuse_local(representation)) {
+            return false;
+        }
+        local.clear_vbr_host_stem();
+        if (reuse_local(representation)) {
+            return false;
+        }
+    }
+    return true;
+}
+
 server_mmproj_lifecycle_test_result
 server_mmproj_lifecycle_for_test() {
     server_mmproj_lifecycle_test_result result;
@@ -24007,6 +24522,17 @@ server_vbr_retention_wiring_for_test() {
 server_vbr_reclaim_policy_result
 server_vbr_reclaim_policy_for_test() {
     server_vbr_reclaim_policy_result result;
+    result.projected_capture_requires_idle_source = true;
+    for (const bool readiness : { false, true }) {
+        for (const int32_t preserve : { -1, 0 }) {
+            for (const size_t slots : { size_t(1), size_t(2) }) {
+                const bool expected = !readiness && (preserve == -1 || slots == 2);
+                result.projected_capture_requires_idle_source &=
+                    server_context_impl::vbr_projected_capture_allowed(
+                        readiness, preserve, slots) == expected;
+            }
+        }
+    }
     {
         vbr_artifact_identity_block identity {
             "vbr-attempt-test", "adapter", "media", 1, 3, 3,
@@ -24620,6 +25146,7 @@ server_vbr_slot_selection_for_test(
     rebound.vbr_idle_capture_attempt_identity[0] = 1;
     rebound.vbr_idle_capture_terminal = true;
     rebound.vbr_idle_capture_published_identity[0] = 2;
+    rebound.vbr_restored_stem_identity[0] = 4;
     rebound.vbr_idle_capture_representation_valid = true;
     rebound.vbr_idle_stem_source_identity[0] = 3;
     rebound.vbr_idle_stem_coverage_tokens = 2;
@@ -24633,6 +25160,7 @@ server_vbr_slot_selection_for_test(
         !rebound.vbr_idle_capture_terminal &&
         rebound.vbr_idle_capture_published_identity ==
             std::array<uint8_t, 32> {} &&
+        rebound.vbr_restored_stem_identity == std::array<uint8_t, 32> {} &&
         !rebound.vbr_idle_capture_representation_valid &&
         rebound.vbr_idle_stem_source_identity ==
             std::array<uint8_t, 32> {} &&
@@ -25441,7 +25969,7 @@ void server_routes::init_routes() {
             return res;
         }
         if (!server_cache_plan_preflight_exposure_allowed(
-                params.hostname, params.api_keys.size())) {
+                params.hostnames, params.api_keys.size())) {
             res->error(format_error_response(
                 "Cache-plan preflight requires a trusted-local single-principal server",
                 ERROR_TYPE_NOT_SUPPORTED));
@@ -25862,7 +26390,7 @@ void server_routes::init_routes() {
     };
 
     this->post_chat_completions_tok = [this](const server_http_req & req) {
-        return handle_count_tokens(ctx_server.vocab, ctx_server.mctx, ctx_server.init_opt, req, TASK_RESPONSE_TYPE_OAI_CHAT);
+        return handle_count_tokens(req, TASK_RESPONSE_TYPE_OAI_CHAT);
     };
 
     this->post_control = [this](const server_http_req & req) {
@@ -25921,7 +26449,7 @@ void server_routes::init_routes() {
     };
 
     this->post_responses_tok_oai = [this](const server_http_req & req) {
-        return handle_count_tokens(ctx_server.vocab, ctx_server.mctx, ctx_server.init_opt, req, TASK_RESPONSE_TYPE_OAI_RESP);
+        return handle_count_tokens(req, TASK_RESPONSE_TYPE_OAI_RESP);
     };
 
     this->post_transcriptions_oai = [this](const server_http_req & req) {
@@ -25971,7 +26499,7 @@ void server_routes::init_routes() {
     };
 
     this->post_anthropic_count_tokens = [this](const server_http_req & req) {
-        return handle_count_tokens(ctx_server.vocab, ctx_server.mctx, ctx_server.init_opt, req, TASK_RESPONSE_TYPE_ANTHROPIC);
+        return handle_count_tokens(req, TASK_RESPONSE_TYPE_ANTHROPIC);
     };
 
     // same with handle_chat_completions, but without inference part
@@ -26466,7 +26994,27 @@ std::unique_ptr<server_res_generator> server_routes::handle_embeddings_impl(cons
         }
     }
 
-    auto tokenized_prompts = tokenize_input_prompts(ctx_server.vocab, ctx_server.mctx, prompt, true, true, ctx_server.init_opt);
+    // same shapes as tokenize_input_prompts(), plus OAI content: { "content": [ { "type": "text"|"image_url"|"input_audio"|"input_video", ... } ] }
+    auto tokenize_entry = [&](const json & p) {
+        if (p.is_object() && p.contains("content")) {
+            return tokenize_oai_content_array(ctx_server.vocab, ctx_server.mctx, meta->chat_params, p.at("content"), true, true, ctx_server.init_opt);
+        }
+        return tokenize_input_subprompt(ctx_server.vocab, ctx_server.mctx, p, true, true, ctx_server.init_opt);
+    };
+
+    std::vector<server_tokens> tokenized_prompts;
+    if (prompt.is_array() && !json_is_array_and_contains_numbers(prompt)) {
+        for (const auto & p : prompt) {
+            tokenized_prompts.push_back(tokenize_entry(p));
+        }
+    } else {
+        tokenized_prompts.push_back(tokenize_entry(prompt));
+    }
+    if (tokenized_prompts.empty()) {
+        res->error(format_error_response("\"input\" must not be empty", ERROR_TYPE_INVALID_REQUEST));
+        return res;
+    }
+
     for (const auto & tokens : tokenized_prompts) {
         // this check is necessary for models that do not add BOS token to the input
         if (tokens.empty()) {
@@ -26527,7 +27075,7 @@ std::unique_ptr<server_res_generator> server_routes::handle_embeddings_impl(cons
     return res;
 }
 
-std::unique_ptr<server_res_generator> server_routes::handle_count_tokens(const llama_vocab * vocab, mtmd_context * mctx, const mtmd_helper_init_opt & init_opt, const server_http_req & req, task_response_type res_type) {
+std::unique_ptr<server_res_generator> server_routes::handle_count_tokens(const server_http_req & req, task_response_type res_type) {
     auto res = create_response();
     std::vector<raw_buffer> files;
     json body = json::parse(req.body);
@@ -26561,13 +27109,13 @@ std::unique_ptr<server_res_generator> server_routes::handle_count_tokens(const l
 
     // TODO @ngxson : refactor this code block, move this to server-common and reuse it in other places
     size_t n_tokens;
-    if (mctx != nullptr) {
+    if (ctx_server.mctx != nullptr) {
         if (!prompt.is_string()) {
             throw std::runtime_error("for mtmd, input prompt must be a string.");
         }
-        n_tokens = process_mtmd_prompt(mctx, prompt.get<std::string>(), files, init_opt, true).size();
+        n_tokens = process_mtmd_prompt(ctx_server.mctx, prompt.get<std::string>(), files, ctx_server.init_opt, true).size();
     } else {
-        n_tokens = tokenize_mixed(vocab, prompt, true, true).size();
+        n_tokens = tokenize_mixed(ctx_server.vocab, prompt, true, true).size();
     }
 
     json response = {{"input_tokens", static_cast<int64_t>(n_tokens)}};

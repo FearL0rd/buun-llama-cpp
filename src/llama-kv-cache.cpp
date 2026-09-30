@@ -4092,11 +4092,12 @@ uint32_t llama_kv_cache::vbr_watermark_cells(uint32_t extra_tokens) const {
 
 uint32_t llama_kv_cache::vbr_import_watermark_cells(
         uint32_t incoming_cells, uint32_t prefix_cells, uint32_t source_high_water,
-        llama_seq_id destination, uint32_t source_backing) const {
-    if (other) { return other->vbr_import_watermark_cells(incoming_cells, prefix_cells, source_high_water, destination, source_backing); }
+        llama_seq_id destination, uint32_t source_backing, bool recycle_incumbent) const {
+    if (other) { return other->vbr_import_watermark_cells(incoming_cells, prefix_cells, source_high_water, destination, source_backing, recycle_incumbent); }
     if (destination < 0 || size_t(destination) >= seq_to_stream.size()) { return 0; }
     const auto & cells = v_cells[seq_to_stream[destination]];
     if (cells.get_used() == 0) {
+        if (recycle_incumbent) { return 0; }
         if (source_high_water == 0) { return vbr_watermark_cells(incoming_cells); }
         // Whole imports preserve source physical placements, including holes
         // left by earlier provisional replacements. Prefix projections pass
@@ -4117,7 +4118,10 @@ uint32_t llama_kv_cache::vbr_import_watermark_cells(
     // The guard prefers provisional free cells, leaving the incumbent's old
     // physical range behind the resumed head. Credit reuse only when the
     // guard must recycle the incumbent (and the prefix fits those rows).
-    if (source_high_water != 0 &&
+    if (recycle_incumbent && (prefix_cells == 0 || prefix_cells > incumbent)) {
+        return 0; // no independently owned incumbent range can hold this prefix
+    }
+    if (!recycle_incumbent && source_high_water != 0 &&
         (prefix_cells <= cells.size()-cells.get_used() || prefix_cells > incumbent)) {
         incumbent = 0;
     }
@@ -4843,6 +4847,9 @@ size_t llama_kv_cache::vbr_flush_deferred_unmaps() {
         }
         flushed += p.unmap_deferred.size();
         p.unmap_deferred.clear();
+        // The mapped-byte floor may have inflated the memo before the tail release.
+        // Reprice against the remaining mappings instead of retaining transient headroom.
+        p.budget_eff_stamp = ~0ull;
     }
     return flushed;
 }
@@ -12322,6 +12329,7 @@ ggml_tensor * llama_kv_cache::build_input_k_idxs(ggml_context * ctx, const llama
     ggml_tensor * k_idxs = ggml_new_tensor_1d(ctx, GGML_TYPE_I64, n_tokens);
 
     ggml_set_input(k_idxs);
+    ggml_set_name(k_idxs, "attn_inp_k_idxs");
 
     return k_idxs;
 }
@@ -12339,6 +12347,7 @@ ggml_tensor * llama_kv_cache::build_input_v_idxs(ggml_context * ctx, const llama
     }
 
     ggml_set_input(v_idxs);
+    ggml_set_name(v_idxs, "attn_inp_v_idxs");
 
     return v_idxs;
 }
@@ -13162,17 +13171,22 @@ void llama_kv_cache::state_append_range(llama_io_read_i & io, llama_seq_id seq_i
 
     slot_info sinfo;
 
-    bool res = state_read_meta(io, strm, cell_count, sinfo, seq_id, nullptr, &append);
-    res = res && vbr_vmm_try_map_import();
-
+    bool mapped = false;
+    bool res = false;
     try {
-        res = res && state_read_data(io, strm, cell_count, sinfo, append.n_keep);
+        res = state_read_meta(io, strm, cell_count, sinfo, seq_id, nullptr, &append);
+        mapped = res && vbr_vmm_try_map_import();
+        res = mapped && state_read_data(io, strm, cell_count, sinfo, append.n_keep);
     } catch (...) {
         res = false;
     }
 
     if (!res) {
+        io.discard();
         seq_rm(seq_id, p0, -1);
+        if (mapped) {
+            state_clear_data(strm, sinfo);
+        }
         throw std::runtime_error("failed to append kv cache range");
     }
 
@@ -13190,7 +13204,7 @@ void llama_kv_cache::state_read_sinfo(
            llama_seq_id   seq_id,
   llama_state_seq_flags   flags,
       slot_info_vec_t *   sinfos_out,
-const slot_info_vec_t *   sinfos_in) {
+const slot_info_vec_t *   sinfos_in) try {
     // Imports are provenance-bearing: recovery is reserved before the first read so a
     // partial-import unwind autorecords and the boundary drain quarantines + invalidates.
     vbr_mutation_op mutation_op(this, vbr_operation_kind::state_import,
@@ -13245,26 +13259,28 @@ const slot_info_vec_t *   sinfos_in) {
 
         slot_info sinfo;
 
-        bool res = true;
-        res = res && state_read_meta(
-                io, strm, cell_count, sinfo, seq_id,
-                sinfos_in ? &(*sinfos_in)[s] : nullptr);
-        // neither branch has grown the VMM physical backing yet: the whole-cache one positions
-        // cells directly, the per-sequence one goes through apply_ubatch(commit = false), which
-        // skips the mapping — state_read_data would write into unmapped VA
-        res = res && vbr_vmm_try_map_import();
-
+        bool res = false;
+        bool mapped = false;
         try {
-            res = res && state_read_data(io, strm, cell_count, sinfo, cell_count);
+            res = state_read_meta(io, strm, cell_count, sinfo, seq_id,
+                    sinfos_in ? &(*sinfos_in)[s] : nullptr);
+            // Both metadata paths place cells without committing physical VMM pages.
+            mapped = res && vbr_vmm_try_map_import();
+            res = mapped && state_read_data(io, strm, cell_count, sinfo, cell_count);
         } catch (...) {
             res = false;
         }
 
         if (!res) {
+            io.discard();
             if (seq_id == -1) {
                 clear(true);
             } else {
                 seq_rm(seq_id, -1, -1);
+                // A failed VMM map cannot have written data and must not be zeroed.
+                if (mapped) {
+                    state_clear_data(strm, sinfo);
+                }
             }
             throw std::runtime_error("failed to restore kv cache");
         }
@@ -13287,6 +13303,18 @@ const slot_info_vec_t *   sinfos_in) {
                 vbr_operation_class::state_api);
         vbr_ownership_rebuild();
     }
+}
+
+catch (...) {
+    // Also cover malformed stream headers or metadata, before/after individual
+    // stream payloads. Never let a deferred reader flush a rejected import.
+    io.discard();
+    if (seq_id == -1) {
+        clear(true);
+    } else {
+        seq_rm(seq_id, -1, -1);
+    }
+    throw;
 }
 
 // The one spelling of "update the index for every sequence that owns a cell".
@@ -13481,12 +13509,16 @@ bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32
 
     if (dest_seq_id != -1) {
         // single sequence
+        const uint32_t n_place = append ? append->n_keep : cell_count;
+        if (n_place > cells.size()) {
+            LLAMA_LOG_ERROR("%s: not enough cells in kv cache\n", __func__);
+            return false;
+        }
         if (!append) {
             seq_rm(dest_seq_id, -1, -1);
         }
 
         // cells past n_place are parsed and dropped
-        const uint32_t n_place = append ? append->n_keep : cell_count;
 
         llama_batch_allocr balloc(hparams.n_pos_per_embd());
 
@@ -13864,6 +13896,116 @@ bool llama_kv_cache::state_read_data(llama_io_read_i & io, uint32_t strm, uint32
     }
 
     return true;
+}
+
+void llama_kv_cache::state_clear(llama_seq_id seq_id) {
+    if (seq_id == -1) {
+        clear(true);
+        return;
+    }
+
+    GGML_ASSERT(seq_id >= 0 && (size_t) seq_id < seq_to_stream.size());
+
+    const uint32_t strm = seq_to_stream[seq_id];
+
+    const auto & cells = v_cells[strm];
+
+    slot_info sinfo;
+    sinfo.s0 = strm;
+    sinfo.s1 = strm;
+    sinfo.resize(1);
+    sinfo.strm[0] = strm;
+
+    // a cell that another sequence still uses keeps its data
+    for (uint32_t i = 0; i < cells.size(); ++i) {
+        if (cells.seq_has(i, seq_id) && cells.seq_count(i) == 1) {
+            sinfo.idxs[0].push_back(i);
+        }
+    }
+
+    seq_rm(seq_id, -1, -1);
+    state_clear_data(strm, sinfo);
+}
+
+// the cleared ranges mirror the write pattern of state_read_data() - keep both in sync
+void llama_kv_cache::state_clear_data(uint32_t strm, const slot_info & attempted) {
+    // A mirrored or shared placement may still belong to another sequence. Only
+    // unowned rows may be scrubbed, including on a failed range append.
+    slot_info sinfo = attempted;
+    if (!sinfo.empty()) {
+        auto & rows = sinfo.idxs[0];
+        const auto & cells = v_cells[strm];
+        rows.erase(std::remove_if(rows.begin(), rows.end(), [&](uint32_t row) {
+            return !cells.is_empty(row);
+        }), rows.end());
+    }
+    // zero the K/V data of the failed restore attempt - the attention can still read the data of free cells
+    if (sinfo.empty() || sinfo.size() == 0) {
+        return;
+    }
+
+    const auto & cells = v_cells[strm];
+
+    const uint32_t cell_count = sinfo.size();
+
+    const bool is_contiguous = sinfo.is_contiguous();
+
+    for (const auto & layer : layers) {
+        const uint32_t il = layer.il;
+
+        const uint32_t n_embd_k_gqa = hparams.n_embd_k_gqa(il);
+
+        auto * k = layer.k_stream[strm];
+
+        const size_t k_size_row = ggml_row_size(k->type, n_embd_k_gqa);
+
+        if (is_contiguous) {
+            llama_clear_tensor_data(k, sinfo.head() * k_size_row, cell_count * k_size_row);
+        } else {
+            for (uint32_t i = 0; i < cell_count; ++i) {
+                llama_clear_tensor_data(k, sinfo.idxs[0][i] * k_size_row, k_size_row);
+            }
+        }
+    }
+
+    for (const auto & layer : layers) {
+        const uint32_t il = layer.il;
+
+        const uint32_t n_embd_v_gqa = hparams.n_embd_v_gqa(il);
+
+        auto * v = layer.v_stream[strm];
+        if (!v) {
+            continue;
+        }
+
+        if (!v_trans) {
+            const size_t v_size_row = ggml_row_size(v->type, n_embd_v_gqa);
+
+            if (is_contiguous) {
+                llama_clear_tensor_data(v, sinfo.head() * v_size_row, cell_count * v_size_row);
+            } else {
+                for (uint32_t i = 0; i < cell_count; ++i) {
+                    llama_clear_tensor_data(v, sinfo.idxs[0][i] * v_size_row, v_size_row);
+                }
+            }
+        } else {
+            const size_t v_size_el = ggml_type_size(v->type);
+
+            if (is_contiguous) {
+                const uint32_t h = sinfo.head();
+
+                for (uint32_t j = 0; j < n_embd_v_gqa; ++j) {
+                    llama_clear_tensor_data(v, (h + j * cells.size()) * v_size_el, cell_count * v_size_el);
+                }
+            } else {
+                for (uint32_t j = 0; j < n_embd_v_gqa; ++j) {
+                    for (uint32_t i = 0; i < cell_count; ++i) {
+                        llama_clear_tensor_data(v, (sinfo.idxs[0][i] + j * cells.size()) * v_size_el, v_size_el);
+                    }
+                }
+            }
+        }
+    }
 }
 
 //

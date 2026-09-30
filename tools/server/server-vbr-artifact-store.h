@@ -449,6 +449,11 @@ struct server_vbr_artifact_ingest_output {
 bool server_vbr_artifact_import_variant_fallback_safe(
     const server_vbr_artifact_import_output & output) noexcept;
 
+// Capacity can be refused by destination pricing before the occupied guard runs.
+// This permits trying the separately guarded durable empty handoff, not adoption.
+bool server_vbr_artifact_import_capacity_refused(
+    const server_vbr_artifact_import_output & output) noexcept;
+
 // Server-internal opaque-reference authorization index. It exposes only one
 // indistinguishable miss result; there is no enumeration or tenant-agnostic
 // lookup door.

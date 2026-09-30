@@ -3674,6 +3674,77 @@ llama_vbr_artifact_catalog::publish_stream_complete(
         pending_reference.unit_content =
             pending_blobs.front().content;
 
+        // Share immutable backing, not unit/version identity. A growing or
+        // sibling snapshot can retain an older unit's exact byte prefix while
+        // keeping its own manifest, representation history and companions.
+        // Only complete existing allocation extents are reused; the suffix is
+        // materialized under its own claim below. No partial allocation is
+        // advertised as released or charged at a smaller size.
+        std::vector<const impl::blob *> payload_prefixes(pending_blobs.size(), nullptr);
+        std::vector<uint64_t> prefix_bytes(pending_blobs.size(), 0);
+        if (sealed_projected) {
+            for (size_t u = 0; u < pending_blobs.size(); ++u) {
+                if (blob_exists[u]) {
+                    continue;
+                }
+                const auto & descriptor = pending_blobs[u].descriptor;
+                for (const auto & entry : impl_->blobs) {
+                    const auto & prior = entry.second;
+                    const auto & old = prior.descriptor;
+                    if (old.child_id != descriptor.child_id ||
+                        old.logical_unit_id != descriptor.logical_unit_id ||
+                        old.side != descriptor.side || old.current_type != descriptor.current_type ||
+                        old.layout != descriptor.layout || old.rank != descriptor.rank ||
+                        old.shards.size() != descriptor.shards.size() ||
+                        prior.payload_shards.size() != descriptor.shards.size()) {
+                        continue;
+                    }
+                    uint64_t bytes = 0;
+                    bool matches = true;
+                    for (size_t s = 0; s < old.shards.size(); ++s) {
+                        const auto & a = old.shards[s];
+                        const auto & b = descriptor.shards[s];
+                        if (a.shard_index != b.shard_index || a.row_bytes != b.row_bytes ||
+                            a.column_count != b.column_count || a.payload_bytes > b.payload_bytes ||
+                            a.payload_bytes > UINT64_MAX - bytes || !prior.payload_shards[s] ||
+                            prior.payload_shards[s]->size() != a.payload_bytes) {
+                            matches = false;
+                            break;
+                        }
+                        bytes += a.payload_bytes;
+                    }
+                    if (!matches || bytes <= prefix_bytes[u]) {
+                        continue;
+                    }
+                    uint64_t allocated = 0;
+                    for (const auto & allocation : prior.allocations) {
+                        if (allocation.category == llama_cache_acct_category::unit_version_payload) {
+                            if (allocation.logical != allocation.resident ||
+                                allocation.resident > UINT64_MAX - allocated) {
+                                matches = false;
+                                break;
+                            }
+                            allocated += allocation.resident;
+                        }
+                    }
+                    if (!matches || allocated != bytes) {
+                        continue;
+                    }
+                    for (size_t s = 0; s < old.shards.size(); ++s) {
+                        if (!segment_lookup[payload_offsets[u] + s]->bytes->prefix_matches(
+                                *prior.payload_shards[s])) {
+                            matches = false;
+                            break;
+                        }
+                    }
+                    if (matches) {
+                        payload_prefixes[u] = &prior;
+                        prefix_bytes[u] = bytes;
+                    }
+                }
+            }
+        }
+
         // Build exact content-addressed leaves. Per-unit payload/stash rows
         // sum to the portable aggregate manifest but retain charge-once
         // allocation identity across references.
@@ -3714,38 +3785,41 @@ llama_vbr_artifact_catalog::publish_stream_complete(
                 payload_bytes += shard.payload_bytes;
             }
             if (payload_bytes != 0) {
-                llama_cache_acct_resource_domain domain;
-                const auto portable =
-                    vbr_artifact_payload_storage_domain();
-                if (!impl_->resolve_domain(portable, domain)) {
-                    result.status =
-                        llama_vbr_artifact_publish_status::
-                            accounting_unavailable;
-                    impl_->n_refusals++;
-                    return result;
+                const auto * shared = blob_exists[u] ? &pending_blobs[u] : payload_prefixes[u];
+                if (shared) {
+                    for (const auto & allocation : shared->allocations) {
+                        if (allocation.category != llama_cache_acct_category::unit_version_payload) {
+                            continue;
+                        }
+                        impl::txn_leaf leaf;
+                        leaf.binding = allocation;
+                        leaf.existing = true;
+                        leaf.owner_index = u;
+                        leaves.push_back(leaf);
+                    }
                 }
-                impl::allocation binding;
-                binding.category =
-                    llama_cache_acct_category::unit_version_payload;
-                binding.domain = domain;
-                binding.logical = payload_bytes;
-                binding.resident = payload_bytes;
-                binding.artifact = pending_blobs[u].artifact;
-                binding.content = pending_blobs[u].content;
-                binding.lineage = pending_blobs[u].lineage;
-                if (!append_leaf(
-                        binding, blob_exists[u]
-                            ? &impl_->blobs.find(
-                                working.unit_blobs[u]
-                                    .unit_version_id.bytes())
-                                  ->second.allocations
-                            : nullptr,
-                        u, false)) {
-                    result.status =
-                        llama_vbr_artifact_publish_status::
-                            publication_failed;
-                    impl_->n_refusals++;
-                    return result;
+                const uint64_t shared_bytes = blob_exists[u] ? payload_bytes : prefix_bytes[u];
+                const uint64_t fresh_bytes = payload_bytes - shared_bytes;
+                if (fresh_bytes != 0) {
+                    llama_cache_acct_resource_domain domain;
+                    if (!impl_->resolve_domain(vbr_artifact_payload_storage_domain(), domain)) {
+                        result.status = llama_vbr_artifact_publish_status::accounting_unavailable;
+                        impl_->n_refusals++;
+                        return result;
+                    }
+                    impl::allocation binding;
+                    binding.category = llama_cache_acct_category::unit_version_payload;
+                    binding.domain = domain;
+                    binding.logical = fresh_bytes;
+                    binding.resident = fresh_bytes;
+                    binding.artifact = pending_blobs[u].artifact;
+                    binding.content = pending_blobs[u].content;
+                    binding.lineage = pending_blobs[u].lineage;
+                    if (!append_leaf(binding, nullptr, u, false)) {
+                        result.status = llama_vbr_artifact_publish_status::publication_failed;
+                        impl_->n_refusals++;
+                        return result;
+                    }
                 }
             }
             if (working.unit_blobs[u].descriptor.clean_stash_state ==
@@ -3913,6 +3987,7 @@ llama_vbr_artifact_catalog::publish_stream_complete(
         struct materialize_context {
             std::vector<impl::blob> * blobs;
             std::vector<impl::stash> * stashes;
+            const std::vector<const impl::blob *> * payload_prefixes;
             const std::vector<bool> * blob_exists;
             const std::vector<bool> * stash_exists;
             const std::vector<size_t> * stash_alias;
@@ -3921,6 +3996,7 @@ llama_vbr_artifact_catalog::publish_stream_complete(
             const std::vector<size_t> * stash_offsets;
         } materialize {
             &pending_blobs, &pending_stashes,
+            &payload_prefixes,
             &blob_exists, &stash_exists, &stash_alias, &segment_lookup,
             &payload_offsets, &stash_offsets,
         };
@@ -3937,7 +4013,13 @@ llama_vbr_artifact_catalog::publish_stream_complete(
                         if (!segment) {
                             return false;
                         }
-                        blob.payload_shards.push_back(segment->bytes);
+                        const auto * prefix = (*context->payload_prefixes)[u];
+                        auto bytes = prefix ? segment->bytes->with_shared_prefix(
+                            *prefix->payload_shards[shard.shard_index]) : segment->bytes;
+                        if (!bytes) {
+                            return false;
+                        }
+                        blob.payload_shards.push_back(std::move(bytes));
                     }
                 }
                 if (blob.stash_id.valid() &&
@@ -3997,10 +4079,9 @@ llama_vbr_artifact_catalog::publish_stream_complete(
                 pending_reference.allocations.push_back(
                     leaves[i].binding);
             }
-            if (leaves[i].existing) {
-                continue;
-            }
-            if (leaves[i].owner_index != SIZE_MAX) {
+            if (leaves[i].owner_index != SIZE_MAX &&
+                !(leaves[i].owner_stash ? stash_exists[leaves[i].owner_index]
+                                       : blob_exists[leaves[i].owner_index])) {
                 auto & owner = leaves[i].owner_stash
                     ? pending_stashes[leaves[i].owner_index].allocations
                     : pending_blobs[leaves[i].owner_index].allocations;
