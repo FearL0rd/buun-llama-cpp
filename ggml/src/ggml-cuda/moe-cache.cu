@@ -2375,6 +2375,159 @@ static int moe_cache_prefill_copy(void * opaque, void * backend_opaque,
     return true;
 }
 
+#if !defined(GGML_USE_HIP)
+static int moe_cache_prefetch_supported(void * backend_opaque, const ggml_tensor * source) {
+    auto backend = (ggml_backend_t) backend_opaque;
+    if (!backend || !ggml_backend_is_cuda(backend) || !source || source->view_src ||
+            source->type != GGML_TYPE_Q2_0 || !source->buffer ||
+            source->buffer->buft != ggml_backend_cuda_host_buffer_type() ||
+            ggml_backend_buffer_get_usage(source->buffer) != GGML_BACKEND_BUFFER_USAGE_WEIGHTS ||
+            (source->flags & GGML_TENSOR_FLAG_INPUT) || !ggml_is_contiguous(source) ||
+            source->ne[2] < 1 || source->ne[2] > 512 || source->ne[3] != 1 ||
+            source->nb[2] % sizeof(uint4) || ggml_nbytes(source) > (256ull << 20)) return 0;
+    auto * ctx = (ggml_backend_cuda_context *) backend->context;
+    return !ctx->external_capture && ggml_cuda_info().device_count == 1 &&
+            ggml_cuda_info().devices[ctx->device].cc == 860;
+}
+
+struct moe_cache_prefetch_job {
+    moe_cache_session * session;
+    const void * source;
+    int device;
+    cudaStream_t stream = nullptr;
+    bool leased = false;
+    bool drained = false;
+    bool success = false;
+};
+
+static thread_local moe_cache_prefetch_job * g_prefetch_job = nullptr;
+
+static bool moe_cache_prefetch_drain(moe_cache_prefetch_job * job) {
+    if (job->drained) return job->success;
+    ggml_cuda_set_device(job->device);
+    const bool ok = cudaStreamSynchronize(job->stream) == cudaSuccess;
+    if (!ok) (void) cudaGetLastError();
+    if (job->leased) {
+        std::lock_guard<std::mutex> lock(job->session->mu);
+        auto source = job->session->active_sources.find(job->source);
+        GGML_ASSERT(source != job->session->active_sources.end() && source->second.references > 0);
+        if (--source->second.references == 0) job->session->active_sources.erase(source);
+        job->session->active_nodes--;
+        job->session->idle_cv.notify_all();
+        job->leased = false;
+    }
+    job->drained = true;
+    job->success = ok;
+    return ok;
+}
+
+static int moe_cache_prefetch_end(void * opaque) {
+    std::unique_ptr<moe_cache_prefetch_job> job((moe_cache_prefetch_job *) opaque);
+    if (!job) return 0;
+    bool ok = moe_cache_prefetch_drain(job.get());
+    ok = (cudaStreamDestroy(job->stream) == cudaSuccess) && ok;
+    if (!ok) (void) cudaGetLastError();
+    if (g_prefetch_job == job.get()) g_prefetch_job = nullptr;
+    return ok;
+}
+
+static void * moe_cache_prefetch_begin(void * opaque, void * backend_opaque,
+        const ggml_tensor * source, ggml_tensor * destination,
+        const uint32_t * selected, size_t selected_words) {
+    if (g_prefetch_job || !opaque || !moe_cache_prefetch_supported(backend_opaque, source) ||
+            !destination || !ggml_are_same_layout(source, destination) ||
+            !destination->buffer || destination->view_src || !destination->data ||
+            uintptr_t(destination->data) % alignof(uint4) ||
+            ggml_backend_buffer_get_usage(destination->buffer) != GGML_BACKEND_BUFFER_USAGE_COMPUTE) return nullptr;
+    if (selected && selected_words < size_t((source->ne[2] + 31) / 32)) return nullptr;
+    const auto used = [&](int e) { return !selected || ((selected[e / 32] >> (e % 32)) & 1u); };
+    auto * ctx = (ggml_backend_cuda_context *) ((ggml_backend_t) backend_opaque)->context;
+    if (destination->buffer->buft != ggml_backend_cuda_buffer_type(ctx->device)) return nullptr;
+    ggml_cuda_set_device(ctx->device);
+    cudaPointerAttributes attributes = {};
+    if (cudaPointerGetAttributes(&attributes, source->data) != cudaSuccess) {
+        (void) cudaGetLastError();
+        return nullptr;
+    }
+    if (attributes.type != cudaMemoryTypeHost) return nullptr;
+    // The destination lifetime begins at the current split, so earlier splits
+    // may still have used this allocation. Drain them before the copy stream
+    // touches it; current-split compute is submitted after begin returns.
+    ggml_backend_synchronize((ggml_backend_t) backend_opaque);
+    auto & session = *(moe_cache_session *) opaque;
+    std::unique_ptr<moe_cache_prefetch_job> job(new (std::nothrow)
+            moe_cache_prefetch_job{&session, source->data, ctx->device});
+    if (!job) return nullptr;
+    if (cudaStreamCreateWithFlags(&job->stream, cudaStreamNonBlocking) != cudaSuccess) {
+        (void) cudaGetLastError();
+        return nullptr;
+    }
+    bool resident[512] = {};
+    bool ready = false;
+    {
+        std::lock_guard<std::mutex> lock(session.mu);
+        if (!session.stopping && !session.dormant && session.active_scopes > 0 && session.devices.size() == 1) {
+            try {
+                auto & lease = session.active_sources[source->data];
+                lease.bytes = std::max(lease.bytes, ggml_nbytes(source));
+                lease.references++;
+                session.active_nodes++;
+                job->leased = true;
+                auto & device = *session.devices[0];
+                const int pool_id = moe_cache_find_pool(device, source->nb[2], source->type);
+                if (!device.dead && pool_id >= 0 && device.pools[pool_id]->slab) {
+                    const auto & pool = *device.pools[pool_id];
+                    moe_cache_pp_copy_refs refs = {};
+                    int hits = 0;
+                    for (int e = 0; e < source->ne[2]; ++e) {
+                        if (!used(e)) continue;
+                        const auto found = pool.map.find({source->data, e});
+                        if (found != pool.map.end() && found->second <= 65535 &&
+                                pool.slots[found->second].state == moe_cache_slot_state::valid) {
+                            resident[e] = true;
+                            refs.packed[hits++] = (uint32_t(e) << 16) | uint32_t(found->second);
+                        }
+                    }
+                    if (hits) {
+                        const size_t vectors = source->nb[2] / sizeof(uint4);
+                        const unsigned blocks = std::min<size_t>(32, (vectors + 255) / 256);
+                        moe_cache_pp_gather<<<dim3(blocks, hits), 256, 0, job->stream>>>(
+                                (const uint4 *) pool.slab, (uint4 *) destination->data, vectors, refs);
+                        ready = cudaGetLastError() == cudaSuccess;
+                    } else ready = true;
+                } else ready = true;
+            } catch (const std::bad_alloc &) {
+                ready = false;
+            }
+        }
+        // Finish resident reads while the pool is protected. The long host DMA
+        // below needs only the source lease; allocator trim can free the pool
+        // during current-split compute without waiting on our dispatch lock.
+        ready = (cudaStreamSynchronize(job->stream) == cudaSuccess) && ready;
+    }
+    for (int e = 0; ready && e < source->ne[2];) {
+        if (!used(e)) { ++e; continue; }
+        int end = e + 1;
+        while (end < source->ne[2] && used(end) && resident[end] == resident[e]) ++end;
+        const size_t padding = end < source->ne[2] && !used(end) ? std::min<size_t>(source->nb[2], 512) : 0;
+        const size_t offset = size_t(resident[e] ? end : e) * source->nb[2];
+        const size_t bytes = (resident[e] ? 0 : size_t(end - e) * source->nb[2]) + padding;
+        if (bytes) {
+            ready = cudaMemcpyAsync((char *) destination->data + offset,
+                    (const char *) source->data + offset, bytes,
+                    cudaMemcpyHostToDevice, job->stream) == cudaSuccess;
+        }
+        e = end;
+    }
+    if (!ready) {
+        moe_cache_prefetch_end(job.release());
+        return nullptr;
+    }
+    g_prefetch_job = job.get();
+    return job.release();
+}
+#endif
+
 static void moe_cache_session_enter(void * opaque) {
     if (g_session_suppressed > 0) {
         g_session_suppressed++;
@@ -4718,6 +4871,12 @@ static size_t moe_cache_trim_session(
 }
 
 extern "C" size_t ggml_moe_cache_trim(int device) {
+#if !defined(GGML_USE_HIP)
+    // An invalidator can hold g_registry_mu while waiting for this thread's
+    // source lease. Drain lookahead before taking that mutex during allocation
+    // pressure, otherwise trim and lease release could wait for each other.
+    if (g_prefetch_job) moe_cache_prefetch_drain(g_prefetch_job);
+#endif
     if (g_session_count.load(std::memory_order_acquire) == 0) {
         return 0;
     }
@@ -4747,6 +4906,11 @@ void ggml_moe_cache_register(const void * owner) {
     ggml_moe_cache.session_enter = moe_cache_session_enter;
     ggml_moe_cache.session_leave = moe_cache_session_leave;
     ggml_moe_cache.prefill_copy = moe_cache_prefill_copy;
+#if !defined(GGML_USE_HIP)
+    ggml_moe_cache.prefetch_supported = moe_cache_prefetch_supported;
+    ggml_moe_cache.prefetch_begin = moe_cache_prefetch_begin;
+    ggml_moe_cache.prefetch_end = moe_cache_prefetch_end;
+#endif
     ggml_moe_cache.begin = moe_cache_begin;
     ggml_moe_cache.plan = moe_cache_plan;
     ggml_moe_cache.dispatch = moe_cache_dispatch;

@@ -4505,6 +4505,47 @@ static bool run_prefill_copy_type(ggml_backend_dev_t dev, ggml_backend_t gpu, gg
                 break;
             }
         }
+        if (!pinned && ggml_moe_cache.prefetch_supported) {
+            check(!ggml_moe_cache.prefetch_supported(gpu, source), "lookahead pageable allocation refusal");
+        }
+        if (ggml_moe_cache.prefetch_supported && ggml_moe_cache.prefetch_supported(gpu, source)) {
+            for (int repeat = 0; repeat < 3; ++repeat) {
+                ggml_backend_tensor_set_async(gpu, destination, sentinel.data(), 0, bytes);
+                ggml_backend_synchronize(gpu);
+                auto job = ggml_moe_cache.prefetch_begin(session, gpu, source, destination, nullptr, 0);
+                check(bool(job) == pinned, "lookahead pinned admission");
+                if (job) check(ggml_moe_cache.prefetch_end(job), "lookahead completion");
+                ggml_backend_tensor_get(destination, actual.data(), 0, bytes);
+                check(actual == (pinned ? input : sentinel), "lookahead full bytes");
+            }
+            check(!ggml_moe_cache.prefetch_begin(nullptr, gpu, source, destination, nullptr, 0), "lookahead null session");
+            const uint32_t short_mask[] = {1};
+            check(!ggml_moe_cache.prefetch_begin(session, gpu, source, destination, short_mask, 1), "lookahead short bitset");
+            for (uint32_t pattern = 0; pinned && ready && pattern < 258; ++pattern) {
+                const uint32_t selected[2] = {
+                    pattern < 256 ? pattern : pattern == 257 ? UINT32_MAX : 0,
+                    pattern == 256 ? uint32_t(1) << 31 : pattern == 257 ? UINT32_MAX : 0};
+                const auto used = [&](int e) { return (selected[e/32] >> (e%32)) & 1u; };
+                ggml_backend_tensor_set_async(gpu, destination, sentinel.data(), 0, bytes);
+                ggml_backend_synchronize(gpu);
+                auto job = ggml_moe_cache.prefetch_begin(session, gpu, source, destination, selected, 2);
+                check(job != nullptr, "lookahead selected admission");
+                if (job) check(ggml_moe_cache.prefetch_end(job), "lookahead selected completion");
+                expected = sentinel;
+                for (int e=0;e<64;++e) {
+                    if (!used(e)) continue;
+                    std::memcpy(expected.data()+e*expert,input.data()+e*expert,expert);
+                    if (e+1<64 && !used(e+1)) {
+                        std::memcpy(expected.data()+(e+1)*expert,input.data()+(e+1)*expert,512);
+                    }
+                }
+                ggml_backend_tensor_get(destination,actual.data(),0,bytes);
+                check(actual == expected, "lookahead selected bytes and padding");
+                if (!ok) break;
+            }
+            check(!ggml_moe_cache.prefetch_supported(cpu, source), "lookahead CPU refusal");
+            printf("cache-prefetch: pinned=%d repeated=3 %s\n", int(pinned), ok ? "OK" : "FAIL");
+        }
         const uint32_t mask[2] = {15, 0};
         ggml_backend_tensor_set_async(gpu, destination, sentinel.data(), 0, bytes);
         ggml_backend_synchronize(gpu);
@@ -4528,6 +4569,26 @@ static bool run_prefill_copy_type(ggml_backend_dev_t dev, ggml_backend_t gpu, gg
         check(!ggml_moe_cache.prefill_copy(session, gpu, source, destination, mask, 2), "invalidated source");
         ggml_backend_tensor_get(destination, actual.data(), 0, bytes);
         check(actual == sentinel, "untouched refusals");
+        if (pinned && ggml_moe_cache.prefetch_supported && ggml_moe_cache.prefetch_supported(gpu, source)) {
+            auto job = ggml_moe_cache.prefetch_begin(session, gpu, source, destination, nullptr, 0);
+            check(job != nullptr, "lookahead invalidated-source copy");
+            if (job) {
+                std::atomic<bool> entered{false}, completed{false};
+                std::thread invalidate([&] {
+                    entered.store(true, std::memory_order_release);
+                    ggml_moe_cache.invalidate(source->data, bytes);
+                    completed.store(true, std::memory_order_release);
+                });
+                while (!entered.load(std::memory_order_acquire)) std::this_thread::yield();
+                std::this_thread::sleep_for(std::chrono::milliseconds(2));
+                check(!completed.load(std::memory_order_acquire), "lookahead source lease");
+                check(ggml_moe_cache.prefetch_end(job), "lookahead release under invalidation");
+                invalidate.join();
+                check(completed.load(std::memory_order_acquire), "lookahead invalidation completes");
+                ggml_backend_tensor_get(destination, actual.data(), 0, bytes);
+                check(actual == input, "lookahead post-invalidation bytes");
+            }
+        }
         ggml_moe_cache.session_leave(session);
         ggml_moe_cache.session_destroy(session);
         ggml_backend_buffer_free(gpu_buffer);

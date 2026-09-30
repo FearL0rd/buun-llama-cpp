@@ -117,6 +117,19 @@ struct ggml_moe_cache_api {
     int (*prefill_copy)(void * session, void * backend, const struct ggml_tensor * source,
             struct ggml_tensor * destination, const uint32_t * selected, size_t n_words);
 
+    // One-projection lookahead. The scheduler reserves destination lifetime
+    // before begin; end drains source reads on every success/failure/abort path.
+    // supported is allocation-independent. A null begin leaves ordinary copying
+    // responsible for the input; a failed end requires the same fallback.
+    // Jobs are thread-affine and end must run on the thread that called begin.
+    int (*prefetch_supported)(void * backend, const struct ggml_tensor * source);
+    // Optional ready-route bitmap, consumed during begin (not retained by job).
+    // Null selects every expert; selected runs include the MMQ read padding.
+    void * (*prefetch_begin)(void * session, void * backend,
+            const struct ggml_tensor * source, struct ggml_tensor * destination,
+            const uint32_t * selected, size_t selected_words);
+    int (*prefetch_end)(void * job);
+
     // Begin one CPU MUL_MAT_ID node. Returns an opaque plan, or NULL when the stock CPU path should handle the complete node.
     void * (*begin)(const char * tensor_name, const void * host_base, size_t expert_size,
                     int64_t n_in, int64_t n_out, int wtype, int64_t n_expert,
