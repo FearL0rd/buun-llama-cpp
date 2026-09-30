@@ -1703,7 +1703,9 @@ struct ggml_backend_cuda_context {
     // widths; sharing a single warmup entry across those shapes prevents any of
     // them from reaching CUDA graph replay.
     std::unordered_map<uint64_t, std::unique_ptr<ggml_cuda_graph>> cuda_graphs;
-    static constexpr size_t max_cuda_graphs = 64;
+    // Offloaded MoE models can have nearly 100 splits before accounting for
+    // speculative widths. A 64-entry LRU churns even across consecutive steps.
+    static constexpr size_t max_cuda_graphs = 256;
 
     int64_t last_graph_eviction_sweep = 0;
 
