@@ -4219,6 +4219,158 @@ static bool run_stream_staging_case(ggml_backend_dev_t dev,
             GGML_ASSERT(mask == ((1ULL << R) - 1) && collect(node, mask, ref));
             ggml_moe_cache.end(node);
             stop(s);
+            if (round == 0 && ggml_moe_cache.output_supported) {
+                auto hc = ggml_init({2*ggml_tensor_overhead(), nullptr, true});
+                auto dc = ggml_init({2*ggml_tensor_overhead(), nullptr, true});
+                auto source = ggml_new_tensor_2d(hc, GGML_TYPE_F32, K, R);
+                source->op = GGML_OP_MUL_MAT_ID;
+                auto destination = ggml_dup_tensor(dc, source);
+                auto hb = ggml_backend_alloc_ctx_tensors_from_buft(hc, buft);
+                auto db = ggml_backend_alloc_ctx_tensors(dc, gpu);
+                GGML_ASSERT(hb && db);
+                ggml_backend_buffer_set_usage(db, GGML_BACKEND_BUFFER_USAGE_COMPUTE);
+                if (ggml_moe_cache.output_supported(gpu, source)) {
+                    // Scatter a subset into nonconsecutive destination rows;
+                    // untouched rows model completed CPU misses. Poison host
+                    // hit rows so an accidental whole upload cannot pass.
+                    for (int pattern : {0, 1, 2, 3, 4, 5}) {
+                        s = start(pattern == 4 ? "collect" : pattern == 5 ? "dispatch" : nullptr);
+                        for (int j = 0; j < topk; ++j) warm(ids[j]);
+                        ggml_backend_tensor_set(source, ref.data(), 0, ggml_nbytes(source));
+                        std::vector<float> poison(ref.size(), -12345.f), actual(ref.size());
+                        ggml_backend_tensor_set_async(gpu, destination, poison.data(), 0, ggml_nbytes(destination));
+                        ggml_backend_synchronize(gpu);
+                        const bool bound = ggml_moe_cache.output_bind(s, gpu, source, destination);
+                        bool pass = bound;
+                        std::vector<int32_t> selected_ids;
+                        std::vector<const float *> selected_acts;
+                        std::vector<float *> selected_outputs;
+                        for (int r = 0; r < R; ++r) {
+                            if (pattern == 0 || (pattern == 1 && r % 3 != 1) || (pattern == 2 && r != R-1)) continue;
+                            selected_ids.push_back(ids[r]);
+                            selected_acts.push_back(rows[r]);
+                            selected_outputs.push_back((float *) source->data + r*K);
+                            std::fill_n(selected_outputs.back(), K, -23456.f);
+                        }
+                        bool collected = false, dispatched = false;
+                        uint64_t selected_mask = 0;
+                        if (!selected_ids.empty()) {
+                            auto job = ggml_moe_cache.fused_plan(&ud, &gd, &dd, GGML_GLU_OP_SWIGLU,
+                                    -inf, inf, -inf, inf, selected_ids.data(), selected_ids.size(), 1,
+                                    selected_acts.data(), &selected_mask);
+                            pass &= job && selected_mask == ((UINT64_C(1) << selected_ids.size()) - 1);
+                            dispatched = job && ggml_moe_cache.fused_dispatch(job);
+                            collected = dispatched && ggml_moe_cache.collect(job, selected_ids.size(), selected_outputs.data(), K);
+                            if (job) ggml_moe_cache.end(job);
+                            pass &= collected == (pattern < 4);
+                        }
+                        if (pattern >= 4) {
+                            // Existing CPU failure retry fills all host rows.
+                            ggml_backend_tensor_set(source, ref.data(), 0, ggml_nbytes(source));
+                        }
+                        const bool copied = ggml_moe_cache.output_copy(s, gpu, source, destination);
+                        pass &= copied == collected;
+                        if (!copied) ggml_backend_tensor_copy(source, destination);
+                        // Drain output_copy's consumer-stream uploads before the
+                        // buffer read, which also orders after the fallback copy.
+                        ggml_backend_synchronize(gpu);
+                        ggml_backend_tensor_get(destination, actual.data(), 0, ggml_nbytes(destination));
+                        pass &= std::memcmp(actual.data(), ref.data(), ggml_nbytes(source)) == 0;
+                        pass &= !ggml_moe_cache.output_copy(s, gpu, source, destination);
+                        if (!pass) {
+                            size_t different = 0, first = actual.size();
+                            for (size_t i = 0; i < actual.size(); ++i) {
+                                if (std::memcmp(&actual[i], &ref[i], sizeof(float))) {
+                                    first = std::min(first, i);
+                                    ++different;
+                                }
+                            }
+                            printf("cache-device-output-detail: bound=%d selected=%zu mask=%llx dispatched=%d collected=%d copied=%d different=%zu",
+                                    bound, selected_ids.size(), (unsigned long long) selected_mask,
+                                    dispatched, collected, copied, different);
+                            if (different) printf(" first=%zu expected=%a actual=%a", first, double(ref[first]), double(actual[first]));
+                            printf("\n");
+                        }
+                        printf("cache-device-output: pinned=%d tokens=%d down=%s pattern=%d %s\n",
+                                pinned, T, dedicated_down ? dedicated_down : "auto", pattern, pass ? "OK" : "FAIL");
+                        ok &= pass;
+                        stop(s);
+                    }
+                    // No active owner, host destination, and views must refuse.
+                    ok &= !ggml_moe_cache.output_bind(nullptr, gpu, source, destination);
+                    s = start();
+                    ok &= !ggml_moe_cache.output_bind(s, gpu, source, source);
+                    auto view = *source;
+                    view.view_src = source;
+                    ok &= !ggml_moe_cache.output_bind(s, gpu, &view, destination);
+                    stop(s);
+
+                    // Actual scheduler boundary: CPU full-FFN producer followed
+                    // by a GPU consumer. Four CPU workers must finish their
+                    // misses before the complementary upload is submitted.
+                    for (int run = 0; run < 14; ++run) {
+                        // Recreate each graph/session twice rather than relying
+                        // on a pointer-stable binding across evaluations.
+                        const int scenario = run % 7;
+                        const char * fail = scenario == 1 ? "dispatch" : scenario == 2 ? "collect" : nullptr;
+                        configure_cache(fail, "4", "1", "40", dedicated_down);
+                        auto ic = ggml_init({4*ggml_tensor_overhead(), nullptr, true});
+                        auto input = ggml_new_tensor_3d(ic, GGML_TYPE_F32, K, 1, T);
+                        auto routes_tensor = ggml_new_tensor_2d(ic, GGML_TYPE_I32, topk, T);
+                        auto ib = ggml_backend_alloc_ctx_tensors(ic, cpu);
+                        GGML_ASSERT(ib);
+                        ggml_set_input(input);
+                        ggml_set_input(routes_tensor);
+                        ggml_backend_tensor_set(input, acts.data(), 0, ggml_nbytes(input));
+                        ggml_backend_tensor_set(routes_tensor, ids.data(), 0, ggml_nbytes(routes_tensor));
+                        auto gc = ggml_init({16*ggml_tensor_overhead()+ggml_graph_overhead(), nullptr, true});
+                        auto gu = ggml_mul_mat_id(gc, up, input, routes_tensor);
+                        auto gg = ggml_mul_mat_id(gc, gate, input, routes_tensor);
+                        auto glu = ggml_swiglu_split(gc, gg, gu);
+                        auto gd = ggml_mul_mat_id(gc, down, glu, routes_tensor);
+                        auto result = ggml_scale(gc, gd, .5f);
+                        if (scenario == 3) ggml_set_input(gd);
+                        if (scenario == 4) ggml_set_output(gd);
+                        ggml_set_output(result);
+                        auto graph = ggml_new_graph(gc);
+                        ggml_build_forward_expand(graph, result);
+                        ggml_backend_t backends[] = {gpu, cpu};
+                        auto sched = ggml_backend_sched_new(backends, nullptr, 2, GGML_DEFAULT_GRAPH_SIZE, scenario == 5, false);
+                        if (scenario == 6) {
+                            ggml_backend_sched_set_eval_callback(sched,
+                                    [](ggml_tensor *, bool, void *) { return true; }, nullptr);
+                        }
+                        ggml_backend_sched_set_tensor_backend(sched, gu, cpu);
+                        ggml_backend_sched_set_tensor_backend(sched, gg, cpu);
+                        ggml_backend_sched_set_tensor_backend(sched, glu, cpu);
+                        ggml_backend_sched_set_tensor_backend(sched, gd, cpu);
+                        ggml_backend_sched_set_tensor_backend(sched, result, gpu);
+                        bool pass = ggml_backend_sched_alloc_graph(sched, graph);
+                        std::vector<float> expected = ref, actual(ref.size());
+                        for (auto & v : expected) v *= .5f;
+                        for (int step = 0; pass && step < 96; ++step) {
+                            pass &= ggml_backend_sched_graph_compute(sched, graph) == GGML_STATUS_SUCCESS;
+                            ggml_backend_tensor_get(result, actual.data(), 0, ggml_nbytes(result));
+                            pass &= compare_output(expected, actual, 5e-4);
+                            if (scenario == 4) {
+                                ggml_backend_tensor_get(gd, actual.data(), 0, ggml_nbytes(gd));
+                                pass &= compare_output(ref, actual, 5e-4);
+                            }
+                        }
+                        printf("cache-device-output-scheduler: pinned=%d tokens=%d scenario=%d failure=%s %s\n",
+                                pinned, T, scenario, fail ? fail : "none", pass ? "OK" : "FAIL");
+                        ok &= pass;
+                        ggml_backend_sched_free(sched);
+                        ggml_free(gc);
+                        ggml_backend_buffer_free(ib);
+                        ggml_free(ic);
+                    }
+                }
+                ggml_backend_buffer_free(db);
+                ggml_backend_buffer_free(hb);
+                ggml_free(dc);
+                ggml_free(hc);
+            }
             {
                 s = start();
                 warm(0);

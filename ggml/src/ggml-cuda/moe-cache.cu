@@ -404,6 +404,12 @@ static std::unordered_map<int, moe_cache_physical_budget> g_physical_budgets;
 struct moe_cache_scope_frame {
     moe_cache_session * requested = nullptr;
     moe_cache_session * active = nullptr;
+    struct {
+        const ggml_tensor * source = nullptr;
+        ggml_tensor * destination = nullptr;
+        int device = -1;
+        uint64_t written = 0;
+    } output;
 };
 static thread_local std::vector<moe_cache_scope_frame> g_session_stack;
 static thread_local int g_session_suppressed = 0;
@@ -2528,6 +2534,74 @@ static void * moe_cache_prefetch_begin(void * opaque, void * backend_opaque,
 }
 #endif
 
+static int moe_cache_output_supported(void * backend_opaque, const ggml_tensor * source) {
+#if defined(GGML_USE_HIP)
+    GGML_UNUSED_VARS(backend_opaque, source);
+    return 0;
+#else
+    auto backend = (ggml_backend_t) backend_opaque;
+    if (!backend || !ggml_backend_is_cuda(backend) || !source ||
+            source->op != GGML_OP_MUL_MAT_ID || source->type != GGML_TYPE_F32 ||
+            source->view_src || !ggml_is_contiguous(source) || source->ne[0] < 1 ||
+            ggml_nrows(source) < 1 || ggml_nrows(source) > 64) return 0;
+    const auto * ctx = (ggml_backend_cuda_context *) backend->context;
+    return !ctx->external_capture && ggml_cuda_info().device_count == 1 &&
+        ggml_cuda_info().devices[ctx->device].cc == 860;
+#endif
+}
+
+static moe_cache_scope_frame * moe_cache_output_frame(void * session) {
+    if (!session || g_session_suppressed || g_session_stack.empty() ||
+            g_session_stack.back().active != session) return nullptr;
+    return &g_session_stack.back();
+}
+
+static int moe_cache_output_bind(void * session, void * backend_opaque,
+        const ggml_tensor * source, ggml_tensor * destination) {
+    auto * frame = moe_cache_output_frame(session);
+    if (!frame) return 0;
+    GGML_ASSERT(frame->output.written == 0);
+    frame->output = {};
+    if (!moe_cache_output_supported(backend_opaque, source) ||
+            !source->buffer || !ggml_backend_buffer_is_host(source->buffer) ||
+            !destination || destination->view_src || !ggml_are_same_layout(source, destination)) return 0;
+    auto * ctx = (ggml_backend_cuda_context *) ((ggml_backend_t) backend_opaque)->context;
+    if (!destination->buffer || destination->buffer->buft != ggml_backend_cuda_buffer_type(ctx->device) ||
+            ggml_backend_buffer_get_usage(destination->buffer) != GGML_BACKEND_BUFFER_USAGE_COMPUTE) return 0;
+    frame->output.source = source;
+    frame->output.destination = destination;
+    frame->output.device = ctx->device;
+    return 1;
+}
+
+static int moe_cache_output_copy(void * session, void * backend_opaque,
+        const ggml_tensor * source, ggml_tensor * destination) {
+    auto * frame = moe_cache_output_frame(session);
+    if (!frame) return 0;
+    if (frame->output.source != source || frame->output.destination != destination) {
+        // Once hits bypass host storage, their matching copy must consume them.
+        GGML_ASSERT(frame->output.written == 0);
+        return 0;
+    }
+    const uint64_t written = frame->output.written;
+    frame->output = {};
+    if (!written) return 0;
+    auto * ctx = (ggml_backend_cuda_context *) ((ggml_backend_t) backend_opaque)->context;
+    ggml_cuda_set_device(ctx->device);
+    const int rows = ggml_nrows(source);
+    for (int row = 0; row < rows;) {
+        if (written & (UINT64_C(1) << row)) { ++row; continue; }
+        int end = row + 1;
+        while (end < rows && !(written & (UINT64_C(1) << end))) ++end;
+        const size_t offset = size_t(row)*source->nb[1];
+        CUDA_CHECK(cudaMemcpyAsync((char *) destination->data + offset,
+                (const char *) source->data + offset, size_t(end - row)*source->nb[1],
+                cudaMemcpyHostToDevice, ctx->stream()));
+        row = end;
+    }
+    return 1;
+}
+
 static void moe_cache_session_enter(void * opaque) {
     if (g_session_suppressed > 0) {
         g_session_suppressed++;
@@ -2540,7 +2614,7 @@ static void moe_cache_session_enter(void * opaque) {
             return;
         }
         try {
-            g_session_stack.push_back({session, nullptr});
+            g_session_stack.push_back({session, nullptr, {}});
         } catch (...) {
             g_session_suppressed++;
         }
@@ -2552,7 +2626,7 @@ static void moe_cache_session_enter(void * opaque) {
             return;
         }
         try {
-            g_session_stack.push_back({session, nullptr});
+            g_session_stack.push_back({session, nullptr, {}});
         } catch (...) {
             g_session_suppressed++;
         }
@@ -2563,14 +2637,14 @@ static void moe_cache_session_enter(void * opaque) {
             return;
         }
         try {
-            g_session_stack.push_back({session, nullptr});
+            g_session_stack.push_back({session, nullptr, {}});
         } catch (...) {
             g_session_suppressed++;
         }
         return;
     }
     try {
-        g_session_stack.push_back({session, session});
+        g_session_stack.push_back({session, session, {}});
     } catch (...) {
         g_session_suppressed++;
         return;
@@ -3573,6 +3647,17 @@ static void moe_cache_collect_scatter(
     }
 }
 
+struct moe_cache_device_rows { int rows[64]; };
+
+static __global__ void moe_cache_output_scatter(const float * source, float * destination,
+        int64_t columns, moe_cache_device_rows map) {
+    const int row = blockIdx.y;
+    for (int64_t col = int64_t(blockIdx.x)*blockDim.x + threadIdx.x;
+            col < columns; col += int64_t(gridDim.x)*blockDim.x) {
+        destination[int64_t(map.rows[row])*columns + col] = source[int64_t(row)*columns + col];
+    }
+}
+
 static int moe_cache_collect(
         void * opaque, int n_hits, float * const * dst_rows, int64_t n_out) {
     moe_cache_node * node = (moe_cache_node *)opaque;
@@ -3600,6 +3685,19 @@ static int moe_cache_collect(
             }
         }
 
+        // The single-device staging planner also wraps its one child in a
+        // composite. Preserve its physical-to-logical row map while reusing
+        // the ordinary collector's device-output handoff and failure handling.
+        auto * frame = moe_cache_output_frame(node->session);
+        if (node->children.size() == 1 && n_hits <= 64 && frame && frame->output.source) {
+            auto * child = node->children.front().get();
+            float * mapped[64];
+            for (int i = 0; i < child->n_result_rows; ++i) mapped[i] = dst_rows[child->row_indices[i]];
+            const int ok = moe_cache_collect(child, child->n_result_rows, mapped, n_out);
+            node->dispatched = false;
+            return ok;
+        }
+
         for (size_t index = 0; index < node->children.size(); index++) {
             child_ok[index] = moe_cache_collect_enqueue(
                     *node->children[index],
@@ -3624,6 +3722,42 @@ static int moe_cache_collect(
     if (!node || !moe_cache_collect_preflight(
             *node, n_hits, dst_rows, n_out, nullptr, n_hits)) {
         return 0;
+    }
+    auto * frame = moe_cache_output_frame(node->session);
+    if (frame && frame->output.source && node->host_base3 && n_hits <= 64 &&
+            frame->output.device == node->device->logical && !frame->output.written &&
+            frame->output.source->ne[0] == n_out) {
+        const auto * source = frame->output.source;
+        const uintptr_t base = (uintptr_t) source->data;
+        const size_t row_bytes = n_out*sizeof(float);
+        moe_cache_device_rows map{};
+        uint64_t written = 0;
+        bool eligible = true;
+        for (int row = 0; row < n_hits; ++row) {
+            const uintptr_t address = (uintptr_t) dst_rows[row];
+            if (address < base || address - base >= ggml_nbytes(source) || (address - base) % row_bytes) {
+                eligible = false;
+                break;
+            }
+            const int index = (address - base)/row_bytes;
+            if (written & (UINT64_C(1) << index)) { eligible = false; break; }
+            map.rows[row] = index;
+            written |= UINT64_C(1) << index;
+        }
+        if (eligible) {
+            auto & device = *node->device;
+            ggml_cuda_set_device(device.logical);
+            bool ok = !device.dead.load() && !moe_cache_fail(*node->session, "collect");
+            if (ok) {
+                const dim3 grid(std::min<int64_t>(32, (n_out + 255)/256), n_hits);
+                moe_cache_output_scatter<<<grid, 256, 0, device.compute_stream>>>(
+                        device.d_out, (float *) frame->output.destination->data, n_out, map);
+                ok = moe_cache_cuda_ok(device, cudaPeekAtLastError(), "output device scatter", true);
+            }
+            ok = moe_cache_collect_finish(*node, ok);
+            if (ok) frame->output.written = written;
+            return ok ? 1 : 0;
+        }
     }
     bool ok = moe_cache_collect_enqueue(*node, n_hits);
     ok = moe_cache_collect_finish(*node, ok);
@@ -4906,6 +5040,9 @@ void ggml_moe_cache_register(const void * owner) {
     ggml_moe_cache.session_enter = moe_cache_session_enter;
     ggml_moe_cache.session_leave = moe_cache_session_leave;
     ggml_moe_cache.prefill_copy = moe_cache_prefill_copy;
+    ggml_moe_cache.output_supported = moe_cache_output_supported;
+    ggml_moe_cache.output_bind = moe_cache_output_bind;
+    ggml_moe_cache.output_copy = moe_cache_output_copy;
 #if !defined(GGML_USE_HIP)
     ggml_moe_cache.prefetch_supported = moe_cache_prefetch_supported;
     ggml_moe_cache.prefetch_begin = moe_cache_prefetch_begin;

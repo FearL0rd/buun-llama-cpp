@@ -844,6 +844,7 @@ struct ggml_backend_sched_split {
     int n_inputs;
     int inputs_capacity;
     int prefetch_input;
+    int device_output_input;
     // graph view of this split
     struct ggml_cgraph graph;
 };
@@ -1527,6 +1528,7 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
 
         ggml_backend_graph_optimize(sched->backends[split->backend_id], &split->graph, &opt_params);
         split->prefetch_input = -1;
+        split->device_output_input = -1;
         if (i > 0 && !sched->callback_eval && sched->n_copies == 1 && sched->moe_cache_session &&
                 sched->splits[i - 1].backend_id == split->backend_id &&
                 ggml_moe_cache.prefetch_supported && ggml_moe_cache.prefetch_begin && ggml_moe_cache.prefetch_end &&
@@ -1539,6 +1541,31 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                             ggml_moe_cache.prefetch_supported(sched->backends[split->backend_id], source)) {
                         split->prefetch_input = j;
                         break;
+                    }
+                }
+            }
+        }
+        if (i > 0 && !sched->callback_eval && sched->n_copies == 1 && sched->moe_cache_session &&
+                ggml_moe_cache.output_supported && ggml_moe_cache.output_bind && ggml_moe_cache.output_copy) {
+            const auto & previous = sched->splits[i - 1];
+            auto * producer_backend = sched->backends[previous.backend_id];
+            if (previous.graph.n_nodes > 0 && producer_backend->iface.synchronize == nullptr &&
+                    ggml_backend_dev_type(producer_backend->device) == GGML_BACKEND_DEVICE_TYPE_CPU) {
+                // Collection identifies this output by its row addresses. More
+                // than one full FFN in a split could recycle those addresses
+                // before the terminal producer runs; keep that split on host.
+                const auto projections = std::count_if(previous.graph.nodes,
+                        previous.graph.nodes + previous.graph.n_nodes,
+                        [](const ggml_tensor * node) { return node->op == GGML_OP_MUL_MAT_ID; });
+                auto * source = previous.graph.nodes[previous.graph.n_nodes - 1];
+                if (projections == 3 && !(source->flags & (GGML_TENSOR_FLAG_INPUT | GGML_TENSOR_FLAG_OUTPUT)) &&
+                        ggml_node_get_use_count(&previous.graph, previous.graph.n_nodes - 1) == 1) {
+                    for (int j = 0; j < split->n_inputs; ++j) {
+                        if (split->inputs[j] == source &&
+                                ggml_moe_cache.output_supported(sched->backends[split->backend_id], source)) {
+                            split->device_output_input = j;
+                            break;
+                        }
                     }
                 }
             }
@@ -1597,13 +1624,19 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
             graph_copy->nodes[graph_copy->n_nodes++] = input_cpy;
         };
         for (int j = 0; j < split->n_inputs; j++) {
-            if (j != split->prefetch_input) add_input(split, j);
+            if (j != split->prefetch_input && j != split->device_output_input) add_input(split, j);
         }
         // Advance both dependencies, not just the upload. This keeps the next
         // weight copy from aliasing anything the current GPU split still uses.
         if (i + 1 < sched->n_splits && sched->splits[i + 1].prefetch_input >= 0) {
             auto * next = &sched->splits[i + 1];
             add_input(next, next->prefetch_input);
+        }
+        // Cached hits may write this copy while the CPU computes its misses.
+        // Reserve it now so it cannot alias storage still live in that split.
+        if (i + 1 < sched->n_splits && sched->splits[i + 1].device_output_input >= 0) {
+            auto * next = &sched->splits[i + 1];
+            add_input(next, next->device_output_input);
         }
 
         for (int j = split->i_start; j < split->i_end; j++) {
@@ -1837,6 +1870,11 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     ggml_backend_synchronize(split_backend);
                 }
 
+                if (input_id == split->device_output_input &&
+                        ggml_moe_cache.output_copy(sched->moe_cache_session, split_backend, input, input_cpy)) {
+                    continue;
+                }
+
                 // when offloading MoE weights, we can reduce the amount of data copied by copying only the experts that are used
                 ggml_tensor * node = split->graph.nodes[0];
                 if (split->graph.n_nodes > 0 &&
@@ -1960,6 +1998,13 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         if (!sched->callback_eval) {
             if (split_id + 1 < sched->n_splits) {
                 auto * next = &splits[split_id + 1];
+                if (next->device_output_input >= 0) {
+                    auto * destination_backend = sched->backends[next->backend_id];
+                    if (!host_reads[next->backend_id]) ggml_backend_synchronize(destination_backend);
+                    auto * source = next->inputs[next->device_output_input];
+                    ggml_moe_cache.output_bind(sched->moe_cache_session, destination_backend, source,
+                            tensor_copy(source, next->backend_id, sched->cur_copy));
+                }
                 if (next->prefetch_input >= 0) {
                     auto * source = next->inputs[next->prefetch_input];
                     const uint32_t * ready = nullptr;
