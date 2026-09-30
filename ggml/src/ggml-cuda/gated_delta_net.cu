@@ -277,9 +277,9 @@ static void launch_gated_delta_net(
                 if constexpr (!KDA) {
                     if (!input_rows && n_tokens >= 256 &&
                         ggml_cuda_info().devices[ggml_cuda_get_device()].cc == 860) {
-                        const dim3 paired_grid(H, n_seqs, S_v / (num_warps * 2));
+                        const dim3 paired_grid(H, n_seqs, S_v / (num_warps * 4));
                         const auto paired_launch = ggml_cuda_kernel_launch_params(paired_grid, block_dims, 0, stream);
-                        ggml_cuda_kernel_launch(gated_delta_net_cuda<128, false, keep_rs_t, sum_eps_t, false, 2>, paired_launch,
+                        ggml_cuda_kernel_launch(gated_delta_net_cuda<128, false, keep_rs_t, sum_eps_t, false, 4>, paired_launch,
                             q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H,
                             n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
                             sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K, l2_norm, input_rows);
