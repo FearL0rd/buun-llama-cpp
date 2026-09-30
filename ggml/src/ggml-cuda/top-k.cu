@@ -10,6 +10,96 @@ using namespace cub;
 #    endif  // CCCL_MAJOR_VERSION >= 3 && CCCL_MINOR_VERSION >= 2
 #endif      // GGML_CUDA_USE_CUB
 
+#if defined(GGML_CUDA_USE_CUB) && !defined(CUB_TOP_K_AVAILABLE) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+namespace {
+// Keep score keys in registers across radix passes, then sort only the survivors.
+// The packed tie key preserves CUB's stable descending order, including signed zeros.
+constexpr int register_top_k_threads=1024, register_top_k_capacity=4096;
+__host__ __device__ uint32_t register_top_k_ordered(uint32_t b) {
+    // CUB treats signed zeros as equivalent. Otherwise preserve radix bit order.
+    if (!(b & 0x7fffffffU)) b=0;
+    return b ^ ((b >> 31) ? 0xffffffffU : 0x80000000U);
+}
+template<int items>
+__global__ __launch_bounds__(register_top_k_threads, 1)
+void register_top_k_select(const float * src, uint64_t * selected, int n, int k) {
+    using Scan=cub::BlockScan<int,register_top_k_threads>;
+    __shared__ union { unsigned hist[32][256]; Scan::TempStorage scan; } scratch;
+    __shared__ uint32_t prefix, mask;
+    __shared__ int rank;
+    const int t=threadIdx.x, row=blockIdx.x;
+    uint32_t keys[items];
+#pragma unroll
+    for(int j=0;j<items;++j) {
+        int i=t*items+j;
+        keys[j]=i<n ? register_top_k_ordered(__float_as_uint(src[size_t(row)*n+i])) : 0;
+    }
+    if(!t) {prefix=mask=0;rank=k;}
+    __syncthreads();
+    for(int shift=24;shift>=0;shift-=8) {
+        for(int h=t;h<32*256;h+=register_top_k_threads) scratch.hist[h/256][h%256]=0;
+        __syncthreads();
+#pragma unroll
+        for(int j=0;j<items;++j) {
+            if(t*items+j<n && (keys[j]&mask)==prefix)
+                atomicAdd(&scratch.hist[t/32][(keys[j]>>shift)&255],1U);
+        }
+        __syncthreads();
+        if(t<256) {
+            unsigned count=0;
+            for(int w=0;w<32;++w) count+=scratch.hist[w][t];
+            scratch.hist[0][t]=count;
+        }
+        __syncthreads();
+        if(!t) {
+            for(int digit=255;digit>=0;--digit) {
+                const int count=scratch.hist[0][digit];
+                if(rank>count) rank-=count;
+                else {prefix|=uint32_t(digit)<<shift;break;}
+            }
+            mask|=0xffU<<shift;
+        }
+        __syncthreads();
+    }
+    int ng=0,ne=0;
+#pragma unroll
+    for(int j=0;j<items;++j) if(t*items+j<n) {ng+=keys[j]>prefix;ne+=keys[j]==prefix;}
+    int bg,be,total;
+    Scan(scratch.scan).ExclusiveSum(ng,bg,total);
+    __syncthreads();
+    Scan(scratch.scan).ExclusiveSum(ne,be);
+    __syncthreads();
+#pragma unroll
+    for(int j=0;j<items;++j) {
+        const int i=t*items+j;
+        if(i>=n) continue;
+        int pos=-1;
+        if(keys[j]>prefix) pos=bg++;
+        else if(keys[j]==prefix) pos=total+be++;
+        if(pos>=0 && pos<k) selected[size_t(row)*register_top_k_capacity+pos]=(uint64_t(keys[j])<<32)|uint32_t(~i);
+    }
+}
+void register_top_k_launch(const float * src,uint64_t * selected,int n,int rows,int k,cudaStream_t stream=0) {
+    if(n<=8192)register_top_k_select<8><<<rows,register_top_k_threads,0,stream>>>(src,selected,n,k);
+    else if(n<=16384)register_top_k_select<16><<<rows,register_top_k_threads,0,stream>>>(src,selected,n,k);
+    else if(n<=32768)register_top_k_select<32><<<rows,register_top_k_threads,0,stream>>>(src,selected,n,k);
+    else if(n<=40960)register_top_k_select<40><<<rows,register_top_k_threads,0,stream>>>(src,selected,n,k);
+    else GGML_ABORT("register top-k shape exceeds dispatch bound");
+}
+__global__ void register_top_k_sort(const uint64_t * selected, int * dst, int k) {
+    using Sort=cub::BlockRadixSort<uint64_t,256,16>;
+    __shared__ Sort::TempStorage tmp;
+    uint64_t keys[16];
+#pragma unroll
+    for(int j=0;j<16;++j) {int i=threadIdx.x*16+j;keys[j]=i<k?selected[size_t(blockIdx.x)*register_top_k_capacity+i]:0;}
+    Sort(tmp).SortDescending(keys);
+#pragma unroll
+    for(int j=0;j<16;++j) {int i=threadIdx.x*16+j;if(i<k)dst[size_t(blockIdx.x)*k+i]=int(~uint32_t(keys[j]));}
+}
+
+} // namespace
+#endif
+
 static constexpr int stable_top_k_chunk = 4096;
 
 static __global__ void stable_top_k_collect_ties(
@@ -327,6 +417,17 @@ void ggml_cuda_op_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const bool       stable = ggml_top_k_is_stable(dst);
     ggml_cuda_pool & pool  = ctx.pool();
     GGML_ASSERT(!stable || k <= 64);
+#if defined(GGML_CUDA_USE_CUB) && !defined(CUB_TOP_K_AVAILABLE) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    // Single-row CUB sort remains faster. This first admission covers measured
+    // QSA verification shapes; bulk prefill and small K keep their existing paths.
+    if (ggml_cuda_info().devices[ctx.device].cc == 860 && !stable && k == 2051 &&
+            nrows >= 4 && nrows <= 16 && ncols >= 4352 && ncols <= 40960) {
+        ggml_cuda_pool_alloc<uint64_t> selected(pool, nrows*register_top_k_capacity);
+        register_top_k_launch(src0_d, selected.get(), ncols, nrows, k, stream);
+        register_top_k_sort<<<nrows, 256, 0, stream>>>(selected.get(), dst_d, k);
+        return;
+    }
+#endif
 #ifdef CUB_TOP_K_AVAILABLE
     // TODO: Switch to `DeviceSegmentedTopK` for multi-row TopK once implemented
     // https://github.com/NVIDIA/cccl/issues/6391
