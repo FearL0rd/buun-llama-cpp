@@ -1613,11 +1613,11 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
     constexpr bool has_sparse_tiled_kernel =
         !fallback &&
         (J == 64 || J == 128) &&
-        (type == GGML_TYPE_IQ2_XXS || type == GGML_TYPE_IQ2_XS ||
+        (type == GGML_TYPE_Q2_0 || type == GGML_TYPE_IQ2_XXS || type == GGML_TYPE_IQ2_XS ||
          type == GGML_TYPE_IQ3_XXS || type == GGML_TYPE_MXFP4);
     const bool use_sparse_sm86 = cc == 860 && J == 128 &&
-        (type == GGML_TYPE_IQ2_XXS || type == GGML_TYPE_IQ3_XXS || type == GGML_TYPE_MXFP4);
-    const bool use_sparse_sm120 = cc == GGML_CUDA_CC_BLACKWELL &&
+        (type == GGML_TYPE_Q2_0 || type == GGML_TYPE_IQ2_XXS || type == GGML_TYPE_IQ3_XXS || type == GGML_TYPE_MXFP4);
+    const bool use_sparse_sm120 = cc == GGML_CUDA_CC_BLACKWELL && type != GGML_TYPE_Q2_0 &&
         args.ncols_max >= (type == GGML_TYPE_IQ2_XS ? 2048 : 128);
     const bool use_sparse_tiled_kernel = has_sparse_tiled_kernel && args.expert_bounds &&
         args.nsamples_y == 1 && (use_sparse_sm86 || use_sparse_sm120) &&
