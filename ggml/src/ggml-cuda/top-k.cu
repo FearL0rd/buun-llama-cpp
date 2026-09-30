@@ -418,10 +418,11 @@ void ggml_cuda_op_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     ggml_cuda_pool & pool  = ctx.pool();
     GGML_ASSERT(!stable || k <= 64);
 #if defined(GGML_CUDA_USE_CUB) && !defined(CUB_TOP_K_AVAILABLE) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
-    // Single-row CUB sort remains faster. This first admission covers measured
-    // QSA verification shapes; bulk prefill and small K keep their existing paths.
+    // Keep short-column prefill and single-row batches on the faster CUB path.
+    // Wide prefill rows amortize register selection; small K is unchanged.
     if (ggml_cuda_info().devices[ctx.device].cc == 860 && !stable && k == 2051 &&
-            nrows >= 4 && nrows <= 16 && ncols >= 4352 && ncols <= 40960) {
+            ncols >= 4352 && ncols <= 40960 &&
+            ((nrows >= 4 && nrows <= 16) || (nrows >= 64 && nrows <= 8192 && ncols >= 16384))) {
         ggml_cuda_pool_alloc<uint64_t> selected(pool, nrows*register_top_k_capacity);
         register_top_k_launch(src0_d, selected.get(), ncols, nrows, k, stream);
         register_top_k_sort<<<nrows, 256, 0, stream>>>(selected.get(), dst_d, k);

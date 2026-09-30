@@ -12876,6 +12876,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // Wide-column prefill admission and the adjacent column/row fallbacks.
+    for (int64_t cols : {16383, 16384, 16387, 40960, 40961}) {
+        for (int64_t rows : {63, 64, 65}) {
+            for (bool ties : {false, true}) {
+                test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {cols, rows, 1, 1}, 2051, ties));
+            }
+        }
+    }
+
     // qwen4exp QSA indexer top-k fusion (get_rows + f16 mask + top_k)
     test_cases.emplace_back(new test_topk_qsa(512,  2048,  1, 1, 1500));
     test_cases.emplace_back(new test_topk_qsa(512,  2048,  2, 1, 1500));
