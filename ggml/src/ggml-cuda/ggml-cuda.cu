@@ -6121,8 +6121,11 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                             v->ne[0], v->ne[1], q_norm->ne[1], v->ne[2], v->ne[3]);
 #if !defined(GGML_USE_HIP)
                     // V keeps the shared convolution alive until deferred normalization.
+                    // In a long recurrent batch each value column otherwise
+                    // repeats the same Q/K norm at every token. Normalize once
+                    // in the paired kernel; retain launch fusion for decode.
                     const bool standard = (!gdn_rms || same_conv) &&
-                        gdn->src[3] && gdn->src[3]->ne[0] == 1;
+                        gdn->src[3] && gdn->src[3]->ne[0] == 1 && v->ne[2] <= 16;
 #else
                     const bool standard = false;
 #endif
