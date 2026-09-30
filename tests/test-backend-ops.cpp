@@ -13182,6 +13182,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // Large normalized softmax routing and both prefill-fusion boundaries.
+    test_cases.emplace_back(new test_topk_moe({512, 2047, 1, 1}, 10, true));
+    test_cases.emplace_back(new test_topk_moe({512, 2048, 1, 1}, 10, true));
+    test_cases.emplace_back(new test_topk_moe({512, 2049, 1, 1}, 32, true));
+    test_cases.emplace_back(new test_topk_moe({512, 2048, 1, 1}, 33, true));
+
     // Cover the supported boundaries, common k = 8 shapes, interleaved views and adds, and k = 16 fallback.
     test_cases.emplace_back(new test_moe_reduce(63,  2, 17));
     test_cases.emplace_back(new test_moe_reduce(2048, 8, 128));
