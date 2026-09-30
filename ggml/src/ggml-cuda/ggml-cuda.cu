@@ -6513,6 +6513,49 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         }
     }
 
+    // Gather F16 cache cells straight into the final head-major F16 window.
+    // Preserve the selection order and attention geometry; only remove the
+    // transient F32 gather and its subsequent layout-changing cast.
+    if (node->op == GGML_OP_GET_ROWS && i + 3 < cgraph->n_nodes &&
+            ggml_cuda_info().devices[cuda_ctx->device].cc == 860) {
+        constexpr ggml_op ops[] = {GGML_OP_GET_ROWS, GGML_OP_RESHAPE, GGML_OP_PERMUTE, GGML_OP_CPY};
+        const int output = i + 3;
+        ggml_tensor * shape = cgraph->nodes[i + 1];
+        ggml_tensor * perm = cgraph->nodes[i + 2];
+        ggml_tensor * dst = cgraph->nodes[output];
+        const ggml_tensor * keys = node->src[0];
+        const ggml_tensor * ids = node->src[1];
+        if (ggml_can_fuse_subgraph(cgraph, i, 4, ops, &output, 1) &&
+                keys && ids && keys->type == GGML_TYPE_F16 && ids->type == GGML_TYPE_I32 &&
+                keys->nb[0] == sizeof(half) && ids->nb[0] == sizeof(int32_t) &&
+                keys->ne[3] == 1 && ids->ne[2] == 1 && ids->ne[3] == 1 &&
+                ids->ne[1] > 0 && ids->ne[1] == keys->ne[2] &&
+                node->type == GGML_TYPE_F32 && ggml_is_contiguous(node) &&
+                shape->src[0] == node && ggml_is_contiguous(shape) &&
+                shape->ne[0] > 0 && shape->ne[1] > 0 && shape->ne[2] > 0 && shape->ne[3] > 0 &&
+                shape->ne[0]*shape->ne[1] == keys->ne[0] && shape->ne[3] % ids->ne[1] == 0 &&
+                ids->ne[0] == shape->ne[2]*(shape->ne[3]/ids->ne[1]) &&
+                perm->src[0] == shape && perm->ne[0] == shape->ne[0] &&
+                perm->ne[1] == shape->ne[2] && perm->ne[2] == shape->ne[1] &&
+                perm->ne[3] == shape->ne[3] && perm->nb[0] == shape->nb[0] &&
+                perm->nb[1] == shape->nb[2] && perm->nb[2] == shape->nb[1] && perm->nb[3] == shape->nb[3] &&
+                dst->src[0] == perm && dst->src[1] == dst && dst->type == GGML_TYPE_F16 &&
+                ggml_is_contiguous(dst) && ggml_are_same_shape(dst, perm) &&
+                !ggml_cuda_tensors_overlap(dst, keys) && !ggml_cuda_tensors_overlap(dst, ids)) {
+            // CPY's self-source is its destination; keys and IDs are the only external reads.
+            const int64_t queries = shape->ne[3]/ids->ne[1];
+            for (int64_t stream = 0; stream < ids->ne[1]; ++stream) {
+                get_rows_cuda((const char *) keys->data + stream*keys->nb[2], GGML_TYPE_F16,
+                        (const int32_t *) ((const char *) ids->data + stream*ids->nb[1]),
+                        (char *) dst->data + stream*queries*dst->nb[3], GGML_TYPE_F16,
+                        dst->ne[0], keys->nb[1], dst->ne[0]*sizeof(half), 0,
+                        dst->ne[1], dst->ne[2], queries, sizeof(int32_t), 0, dst->ne[1]*sizeof(int32_t),
+                        dst->nb[1], dst->nb[2], dst->nb[3], cuda_ctx->stream());
+            }
+            return 3;
+        }
+    }
+
     // QSA pooling: four ordered member slices of a gathered F16 history.
     // This is stateless; cache layout/sequence changes still flow through IDs.
     if (node->op == GGML_OP_GET_ROWS && i + 13 < cgraph->n_nodes &&

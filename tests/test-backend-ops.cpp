@@ -2562,6 +2562,32 @@ struct test_get_rows_mean4 : public test_get_rows {
     }
 };
 
+// Preserve selected row order while converting a gathered window to head-major layout.
+struct test_get_rows_cast : public test_get_rows {
+    const int heads, queries, variant;
+
+    test_get_rows_cast(int dim, int heads, int width, int queries, int streams, bool pitched, int variant)
+        : test_get_rows(GGML_TYPE_F16, dim*heads, 3*width + 7, width*queries, streams, 1,
+                        false, pitched, pitched ? 3 : 0), heads(heads), queries(queries), variant(variant) {}
+
+    std::string op_desc(ggml_tensor *) override { return "GET_ROWS_CAST"; }
+    std::string vars() override {
+        return test_get_rows::vars() + "," + VARS_TO_STR3(heads, queries, variant);
+    }
+    bool run_whole_graph() override { return true; }
+    double max_nmse_err() override { return 0.0; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * gathered = test_get_rows::build_graph(ctx);
+        if (variant == 1) ggml_set_output(gathered);
+        ggml_tensor * shape = ggml_reshape_4d(ctx, gathered, n/heads, heads, r/queries, queries*be1);
+        ggml_tensor * perm = ggml_permute(ctx, shape, 0, 2, 1, 3);
+        ggml_tensor * out = ggml_cast(ctx, perm, variant == 2 ? GGML_TYPE_F32 : GGML_TYPE_F16);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 // GGML_OP_GET_ROWS_BACK
 struct test_get_rows_back : public test_case {
     const ggml_type type;
@@ -11081,6 +11107,22 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                 for (bool pitched : {false, true}) {
                     for (int variant : {0, 1, 2}) {
                         test_cases.emplace_back(new test_get_rows_mean4(dim, blocks, streams, pitched, variant));
+                    }
+                }
+            }
+        }
+    }
+
+    for (int dim : {64, 256}) {
+        for (int heads : {1, 4}) {
+            for (int width : {3, 2051}) {
+                for (int queries : {1, 4}) {
+                    for (int streams : {1, 2}) {
+                        for (bool pitched : {false, true}) {
+                            for (int variant : {0, 1, 2}) {
+                                test_cases.emplace_back(new test_get_rows_cast(dim, heads, width, queries, streams, pitched, variant));
+                            }
+                        }
                     }
                 }
             }
