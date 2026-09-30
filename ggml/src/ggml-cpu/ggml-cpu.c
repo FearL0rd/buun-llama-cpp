@@ -2298,7 +2298,7 @@ static void ggml_compute_forward_mul_mat_id_one_chunk(
     ggml_vec_dot_t    const vec_dot      = type_traits_cpu[type].vec_dot;
     enum ggml_type    const vec_dot_type = type_traits_cpu[type].vec_dot_type;
 
-#if defined(__AVX512VBMI__) && defined(__AVX512VNNI__) && defined(__AVX512VL__)
+#if defined(__AVX2__)
     // Amortize activation preparation over at least one output-column tile.
     const bool prepare_q2 = ne00 <= 16384 && ir0_end - ir0_start >= 16;
     if (type == GGML_TYPE_Q2_0 && (prepare_q2 || ir1_end - ir1_start > 1)) {
