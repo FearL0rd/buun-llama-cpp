@@ -1394,7 +1394,8 @@ struct llm_graph_context {
             ggml_tensor * v_mla, // [n_embd_head_v_mla, n_embd_head_v, n_head_v] // TODO: remove
                   float   kq_scale,
                     int   il,
-            ggml_tensor * wo_in_s = nullptr) const;
+            ggml_tensor * wo_in_s = nullptr,
+                   bool   kv_only = false) const;
 
     llm_graph_input_attn_k  * build_attn_inp_k() const;
 
