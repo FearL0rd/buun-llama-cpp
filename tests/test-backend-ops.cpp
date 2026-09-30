@@ -13241,6 +13241,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 32,   8, 1, 1, false, false, /*K=*/3));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64,  16, 2, 1, false, false, /*K=*/4));
 
+    // Paired-column prefill: include the dispatch boundary, strided inputs,
+    // head broadcasting and multiple sequences, with and without snapshots.
+    for (int64_t tokens : {255, 256, 257}) {
+        for (bool permuted : {false, true}) {
+            test_cases.emplace_back(new test_gated_delta_net(
+                GGML_TYPE_F32, 2, 128, tokens, 2, 3, permuted, false, 3));
+        }
+    }
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 2, 128, 257, 2, 3));
+
     for (int64_t tokens : {1, 4, 512}) {
         for (float amplitude : {0.0f, 1e-4f, 1.0f}) {
             for (bool deferred : {false, true}) {
