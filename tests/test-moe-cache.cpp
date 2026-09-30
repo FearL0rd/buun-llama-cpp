@@ -4427,8 +4427,8 @@ static bool run_stream_staging(ggml_backend_dev_t device,
     if (!ggml_moe_cache.query_config(0, 4, &config) || !ggml_moe_cache.query_device(device, &config, &caps)) {
         return false;
     }
-    if (caps.compute_capability != 1200) {
-        printf("cache-stream-stage: SKIP (requires consumer SM120)\n");
+    if (caps.compute_capability != 860 && caps.compute_capability != 1200) {
+        printf("cache-stream-stage: SKIP (requires SM86 or SM120)\n");
         return true;
     }
     bool ok = true;

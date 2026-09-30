@@ -4153,13 +4153,14 @@ static void * moe_cache_fused_plan(
 
     bool stream_stage = false;
 #if !defined(GGML_USE_HIP)
-    // Measured for small speculative Q2 batches on consumer Blackwell. Use the
+    // Small speculative Q2 batches on consumer Ampere and Blackwell use the
     // same full-FFN planner for resident and transient experts, without changing
     // the existing multi-device routing or larger prompt-processing batches.
     stream_stage = down && session->devices.size() == 1 && n_tokens <= 4 &&
         up->type == GGML_TYPE_Q2_0 && down->type == up->type &&
         up->expert_size == down->expert_size && up->expert_size <= 512*1024 &&
-        ggml_cuda_info().devices[session->devices.front()->logical].cc == GGML_CUDA_CC_BLACKWELL;
+        (ggml_cuda_info().devices[session->devices.front()->logical].cc == 860 ||
+         ggml_cuda_info().devices[session->devices.front()->logical].cc == GGML_CUDA_CC_BLACKWELL);
 #endif
     if (down && (expert_parallel || stream_stage)) {
         if (!expert_parallel) {
