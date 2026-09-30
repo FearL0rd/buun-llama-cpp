@@ -1743,6 +1743,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         struct ggml_backend_sched_split * split = &splits[split_id];
         int split_backend_id = split->backend_id;
         ggml_backend_t split_backend = sched->backends[split_backend_id];
+        bool host_reads[GGML_SCHED_MAX_BACKENDS] = {};
 
         // ensure the previous split's async work has completed before we start
         // this split, the allocator may have reused buffer regions across splits
@@ -1876,6 +1877,22 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     }
                     copy_experts(first_id, last_id);
                 } else {
+                    // A synchronous CPU split can enqueue all its device inputs on
+                    // their producer streams, then wait once per producer. Separate
+                    // blocking tensor reads otherwise drain the same GPU repeatedly.
+                    ggml_backend_buffer_t src_buf = input->view_src ? input->view_src->buffer : input->buffer;
+                    ggml_backend_buffer_t dst_buf = input_cpy->view_src ? input_cpy->view_src->buffer : input_cpy->buffer;
+                    if (ggml_backend_dev_type(split_backend->device) == GGML_BACKEND_DEVICE_TYPE_CPU &&
+                        split_backend->iface.synchronize == nullptr &&
+                        input_backend->iface.get_tensor_async != nullptr &&
+                        src_buf->buft == ggml_backend_get_default_buffer_type(input_backend) &&
+                        !ggml_backend_buffer_is_host(src_buf) && ggml_backend_buffer_is_host(dst_buf)) {
+                        GGML_ASSERT(ggml_are_same_layout(input, input_cpy));
+                        ggml_backend_moe_cache_invalidate_buffer(dst_buf, input_cpy->data, ggml_nbytes(input_cpy));
+                        ggml_backend_tensor_get_async(input_backend, input, input_cpy->data, 0, ggml_nbytes(input));
+                        host_reads[ggml_backend_sched_backend_id(sched, input_backend)] = true;
+                        continue;
+                    }
                     // try async copy, but if not possible, we can still use a sync copy without synchronizing the dst backend, since we handle the synchronization here with multiple copies and events
                     // TODO: add public function to facilitate this, since applications do not have direct access to the backend interface
                     if (!split_backend->iface.cpy_tensor_async || !split_backend->iface.cpy_tensor_async(input_backend, split_backend, input, input_cpy)) {
@@ -1888,6 +1905,12 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         ggml_backend_tensor_copy(input, input_cpy);
                     }
                 }
+            }
+        }
+
+        for (int backend_id = 0; backend_id < sched->n_backends; ++backend_id) {
+            if (host_reads[backend_id]) {
+                ggml_backend_synchronize(sched->backends[backend_id]);
             }
         }
 
