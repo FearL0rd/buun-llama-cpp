@@ -6513,6 +6513,61 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         }
     }
 
+    // QSA pooling: four ordered member slices of a gathered F16 history.
+    // This is stateless; cache layout/sequence changes still flow through IDs.
+    if (node->op == GGML_OP_GET_ROWS && i + 13 < cgraph->n_nodes &&
+            ggml_cuda_info().devices[cuda_ctx->device].cc == 860) {
+        constexpr ggml_op ops[] = {
+            GGML_OP_GET_ROWS, GGML_OP_RESHAPE,
+            GGML_OP_VIEW, GGML_OP_CONT, GGML_OP_VIEW, GGML_OP_CONT, GGML_OP_ADD,
+            GGML_OP_VIEW, GGML_OP_CONT, GGML_OP_ADD,
+            GGML_OP_VIEW, GGML_OP_CONT, GGML_OP_ADD, GGML_OP_SCALE,
+        };
+        const int output = i + 13;
+        ggml_tensor * shape = cgraph->nodes[i + 1];
+        ggml_tensor * dst = cgraph->nodes[output];
+        const ggml_tensor * keys = node->src[0];
+        const ggml_tensor * ids = node->src[1];
+        bool match = ggml_can_fuse_subgraph(cgraph, i, 14, ops, &output, 1) &&
+            keys && ids && keys->type == GGML_TYPE_F16 && ids->type == GGML_TYPE_I32 &&
+            keys->nb[0] == sizeof(half) && ids->nb[0] == sizeof(int32_t) &&
+            keys->ne[3] == 1 && ids->ne[2] == 1 && ids->ne[3] == 1 &&
+            shape->src[0] == node && shape->ne[1] == 4 && ggml_is_contiguous(node) &&
+            dst->type == GGML_TYPE_F32 && ggml_is_contiguous(dst) &&
+            dst->ne[0] == keys->ne[0] && dst->ne[0] > 0 && dst->ne[1] > 0 &&
+            ids->ne[0] == 4*dst->ne[1] && ids->ne[1] == keys->ne[2] &&
+            dst->ne[2] == keys->ne[2] && dst->ne[3] == 1 &&
+            shape->ne[0] == dst->ne[0] && shape->ne[2] == dst->ne[1] &&
+            shape->ne[3] == dst->ne[2] &&
+            ggml_get_op_params_f32(dst, 0) == .25f && ggml_get_op_params_f32(dst, 1) == 0.0f;
+        ggml_tensor * sum = nullptr;
+        const int views[] = {2, 4, 7, 10};
+        for (int member = 0; match && member < 4; ++member) {
+            ggml_tensor * view = cgraph->nodes[i + views[member]];
+            ggml_tensor * copy = cgraph->nodes[i + views[member] + 1];
+            match = view->src[0] == shape && copy->src[0] == view &&
+                view->view_offs == size_t(member)*shape->nb[1] &&
+                view->nb[0] == sizeof(float) && view->nb[1] == shape->nb[2] &&
+                view->nb[2] == shape->nb[3] && ggml_are_same_shape(view, dst) &&
+                copy->type == GGML_TYPE_F32 && ggml_is_contiguous(copy) &&
+                ggml_are_same_shape(copy, dst);
+            if (member == 0) {
+                sum = copy;
+            } else {
+                ggml_tensor * add = cgraph->nodes[i + views[member] + 2];
+                match = match && add->src[0] == sum && add->src[1] == copy &&
+                    add->type == GGML_TYPE_F32 && ggml_are_same_shape(add, dst);
+                sum = add;
+            }
+        }
+        if (match && dst->src[0] == sum &&
+                !ggml_cuda_tensors_overlap(dst, keys) && !ggml_cuda_tensors_overlap(dst, ids) &&
+                ggml_cuda_check_fusion_memory_ranges(cgraph, i, 14, &output, 1)) {
+            ggml_cuda_op_get_rows_mean4(*cuda_ctx, node, dst);
+            return 13;
+        }
+    }
+
     // Single-sequence verification can read the indexed initial state directly.
     // The source remains an explicit graph dependency; no host-side row index
     // is baked into a captured graph. Keep all other shapes on the gather path.

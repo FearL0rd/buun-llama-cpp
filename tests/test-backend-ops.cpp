@@ -2530,6 +2530,38 @@ struct test_get_rows : public test_case {
     }
 };
 
+// Gathered history pooling: preserve ordered sums, pitched rows, and visible members.
+struct test_get_rows_mean4 : public test_get_rows {
+    const int variant;
+
+    test_get_rows_mean4(int dim, int blocks, int streams, bool pitched, int variant)
+        : test_get_rows(GGML_TYPE_F16, dim, 4*blocks + 7, 4*blocks, streams, 1,
+                        false, pitched, pitched ? 3 : 0), variant(variant) {}
+
+    std::string op_desc(ggml_tensor *) override { return "GET_ROWS_MEAN4"; }
+    std::string vars() override {
+        return test_get_rows::vars() + ",variant=" + std::to_string(variant);
+    }
+    bool run_whole_graph() override { return true; }
+    double max_nmse_err() override { return 0.0; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * gathered = test_get_rows::build_graph(ctx);
+        ggml_tensor * shape = ggml_reshape_4d(ctx, gathered, n, 4, r/4, be1);
+        ggml_tensor * sum = nullptr;
+        for (int member = 0; member < 4; ++member) {
+            ggml_tensor * view = ggml_view_3d(ctx, shape, n, r/4, be1,
+                    shape->nb[2], shape->nb[3], member*shape->nb[1]);
+            ggml_tensor * copy = ggml_cont(ctx, view);
+            if (member == 0 && variant == 1) ggml_set_output(copy);
+            sum = sum ? ggml_add(ctx, sum, copy) : copy;
+        }
+        ggml_tensor * out = ggml_scale(ctx, sum, variant == 2 ? 0.2f : 0.25f);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 // GGML_OP_GET_ROWS_BACK
 struct test_get_rows_back : public test_case {
     const ggml_type type;
@@ -11042,6 +11074,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
     test_cases.emplace_back(new test_get_rows(GGML_TYPE_F32, 256, 8, 2, 1, 1, false, true, 3));
+
+    for (int dim : {64, 128, 256}) {
+        for (int blocks : {1, 17, 1025}) {
+            for (int streams : {1, 2}) {
+                for (bool pitched : {false, true}) {
+                    for (int variant : {0, 1, 2}) {
+                        test_cases.emplace_back(new test_get_rows_mean4(dim, blocks, streams, pitched, variant));
+                    }
+                }
+            }
+        }
+    }
 
     test_cases.emplace_back(new test_get_rows_back(GGML_TYPE_F32, 1, 8, 2, 1, false));
     test_cases.emplace_back(new test_get_rows_back(GGML_TYPE_F32, 1, 70000, 4, 1, false)); // row count > CUDA grid-y limit (65535)
