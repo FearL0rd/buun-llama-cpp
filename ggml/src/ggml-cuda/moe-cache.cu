@@ -3302,10 +3302,11 @@ static int moe_cache_dispatch_internal(
         ggml_cuda_moe_cache_mmv_path::generic;
     if (ok && full) {
         // The short Q2 down projection benefits from the dedicated MMV on
-        // consumer Blackwell. Leave unmeasured shapes and architectures alone.
+        // SM86 and consumer Blackwell. Leave unmeasured shapes and architectures alone.
+        const int down_cc = ggml_cuda_info().devices[device.logical].cc;
         const bool dedicated_down = session.config.dedicated_down_mmv >= 0
             ? session.config.dedicated_down_mmv != 0
-            : ggml_cuda_info().devices[device.logical].cc == GGML_CUDA_CC_BLACKWELL &&
+            : (down_cc == 860 || down_cc == GGML_CUDA_CC_BLACKWELL) &&
               down_pool->wtype == GGML_TYPE_Q2_0 && n_out == 640 && node->n_out == 2560;
         down_mmv_path = ggml_cuda_moe_cache_mmv(
                 down_pool->slab, (ggml_type)down_pool->wtype,
