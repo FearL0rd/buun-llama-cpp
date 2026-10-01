@@ -2533,6 +2533,8 @@ struct test_get_rows : public test_case {
 // Gathered history pooling: preserve ordered sums, pitched rows, and visible members.
 struct test_get_rows_mean4 : public test_get_rows {
     const int variant;
+    ggml_tensor * observed = nullptr;
+    ggml_tensor * out = nullptr;
 
     test_get_rows_mean4(int dim, int blocks, int streams, bool pitched, int variant)
         : test_get_rows(GGML_TYPE_F16, dim, 4*blocks + 7, 4*blocks, streams, 1,
@@ -2553,18 +2555,27 @@ struct test_get_rows_mean4 : public test_get_rows {
             ggml_tensor * view = ggml_view_3d(ctx, shape, n, r/4, be1,
                     shape->nb[2], shape->nb[3], member*shape->nb[1]);
             ggml_tensor * copy = ggml_cont(ctx, view);
-            if (member == 0 && variant == 1) ggml_set_output(copy);
+            if (member == 0 && variant == 1) {
+                observed = copy;
+                ggml_set_output(observed);
+            }
             sum = sum ? ggml_add(ctx, sum, copy) : copy;
         }
-        ggml_tensor * out = ggml_scale(ctx, sum, variant == 2 ? 0.2f : 0.25f);
+        out = ggml_scale(ctx, sum, variant == 2 ? 0.2f : 0.25f);
         ggml_set_name(out, "out");
         return out;
+    }
+
+    std::vector<ggml_tensor *> fusion_test_nodes() override {
+        return observed ? std::vector<ggml_tensor *>{out, observed} : std::vector<ggml_tensor *>{out};
     }
 };
 
 // Preserve selected row order while converting a gathered window to head-major layout.
 struct test_get_rows_cast : public test_get_rows {
     const int heads, queries, variant;
+    ggml_tensor * observed = nullptr;
+    ggml_tensor * out = nullptr;
 
     test_get_rows_cast(int dim, int heads, int width, int queries, int streams, bool pitched, int variant)
         : test_get_rows(GGML_TYPE_F16, dim*heads, 3*width + 7, width*queries, streams, 1,
@@ -2579,12 +2590,19 @@ struct test_get_rows_cast : public test_get_rows {
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * gathered = test_get_rows::build_graph(ctx);
-        if (variant == 1) ggml_set_output(gathered);
+        if (variant == 1) {
+            observed = gathered;
+            ggml_set_output(observed);
+        }
         ggml_tensor * shape = ggml_reshape_4d(ctx, gathered, n/heads, heads, r/queries, queries*be1);
         ggml_tensor * perm = ggml_permute(ctx, shape, 0, 2, 1, 3);
-        ggml_tensor * out = ggml_cast(ctx, perm, variant == 2 ? GGML_TYPE_F32 : GGML_TYPE_F16);
+        out = ggml_cast(ctx, perm, variant == 2 ? GGML_TYPE_F32 : GGML_TYPE_F16);
         ggml_set_name(out, "out");
         return out;
+    }
+
+    std::vector<ggml_tensor *> fusion_test_nodes() override {
+        return observed ? std::vector<ggml_tensor *>{out, observed} : std::vector<ggml_tensor *>{out};
     }
 };
 
