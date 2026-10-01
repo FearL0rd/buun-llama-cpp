@@ -133,7 +133,8 @@ struct ggml_moe_cache_api {
     // Closed CPU-output -> device-copy handoff for this scheduler evaluation.
     // The scheduler reserves destination before the CPU producer and drains
     // earlier device reads before bind. copy runs after CPU completion, uploads
-    // misses, and consumes the binding. A zero return uses the ordinary copy.
+    // misses, and consumes the binding. Zero uses the ordinary copy, positive
+    // means consumed, and negative reports a failed deferred collection.
     int (*output_supported)(void * backend, const struct ggml_tensor * source);
     int (*output_bind)(void * session, void * backend, const struct ggml_tensor * source,
             struct ggml_tensor * destination);

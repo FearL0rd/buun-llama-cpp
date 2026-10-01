@@ -4233,8 +4233,9 @@ static bool run_stream_staging_case(ggml_backend_dev_t dev,
                     // Scatter a subset into nonconsecutive destination rows;
                     // untouched rows model completed CPU misses. Poison host
                     // hit rows so an accidental whole upload cannot pass.
-                    for (int pattern : {0, 1, 2, 3, 4, 5}) {
-                        s = start(pattern == 4 ? "collect" : pattern == 5 ? "dispatch" : nullptr);
+                    for (int pattern : {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10}) {
+                        s = start(pattern == 4 ? "collect" : pattern == 5 ? "dispatch" :
+                                pattern == 6 ? "collect-retire" : nullptr);
                         for (int j = 0; j < topk; ++j) warm(ids[j]);
                         ggml_backend_tensor_set(source, ref.data(), 0, ggml_nbytes(source));
                         std::vector<float> poison(ref.size(), -12345.f), actual(ref.size());
@@ -4262,15 +4263,48 @@ static bool run_stream_staging_case(ggml_backend_dev_t dev,
                             dispatched = job && ggml_moe_cache.fused_dispatch(job);
                             collected = dispatched && ggml_moe_cache.collect(job, selected_ids.size(), selected_outputs.data(), K);
                             if (job) ggml_moe_cache.end(job);
-                            pass &= collected == (pattern < 4);
+                            pass &= collected == (pattern < 4 || pattern >= 6);
                         }
-                        if (pattern >= 4) {
+                        if (pattern == 4 || pattern == 5) {
                             // Existing CPU failure retry fills all host rows.
                             ggml_backend_tensor_set(source, ref.data(), 0, ggml_nbytes(source));
                         }
-                        const bool copied = ggml_moe_cache.output_copy(s, gpu, source, destination);
-                        pass &= copied == collected;
-                        if (!copied) ggml_backend_tensor_copy(source, destination);
+                        if (pattern == 7) {
+                            // Retained source lease must drain before invalidation.
+                            ggml_moe_cache.invalidate(up->data, ggml_nbytes(up));
+                        }
+                        if (pattern == 8) {
+                            // A nested scope cannot strand a previous owner.
+                            ggml_moe_cache.session_enter(nullptr);
+                            ggml_moe_cache.session_leave(nullptr);
+                        }
+                        if (pattern == 9) {
+                            // Abandon the scheduler scope before its copy door.
+                            // Shutdown must still retire leases and slot readers.
+                            ggml_moe_cache.session_leave(s);
+                        }
+                        std::atomic<bool> invalidating{false}, invalidated{false};
+                        std::thread invalidator;
+                        if (pattern == 10 && collected) {
+                            // The parked composite must retain its source lease,
+                            // then retire without acquiring the registry mutex
+                            // held by a concurrent invalidator waiting on it.
+                            invalidator = std::thread([&] {
+                                invalidating.store(true);
+                                ggml_moe_cache.invalidate(up->data, ggml_nbytes(up));
+                                invalidated.store(true);
+                            });
+                            while (!invalidating.load()) std::this_thread::yield();
+                            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+                            pass &= !invalidated.load();
+                        }
+                        const int copied = ggml_moe_cache.output_copy(s, gpu, source, destination);
+                        if (invalidator.joinable()) {
+                            invalidator.join();
+                            pass &= invalidated.load();
+                        }
+                        pass &= copied == (pattern == 6 ? -1 : pattern == 9 ? 0 : int(collected));
+                        if (copied == 0 && pattern != 9) ggml_backend_tensor_copy(source, destination);
                         // Drain output_copy's consumer-stream uploads before the
                         // buffer read, which also orders after the fallback copy.
                         ggml_backend_synchronize(gpu);
@@ -4308,11 +4342,12 @@ static bool run_stream_staging_case(ggml_backend_dev_t dev,
                     // Actual scheduler boundary: CPU full-FFN producer followed
                     // by a GPU consumer. Four CPU workers must finish their
                     // misses before the complementary upload is submitted.
-                    for (int run = 0; run < 14; ++run) {
+                    for (int run = 0; run < 16; ++run) {
                         // Recreate each graph/session twice rather than relying
                         // on a pointer-stable binding across evaluations.
-                        const int scenario = run % 7;
-                        const char * fail = scenario == 1 ? "dispatch" : scenario == 2 ? "collect" : nullptr;
+                        const int scenario = run % 8;
+                        const char * fail = scenario == 1 ? "dispatch" : scenario == 2 ? "collect" :
+                                scenario == 7 ? "collect-retire" : nullptr;
                         configure_cache(fail, "4", "1", "40", dedicated_down);
                         auto ic = ggml_init({4*ggml_tensor_overhead(), nullptr, true});
                         auto input = ggml_new_tensor_3d(ic, GGML_TYPE_F32, K, 1, T);
@@ -4348,8 +4383,14 @@ static bool run_stream_staging_case(ggml_backend_dev_t dev,
                         bool pass = ggml_backend_sched_alloc_graph(sched, graph);
                         std::vector<float> expected = ref, actual(ref.size());
                         for (auto & v : expected) v *= .5f;
+                        int deferred_failures = 0;
                         for (int step = 0; pass && step < 96; ++step) {
-                            pass &= ggml_backend_sched_graph_compute(sched, graph) == GGML_STATUS_SUCCESS;
+                            const auto status = ggml_backend_sched_graph_compute(sched, graph);
+                            if (scenario == 7 && status == GGML_STATUS_FAILED) {
+                                ++deferred_failures;
+                                continue;
+                            }
+                            pass &= status == GGML_STATUS_SUCCESS;
                             ggml_backend_tensor_get(result, actual.data(), 0, ggml_nbytes(result));
                             pass &= compare_output(expected, actual, 5e-4);
                             if (scenario == 4) {
@@ -4357,6 +4398,7 @@ static bool run_stream_staging_case(ggml_backend_dev_t dev,
                                 pass &= compare_output(ref, actual, 5e-4);
                             }
                         }
+                        if (scenario == 7) pass &= deferred_failures > 0;
                         printf("cache-device-output-scheduler: pinned=%d tokens=%d scenario=%d failure=%s %s\n",
                                 pinned, T, scenario, fail ? fail : "none", pass ? "OK" : "FAIL");
                         ok &= pass;

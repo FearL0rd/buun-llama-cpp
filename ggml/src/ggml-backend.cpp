@@ -1870,9 +1870,13 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     ggml_backend_synchronize(split_backend);
                 }
 
-                if (input_id == split->device_output_input &&
-                        ggml_moe_cache.output_copy(sched->moe_cache_session, split_backend, input, input_cpy)) {
-                    continue;
+                if (input_id == split->device_output_input) {
+                    const int copied = ggml_moe_cache.output_copy(
+                            sched->moe_cache_session, split_backend, input, input_cpy);
+                    // Deferred collection errors must stop the graph, not copy
+                    // host rows that were deliberately never computed.
+                    if (copied < 0) return GGML_STATUS_FAILED;
+                    if (copied > 0) continue;
                 }
 
                 // when offloading MoE weights, we can reduce the amount of data copied by copying only the experts that are used

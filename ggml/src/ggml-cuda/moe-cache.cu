@@ -367,6 +367,7 @@ struct moe_cache_node {
     int n_pins = 0;
     bool planned = false;
     bool dispatched = false;
+    bool deferred_collect = false;
     bool owns_active = true;
     bool composite = false;
     int n_result_rows = 0;
@@ -409,10 +410,16 @@ struct moe_cache_scope_frame {
         ggml_tensor * destination = nullptr;
         int device = -1;
         uint64_t written = 0;
+        moe_cache_node * pending = nullptr;
+        bool failed = false;
     } output;
 };
 static thread_local std::vector<moe_cache_scope_frame> g_session_stack;
 static thread_local int g_session_suppressed = 0;
+// Retain the entire owner (including composite leases)
+// until the scheduler consumes device output. Never detach pins from the node.
+static thread_local std::unique_ptr<moe_cache_node> g_pending_output;
+static void moe_cache_retire_pending();
 static size_t moe_cache_trim_session(
         moe_cache_session & session, int physical_device);
 
@@ -2245,6 +2252,7 @@ static void moe_cache_free_device(moe_cache_device & device) {
 }
 
 static void moe_cache_session_destroy(void * opaque) {
+    moe_cache_retire_pending();
     moe_cache_session * session = (moe_cache_session *)opaque;
     if (!session) {
         return;
@@ -2558,6 +2566,7 @@ static moe_cache_scope_frame * moe_cache_output_frame(void * session) {
 
 static int moe_cache_output_bind(void * session, void * backend_opaque,
         const ggml_tensor * source, ggml_tensor * destination) {
+    moe_cache_retire_pending();
     auto * frame = moe_cache_output_frame(session);
     if (!frame) return 0;
     GGML_ASSERT(frame->output.written == 0);
@@ -2576,6 +2585,7 @@ static int moe_cache_output_bind(void * session, void * backend_opaque,
 
 static int moe_cache_output_copy(void * session, void * backend_opaque,
         const ggml_tensor * source, ggml_tensor * destination) {
+    moe_cache_retire_pending();
     auto * frame = moe_cache_output_frame(session);
     if (!frame) return 0;
     if (frame->output.source != source || frame->output.destination != destination) {
@@ -2583,8 +2593,10 @@ static int moe_cache_output_copy(void * session, void * backend_opaque,
         GGML_ASSERT(frame->output.written == 0);
         return 0;
     }
+    const bool failed = frame->output.failed;
     const uint64_t written = frame->output.written;
     frame->output = {};
+    if (failed) return -1;
     if (!written) return 0;
     auto * ctx = (ggml_backend_cuda_context *) ((ggml_backend_t) backend_opaque)->context;
     ggml_cuda_set_device(ctx->device);
@@ -2603,6 +2615,7 @@ static int moe_cache_output_copy(void * session, void * backend_opaque,
 }
 
 static void moe_cache_session_enter(void * opaque) {
+    moe_cache_retire_pending();
     if (g_session_suppressed > 0) {
         g_session_suppressed++;
         return;
@@ -2653,6 +2666,7 @@ static void moe_cache_session_enter(void * opaque) {
 }
 
 static void moe_cache_session_leave(void * opaque) {
+    moe_cache_retire_pending();
     if (g_session_suppressed > 0) {
         g_session_suppressed--;
         return;
@@ -2681,6 +2695,7 @@ static void * moe_cache_begin(
         const char * name, const void * host_base, size_t expert_size,
         int64_t n_in, int64_t n_out, int wtype, int64_t n_expert,
         int64_t n_tokens, int64_t n_rows) {
+    moe_cache_retire_pending();
     if (g_session_suppressed > 0 || g_session_stack.empty()) {
         return nullptr;
     }
@@ -3694,6 +3709,7 @@ static int moe_cache_collect(
             float * mapped[64];
             for (int i = 0; i < child->n_result_rows; ++i) mapped[i] = dst_rows[child->row_indices[i]];
             const int ok = moe_cache_collect(child, child->n_result_rows, mapped, n_out);
+            node->deferred_collect = child->deferred_collect;
             node->dispatched = false;
             return ok;
         }
@@ -3754,7 +3770,16 @@ static int moe_cache_collect(
                         device.d_out, (float *) frame->output.destination->data, n_out, map);
                 ok = moe_cache_cuda_ok(device, cudaPeekAtLastError(), "output device scatter", true);
             }
-            ok = moe_cache_collect_finish(*node, ok);
+            if (ok) {
+                // CPU hit rows are intentionally absent. Retain ownership and
+                // delay the same synchronization until output_copy, before any
+                // consumer runs. The ordinary host-output route is unchanged.
+                GGML_ASSERT(!g_pending_output && !frame->output.pending);
+                node->deferred_collect = true;
+                frame->output.pending = node;
+            } else {
+                ok = moe_cache_collect_finish(*node, false);
+            }
             if (ok) frame->output.written = written;
             return ok ? 1 : 0;
         }
@@ -3770,6 +3795,11 @@ static int moe_cache_collect(
 static void moe_cache_end(void * opaque) {
     std::unique_ptr<moe_cache_node> node((moe_cache_node *)opaque);
     if (!node) {
+        return;
+    }
+    if (node->deferred_collect) {
+        GGML_ASSERT(!g_pending_output);
+        g_pending_output = std::move(node);
         return;
     }
 
@@ -3820,6 +3850,30 @@ static void moe_cache_end(void * opaque) {
         node->dispatch_lock.unlock();
         moe_cache_trim_session(session, node->device->physical);
     }
+}
+
+static void moe_cache_retire_pending() {
+    if (!g_pending_output) return;
+    auto owner = std::move(g_pending_output);
+    // The one-device composite owns source leases; its child owns slot pins
+    // and the dispatch lock. Keep both alive until the stream is finished.
+    GGML_ASSERT(!owner->composite || owner->children.size() == 1);
+    auto * producer = owner->composite ? owner->children.front().get() : owner.get();
+    GGML_ASSERT(producer->deferred_collect && producer->dispatched);
+    const bool ok = moe_cache_collect_finish(*producer,
+            !moe_cache_fail(*producer->session, "collect-retire"));
+    bool found = false;
+    for (auto & frame : g_session_stack) {
+        if (frame.output.pending == producer) {
+            frame.output.pending = nullptr;
+            frame.output.failed = !ok;
+            found = true;
+        }
+    }
+    GGML_ASSERT(found);
+    producer->deferred_collect = false;
+    owner->deferred_collect = false;
+    moe_cache_end(owner.release());
 }
 
 // Called under session.mu and the device dispatch lock. Retire a few unpinned
@@ -4348,6 +4402,7 @@ static void * moe_cache_fused_plan(
         float gate_min, float gate_max,
         const int32_t * ids, int n_ids, int64_t n_tokens,
         const float * const * act_rows, uint64_t * hit_mask) {
+    moe_cache_retire_pending();
     if (hit_mask) {
         *hit_mask = 0;
     }
@@ -4953,6 +5008,7 @@ static void moe_cache_invalidate_session(
 }
 
 static void moe_cache_invalidate(const void * base, size_t size) {
+    moe_cache_retire_pending();
     if (!base || size == 0 ||
         g_session_count.load(std::memory_order_acquire) == 0) {
         return;
@@ -4965,6 +5021,7 @@ static void moe_cache_invalidate(const void * base, size_t size) {
 
 static size_t moe_cache_trim_session(
         moe_cache_session & session, int physical_device) {
+    moe_cache_retire_pending();
     moe_cache_device * selected = nullptr;
     for (auto & device_ptr : session.devices) {
         if (device_ptr->physical == physical_device) {
@@ -5005,6 +5062,9 @@ static size_t moe_cache_trim_session(
 }
 
 extern "C" size_t ggml_moe_cache_trim(int device) {
+    // Drain before the registry mutex: an invalidator may hold it while waiting
+    // for this node's retained source lease. Also avoid reacquiring dispatch_mu.
+    moe_cache_retire_pending();
 #if !defined(GGML_USE_HIP)
     // An invalidator can hold g_registry_mu while waiting for this thread's
     // source lease. Drain lookahead before taking that mutex during allocation
