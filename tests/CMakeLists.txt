@@ -160,6 +160,9 @@ target_link_libraries(test-server-resume-store PRIVATE vendor::hash)
 llama_build_and_test(test-kv-cells.cpp)
 target_include_directories(test-kv-cells PRIVATE ${PROJECT_SOURCE_DIR}/src)
 
+llama_build_and_test(test-kv-cache-mask.cpp)
+target_include_directories(test-kv-cache-mask PRIVATE ${PROJECT_SOURCE_DIR}/src)
+
 llama_build_and_test(test-sha256.cpp ${PROJECT_SOURCE_DIR}/vendor/hash/sha256/sha256.c)
 target_include_directories(test-sha256 PRIVATE ${PROJECT_SOURCE_DIR}/src ${PROJECT_SOURCE_DIR}/vendor/hash)
 
