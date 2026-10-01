@@ -4630,6 +4630,107 @@ static bool ggml_cuda_check_fusion_memory_ranges(const ggml_cgraph * cgraph,
     return is_ok;
 }
 
+// Recognize the closed selected-KV interval structurally: the cache views can
+// add metadata nodes, so the real graph need not have the fixture's node count.
+static int ggml_cuda_try_ordered_attention(ggml_backend_cuda_context & ctx,
+        const ggml_cgraph * graph, int first) {
+    if (ggml_cuda_info().devices[ctx.device].cc != 860 || graph->nodes[first]->op != GGML_OP_GET_ROWS) return 0;
+    int last = first + 1;
+    for (; last < graph->n_nodes && last < first + 20; ++last) {
+        const auto op = graph->nodes[last]->op;
+        if (op == GGML_OP_FLASH_ATTN_EXT) break;
+        if (op != GGML_OP_GET_ROWS && op != GGML_OP_VIEW && op != GGML_OP_RESHAPE &&
+                op != GGML_OP_PERMUTE && op != GGML_OP_CPY) return 0;
+    }
+    if (last >= graph->n_nodes || last >= first + 20 || graph->nodes[last]->op != GGML_OP_FLASH_ATTN_EXT) return 0;
+    auto * out = graph->nodes[last];
+    const auto * q = out->src[0];
+    if (!q || q->ne[3] < 1 || q->ne[3] > 4) return 0;
+    const auto kv_gather = [q](const ggml_tensor * cast) -> const ggml_tensor * {
+        if (!cast || cast->op != GGML_OP_CPY || cast->src[1] != cast ||
+                cast->type != GGML_TYPE_F16 || !ggml_is_contiguous(cast)) return nullptr;
+        const auto * perm = cast->src[0];
+        const auto * shape = perm ? perm->src[0] : nullptr;
+        const auto * gather = shape ? shape->src[0] : nullptr;
+        if (!perm || perm->op != GGML_OP_PERMUTE || !shape || shape->op != GGML_OP_RESHAPE ||
+                !gather || gather->op != GGML_OP_GET_ROWS || gather->type != GGML_TYPE_F32 ||
+                !ggml_is_contiguous(gather) || !ggml_is_contiguous(shape) ||
+                shape->ne[0] != 256 || shape->ne[1] != 2 || shape->ne[2] != 2051 || shape->ne[3] != q->ne[3] ||
+                perm->ne[0] != 256 || perm->ne[1] != 2051 || perm->ne[2] != 2 || perm->ne[3] != q->ne[3] ||
+                perm->nb[0] != shape->nb[0] || perm->nb[1] != shape->nb[2] ||
+                perm->nb[2] != shape->nb[1] || perm->nb[3] != shape->nb[3] ||
+                !ggml_are_same_shape(cast, perm)) return nullptr;
+        return gather;
+    };
+    const auto * kg = kv_gather(out->src[1]);
+    const auto * vg = kv_gather(out->src[2]);
+    if (kg != graph->nodes[first] || !vg || !kg->src[0] || !kg->src[1] ||
+            !vg->src[0] || vg->src[1] != kg->src[1]) return 0;
+    const auto * cast = out->src[3];
+    const auto * shape = cast ? cast->src[0] : nullptr;
+    const auto * mg = shape ? shape->src[0] : nullptr;
+    if (!cast || cast->op != GGML_OP_CPY || cast->src[1] != cast || cast->type != GGML_TYPE_F16 ||
+            !shape || shape->op != GGML_OP_RESHAPE || !ggml_is_contiguous(shape) ||
+            !mg || mg->op != GGML_OP_GET_ROWS || mg->type != GGML_TYPE_F32 ||
+            !mg->src[0] || !mg->src[1] || !ggml_is_contiguous(mg) ||
+            !ggml_is_contiguous(cast) || !ggml_are_same_shape(cast, shape) ||
+            shape->ne[0] != 2051 || shape->ne[1] != 1 || shape->ne[2] != 1 || shape->ne[3] != q->ne[3] ||
+            mg->ne[0] != 1 || mg->ne[1] != 2051 || mg->ne[2] != q->ne[3] || mg->ne[3] != 1 ||
+            !ggml_is_contiguous(mg->src[1]) || mg->src[1]->data != kg->src[1]->data ||
+            ggml_nelements(mg->src[1]) != ggml_nelements(kg->src[1])) return 0;
+
+    const ggml_tensor * required_nodes[] = {kg, out->src[1]->src[0]->src[0], out->src[1]->src[0], out->src[1],
+        vg, out->src[2]->src[0]->src[0], out->src[2]->src[0], out->src[2], mg, shape, cast};
+    for (const auto * required : required_nodes) {
+        if (std::find(graph->nodes + first, graph->nodes + last, required) == graph->nodes + last) return 0;
+    }
+
+    // Only materialized results (and their aliases) disappear. External-input
+    // views remain valid, including host views whose consumers the scheduler
+    // redirected to device copies without changing the original use counts.
+    bool elided[20] = {};
+    for (int i = first; i < last; ++i) {
+        const auto * part = graph->nodes[i];
+        if ((part->op == GGML_OP_GET_ROWS && part != kg && part != vg && part != mg) ||
+                (part->op == GGML_OP_CPY && part != out->src[1] && part != out->src[2] && part != cast)) return 0;
+        bool loses_data = part->op == GGML_OP_GET_ROWS || part->op == GGML_OP_CPY;
+        for (int j = first; j < i; ++j) {
+            if (!elided[j - first]) continue;
+            loses_data |= part->view_src == graph->nodes[j];
+            for (auto * src : part->src) loses_data |= src == graph->nodes[j];
+        }
+        elided[i - first] = loses_data;
+        if (!loses_data) continue;
+        if (part->flags & (GGML_TENSOR_FLAG_INPUT | GGML_TENSOR_FLAG_OUTPUT)) return 0;
+        int internal = 0;
+        for (int j = first; j <= last; ++j) {
+            for (auto * src : graph->nodes[j]->src) internal += src == part;
+        }
+        if (internal != ggml_node_get_use_count(graph, i)) return 0;
+    }
+    const ggml_tensor * inputs[] = {q, kg->src[0], vg->src[0], kg->src[1], mg->src[0]};
+    bool overlaps = false;
+    for (const auto * source : inputs) {
+        if (!source->buffer || !out->buffer) return 0;
+        for (int i = first; i < last; ++i) {
+            if (elided[i - first] && source == graph->nodes[i]) return 0;
+        }
+        overlaps |= ggml_cuda_tensors_overlap(out, source);
+    }
+    // Gallocr may reuse selected-ID storage after the gathers. Indexed FA still
+    // reads it, so stage only the small final output when those lifetimes overlap.
+    // Both the launch and copy use the pool's stream; no host synchronization or
+    // global graph-allocation changes are needed.
+    ggml_cuda_pool_alloc<float> staged(ctx.pool());
+    ggml_tensor result = *out;
+    if (overlaps) result.data = staged.alloc(ggml_nelements(out));
+    if (!ggml_cuda_flash_attn_ext_ordered(ctx, &result, kg->src[0], vg->src[0], kg->src[1], mg->src[0])) return 0;
+    if (overlaps) {
+        CUDA_CHECK(cudaMemcpyAsync(out->data, result.data, ggml_nbytes(out), cudaMemcpyDeviceToDevice, ctx.stream()));
+    }
+    return last - first;
+}
+
 static int32_t ggml_cuda_tensor_use_count(
         const ggml_cgraph * cgraph, const ggml_tensor * tensor) {
     const size_t hash_pos = ggml_hash_find(&cgraph->visited_hash_set, tensor);
@@ -6561,6 +6662,8 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 !ggml_cuda_tensors_overlap(out, mask) &&
                 ggml_cuda_top_k_qsa(*cuda_ctx, out, scores, ids, mask)) return 7;
     }
+
+    if (const int skipped = ggml_cuda_try_ordered_attention(*cuda_ctx, cgraph, i)) return skipped;
 
     // Gather F16 cache cells straight into the final head-major F16 window.
     // Preserve the selection order and attention geometry; only remove the

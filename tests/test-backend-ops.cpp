@@ -9863,6 +9863,80 @@ struct test_flash_attn_ext : public test_case {
     }
 };
 
+// Selected KV attention must preserve ordered/duplicate indices and observed
+// intermediates. Whole-graph execution lets backend fusion run.
+struct test_selected_flash_attn : public test_case {
+    const int queries, width, variant;
+    static constexpr int physical = 2304;
+    ggml_tensor * observed = nullptr;
+    ggml_tensor * result = nullptr;
+
+    test_selected_flash_attn(int queries, int width, int variant)
+        : queries(queries), width(width), variant(variant) {}
+
+    std::string op_desc(ggml_tensor *) override { return "SELECTED_FLASH_ATTN"; }
+    std::string vars() override { return VARS_TO_STR3(queries, width, variant); }
+    bool run_whole_graph() override { return true; }
+    double max_nmse_err() override { return 5e-4; } // CPU versus backend attention
+    std::vector<ggml_tensor *> fusion_test_nodes() override {
+        return observed ? std::vector<ggml_tensor *>{observed, result}
+                        : std::vector<ggml_tensor *>{result};
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        auto * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 256, 1, 24, queries);
+        auto * k = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, 512, physical, 1);
+        auto * v = variant == 5 ? k : ggml_new_tensor_3d(ctx, GGML_TYPE_F16, 512, physical, 1);
+        auto * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, width, queries);
+        ggml_set_name(ids, "selected_ids");
+        auto * mask = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, physical, queries);
+        ggml_set_name(mask, "physical_mask");
+        auto * flat_ids = ggml_reshape_2d(ctx, ids, width*queries, 1);
+        auto * kg = ggml_get_rows(ctx, k, flat_ids);
+        if (variant == 1) v = ggml_view_3d(ctx, v, 512, physical, 1, v->nb[1], v->nb[2], 0);
+        auto * vg = ggml_get_rows(ctx, v, flat_ids);
+        auto * ks = ggml_reshape_4d(ctx, kg, 256, 2, width, queries);
+        auto * vs = ggml_reshape_4d(ctx, vg, 256, 2, width, queries);
+        auto * mc = ggml_view_3d(ctx, mask, 1, physical, queries, mask->nb[0], mask->nb[1], 0);
+        auto * mi = ggml_reshape_3d(ctx, ids, width, queries, 1);
+        auto * mg = ggml_get_rows(ctx, mc, mi);
+        auto * mf = ggml_cast(ctx, ggml_reshape_4d(ctx, mg, width, 1, 1, queries), GGML_TYPE_F16);
+        auto * kf = ggml_cast(ctx, ggml_permute(ctx, ks, 0, 2, 1, 3), GGML_TYPE_F16);
+        auto * vf = ggml_cast(ctx, ggml_permute(ctx, vs, 0, 2, 1, 3), GGML_TYPE_F16);
+        observed = variant == 2 ? kg : variant == 3 ? vf : variant == 4 ? mf : nullptr;
+        if (observed) ggml_set_output(observed);
+        result = ggml_flash_attn_ext(ctx, q, kf, vf, mf, 1.f/16.f, 0.f, 0.f);
+        ggml_prec_set_acc(result, GGML_PREC_F32);
+        return result;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (auto * t = ggml_get_first_tensor(ctx); t; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->op != GGML_OP_NONE) continue;
+            if (strcmp(t->name, "selected_ids") == 0) {
+                std::vector<int32_t> data(ggml_nelements(t));
+                for (int s = 0; s < queries; ++s) {
+                    for (int i = 0; i < width; ++i) {
+                        data[s*width + i] = i < 2 ? 1 : (i*997 + s*31) % physical;
+                    }
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, data.size()*sizeof(data[0]));
+            } else if (strcmp(t->name, "physical_mask") == 0) {
+                std::vector<ggml_fp16_t> data(ggml_nelements(t));
+                for (int s = 0; s < queries; ++s) {
+                    for (int i = 0; i < physical; ++i) {
+                        const bool hidden = i % 11 == 0 || i > physical*(s+1)/queries;
+                        data[s*physical + i] = ggml_fp32_to_fp16(hidden ? -INFINITY : (i%7 - 3)*0.125f);
+                    }
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, data.size()*sizeof(data[0]));
+            } else {
+                init_tensor_uniform(t, -0.5f, 0.5f);
+            }
+        }
+    }
+};
+
 // GGML_OP_CROSS_ENTROPY_LOSS
 struct test_cross_entropy_loss : public test_case {
     const ggml_type type;
@@ -12936,6 +13010,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_topk_qsa(shape[0], shape[1], shape[2], shape[3], 2051, observed));
         }
     }
+
+    for (int queries : {1, 2, 3, 4}) {
+        for (int variant = 0; variant < 6; ++variant) {
+            test_cases.emplace_back(new test_selected_flash_attn(queries, 2051, variant));
+        }
+    }
+    // Adjacent unsupported fusion shapes must retain ordinary attention.
+    test_cases.emplace_back(new test_selected_flash_attn(5, 2051, 0));
+    test_cases.emplace_back(new test_selected_flash_attn(4, 2052, 0));
 
     // exhaustive top_k tests
     //for (int i = 1; i < 9999; ++i) {

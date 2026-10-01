@@ -12,6 +12,55 @@
 #include <atomic>
 #include <sys/stat.h>
 #include <vector>
+
+bool ggml_cuda_flash_attn_ext_ordered(ggml_backend_cuda_context & ctx, ggml_tensor * dst,
+        const ggml_tensor * keys, const ggml_tensor * values,
+        const ggml_tensor * ids, const ggml_tensor * mask_cells) {
+#if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
+    GGML_UNUSED_VARS(ctx, dst, keys, values, ids, mask_cells);
+    return false;
+#else
+    const ggml_tensor * q = dst->src[0];
+    if (ggml_cuda_info().devices[ctx.device].cc != 860 || !q ||
+            q->type != GGML_TYPE_F32 || q->ne[0] != 256 || q->ne[1] != 1 ||
+            q->ne[2] != 24 || q->ne[3] < 1 || q->ne[3] > 4 ||
+            dst->type != GGML_TYPE_F32 || !ggml_is_contiguous(dst) ||
+            ggml_get_op_params_f32(dst, 1) != 0.f || ggml_get_op_params_f32(dst, 2) != 0.f ||
+            ggml_flash_attn_ext_get_prec(dst) != GGML_PREC_F32 || dst->src[4] ||
+            keys->type != GGML_TYPE_F16 || values->type != GGML_TYPE_F16 ||
+            keys->ne[0] != 512 || values->ne[0] != 512 ||
+            keys->ne[1] != values->ne[1] || keys->ne[1] < 2051 ||
+            keys->ne[2] != 1 || keys->ne[3] != 1 || values->ne[2] != 1 || values->ne[3] != 1 ||
+            keys->nb[0] != sizeof(half) || values->nb[0] != sizeof(half) ||
+            ids->type != GGML_TYPE_I32 || !ggml_is_contiguous(ids) ||
+            ggml_nelements(ids) != 2051*q->ne[3] ||
+            mask_cells->type != GGML_TYPE_F16 || mask_cells->ne[0] != 1 ||
+            mask_cells->ne[1] != keys->ne[1] || mask_cells->ne[2] != q->ne[3] ||
+            mask_cells->ne[3] != 1 || mask_cells->nb[1] != sizeof(half)) return false;
+
+    // Metadata-only views of the original pools. The selected width is logical;
+    // ordered IDs map every load to a physical row, including the mask load.
+    ggml_tensor k = *dst->src[1], v = *dst->src[2], mask = *dst->src[3], out = *dst;
+    for (auto pair : {std::make_pair(&k, keys), std::make_pair(&v, values)}) {
+        pair.first->data = pair.second->data;
+        pair.first->nb[0] = sizeof(half);
+        pair.first->nb[1] = pair.second->nb[1];
+        pair.first->nb[2] = 256*sizeof(half);
+        pair.first->nb[3] = 0;
+    }
+    mask.data = mask_cells->data;
+    mask.ne[0] = mask_cells->ne[1];
+    mask.nb[0] = sizeof(half);
+    mask.nb[1] = mask.nb[2] = mask.nb[3] = mask_cells->nb[2];
+    out.src[1] = &k;
+    out.src[2] = &v;
+    out.src[3] = &mask;
+    ggml_cuda_flash_attn_ext_mma_f16_case<256, 256, 8, 1, false, true>(
+        ctx, &out, (const int32_t *) ids->data);
+    return true;
+#endif
+}
+
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 // one list per group of ncols1 queries: a column is selected if any query of the group can see it
 template <int ncols1, bool oob>
