@@ -130,7 +130,52 @@ gated_delta_net_cuda(const float * q,
         GGML_UNUSED(l2_norm);
 #endif
 
-        if constexpr (!KDA) {
+        if constexpr (!KDA && cols_per_warp == 4) {
+            // Interleave independent columns without changing each column's
+            // FMA or XOR reduction order. The existing SM86 prefill dispatcher
+            // alone selects this four-column geometry.
+            const float g_val = GDN_EXPF(*g_t);
+            float kv[cols_per_warp] = {}, delta[cols_per_warp], output[cols_per_warp] = {};
+#pragma unroll
+            for (int r = 0; r < rows_per_lane; ++r) {
+#pragma unroll
+                for (int c = 0; c < cols_per_warp; ++c) {
+                    kv[c] += s_shards[c][r] * k_reg[r];
+                }
+            }
+#pragma unroll
+            for (int offset = warp_size/2; offset > 0; offset >>= 1) {
+#pragma unroll
+                for (int c = 0; c < cols_per_warp; ++c) {
+                    kv[c] += __shfl_xor_sync(0xFFFFFFFFULL, kv[c], offset, warp_size);
+                }
+            }
+#pragma unroll
+            for (int c = 0; c < cols_per_warp; ++c) {
+                delta[c] = (v_t[col + c] - g_val * kv[c]) * beta_val;
+            }
+#pragma unroll
+            for (int r = 0; r < rows_per_lane; ++r) {
+#pragma unroll
+                for (int c = 0; c < cols_per_warp; ++c) {
+                    s_shards[c][r] = g_val * s_shards[c][r] + k_reg[r] * delta[c];
+                    output[c] += s_shards[c][r] * q_reg[r];
+                }
+            }
+#pragma unroll
+            for (int offset = warp_size/2; offset > 0; offset >>= 1) {
+#pragma unroll
+                for (int c = 0; c < cols_per_warp; ++c) {
+                    output[c] += __shfl_xor_sync(0xFFFFFFFFULL, output[c], offset, warp_size);
+                }
+            }
+            if (lane == 0) {
+#pragma unroll
+                for (int c = 0; c < cols_per_warp; ++c) {
+                    attn_data[col + c] = output[c] * scale;
+                }
+            }
+        } else if constexpr (!KDA) {
             const float g_val = GDN_EXPF(*g_t);
 
 #pragma unroll
