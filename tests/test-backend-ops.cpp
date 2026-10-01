@@ -13276,7 +13276,27 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_ext(576, 512, 1, {20, 1}, 1024,  64, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0, {0, 1, 2, 3}, true, true));
 
     // Qwen QSA: 256/256, gqa 12, budget 2048.
-    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, 8192, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, 2048));
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, 8192, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, false, false, 2048));
+
+    // GQA12 prefill tiles: include both sides of the 2048-query dispatch
+    // boundary, a partial tile, and decode/verification fallback batches.
+    for (int64_t queries : {1, 4, 2047, 2048, 2049, 4352}) {
+        for (const auto & layout : {std::array<int32_t, 4>{0, 1, 2, 3}, {0, 2, 1, 3}}) {
+            test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, 4352, queries,
+                true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, layout));
+        }
+    }
+
+    // A holey mask alone does not select sparse FA. Exercise the actual hint
+    // at both sides of its 2 * 8-query-tile * 2048-cell crossover, where a
+    // dense-only prefill tile override must yield to the compacted algorithm.
+    for (int64_t kv : {32512, 32768}) {
+        for (const auto & layout : {std::array<int32_t, 4>{0, 1, 2, 3}, {0, 2, 1, 3}}) {
+            test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, kv, 2048,
+                true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, layout,
+                true, false, false, false, 2048));
+        }
+    }
 
     // more V-is-sub-view-of-K cases: other head shapes, and full views with equal head sizes
     test_cases.emplace_back(new test_flash_attn_ext(320, 256, 1, {32, 1}, 512, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, true));
@@ -13505,6 +13525,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 2, 128, 257, 2, 3));
+
+    // Full 48-value-head prefill with speculative snapshots. Keep the large
+    // tile and ragged final chunk represented alongside dispatch boundaries.
+    for (int64_t tokens : {3855, 4352}) {
+        test_cases.emplace_back(new test_gated_delta_net(
+            GGML_TYPE_F32, 16, 128, tokens, 1, 3, false, false, 4));
+    }
 
     for (int64_t tokens : {1, 4, 512}) {
         for (float amplitude : {0.0f, 1e-4f, 1.0f}) {
@@ -13886,9 +13913,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     // Sparse flash attention (n_kv_max hint) decode across KV depths.
     // Shapes: 576/512 DeepSeek MLA, 512/512 DeepSeek-V4/GLM-5.2, 256/256 gqa12 Qwen QSA.
     for (int64_t kv : {4096, 16384, 32768}) {
-        test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, { 8, 1}, kv, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false,  512));
-        test_cases.emplace_back(new test_flash_attn_ext(576, 512, 1, {16, 1}, kv, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, true,   512));
-        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, kv, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, 2048));
+        test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, { 8, 1}, kv, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, false, false,  512));
+        test_cases.emplace_back(new test_flash_attn_ext(576, 512, 1, {16, 1}, kv, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, true,  false, false,  512));
+        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, kv, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, false, false, 2048));
     }
 
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 8, {8, 1}, 7680, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
