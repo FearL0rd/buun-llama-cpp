@@ -385,6 +385,23 @@ static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2(ggml_backend_cuda_con
     GGML_ASSERT(Q->ne[2] % K->ne[2] == 0);
     const int gqa_ratio = Q->ne[2] / K->ne[2];
 
+    // A 12-head group wastes four columns in the 8-head tile. For long
+    // prefill on SM86, three 4-head tiles reuse each KV tile across twice
+    // as many queries. Preserve the original compacted sparse route: changing
+    // its tile also changes its gather cost and reduction. Small batches keep
+    // their original stream-K splits.
+    if constexpr (DKQ == 256 && DV == 256 && !V_is_K_view) {
+        if (cc == 860 && use_gqa_opt && Q->type == GGML_TYPE_F32 &&
+                K->type == GGML_TYPE_F16 && V->type == GGML_TYPE_F16 &&
+                Q->ne[2] == 24 && K->ne[2] == 2 && Q->ne[3] == 1 &&
+                Q->ne[1] >= 2048 && ggml_flash_attn_ext_get_prec(dst) == GGML_PREC_F32 &&
+                ggml_get_op_params_f32(dst, 2) == 0.0f && !dst->src[4] &&
+                !ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(cc, dst, 8, 8)) {
+            ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<DKQ, DV, 4, V_is_K_view>(ctx, dst);
+            return;
+        }
+    }
+
     // For 6:1 GQA, the generic 8-head tile wastes two columns. On SM80/D256,
     // three 2-head tiles are faster for full 1K-aligned prefill batches, where
     // both layouts avoid stream-K fixup. Tail batches keep the original layout.
