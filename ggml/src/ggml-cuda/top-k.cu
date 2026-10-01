@@ -20,9 +20,30 @@ __host__ __device__ uint32_t register_top_k_ordered(uint32_t b) {
     if (!(b & 0x7fffffffU)) b=0;
     return b ^ ((b >> 31) ? 0xffffffffU : 0x80000000U);
 }
-template<int items>
+struct top_k_dense_reader {
+    const float * values;
+    int columns;
+    __device__ float operator()(int row, int column) const {
+        return values[size_t(row)*columns + column];
+    }
+};
+
+struct top_k_qsa_reader {
+    const float * scores;
+    const int32_t * cell_blocks;
+    const half * mask;
+    int columns, queries, blocks;
+    __device__ float operator()(int row, int column) const {
+        const int stream = row/queries, query = row%queries;
+        const int block = cell_blocks[size_t(stream)*columns + column];
+        return scores[(size_t(stream)*queries + query)*blocks + block] +
+            __half2float(mask[size_t(row)*columns + column]);
+    }
+};
+
+template<int items, typename Reader>
 __global__ __launch_bounds__(register_top_k_threads, 1)
-void register_top_k_select(const float * src, uint64_t * selected, int n, int k) {
+void register_top_k_select(Reader read, uint64_t * selected, int n, int k) {
     using Scan=cub::BlockScan<int,register_top_k_threads>;
     __shared__ union { unsigned hist[32][256]; Scan::TempStorage scan; } scratch;
     __shared__ uint32_t prefix, mask;
@@ -32,7 +53,7 @@ void register_top_k_select(const float * src, uint64_t * selected, int n, int k)
 #pragma unroll
     for(int j=0;j<items;++j) {
         int i=t*items+j;
-        keys[j]=i<n ? register_top_k_ordered(__float_as_uint(src[size_t(row)*n+i])) : 0;
+        keys[j]=i<n ? register_top_k_ordered(__float_as_uint(read(row,i))) : 0;
     }
     if(!t) {prefix=mask=0;rank=k;}
     __syncthreads();
@@ -79,11 +100,12 @@ void register_top_k_select(const float * src, uint64_t * selected, int n, int k)
         if(pos>=0 && pos<k) selected[size_t(row)*register_top_k_capacity+pos]=(uint64_t(keys[j])<<32)|uint32_t(~i);
     }
 }
-void register_top_k_launch(const float * src,uint64_t * selected,int n,int rows,int k,cudaStream_t stream=0) {
-    if(n<=8192)register_top_k_select<8><<<rows,register_top_k_threads,0,stream>>>(src,selected,n,k);
-    else if(n<=16384)register_top_k_select<16><<<rows,register_top_k_threads,0,stream>>>(src,selected,n,k);
-    else if(n<=32768)register_top_k_select<32><<<rows,register_top_k_threads,0,stream>>>(src,selected,n,k);
-    else if(n<=40960)register_top_k_select<40><<<rows,register_top_k_threads,0,stream>>>(src,selected,n,k);
+template<typename Reader>
+void register_top_k_launch(Reader read,uint64_t * selected,int n,int rows,int k,cudaStream_t stream=0) {
+    if(n<=8192)register_top_k_select<8><<<rows,register_top_k_threads,0,stream>>>(read,selected,n,k);
+    else if(n<=16384)register_top_k_select<16><<<rows,register_top_k_threads,0,stream>>>(read,selected,n,k);
+    else if(n<=32768)register_top_k_select<32><<<rows,register_top_k_threads,0,stream>>>(read,selected,n,k);
+    else if(n<=40960)register_top_k_select<40><<<rows,register_top_k_threads,0,stream>>>(read,selected,n,k);
     else GGML_ABORT("register top-k shape exceeds dispatch bound");
 }
 __global__ void register_top_k_sort(const uint64_t * selected, int * dst, int k) {
@@ -99,6 +121,34 @@ __global__ void register_top_k_sort(const uint64_t * selected, int * dst, int k)
 
 } // namespace
 #endif
+
+bool ggml_cuda_top_k_qsa(ggml_backend_cuda_context & ctx, ggml_tensor * dst,
+        const ggml_tensor * scores, const ggml_tensor * cell_blocks, const ggml_tensor * mask) {
+#if defined(GGML_CUDA_USE_CUB) && !defined(CUB_TOP_K_AVAILABLE) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    if (ggml_cuda_info().devices[ctx.device].cc != 860 || ggml_top_k_is_stable(dst) ||
+            scores->type != GGML_TYPE_F32 || cell_blocks->type != GGML_TYPE_I32 ||
+            mask->type != GGML_TYPE_F16 || dst->type != GGML_TYPE_I32 ||
+            !ggml_is_contiguous(scores) || !ggml_is_contiguous(cell_blocks) ||
+            !ggml_is_contiguous(mask) || !ggml_is_contiguous(dst)) return false;
+    const int64_t columns = cell_blocks->ne[0], queries = scores->ne[1], blocks = scores->ne[0];
+    const int64_t streams = scores->ne[2], rows = queries*streams, k = dst->ne[0];
+    if (queries < 1 || blocks < 1 || blocks > INT_MAX || streams < 1 || scores->ne[3] != 1 ||
+            cell_blocks->ne[1] != streams || ggml_nrows(cell_blocks) != streams ||
+            ggml_nelements(mask) != columns*rows || dst->ne[1] != queries ||
+            dst->ne[2] != streams || dst->ne[3] != 1 || k != 2051 ||
+            columns < 4352 || columns > 40960 ||
+            !((rows >= 4 && rows <= 16) || (rows >= 64 && rows <= 8192 && columns >= 16384))) return false;
+    ggml_cuda_pool_alloc<uint64_t> selected(ctx.pool(), rows*register_top_k_capacity);
+    const top_k_qsa_reader read{(const float *) scores->data, (const int32_t *) cell_blocks->data,
+        (const half *) mask->data, int(columns), int(queries), int(blocks)};
+    register_top_k_launch(read, selected.get(), columns, rows, k, ctx.stream());
+    register_top_k_sort<<<rows, 256, 0, ctx.stream()>>>(selected.get(), (int *) dst->data, k);
+    return true;
+#else
+    GGML_UNUSED_VARS(ctx, dst, scores, cell_blocks, mask);
+    return false;
+#endif
+}
 
 static constexpr int stable_top_k_chunk = 4096;
 
@@ -424,7 +474,7 @@ void ggml_cuda_op_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
             ncols >= 4352 && ncols <= 40960 &&
             ((nrows >= 4 && nrows <= 16) || (nrows >= 64 && nrows <= 8192 && ncols >= 16384))) {
         ggml_cuda_pool_alloc<uint64_t> selected(pool, nrows*register_top_k_capacity);
-        register_top_k_launch(src0_d, selected.get(), ncols, nrows, k, stream);
+        register_top_k_launch(top_k_dense_reader{src0_d, int(ncols)}, selected.get(), ncols, nrows, k, stream);
         register_top_k_sort<<<nrows, 256, 0, stream>>>(selected.get(), dst_d, k);
         return;
     }

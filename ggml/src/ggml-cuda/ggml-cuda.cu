@@ -6513,6 +6513,55 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         }
     }
 
+    // Select directly from compressed QSA scores and the original mask. The
+    // integer order is unchanged; only the expanded score surface is elided.
+    if (node->op == GGML_OP_CONT && i + 7 < cgraph->n_nodes &&
+            ggml_cuda_info().devices[cuda_ctx->device].cc == 860 &&
+            node->src[0] && node->src[0]->op == GGML_OP_PERMUTE &&
+            cgraph->nodes[i + 1]->op == GGML_OP_GET_ROWS) {
+        constexpr ggml_op ops[] = {GGML_OP_CONT, GGML_OP_GET_ROWS, GGML_OP_PERMUTE, GGML_OP_CONT,
+            GGML_OP_CPY, GGML_OP_RESHAPE, GGML_OP_ADD, GGML_OP_TOP_K};
+        bool closed = true;
+        for (int j = 0; j < 8; ++j) {
+            const auto * part = cgraph->nodes[i + j];
+            if (part->op != ops[j] || !(part->flags & GGML_TENSOR_FLAG_COMPUTE) ||
+                    (j < 7 && ((part->flags & GGML_TENSOR_FLAG_OUTPUT) ||
+                     ggml_node_get_use_count(cgraph, i + j) != (j == 4 ? 2 : 1)))) closed = false;
+        }
+        const auto * score_perm = node->src[0];
+        const auto * scores = score_perm->src[0];
+        const auto * gather = cgraph->nodes[i + 1];
+        const auto * perm = cgraph->nodes[i + 2];
+        const auto * cont = cgraph->nodes[i + 3];
+        const auto * cast = cgraph->nodes[i + 4];
+        const auto * shape = cgraph->nodes[i + 5];
+        const auto * add = cgraph->nodes[i + 6];
+        auto * out = cgraph->nodes[i + 7];
+        const auto * ids = gather->src[1];
+        const auto * mask = cast->src[0];
+        if (closed && scores && ids && mask &&
+                score_perm->ne[0] == scores->ne[1] && score_perm->ne[1] == scores->ne[0] &&
+                score_perm->ne[2] == scores->ne[2] && score_perm->ne[3] == scores->ne[3] &&
+                score_perm->nb[0] == scores->nb[1] && score_perm->nb[1] == scores->nb[0] &&
+                score_perm->nb[2] == scores->nb[2] && score_perm->nb[3] == scores->nb[3] &&
+                ggml_are_same_shape(node, score_perm) && gather->src[0] == node &&
+                perm->src[0] == gather && cont->src[0] == perm && cast->src[1] == cast &&
+                shape->src[0] == cast && add->src[0] == cont && add->src[1] == shape && out->src[0] == add &&
+                node->type == GGML_TYPE_F32 && ggml_is_contiguous(node) &&
+                gather->type == GGML_TYPE_F32 && ggml_is_contiguous(gather) &&
+                perm->ne[0] == gather->ne[1] && perm->ne[1] == gather->ne[0] &&
+                perm->ne[2] == gather->ne[2] && perm->ne[3] == gather->ne[3] &&
+                perm->nb[0] == gather->nb[1] && perm->nb[1] == gather->nb[0] &&
+                perm->nb[2] == gather->nb[2] && perm->nb[3] == gather->nb[3] &&
+                ggml_is_contiguous(cont) && ggml_are_same_shape(cont, perm) &&
+                cast->type == GGML_TYPE_F32 && ggml_is_contiguous(cast) && ggml_are_same_shape(cast, mask) &&
+                ggml_is_contiguous(shape) && ggml_are_same_shape(cont, shape) &&
+                add->type == GGML_TYPE_F32 && ggml_are_same_shape(add, cont) &&
+                !ggml_cuda_tensors_overlap(out, scores) && !ggml_cuda_tensors_overlap(out, ids) &&
+                !ggml_cuda_tensors_overlap(out, mask) &&
+                ggml_cuda_top_k_qsa(*cuda_ctx, out, scores, ids, mask)) return 7;
+    }
+
     // Gather F16 cache cells straight into the final head-major F16 window.
     // Preserve the selection order and attention geometry; only remove the
     // transient F32 gather and its subsequent layout-changing cast.
