@@ -185,6 +185,9 @@ GGML_API void ggml_moe_cache_unregister(const void * owner);
 GGML_API void ggml_backend_sched_set_moe_cache(
         ggml_backend_sched_t sched, enum ggml_moe_cache_mode mode,
         size_t budget_mib, int expert_parallel, int cpu_overlap, const char * profile_path);
+// Resolved provider admission, including no_alloc graph reservation. A session
+// does not imply that any particular expert is currently resident.
+GGML_API bool ggml_backend_sched_has_moe_cache(ggml_backend_sched_t sched);
 
 #ifdef __cplusplus
 }

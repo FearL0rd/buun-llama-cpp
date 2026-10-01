@@ -913,6 +913,8 @@ if (NOT LLAMA_USE_SYSTEM_GGML)
 endif()
 
 llama_build_and_test(test-moe-cache-fit.cpp)
+llama_build_and_test(test-moe-routing.cpp)
+target_include_directories(test-moe-routing PRIVATE ../src ../ggml/src)
 llama_build_and_test(test-meta-step-cache.cpp)
 llama_build_and_test(test-auto-memory-policy.cpp)
 llama_build_and_test(test-kv-cell-position-index.cpp)

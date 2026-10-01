@@ -2196,6 +2196,10 @@ void ggml_backend_sched_set_moe_cache(
             cache_backends, sched->n_backends, &config);
 }
 
+bool ggml_backend_sched_has_moe_cache(ggml_backend_sched_t sched) {
+    return sched->moe_cache_session != nullptr;
+}
+
 void ggml_backend_sched_free(ggml_backend_sched_t sched) {
     if (sched == NULL) {
         return;

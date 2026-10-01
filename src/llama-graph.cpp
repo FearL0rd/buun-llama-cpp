@@ -1,8 +1,10 @@
 #include "llama-graph.h"
 
 #include "ggml-turbo-meansub.h"
+#include "../ggml/src/ggml-backend-moe-cache.h"
 #include "llama-impl.h"
 #include "llama-model.h"
+#include "llama-moe-routing.h"
 #include "llama-batch.h"
 #include "llama-context.h"
 #include "llama-cparams.h"
@@ -2663,6 +2665,15 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 
     //call early so that topk-moe can be used
     ggml_build_forward_expand(gf, weights);
+
+    // Keep top-k and weight normalization adjacent for backend fusion, then
+    // pack the narrow routing view before expert offload downloads it. This
+    // uses the ordinary CONT operation rather than backend-specific transfers.
+    if (llama_moe_ids_need_compaction(selected_experts, n_tokens,
+            ggml_backend_sched_has_moe_cache(sched), { up_exps, gate_exps, down_exps, gate_up_exps })) {
+        selected_experts = ggml_cont(ctx0, selected_experts);
+        cb(selected_experts, "ffn_moe_topk_cont", il);
+    }
 
     cur = ggml_reshape_3d(ctx0, cur, n_embd, 1, n_tokens);
 
