@@ -851,7 +851,7 @@ static bool run_fused_cpu_fallbacks(ggml_backend_t cpu) {
                         ggml_backend_tensor_get(graph.out, actual.data(), 0, actual.size()*sizeof(float));
                         // Mixed hits can move an expert below the IQ panel's batch cutoff.
                         const bool match = compare_output(reference, actual, 1e-10);
-                        const bool cell_ok = match && fused_calls > 0 &&
+                        const bool cell_ok = match && fused_calls == 1 &&
                             (partial ? full_calls == 0 : full_calls > 0) && end_calls == fused_calls &&
                             (fail_dispatch ? collect_calls == 0 : collect_calls == fused_calls);
                         printf("cache-fused-cpu-%s-tokens%d-mask%llx-pair%d-failure%d: %s\n", ggml_type_name(type),
@@ -4894,6 +4894,7 @@ static bool run_prefill_copy_multi(ggml_backend_dev_t dev, ggml_backend_t gpu, g
 int main(int argc, char ** argv) {
     const bool profile_writer = argc == 6 && std::strcmp(argv[1], "--profile-writer") == 0;
     const bool host_buffer = argc == 2 && std::strcmp(argv[1], "--host-buffer") == 0;
+    const bool persistent_pool = argc == 2 && std::strcmp(argv[1], "--cpu-persistent-pool") == 0;
     if (!run_pool_limits()) return 1;
     if (argc > 0 && argv[0]) {
         std::error_code ec;
@@ -4905,7 +4906,10 @@ int main(int argc, char ** argv) {
     log_capture capture;
     ggml_log_set(log_callback, &capture);
 
-    ggml_backend_dev_t cuda_device = find_cuda_device();
+    if (persistent_pool) {
+        ggml_backend_load_all();
+    }
+    ggml_backend_dev_t cuda_device = persistent_pool ? nullptr : find_cuda_device();
     ggml_backend_t cpu = init_cpu_backend();
     if (!cpu) {
         fprintf(stderr, "failed to initialize CPU backend\n");
@@ -4913,6 +4917,32 @@ int main(int argc, char ** argv) {
     }
     auto set_n_threads = (ggml_backend_set_n_threads_t) ggml_backend_reg_get_proc_address(
             ggml_backend_dev_backend_reg(ggml_backend_get_device(cpu)), "ggml_backend_set_n_threads");
+    if (persistent_pool) {
+        const auto reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(cpu));
+        const auto create = (ggml_threadpool * (*)(ggml_threadpool_params *))
+            ggml_backend_reg_get_proc_address(reg, "ggml_threadpool_new");
+        const auto destroy = (void (*)(ggml_threadpool *))
+            ggml_backend_reg_get_proc_address(reg, "ggml_threadpool_free");
+        const auto attach = (void (*)(ggml_backend_t, ggml_threadpool *))
+            ggml_backend_reg_get_proc_address(reg, "ggml_backend_cpu_set_threadpool");
+        GGML_ASSERT(create && destroy && attach && set_n_threads);
+        auto params = ggml_threadpool_params_default(6);
+        auto * pool = create(&params);
+        GGML_ASSERT(pool);
+        attach(cpu, pool);
+        bool ok = true;
+        for (int threads : { 1, 2, 4, 6, 4, 2, 1 }) {
+            set_n_threads(cpu, threads);
+            printf("cache-fused-cpu-persistent-pool: threads=%d\n", threads);
+            ok &= run_fused_cpu_fallbacks(cpu);
+            ok &= run_fused_alias_fallbacks(cpu);
+        }
+        attach(cpu, nullptr);
+        destroy(pool);
+        printf("cache-fused-cpu-persistent-pool: %s\n", ok ? "PASS" : "FAIL");
+        ggml_backend_free(cpu);
+        return ok ? 0 : 1;
+    }
     // Profile writer subprocesses must reach their rendezvous promptly. They
     // exercise profile I/O, not the parent's complete CPU fallback matrix.
     if (!profile_writer) {
