@@ -50,7 +50,7 @@ start_server() { # $1 = 0|1 (MMQ MoE env)
         --split-mode layer \
         --models-autoload \
         --parallel 2 \
-        -b 4096 -ub 4096 -fa 1 \
+        -b 2048 -ub 4096 -fa 1 \
         --jinja \
         --spec-draft-threads 3 \
         --cache-ram -1 \
@@ -102,18 +102,24 @@ run_scenario() { # $1=off|on $2=alias
         cp "$WORK/server-current.log" "$WORK/server-r5-$scenario-FAILED.log"
         kill_server; return
     fi
+    # refuse to measure on a degraded load (repeated buffer alloc failures)
+    if grep -aq 'cudaMalloc failed' "$WORK/server-current.log"; then
+        echo "| $scenario | $alias | LOAD_DEGRADED_OOM | | | | | |" >> "$RESULTS"
+        cp "$WORK/server-current.log" "$WORK/server-r5-$scenario-FAILED.log"
+        kill_server; return
+    fi
     # long prompt, 3 measured (uncached, cache-prompt off): prefill speed
     for i in 1 2 3; do
         row=$(measure "$sjl")
         set -- $row
-        echo "| $scenario-prefill | $alias | req$i | $1 | $2 | $3 | $4 | $5 |" >> "$RESULTS"
+        echo "| $scenario-prefill | $alias | req$i | ${1:-0} | ${2:-0} | ${3:-0} | ${4:-0} | ${5:-0} |" >> "$RESULTS"
     done
     # decode regression check on the same server (short prompt, spec on)
     curl -s -o /dev/null --max-time 600 -H 'Content-Type: application/json' -d @"$sjs" "http://127.0.0.1:$PORT/v1/chat/completions" || true
     for i in 1 2; do
         row=$(measure "$sjs")
         set -- $row
-        echo "| $scenario-decode | $alias | req$i | $1 | $2 | $3 | $4 | $5 |" >> "$RESULTS"
+        echo "| $scenario-decode | $alias | req$i | ${1:-0} | ${2:-0} | ${3:-0} | ${4:-0} | ${5:-0} |" >> "$RESULTS"
     done
     cp "$WORK/server-current.log" "$WORK/server-r5-$scenario.log"
     kill_server
