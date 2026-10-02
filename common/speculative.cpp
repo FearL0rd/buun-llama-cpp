@@ -2644,9 +2644,12 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         chain_heads   = n_mtp_layers > 1 && !is_mem_shared;
 
         const char * adaptive_env = getenv("GGML_MTP_DRAFT_ADAPTIVE");
-        adaptive_recursive_depth = n_mtp_layers == 1 && !is_mem_shared && this->params.n_max == 3 &&
+        // Qualified recursive caps retain backoff/recovery; a larger configured
+        // cap must not silently turn low-match prose into fixed-depth drafting.
+        adaptive_recursive_depth = n_mtp_layers == 1 && !is_mem_shared &&
+                                   this->params.n_max >= 3 && this->params.n_max <= 5 &&
                                    !(adaptive_env && atoi(adaptive_env) == 0);
-        adaptive.assign(n_seq, common_speculative_mtp_adaptive(this->params.n_min));
+        adaptive.assign(n_seq, common_speculative_mtp_adaptive(this->params.n_min, this->params.n_max));
         adaptive_last_draft_size.assign(n_seq, 0);
 
         if (chain_heads) {
