@@ -1702,7 +1702,9 @@ static bool moe_cache_prepare_budget(
     ggml_cuda_set_device(device.logical);
     size_t free_memory = 0;
     size_t total_memory = 0;
-    cudaError_t error = cudaMemGetInfo(&free_memory, &total_memory);
+    // Use the same physical VRAM accounting as model fitting on HIP, where
+    // hipMemGetInfo can overcharge small VMM mappings.
+    cudaError_t error = ggml_cuda_device_memory_info(device.logical, &free_memory, &total_memory);
     if (!moe_cache_cuda_ok(device, error, "memory query", false)) {
         device.dead.store(true);
         return false;

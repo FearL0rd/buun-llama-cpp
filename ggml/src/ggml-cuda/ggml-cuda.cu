@@ -8896,7 +8896,7 @@ static int ggml_cuda_physical_device_share_count(int device) {
     return info.devices[device].physical_share_count;
 }
 
-static cudaError_t ggml_cuda_device_memory_info(int device, size_t * free, size_t * total) {
+cudaError_t ggml_cuda_device_memory_info(int device, size_t * free, size_t * total) {
     ggml_cuda_set_device(device);
     const cudaError_t err = cudaMemGetInfo(free, total);
 #if defined(GGML_USE_HIP) && defined(__linux__)

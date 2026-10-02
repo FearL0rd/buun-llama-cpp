@@ -3809,12 +3809,14 @@ static bool run_shared_budget(
     size_t total_bytes = 0;
     ggml_backend_dev_memory(cuda->device, &free_bytes, &total_bytes);
     const size_t free_mib = free_bytes >> 20;
-    if (free_mib < 64) {
+    if (free_mib < 128) {
         printf("cache-shared-budget: SKIP (insufficient free VRAM)\n");
         return true;
     }
 
-    const std::string reserve = std::to_string(free_mib - 24);
+    // Leave enough headroom that a few MiB of driver/display allocation churn
+    // does not look like a broken claim split on a display-attached GPU.
+    const std::string reserve = std::to_string(free_mib - 64);
     set_env("GGML_CUDA_MOE_CACHE_BUDGET_MB", nullptr);
     set_env("GGML_CUDA_MOE_CACHE_RESERVE_MB", reserve.c_str());
     capture.clear();
@@ -3856,8 +3858,8 @@ static bool run_shared_budget(
     ggml_moe_cache.session_destroy(first);
 
     const std::string shared_log = capture.get();
-    const bool divided = count_field_at_least(shared_log, "granted=", 8) == 2 &&
-        max_field_value(shared_log, "granted=") <= 16;
+    const bool divided = count_field_at_least(shared_log, "granted=", 24) == 2 &&
+        max_field_value(shared_log, "granted=") <= 40;
 
     capture.clear();
     void * replacement = create_direct_session(cuda, cpu);
@@ -3871,10 +3873,10 @@ static bool run_shared_budget(
         ggml_moe_cache.session_destroy(replacement);
     }
     const std::string replacement_log = capture.get();
-    const bool released = max_field_value(replacement_log, "granted=") >= 20;
+    const bool released = max_field_value(replacement_log, "granted=") >= 56;
 
     capture.clear();
-    const std::string high_reserve = std::to_string(free_mib - 8);
+    const std::string high_reserve = std::to_string(free_mib - 16);
     set_env("GGML_CUDA_MOE_CACHE_RESERVE_MB", high_reserve.c_str());
     void * high = create_direct_session(cuda, cpu);
     set_env("GGML_CUDA_MOE_CACHE_RESERVE_MB", reserve.c_str());
