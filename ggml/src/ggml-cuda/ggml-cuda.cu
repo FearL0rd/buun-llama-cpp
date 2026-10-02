@@ -4013,6 +4013,9 @@ static bool ggml_cuda_is_view_or_noop(const ggml_tensor * t) {
 static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
 
     bool use_cuda_graph = true;
+    // Prefill-width splits are compute bound, so replay saves little, while each executable pins
+    // ~100 MiB of VRAM per distinct shape. Keep graphs for decode, verify and draft widths.
+    constexpr int64_t max_graph_tokens = 128;
     // Loop over nodes in GGML graph to obtain info needed for CUDA graph
 
     for (int i = 0; i < cgraph->n_nodes; i++) {
@@ -4020,6 +4023,11 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
 
         if (ggml_cuda_is_view_or_noop(node)) {
             continue;
+        }
+
+        if (node->op == GGML_OP_MUL_MAT && node->ne[1] > max_graph_tokens) {
+            use_cuda_graph = false;
+            break;
         }
 
         if (node->op == GGML_OP_MUL_MAT_ID) {
