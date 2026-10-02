@@ -4108,6 +4108,26 @@ static bool ggml_cuda_graph_update_required(
     return res;
 }
 
+// A large prefill executable holds ~100 MiB of device memory. When VRAM is fully committed (e.g. a
+// MoE cache sized to free memory), trade older cached executables for this one instead of aborting.
+static void ggml_cuda_graph_instantiate(ggml_backend_cuda_context * cuda_ctx, ggml_cuda_graph * graph) {
+    bool synced = false;
+    cudaError_t err;
+    while ((err = cudaGraphInstantiate(&graph->instance, graph->graph, NULL, NULL, 0)) == cudaErrorMemoryAllocation) {
+        (void) cudaGetLastError();
+        if (cuda_ctx->release_lru_cuda_graph_instance(graph)) {
+            continue;
+        }
+        if (synced) {
+            break;
+        }
+        // Executables destroyed while in flight are freed only when their launch completes.
+        CUDA_CHECK(cudaStreamSynchronize(cuda_ctx->stream()));
+        synced = true;
+    }
+    CUDA_CHECK(err);
+}
+
 static void ggml_cuda_graph_update_executable(ggml_backend_cuda_context * cuda_ctx, uint64_t graph_key) {
     ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
 
@@ -4130,7 +4150,7 @@ static void ggml_cuda_graph_update_executable(ggml_backend_cuda_context * cuda_c
         (void)cudaGetLastError();
         CUDA_CHECK(cudaGraphExecDestroy(graph->instance));
         graph->instance = nullptr;
-        CUDA_CHECK(cudaGraphInstantiate(&graph->instance, graph->graph, NULL, NULL, 0));
+        ggml_cuda_graph_instantiate(cuda_ctx, graph);
     } else {
         GGML_ASSERT(stat == cudaSuccess);
     }
@@ -8379,7 +8399,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
     if (use_cuda_graph) {
         ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
         if (graph->instance == nullptr) { // Create executable graph from captured graph.
-            CUDA_CHECK(cudaGraphInstantiate(&graph->instance, graph->graph, NULL, NULL, 0));
+            ggml_cuda_graph_instantiate(cuda_ctx, graph);
         }
         if (cuda_graph_update_required) { // Update graph executable
             ggml_cuda_graph_update_executable(cuda_ctx, graph_key);

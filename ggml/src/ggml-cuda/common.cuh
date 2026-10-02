@@ -1742,6 +1742,23 @@ struct ggml_backend_cuda_context {
         return it->second.get();
     }
 
+    // Destroys the least recently used executable other than keep; the entry recaptures on next use.
+    bool release_lru_cuda_graph_instance(const ggml_cuda_graph * keep) {
+        ggml_cuda_graph * lru = nullptr;
+        for (auto & [key, graph] : cuda_graphs) {
+            if (graph.get() != keep && graph->instance != nullptr &&
+                    (lru == nullptr || graph->last_used_time < lru->last_used_time)) {
+                lru = graph.get();
+            }
+        }
+        if (lru == nullptr) {
+            return false;
+        }
+        CUDA_CHECK(cudaGraphExecDestroy(lru->instance));
+        lru->instance = nullptr;
+        return true;
+    }
+
     // Check if any CUDA graph is enabled for this context (used by kernels that need to know
     // if graphs are in use without having access to the specific graph key)
     bool any_cuda_graph_enabled() const {
