@@ -851,7 +851,7 @@ static bool run_fused_cpu_fallbacks(ggml_backend_t cpu) {
                         ggml_backend_tensor_get(graph.out, actual.data(), 0, actual.size()*sizeof(float));
                         // Mixed hits can move an expert below the IQ panel's batch cutoff.
                         const bool match = compare_output(reference, actual, 1e-10);
-                        const bool cell_ok = match && fused_calls > 0 &&
+                        const bool cell_ok = match && fused_calls == 1 &&
                             (partial ? full_calls == 0 : full_calls > 0) && end_calls == fused_calls &&
                             (fail_dispatch ? collect_calls == 0 : collect_calls == fused_calls);
                         printf("cache-fused-cpu-%s-tokens%d-mask%llx-pair%d-failure%d: %s\n", ggml_type_name(type),
@@ -4219,6 +4219,200 @@ static bool run_stream_staging_case(ggml_backend_dev_t dev,
             GGML_ASSERT(mask == ((1ULL << R) - 1) && collect(node, mask, ref));
             ggml_moe_cache.end(node);
             stop(s);
+            if (round == 0 && ggml_moe_cache.output_supported) {
+                auto hc = ggml_init({2*ggml_tensor_overhead(), nullptr, true});
+                auto dc = ggml_init({2*ggml_tensor_overhead(), nullptr, true});
+                auto source = ggml_new_tensor_2d(hc, GGML_TYPE_F32, K, R);
+                source->op = GGML_OP_MUL_MAT_ID;
+                auto destination = ggml_dup_tensor(dc, source);
+                auto hb = ggml_backend_alloc_ctx_tensors_from_buft(hc, buft);
+                auto db = ggml_backend_alloc_ctx_tensors(dc, gpu);
+                GGML_ASSERT(hb && db);
+                ggml_backend_buffer_set_usage(db, GGML_BACKEND_BUFFER_USAGE_COMPUTE);
+                if (ggml_moe_cache.output_supported(gpu, source)) {
+                    // Scatter a subset into nonconsecutive destination rows;
+                    // untouched rows model completed CPU misses. Poison host
+                    // hit rows so an accidental whole upload cannot pass.
+                    for (int pattern : {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10}) {
+                        s = start(pattern == 4 ? "collect" : pattern == 5 ? "dispatch" :
+                                pattern == 6 ? "collect-retire" : nullptr);
+                        for (int j = 0; j < topk; ++j) warm(ids[j]);
+                        ggml_backend_tensor_set(source, ref.data(), 0, ggml_nbytes(source));
+                        std::vector<float> poison(ref.size(), -12345.f), actual(ref.size());
+                        ggml_backend_tensor_set_async(gpu, destination, poison.data(), 0, ggml_nbytes(destination));
+                        ggml_backend_synchronize(gpu);
+                        const bool bound = ggml_moe_cache.output_bind(s, gpu, source, destination);
+                        bool pass = bound;
+                        std::vector<int32_t> selected_ids;
+                        std::vector<const float *> selected_acts;
+                        std::vector<float *> selected_outputs;
+                        for (int r = 0; r < R; ++r) {
+                            if (pattern == 0 || (pattern == 1 && r % 3 != 1) || (pattern == 2 && r != R-1)) continue;
+                            selected_ids.push_back(ids[r]);
+                            selected_acts.push_back(rows[r]);
+                            selected_outputs.push_back((float *) source->data + r*K);
+                            std::fill_n(selected_outputs.back(), K, -23456.f);
+                        }
+                        bool collected = false, dispatched = false;
+                        uint64_t selected_mask = 0;
+                        if (!selected_ids.empty()) {
+                            auto job = ggml_moe_cache.fused_plan(&ud, &gd, &dd, GGML_GLU_OP_SWIGLU,
+                                    -inf, inf, -inf, inf, selected_ids.data(), selected_ids.size(), 1,
+                                    selected_acts.data(), &selected_mask);
+                            pass &= job && selected_mask == ((UINT64_C(1) << selected_ids.size()) - 1);
+                            dispatched = job && ggml_moe_cache.fused_dispatch(job);
+                            collected = dispatched && ggml_moe_cache.collect(job, selected_ids.size(), selected_outputs.data(), K);
+                            if (job) ggml_moe_cache.end(job);
+                            pass &= collected == (pattern < 4 || pattern >= 6);
+                        }
+                        if (pattern == 4 || pattern == 5) {
+                            // Existing CPU failure retry fills all host rows.
+                            ggml_backend_tensor_set(source, ref.data(), 0, ggml_nbytes(source));
+                        }
+                        if (pattern == 7) {
+                            // Retained source lease must drain before invalidation.
+                            ggml_moe_cache.invalidate(up->data, ggml_nbytes(up));
+                        }
+                        if (pattern == 8) {
+                            // A nested scope cannot strand a previous owner.
+                            ggml_moe_cache.session_enter(nullptr);
+                            ggml_moe_cache.session_leave(nullptr);
+                        }
+                        if (pattern == 9) {
+                            // Abandon the scheduler scope before its copy door.
+                            // Shutdown must still retire leases and slot readers.
+                            ggml_moe_cache.session_leave(s);
+                        }
+                        std::atomic<bool> invalidating{false}, invalidated{false};
+                        std::thread invalidator;
+                        if (pattern == 10 && collected) {
+                            // The parked composite must retain its source lease,
+                            // then retire without acquiring the registry mutex
+                            // held by a concurrent invalidator waiting on it.
+                            invalidator = std::thread([&] {
+                                invalidating.store(true);
+                                ggml_moe_cache.invalidate(up->data, ggml_nbytes(up));
+                                invalidated.store(true);
+                            });
+                            while (!invalidating.load()) std::this_thread::yield();
+                            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+                            pass &= !invalidated.load();
+                        }
+                        const int copied = ggml_moe_cache.output_copy(s, gpu, source, destination);
+                        if (invalidator.joinable()) {
+                            invalidator.join();
+                            pass &= invalidated.load();
+                        }
+                        pass &= copied == (pattern == 6 ? -1 : pattern == 9 ? 0 : int(collected));
+                        if (copied == 0 && pattern != 9) ggml_backend_tensor_copy(source, destination);
+                        // Drain output_copy's consumer-stream uploads before the
+                        // buffer read, which also orders after the fallback copy.
+                        ggml_backend_synchronize(gpu);
+                        ggml_backend_tensor_get(destination, actual.data(), 0, ggml_nbytes(destination));
+                        pass &= std::memcmp(actual.data(), ref.data(), ggml_nbytes(source)) == 0;
+                        pass &= !ggml_moe_cache.output_copy(s, gpu, source, destination);
+                        if (!pass) {
+                            size_t different = 0, first = actual.size();
+                            for (size_t i = 0; i < actual.size(); ++i) {
+                                if (std::memcmp(&actual[i], &ref[i], sizeof(float))) {
+                                    first = std::min(first, i);
+                                    ++different;
+                                }
+                            }
+                            printf("cache-device-output-detail: bound=%d selected=%zu mask=%llx dispatched=%d collected=%d copied=%d different=%zu",
+                                    bound, selected_ids.size(), (unsigned long long) selected_mask,
+                                    dispatched, collected, copied, different);
+                            if (different) printf(" first=%zu expected=%a actual=%a", first, double(ref[first]), double(actual[first]));
+                            printf("\n");
+                        }
+                        printf("cache-device-output: pinned=%d tokens=%d down=%s pattern=%d %s\n",
+                                pinned, T, dedicated_down ? dedicated_down : "auto", pattern, pass ? "OK" : "FAIL");
+                        ok &= pass;
+                        stop(s);
+                    }
+                    // No active owner, host destination, and views must refuse.
+                    ok &= !ggml_moe_cache.output_bind(nullptr, gpu, source, destination);
+                    s = start();
+                    ok &= !ggml_moe_cache.output_bind(s, gpu, source, source);
+                    auto view = *source;
+                    view.view_src = source;
+                    ok &= !ggml_moe_cache.output_bind(s, gpu, &view, destination);
+                    stop(s);
+
+                    // Actual scheduler boundary: CPU full-FFN producer followed
+                    // by a GPU consumer. Four CPU workers must finish their
+                    // misses before the complementary upload is submitted.
+                    for (int run = 0; run < 16; ++run) {
+                        // Recreate each graph/session twice rather than relying
+                        // on a pointer-stable binding across evaluations.
+                        const int scenario = run % 8;
+                        const char * fail = scenario == 1 ? "dispatch" : scenario == 2 ? "collect" :
+                                scenario == 7 ? "collect-retire" : nullptr;
+                        configure_cache(fail, "4", "1", "40", dedicated_down);
+                        auto ic = ggml_init({4*ggml_tensor_overhead(), nullptr, true});
+                        auto input = ggml_new_tensor_3d(ic, GGML_TYPE_F32, K, 1, T);
+                        auto routes_tensor = ggml_new_tensor_2d(ic, GGML_TYPE_I32, topk, T);
+                        auto ib = ggml_backend_alloc_ctx_tensors(ic, cpu);
+                        GGML_ASSERT(ib);
+                        ggml_set_input(input);
+                        ggml_set_input(routes_tensor);
+                        ggml_backend_tensor_set(input, acts.data(), 0, ggml_nbytes(input));
+                        ggml_backend_tensor_set(routes_tensor, ids.data(), 0, ggml_nbytes(routes_tensor));
+                        auto gc = ggml_init({16*ggml_tensor_overhead()+ggml_graph_overhead(), nullptr, true});
+                        auto gu = ggml_mul_mat_id(gc, up, input, routes_tensor);
+                        auto gg = ggml_mul_mat_id(gc, gate, input, routes_tensor);
+                        auto glu = ggml_swiglu_split(gc, gg, gu);
+                        auto gd = ggml_mul_mat_id(gc, down, glu, routes_tensor);
+                        auto result = ggml_scale(gc, gd, .5f);
+                        if (scenario == 3) ggml_set_input(gd);
+                        if (scenario == 4) ggml_set_output(gd);
+                        ggml_set_output(result);
+                        auto graph = ggml_new_graph(gc);
+                        ggml_build_forward_expand(graph, result);
+                        ggml_backend_t backends[] = {gpu, cpu};
+                        auto sched = ggml_backend_sched_new(backends, nullptr, 2, GGML_DEFAULT_GRAPH_SIZE, scenario == 5, false);
+                        if (scenario == 6) {
+                            ggml_backend_sched_set_eval_callback(sched,
+                                    [](ggml_tensor *, bool, void *) { return true; }, nullptr);
+                        }
+                        ggml_backend_sched_set_tensor_backend(sched, gu, cpu);
+                        ggml_backend_sched_set_tensor_backend(sched, gg, cpu);
+                        ggml_backend_sched_set_tensor_backend(sched, glu, cpu);
+                        ggml_backend_sched_set_tensor_backend(sched, gd, cpu);
+                        ggml_backend_sched_set_tensor_backend(sched, result, gpu);
+                        bool pass = ggml_backend_sched_alloc_graph(sched, graph);
+                        std::vector<float> expected = ref, actual(ref.size());
+                        for (auto & v : expected) v *= .5f;
+                        int deferred_failures = 0;
+                        for (int step = 0; pass && step < 96; ++step) {
+                            const auto status = ggml_backend_sched_graph_compute(sched, graph);
+                            if (scenario == 7 && status == GGML_STATUS_FAILED) {
+                                ++deferred_failures;
+                                continue;
+                            }
+                            pass &= status == GGML_STATUS_SUCCESS;
+                            ggml_backend_tensor_get(result, actual.data(), 0, ggml_nbytes(result));
+                            pass &= compare_output(expected, actual, 5e-4);
+                            if (scenario == 4) {
+                                ggml_backend_tensor_get(gd, actual.data(), 0, ggml_nbytes(gd));
+                                pass &= compare_output(ref, actual, 5e-4);
+                            }
+                        }
+                        if (scenario == 7) pass &= deferred_failures > 0;
+                        printf("cache-device-output-scheduler: pinned=%d tokens=%d scenario=%d failure=%s %s\n",
+                                pinned, T, scenario, fail ? fail : "none", pass ? "OK" : "FAIL");
+                        ok &= pass;
+                        ggml_backend_sched_free(sched);
+                        ggml_free(gc);
+                        ggml_backend_buffer_free(ib);
+                        ggml_free(ic);
+                    }
+                }
+                ggml_backend_buffer_free(db);
+                ggml_backend_buffer_free(hb);
+                ggml_free(dc);
+                ggml_free(hc);
+            }
             {
                 s = start();
                 warm(0);
@@ -4427,8 +4621,8 @@ static bool run_stream_staging(ggml_backend_dev_t device,
     if (!ggml_moe_cache.query_config(0, 4, &config) || !ggml_moe_cache.query_device(device, &config, &caps)) {
         return false;
     }
-    if (caps.compute_capability != 1200) {
-        printf("cache-stream-stage: SKIP (requires consumer SM120)\n");
+    if (caps.compute_capability != 860 && caps.compute_capability != 1200) {
+        printf("cache-stream-stage: SKIP (requires SM86 or SM120)\n");
         return true;
     }
     bool ok = true;
@@ -4505,6 +4699,47 @@ static bool run_prefill_copy_type(ggml_backend_dev_t dev, ggml_backend_t gpu, gg
                 break;
             }
         }
+        if (!pinned && ggml_moe_cache.prefetch_supported) {
+            check(!ggml_moe_cache.prefetch_supported(gpu, source), "lookahead pageable allocation refusal");
+        }
+        if (ggml_moe_cache.prefetch_supported && ggml_moe_cache.prefetch_supported(gpu, source)) {
+            for (int repeat = 0; repeat < 3; ++repeat) {
+                ggml_backend_tensor_set_async(gpu, destination, sentinel.data(), 0, bytes);
+                ggml_backend_synchronize(gpu);
+                auto job = ggml_moe_cache.prefetch_begin(session, gpu, source, destination, nullptr, 0);
+                check(bool(job) == pinned, "lookahead pinned admission");
+                if (job) check(ggml_moe_cache.prefetch_end(job), "lookahead completion");
+                ggml_backend_tensor_get(destination, actual.data(), 0, bytes);
+                check(actual == (pinned ? input : sentinel), "lookahead full bytes");
+            }
+            check(!ggml_moe_cache.prefetch_begin(nullptr, gpu, source, destination, nullptr, 0), "lookahead null session");
+            const uint32_t short_mask[] = {1};
+            check(!ggml_moe_cache.prefetch_begin(session, gpu, source, destination, short_mask, 1), "lookahead short bitset");
+            for (uint32_t pattern = 0; pinned && ready && pattern < 258; ++pattern) {
+                const uint32_t selected[2] = {
+                    pattern < 256 ? pattern : pattern == 257 ? UINT32_MAX : 0,
+                    pattern == 256 ? uint32_t(1) << 31 : pattern == 257 ? UINT32_MAX : 0};
+                const auto used = [&](int e) { return (selected[e/32] >> (e%32)) & 1u; };
+                ggml_backend_tensor_set_async(gpu, destination, sentinel.data(), 0, bytes);
+                ggml_backend_synchronize(gpu);
+                auto job = ggml_moe_cache.prefetch_begin(session, gpu, source, destination, selected, 2);
+                check(job != nullptr, "lookahead selected admission");
+                if (job) check(ggml_moe_cache.prefetch_end(job), "lookahead selected completion");
+                expected = sentinel;
+                for (int e=0;e<64;++e) {
+                    if (!used(e)) continue;
+                    std::memcpy(expected.data()+e*expert,input.data()+e*expert,expert);
+                    if (e+1<64 && !used(e+1)) {
+                        std::memcpy(expected.data()+(e+1)*expert,input.data()+(e+1)*expert,512);
+                    }
+                }
+                ggml_backend_tensor_get(destination,actual.data(),0,bytes);
+                check(actual == expected, "lookahead selected bytes and padding");
+                if (!ok) break;
+            }
+            check(!ggml_moe_cache.prefetch_supported(cpu, source), "lookahead CPU refusal");
+            printf("cache-prefetch: pinned=%d repeated=3 %s\n", int(pinned), ok ? "OK" : "FAIL");
+        }
         const uint32_t mask[2] = {15, 0};
         ggml_backend_tensor_set_async(gpu, destination, sentinel.data(), 0, bytes);
         ggml_backend_synchronize(gpu);
@@ -4528,6 +4763,26 @@ static bool run_prefill_copy_type(ggml_backend_dev_t dev, ggml_backend_t gpu, gg
         check(!ggml_moe_cache.prefill_copy(session, gpu, source, destination, mask, 2), "invalidated source");
         ggml_backend_tensor_get(destination, actual.data(), 0, bytes);
         check(actual == sentinel, "untouched refusals");
+        if (pinned && ggml_moe_cache.prefetch_supported && ggml_moe_cache.prefetch_supported(gpu, source)) {
+            auto job = ggml_moe_cache.prefetch_begin(session, gpu, source, destination, nullptr, 0);
+            check(job != nullptr, "lookahead invalidated-source copy");
+            if (job) {
+                std::atomic<bool> entered{false}, completed{false};
+                std::thread invalidate([&] {
+                    entered.store(true, std::memory_order_release);
+                    ggml_moe_cache.invalidate(source->data, bytes);
+                    completed.store(true, std::memory_order_release);
+                });
+                while (!entered.load(std::memory_order_acquire)) std::this_thread::yield();
+                std::this_thread::sleep_for(std::chrono::milliseconds(2));
+                check(!completed.load(std::memory_order_acquire), "lookahead source lease");
+                check(ggml_moe_cache.prefetch_end(job), "lookahead release under invalidation");
+                invalidate.join();
+                check(completed.load(std::memory_order_acquire), "lookahead invalidation completes");
+                ggml_backend_tensor_get(destination, actual.data(), 0, bytes);
+                check(actual == input, "lookahead post-invalidation bytes");
+            }
+        }
         ggml_moe_cache.session_leave(session);
         ggml_moe_cache.session_destroy(session);
         ggml_backend_buffer_free(gpu_buffer);
@@ -4639,6 +4894,7 @@ static bool run_prefill_copy_multi(ggml_backend_dev_t dev, ggml_backend_t gpu, g
 int main(int argc, char ** argv) {
     const bool profile_writer = argc == 6 && std::strcmp(argv[1], "--profile-writer") == 0;
     const bool host_buffer = argc == 2 && std::strcmp(argv[1], "--host-buffer") == 0;
+    const bool persistent_pool = argc == 2 && std::strcmp(argv[1], "--cpu-persistent-pool") == 0;
     if (!run_pool_limits()) return 1;
     if (argc > 0 && argv[0]) {
         std::error_code ec;
@@ -4650,7 +4906,10 @@ int main(int argc, char ** argv) {
     log_capture capture;
     ggml_log_set(log_callback, &capture);
 
-    ggml_backend_dev_t cuda_device = find_cuda_device();
+    if (persistent_pool) {
+        ggml_backend_load_all();
+    }
+    ggml_backend_dev_t cuda_device = persistent_pool ? nullptr : find_cuda_device();
     ggml_backend_t cpu = init_cpu_backend();
     if (!cpu) {
         fprintf(stderr, "failed to initialize CPU backend\n");
@@ -4658,6 +4917,32 @@ int main(int argc, char ** argv) {
     }
     auto set_n_threads = (ggml_backend_set_n_threads_t) ggml_backend_reg_get_proc_address(
             ggml_backend_dev_backend_reg(ggml_backend_get_device(cpu)), "ggml_backend_set_n_threads");
+    if (persistent_pool) {
+        const auto reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(cpu));
+        const auto create = (ggml_threadpool * (*)(ggml_threadpool_params *))
+            ggml_backend_reg_get_proc_address(reg, "ggml_threadpool_new");
+        const auto destroy = (void (*)(ggml_threadpool *))
+            ggml_backend_reg_get_proc_address(reg, "ggml_threadpool_free");
+        const auto attach = (void (*)(ggml_backend_t, ggml_threadpool *))
+            ggml_backend_reg_get_proc_address(reg, "ggml_backend_cpu_set_threadpool");
+        GGML_ASSERT(create && destroy && attach && set_n_threads);
+        auto params = ggml_threadpool_params_default(6);
+        auto * pool = create(&params);
+        GGML_ASSERT(pool);
+        attach(cpu, pool);
+        bool ok = true;
+        for (int threads : { 1, 2, 4, 6, 4, 2, 1 }) {
+            set_n_threads(cpu, threads);
+            printf("cache-fused-cpu-persistent-pool: threads=%d\n", threads);
+            ok &= run_fused_cpu_fallbacks(cpu);
+            ok &= run_fused_alias_fallbacks(cpu);
+        }
+        attach(cpu, nullptr);
+        destroy(pool);
+        printf("cache-fused-cpu-persistent-pool: %s\n", ok ? "PASS" : "FAIL");
+        ggml_backend_free(cpu);
+        return ok ? 0 : 1;
+    }
     // Profile writer subprocesses must reach their rendezvous promptly. They
     // exercise profile I/O, not the parent's complete CPU fallback matrix.
     if (!profile_writer) {

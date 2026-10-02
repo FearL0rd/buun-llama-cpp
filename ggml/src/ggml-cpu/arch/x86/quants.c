@@ -795,10 +795,16 @@ void ggml_vec_dot_q2_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const voi
 #endif
 }
 
-#if defined(__AVX512VBMI__) && defined(__AVX512VNNI__) && defined(__AVX512VL__)
+#if defined(__AVX2__)
 static inline __m256i q2_0_codes_dot(__m256i codes, const int8_t * act) {
+#if defined(__AVX512VNNI__) && defined(__AVX512VL__)
     return _mm256_dpbusd_epi32(_mm256_setzero_si256(), codes,
             _mm256_loadu_si256((const __m256i *) act));
+#else
+    // Codes are in [0, 3], so the signed 16-bit pair sums cannot saturate.
+    return _mm256_madd_epi16(_mm256_maddubs_epi16(codes,
+            _mm256_loadu_si256((const __m256i *) act)), _mm256_set1_epi16(1));
+#endif
 }
 
 struct q2_0_prepared_act {

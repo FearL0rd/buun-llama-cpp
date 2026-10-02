@@ -2973,8 +2973,13 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                             common_token_to_piece(ctx_dft, cur_p->data[k].id).c_str());
                 }
 
-                // only collect very high-confidence draft tokens
-                if (cur_p->data[0].p < params.p_min) {
+                // For separate-cache greedy MTP, confidence stops the next
+                // draft step. Keep the proposal already computed for target
+                // verification; shared, chained and sampled proposals retain
+                // their existing admission policy.
+                const bool stop_after_proposal = cur_p->data[0].p < params.p_min &&
+                    !is_mem_shared && !chain_heads && proposal_sampling[seq_id].top_k == 0;
+                if (cur_p->data[0].p < params.p_min && !stop_after_proposal) {
                     drafting[seq_id] = false;
                     n_drafting--;
 
@@ -3002,7 +3007,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 if (dp.n_max > 0) {
                     n_max_eff = std::min(n_max_eff, dp.n_max);
                 }
-                if (n_max_eff <= (int) result.size()) {
+                if (stop_after_proposal || n_max_eff <= (int) result.size()) {
                     drafting[seq_id] = false;
                     n_drafting--;
                     continue;

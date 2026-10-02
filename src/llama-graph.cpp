@@ -1,8 +1,10 @@
 #include "llama-graph.h"
 
 #include "ggml-turbo-meansub.h"
+#include "../ggml/src/ggml-backend-moe-cache.h"
 #include "llama-impl.h"
 #include "llama-model.h"
+#include "llama-moe-routing.h"
 #include "llama-batch.h"
 #include "llama-context.h"
 #include "llama-cparams.h"
@@ -2664,6 +2666,15 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     //call early so that topk-moe can be used
     ggml_build_forward_expand(gf, weights);
 
+    // Keep top-k and weight normalization adjacent for backend fusion, then
+    // pack the narrow routing view before expert offload downloads it. This
+    // uses the ordinary CONT operation rather than backend-specific transfers.
+    if (llama_moe_ids_need_compaction(selected_experts, n_tokens,
+            ggml_backend_sched_has_moe_cache(sched), { up_exps, gate_exps, down_exps, gate_up_exps })) {
+        selected_experts = ggml_cont(ctx0, selected_experts);
+        cb(selected_experts, "ffn_moe_topk_cont", il);
+    }
+
     cur = ggml_reshape_3d(ctx0, cur, n_embd, 1, n_tokens);
 
     if (weight_before_ffn) {
@@ -3436,11 +3447,14 @@ ggml_tensor * llm_graph_context::build_attn(
         ggml_tensor * v_mla, // TODO: remove
             float     kq_scale,
             int       il,
-        ggml_tensor * wo_in_s) const {
+        ggml_tensor * wo_in_s,
+               bool   kv_only) const {
     GGML_ASSERT(v_mla == nullptr);
 
     if (inp->self_k_rot) {
-        q_cur = llama_mul_mat_hadamard(ctx0, q_cur, inp->self_k_rot);
+        if (!kv_only) {
+            q_cur = llama_mul_mat_hadamard(ctx0, q_cur, inp->self_k_rot);
+        }
         k_cur = llama_mul_mat_hadamard(ctx0, k_cur, inp->self_k_rot);
     }
 
@@ -3451,7 +3465,9 @@ ggml_tensor * llm_graph_context::build_attn(
     // these nodes are added to the graph together so that they are not reordered
     // by doing so, the number of splits in the graph is reduced
     // expand k later to enable rope fusion which directly writes into k-v cache
-    ggml_build_forward_expand(gf, q_cur);
+    if (!kv_only) {
+        ggml_build_forward_expand(gf, q_cur);
+    }
     ggml_build_forward_expand(gf, v_cur);
     ggml_build_forward_expand(gf, k_cur);
 
@@ -3464,6 +3480,10 @@ ggml_tensor * llm_graph_context::build_attn(
 
         ggml_build_forward_expand(gf, mctx_cur->cpy_k(ctx0, k_cur, k_idxs, il));
         ggml_build_forward_expand(gf, mctx_cur->cpy_v(ctx0, v_cur, v_idxs, il));
+    }
+
+    if (kv_only) {
+        return nullptr;
     }
 
     ggml_tensor * kq_mask = inp->get_kq_mask();
