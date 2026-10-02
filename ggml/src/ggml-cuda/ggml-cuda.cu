@@ -6965,6 +6965,22 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         }
     }
 
+    // Segmented rotations already have the transform width, without a reshape.
+    // Read their strided activation views directly during the signed FWHT.
+    if (ggml_can_fuse_subgraph(cgraph, i, { GGML_OP_MUL, GGML_OP_MUL_MAT }, { i + 1 })) {
+        ggml_tensor * mm = cgraph->nodes[i + 1];
+        const ggml_tensor * x = node->src[0];
+        const ggml_tensor * signs = node->src[1];
+        const int output = i + 1;
+        if (mm->src[1] == node && ggml_get_op_params_i32(mm, 1) == GGML_HINT_SRC0_IS_HADAMARD &&
+            signs->ne[0] == x->ne[0] && ggml_nelements(signs) == x->ne[0] &&
+            ggml_are_same_shape(x, mm) && node->type == x->type &&
+            ggml_cuda_check_fusion_memory_ranges(cgraph, i, 2, &output, 1) &&
+            ggml_cuda_op_fwht_signed(*cuda_ctx, x, signs, mm)) {
+            return 1;
+        }
+    }
+
     // Hadamard sign flip + reshape + FWHT-hint matmul: multiply the sign
     // vector during the transform's load instead of a separate full pass
     if (ggml_can_fuse_subgraph(cgraph, i, { GGML_OP_MUL, GGML_OP_RESHAPE, GGML_OP_MUL_MAT }, { i + 2 })) {

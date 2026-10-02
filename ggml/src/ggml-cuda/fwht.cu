@@ -45,7 +45,8 @@ __device__ __forceinline__ float fwht_load<half>(const half value) {
 template <int N, typename T, bool has_signs>
 __launch_bounds__(4*ggml_cuda_get_physical_warp_size(), 1)
 __global__ void fwht_cuda(const T * src, float * dst, const int64_t n_rows, const float scale,
-                          const float * signs, const int n_blk) {
+                          const float * signs, const int n_blk, const int src_blocks,
+                          const int64_t src_row_stride) {
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
 
     const int64_t r = (int64_t) blockIdx.x * blockDim.y + threadIdx.y;
@@ -54,7 +55,8 @@ __global__ void fwht_cuda(const T * src, float * dst, const int64_t n_rows, cons
         return;
     }
 
-    src += r * N;
+    src += src_row_stride == int64_t(src_blocks) * N ? r * N :
+        (r / src_blocks) * src_row_stride + (r % src_blocks) * N;
     dst += r * N;
 
     static constexpr int el_w = N / warp_size;
@@ -87,7 +89,8 @@ __global__ void fwht_cuda(const T * src, float * dst, const int64_t n_rows, cons
 template <typename T>
 static bool fwht_launch(ggml_backend_cuda_context & ctx, const T * src_d, float * dst_d,
                         const int n, const int64_t rows, const float scale,
-                        const float * signs, const int n_blk) {
+                        const float * signs, const int n_blk, const int src_blocks,
+                        const int64_t src_row_stride) {
     const int warp_size = ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size;
     const int rows_per_block = 4;
     const int64_t num_blocks = (rows + rows_per_block - 1) / rows_per_block;
@@ -101,9 +104,9 @@ static bool fwht_launch(ggml_backend_cuda_context & ctx, const T * src_d, float 
 #define FWHT_CASE(NN) \
         case NN: \
             if (signs) { \
-                ggml_cuda_kernel_launch(fwht_cuda<NN, T, true>,  launch_params, src_d, dst_d, rows, scale, signs, n_blk); \
+                ggml_cuda_kernel_launch(fwht_cuda<NN, T, true>,  launch_params, src_d, dst_d, rows, scale, signs, n_blk, src_blocks, src_row_stride); \
             } else { \
-                ggml_cuda_kernel_launch(fwht_cuda<NN, T, false>, launch_params, src_d, dst_d, rows, scale, nullptr, 1); \
+                ggml_cuda_kernel_launch(fwht_cuda<NN, T, false>, launch_params, src_d, dst_d, rows, scale, nullptr, 1, src_blocks, src_row_stride); \
             } \
             return true;
         FWHT_CASE(64)
@@ -121,11 +124,21 @@ static bool fwht_launch(ggml_backend_cuda_context & ctx, const T * src_d, float 
 static bool fwht_dispatch(ggml_backend_cuda_context & ctx, const ggml_tensor * src, ggml_tensor * dst,
                           const ggml_tensor * signs_t) {
     GGML_ASSERT(ggml_nelements(src) == ggml_nelements(dst));
-    if (!ggml_is_contiguous(src) || !ggml_is_contiguous(dst)) {
+    // Segment views have contiguous elements but skip the other segments
+    // between rows. Higher-dimensional strided layouts keep the fallback.
+    if ((!ggml_is_contiguous(src) &&
+            (src->ne[2] != 1 || src->ne[3] != 1 || src->nb[0] != ggml_type_size(src->type))) ||
+        !ggml_is_contiguous(dst)) {
         return false;
     }
     const int     n    = dst->ne[0];
     const int64_t rows = ggml_nelements(dst) / n;
+
+    if (src->ne[0] % n != 0) {
+        return false;
+    }
+    const int src_blocks = src->ne[0] / n;
+    const int64_t src_row_stride = src->nb[1] / ggml_type_size(src->type);
 
     if ((src->type != GGML_TYPE_F32 && src->type != GGML_TYPE_F16) || dst->type != GGML_TYPE_F32) {
         return false;
@@ -145,9 +158,11 @@ static bool fwht_dispatch(ggml_backend_cuda_context & ctx, const ggml_tensor * s
     const float scale = 1 / sqrtf(n);
 
     if (src->type == GGML_TYPE_F32) {
-        return fwht_launch<float>(ctx, (const float *) src->data, dst_d, n, rows, scale, signs, n_blk);
+        return fwht_launch<float>(ctx, (const float *) src->data, dst_d, n, rows, scale, signs, n_blk,
+                                  src_blocks, src_row_stride);
     }
-    return fwht_launch<half>(ctx, (const half *) src->data, dst_d, n, rows, scale, signs, n_blk);
+    return fwht_launch<half>(ctx, (const half *) src->data, dst_d, n, rows, scale, signs, n_blk,
+                             src_blocks, src_row_stride);
 }
 
 bool ggml_cuda_op_fwht(ggml_backend_cuda_context & ctx, const ggml_tensor * src, ggml_tensor * dst) {
