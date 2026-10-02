@@ -15,6 +15,7 @@ static bool check(ggml_backend_t backend, const std::vector<int> & blocks, int r
     for (int n : blocks) width += n;
     auto * ctx = ggml_init({ 2*1024*1024, nullptr, true });
     auto * storage = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, width + (strided ? 32 : 0), rows);
+    ggml_set_input(storage);
     auto * input = ggml_view_2d(ctx, storage, width, rows, storage->nb[1], 0);
     std::vector<float> data(ggml_nelements(storage)), reference(width*rows);
     for (size_t i = 0; i < data.size(); ++i) data[i] = std::sin(float(i)*0.017f);
@@ -54,6 +55,7 @@ static bool check(ggml_backend_t backend, const std::vector<int> & blocks, int r
         offset += n;
     }
     auto * output = llama_hadamard_segments_apply(ctx, input, transform);
+    ggml_set_output(output);
     auto * graph = ggml_new_graph(ctx);
     ggml_build_forward_expand(graph, output);
     auto * buffer = ggml_backend_alloc_ctx_tensors(ctx, backend);
@@ -88,7 +90,7 @@ int main() {
         auto * backend = ggml_backend_dev_init(ggml_backend_dev_get(d), nullptr);
         GGML_ASSERT(backend);
         for (const auto & blocks : {std::vector<int>{1024,1024,512}, std::vector<int>{512,128}, std::vector<int>{128}}) {
-            for (int rows : {1,4,20}) {
+            for (int rows : {1,3,4,20}) {
                 for (bool strided : {false,true}) ok &= check(backend, blocks, rows, strided);
             }
         }
