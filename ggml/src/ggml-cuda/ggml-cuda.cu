@@ -4213,8 +4213,14 @@ static bool ggml_cuda_should_fuse_rms_norm_mul_rope(const ggml_tensor * rms_norm
         return false;
     }
 
+    // a reshape between mul and rope only regroups rows when everything is contiguous and the weight is one row
     if (rope->src[0] != mul) {
-        return false;
+        const ggml_tensor * shape = rope->src[0];
+        const ggml_tensor * weight = mul->src[0] == rms_norm ? mul->src[1] : mul->src[0];
+        if (shape->op != GGML_OP_RESHAPE || shape->src[0] != mul || shape->ne[0] != mul->ne[0] ||
+                !ggml_is_contiguous(rms_norm->src[0]) || !ggml_is_contiguous(mul) || ggml_nrows(weight) != 1) {
+            return false;
+        }
     }
 
     //if rms norm is the B operand, then we don't handle broadcast
@@ -5510,6 +5516,21 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
 
         if (ggml_cuda_should_fuse_rms_norm_mul_rope(rms_norm, mul, rope)) {
             int out_nodes[] = { node_idx + 2 };
+            return ggml_cuda_check_fusion_memory_ranges(cgraph, node_idx, (int)ops.size(), out_nodes, 1);
+        }
+        return false;
+    }
+
+    std::initializer_list<enum ggml_op> rms_norm_mul_reshape_rope_ops = { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_RESHAPE, GGML_OP_ROPE };
+
+    if (is_equal(rms_norm_mul_reshape_rope_ops, ops) && ggml_can_fuse_subgraph(cgraph, node_idx, ops, { node_idx + 3 })) {
+        const ggml_tensor * rms_norm = cgraph->nodes[node_idx];
+        const ggml_tensor * mul      = cgraph->nodes[node_idx + 1];
+        const ggml_tensor * rope     = cgraph->nodes[node_idx + 3];
+
+        if (ggml_check_edges(cgraph, node_idx, {{1, 0, 0}, {2, 0, 1}, {3, 0, 2}}) &&
+            ggml_cuda_should_fuse_rms_norm_mul_rope(rms_norm, mul, rope)) {
+            int out_nodes[] = { node_idx + 3 };
             return ggml_cuda_check_fusion_memory_ranges(cgraph, node_idx, (int)ops.size(), out_nodes, 1);
         }
         return false;
@@ -8053,6 +8074,11 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ROPE }, {})) {
         ggml_cuda_op_rms_norm_mul_rope_fused(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2], nullptr);
         return 2;
+    }
+
+    if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_RESHAPE, GGML_OP_ROPE }, {})) {
+        ggml_cuda_op_rms_norm_mul_rope_fused(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 3], nullptr);
+        return 3;
     }
 
     // Gated RMS normalization: preserve the original per-row reduction and

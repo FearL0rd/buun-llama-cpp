@@ -2995,6 +2995,58 @@ struct test_rms_norm_mul_rope : public test_case {
     }
 };
 
+// qwen4exp QSA pooled keys: norm rows laid out as [dim, n, 1], regrouped to one head per position for rope
+struct test_rms_norm_mul_reshape_rope : public test_case {
+    const int64_t dim;
+    const int64_t n;
+    const int mode;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "RMS_NORM_MUL_RESHAPE_ROPE";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override {
+        return VARS_TO_STR3(dim, n, mode);
+    }
+
+    test_rms_norm_mul_reshape_rope(int64_t dim, int64_t n, int mode)
+        : dim(dim), n(n), mode(mode) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, dim, n, 1);
+        ggml_tensor * w = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, dim);
+        a = ggml_mul(ctx, ggml_rms_norm(ctx, a, 1e-6f), w);
+        a = ggml_reshape_3d(ctx, a, dim, 1, n);
+        const bool is_mrope = mode & GGML_ROPE_TYPE_MROPE;
+        ggml_tensor * pos = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n * (is_mrope ? 4 : 1));
+        if (is_mrope) {
+            int sections[4] = { 11, 11, 10, 0 };
+            a = ggml_rope_multi(ctx, a, pos, nullptr, 64, sections, mode, 0, 10000.0f, 1.0f, 0.0f, 1.0f, 32.0f, 1.0f);
+        } else {
+            a = ggml_rope(ctx, a, pos, 64, mode);
+        }
+        ggml_set_name(a, "out");
+        return a;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->type == GGML_TYPE_I32) {
+                std::vector<int32_t> data(ggml_nelements(t));
+                for (int32_t & value : data) {
+                    value = rand() % 512;
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, ggml_nbytes(t));
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
 // GGML_OP_ARGMAX
 struct test_argmax : public test_case {
     const ggml_type type;
@@ -12001,6 +12053,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                     test_cases.emplace_back(new test_rms_norm_mul_rope({8192, 2, 2, 1}, 1e-6f, multi_add, set_rows, broadcast, rope));
                 }
             }
+        }
+    }
+    for (int mode : {GGML_ROPE_TYPE_NEOX, GGML_ROPE_TYPE_MROPE, GGML_ROPE_TYPE_IMROPE}) {
+        for (int64_t n : {1, 3, 8256, 65536}) {
+            test_cases.emplace_back(new test_rms_norm_mul_reshape_rope(128, n, mode));
         }
     }
     for (int64_t d_conv : {3, 4, 9}) {
