@@ -101,9 +101,6 @@ int main() {
     GGML_ASSERT(backend);
     bool ok = true;
     for (int rows : {256, 512, 1024, 2048, 4097}) {
-        if (props.major == 8 && rows < 2048) {
-            continue; // SM86's existing exact-prefill dispatch starts here.
-        }
         for (int used : {1, 10, 16, 32}) {
             for (int seed = 0; seed < 3; ++seed) {
                 ok = check(backend, rows, used, seed) && ok;

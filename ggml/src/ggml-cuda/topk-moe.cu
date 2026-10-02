@@ -438,9 +438,10 @@ void ggml_cuda_op_topk_moe(ggml_backend_cuda_context &     ctx,
     config.delayed_softmax   = args.delayed_softmax;
 
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
-    // Compact routing IDs also expose this fusion on SM75 prefill batches.
+    // Compact routing IDs expose this fusion from 256-row prefill batches
+    // on both SM75 and SM86; preserve the unfused router's ordered arithmetic.
     const int cc = ggml_cuda_info().devices[ctx.device].cc;
-    if (((cc == 860 && n_rows >= 2048) || (cc == 750 && n_rows >= 256)) &&
+    if ((cc == 860 || cc == 750) && n_rows >= 256 &&
             n_experts == 512 && n_expert_used > 0 && n_expert_used <= 32 &&
             args.softmax && with_norm && !args.sigmoid && !args.sqrt_softplus &&
             !args.delayed_softmax && !bias && !scale) {
