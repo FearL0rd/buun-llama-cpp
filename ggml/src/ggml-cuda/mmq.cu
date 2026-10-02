@@ -472,6 +472,20 @@ bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t
 #endif //GGML_CUDA_FORCE_MMQ
 
     if (GGML_CUDA_CC_IS_NVIDIA(cc)) {
+        // MoE + fp16 tensor cores + batch >= MMQ_DP4A_MAX_BATCH_SIZE lands in the sorted
+        // per-expert fallback (mul_mat_id tail), which host-syncs twice per tensor and
+        // launches one small GEMM per used expert. Volta (sm_70) has fp16 mma but no
+        // turing_mma, so every prefill-sized MoE batch takes that path there. dp4a MMQ
+        // handles the expert routing on device and needs no sync; the AMD branch below
+        // reaches the same conclusion for RDNA3 at n_experts >= 64. Opt-in for A/B:
+        // GGML_CUDA_MMQ_MOE_ALL_BATCHES=1 extends it to any NVIDIA cc with dp4a.
+        static const bool mmq_moe_all_batches = [] {
+            const char * s = getenv("GGML_CUDA_MMQ_MOE_ALL_BATCHES");
+            return s ? atoi(s) != 0 : false;
+        }();
+        if (mmq_moe_all_batches && n_experts > 0 && cc >= GGML_CUDA_CC_DP4A) {
+            return true;
+        }
         return !fp16_mma_hardware_available(cc) || ne11 < MMQ_DP4A_MAX_BATCH_SIZE;
     }
 
