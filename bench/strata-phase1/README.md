@@ -43,3 +43,20 @@ of the remaining gap; what is left is pipeline-level (chunk overlap, GEMM effici
   VBR-degrade/turbo interaction with large ubatches on this model; needs its own
   investigation. Round 3 established that Flash-Next prefill works at `-ub 512`, so round 8
   runs the A/B there (the production ubatch).
+
+## Round 8 (Flash-Next, `-ub 512`, no mmproj — production ubatch)
+
+| path | prefill t/s (req2/req3) | short-ctx decode t/s |
+|---|---:|---:|
+| fallback (V100 sorted per-expert) | 394.7-398.9 | 43.5 |
+| MMQ MoE (V100 dp4a) | **582.3-588.2** | 43.5-43.7 |
+
+**+48% prefill at the production ubatch with no decode cost.** The change is validated on
+both models: Coder +50% (`-ub 4096`, 700 -> 1,040 t/s), Flash-Next +48% (`-ub 512`,
+395 -> 585 t/s). Enable with `GGML_CUDA_MMQ_MOE_ALL_BATCHES=1` in the launch environment;
+the gate is off by default pending broader hardware validation.
+
+Flash-Next caveats (both pre-existing, independent of this change): mmproj OOM on the 3090
+at ub > 512 (needs `ot` rebalancing to raise the ubatch), and a "Compute error" ~2-3 s into
+long prefills at `-ub >= 2048` (VBR/turbo interaction, untested against this change because
+the off arm fails identically).
