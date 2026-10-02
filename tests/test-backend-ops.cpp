@@ -14094,6 +14094,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
             test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {cols, nrows, 1, 1}, 2048));
         }
     }
+    // QSA selection width (2051): decode, MTP verify and prefill rows at 4K/8K/32K cache widths
+    for (auto cols : {4352, 8192, 33024}) {
+        for (auto nrows : {1, 2, 3, 4, 16, 64, 512, 4352}) {
+            test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {cols, nrows, 1, 1}, 2051));
+        }
+    }
     // backend sampler: one row of the vocab (llama-sampler.cpp top_k)
     for (auto k : {20, 40}) {
         test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {151936, 1, 1, 1}, k));
