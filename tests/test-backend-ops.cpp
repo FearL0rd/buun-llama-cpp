@@ -12934,6 +12934,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {n, 2, 1, 3}, k, true));
         }
     }
+    // Qwen4 QSA: HIP packs these sorted rows from VMM-backed scratch.
+    test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {512, 64, 1, 1}, 256));
     for (int64_t n : {4095, 4096, 4097, 16385}) {
         for (int k : {1, 16, 64}) {
             test_cases.emplace_back(new test_top_k(

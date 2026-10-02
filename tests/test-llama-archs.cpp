@@ -622,6 +622,121 @@ static std::pair<llama_model_ptr, llama_context_ptr> get_model_and_ctx(
 
 static void test_bonsai_mapped_load(llama_model * model, gguf_context * meta, llama_model_params params);
 
+static void test_mooney_loader(const size_t seed) {
+    const auto metadata = [](bool mtp = false) {
+        auto meta = get_gguf_ctx(LLM_ARCH_QWEN4EXP, true);
+        if (mtp) {
+            // Reinterpret the second block as an embedded draft block, which
+            // a target-only load must skip even when its weights are folded.
+            GGML_ASSERT(gguf_remove_key(meta.get(), "qwen4exp.ple.layers") >= 0);
+            llama_model_saver saver(LLM_ARCH_QWEN4EXP, meta.get());
+            saver.add_kv(LLM_KV_NEXTN_PREDICT_LAYERS, uint32_t(1));
+            saver.add_kv(LLM_KV_FULL_ATTENTION_INTERVAL, uint32_t(1));
+            saver.add_kv(LLM_KV_ATTENTION_COMPRESS_RATIOS, std::vector<uint32_t>({4, 0}));
+        }
+        // Callback models synthesize a combined gate/up tensor. Use the two
+        // required down tensors to exercise independent per-weight transforms.
+        gguf_set_val_u32(meta.get(), "qwen4exp.expert_feed_forward_length", 256);
+        const char * names[] = {"blk.0.ffn_down_exps.weight", "blk.1.ffn_down_exps.weight"};
+        gguf_set_val_u32(meta.get(), "lowbitflash.rot.version", 1);
+        gguf_set_arr_str(meta.get(), "lowbitflash.rot.weight_names", names, 2);
+        const int32_t blocks[] = {128, 128};
+        std::vector<int32_t> signs(256, 1);
+        for (int i = 0; i < 2; ++i) {
+            signs[3] = i ? -1 : 1; // same shape, deliberately different transforms
+            signs[131] = i ? 1 : -1; // second segment must use its own offset
+            gguf_set_arr_data(meta.get(), (std::string("lowbitflash.rot.blocks.")+names[i]).c_str(),
+                              GGUF_TYPE_INT32, blocks, 2);
+            gguf_set_arr_data(meta.get(), (std::string("lowbitflash.rot.signs.")+names[i]).c_str(),
+                              GGUF_TYPE_INT32, signs.data(), signs.size());
+        }
+        return meta;
+    };
+    for (bool mtp : {false, true})
+    for (bool load_mtp : {false, true})
+    for (int offload : {0, 99}) {
+        if (load_mtp && !mtp) continue;
+        if (offload && !ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU)) continue;
+        auto meta = metadata(mtp);
+        auto mp = llama_model_default_params();
+        mp.load_mtp = load_mtp;
+        mp.n_gpu_layers = offload;
+        mp.progress_callback = silent_model_load_progress;
+        tensor_data_params data = {seed, 0.01f};
+        llama_model_ptr real(llama_model_init_from_user(meta.get(), set_tensor_data, &data, mp));
+        GGML_ASSERT(real);
+        mp.no_alloc = true;
+        llama_model_ptr dry(llama_model_init_from_user(meta.get(), set_tensor_data, nullptr, mp));
+        GGML_ASSERT(dry && real->memory_breakdown() == dry->memory_breakdown());
+        for (auto * model : {real.get(), dry.get()}) {
+            GGML_ASSERT(model->hadamard_rotations.size() == (mtp && !load_mtp ? 1 : 2));
+            ggml_tensor * shared = nullptr;
+            std::vector<ggml_tensor *> sign_tensors;
+            for (const auto & [weight, transform] : model->hadamard_rotations) {
+                GGML_ASSERT(transform.segments.size() == 2);
+                int offset = 0;
+                for (const auto & segment : transform.segments) {
+                    if (!shared) shared = segment.rot;
+                    GGML_ASSERT(segment.rot == shared);
+                    GGML_ASSERT((segment.rot->data == nullptr) == model->hparams.no_alloc);
+                    GGML_ASSERT((segment.signs->data == nullptr) == model->hparams.no_alloc);
+                    GGML_ASSERT(segment.offset == offset);
+                    GGML_ASSERT(std::find(sign_tensors.begin(), sign_tensors.end(), segment.signs) == sign_tensors.end());
+                    sign_tensors.push_back(segment.signs);
+                    if (!model->hparams.no_alloc) {
+                        std::vector<float> actual(128);
+                        ggml_backend_tensor_get(segment.signs, actual.data(), 0, actual.size()*sizeof(float));
+                        const bool second_weight = std::string(weight->name) == "blk.1.ffn_down_exps.weight";
+                        for (int j = 0; j < 128; ++j) {
+                            const int position = offset + j;
+                            const float expected = (position == 3 && second_weight) ||
+                                                   (position == 131 && !second_weight) ? -1.0f : 1.0f;
+                            GGML_ASSERT(actual[j] == expected);
+                        }
+                    }
+                    offset += 128;
+                }
+            }
+            auto cp = llama_context_default_params();
+            cp.n_ctx = 256;
+            cp.n_batch = cp.n_ubatch = 32;
+            cp.type_k = cp.type_v = GGML_TYPE_F16;
+            llama_context_ptr context(llama_init_from_model(model, cp));
+            GGML_ASSERT(context); // first-graph verifier must accept both exact sign chains
+        }
+    }
+    for (int bad = 0; bad < 6; ++bad) {
+        auto meta = metadata();
+        const char * key = "lowbitflash.rot.signs.blk.0.ffn_down_exps.weight";
+        if (bad == 0) gguf_set_val_u32(meta.get(), "lowbitflash.rot.version", 2);
+        if (bad == 1) {
+            std::vector<int32_t> signs(256, 1); signs[0] = 0;
+            gguf_set_arr_data(meta.get(), key, GGUF_TYPE_INT32, signs.data(), signs.size());
+        }
+        if (bad == 2) gguf_set_val_str(meta.get(), key, "not an array");
+        if (bad == 3) {
+            const int32_t block = 192;
+            gguf_set_arr_data(meta.get(), "lowbitflash.rot.blocks.blk.0.ffn_down_exps.weight", GGUF_TYPE_INT32, &block, 1);
+        }
+        if (bad == 4) {
+            const char * names[] = {"token_embd.weight"};
+            gguf_set_arr_str(meta.get(), "lowbitflash.rot.inverse_names", names, 1);
+        }
+        if (bad == 5) {
+            const char * names[] = {"blk.9.ffn_down_exps.weight"};
+            gguf_set_arr_str(meta.get(), "lowbitflash.rot.weight_names", names, 1);
+            const int32_t block = 256;
+            std::vector<int32_t> signs(256, 1);
+            gguf_set_arr_data(meta.get(), "lowbitflash.rot.blocks.blk.9.ffn_down_exps.weight", GGUF_TYPE_INT32, &block, 1);
+            gguf_set_arr_data(meta.get(), "lowbitflash.rot.signs.blk.9.ffn_down_exps.weight", GGUF_TYPE_INT32, signs.data(), signs.size());
+        }
+        auto mp = llama_model_default_params();
+        mp.no_alloc = true;
+        llama_model_ptr model(llama_model_init_from_user(meta.get(), set_tensor_data, nullptr, mp));
+        GGML_ASSERT(!model);
+    }
+}
+
 static void test_bonsai_loader(const size_t seed) {
     const auto metadata = [] {
         auto meta = get_gguf_ctx(LLM_ARCH_LLAMA, false);
@@ -4591,6 +4706,7 @@ int main(int argc, char ** argv) {
             test_qwen35_mtp_fused_qkv(seed, LLM_ARCH_QWEN35MOE);
         }
         if (arch_matches(arch_filter, LLM_ARCH_QWEN4EXP)) {
+            test_mooney_loader(seed);
             test_qwen4_ple_recurrent_resize(seed);
             test_qwen4_indexed_cache_admission(seed);
             test_qwen4_vbr_cuda(seed);

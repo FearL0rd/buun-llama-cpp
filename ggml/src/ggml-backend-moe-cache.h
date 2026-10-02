@@ -15,7 +15,7 @@ static inline size_t ggml_moe_cache_effective_min_expert_bytes(
     // Q2_0 stores twice as many weights per byte as Q4_0. A 450 KiB
     // Q2_0 expert should not miss the ordinary 512 KiB floor merely because
     // its codes are more compact; retain the same minimum weight count.
-    if (wtype == GGML_TYPE_Q2_0) return default_minimum / 2;
+    if (wtype == GGML_TYPE_Q2_0 || wtype == GGML_TYPE_Q2_0_G128) return default_minimum / 2;
     return default_minimum;
 }
 

@@ -759,7 +759,7 @@ static bool run_fused_cpu_fallbacks(ggml_backend_t cpu) {
     static int end_calls;
     static int collect_calls;
     bool ok = true;
-    for (ggml_type type : { GGML_TYPE_Q2_0, GGML_TYPE_MXFP4, GGML_TYPE_Q4_K, GGML_TYPE_IQ2_XXS }) {
+    for (ggml_type type : { GGML_TYPE_Q2_0, GGML_TYPE_Q2_0_G128, GGML_TYPE_MXFP4, GGML_TYPE_Q4_K, GGML_TYPE_IQ2_XXS }) {
         for (int tokens : { 1, 2, 3, 4, 8, 16 }) {
             ggml_context * ctx = ggml_init({ 8*ggml_tensor_overhead(), nullptr, true });
             GGML_ASSERT(ctx);
@@ -1352,7 +1352,11 @@ static bool init_mxfp4_fixture(
         int64_t mxfp4_n_in,
         int64_t mxfp4_n_out,
         ggml_backend_t cpu,
-        mxfp4_fixture & fixture) {
+        mxfp4_fixture & fixture,
+        ggml_type type = GGML_TYPE_MXFP4,
+        int64_t tokens = n_tokens,
+        int64_t used = n_used,
+        int64_t activation_rows = 1) {
     const ggml_init_params params = {
         8 * ggml_tensor_overhead(),
         nullptr,
@@ -1365,12 +1369,12 @@ static bool init_mxfp4_fixture(
     }
 
     fixture.weights = ggml_new_tensor_3d(
-            fixture.ctx, GGML_TYPE_MXFP4,
+            fixture.ctx, type,
             mxfp4_n_in, mxfp4_n_out, n_expert);
     ggml_tensor * ids = ggml_new_tensor_2d(
-            fixture.ctx, GGML_TYPE_I32, n_used, n_tokens);
+            fixture.ctx, GGML_TYPE_I32, used, tokens);
     ggml_tensor * activations = ggml_new_tensor_3d(
-            fixture.ctx, GGML_TYPE_F32, mxfp4_n_in, 1, n_tokens);
+            fixture.ctx, GGML_TYPE_F32, mxfp4_n_in, activation_rows, tokens);
     ggml_set_name(fixture.weights, weight_name);
     ggml_set_name(ids, "moe_cache_mxfp4_ids");
     ggml_set_name(activations, "moe_cache_mxfp4_activations");
@@ -1392,7 +1396,7 @@ static bool init_mxfp4_fixture(
     }
     std::vector<uint8_t> weights_mxfp4(ggml_nbytes(fixture.weights));
     const size_t quantized = ggml_quantize_chunk(
-            GGML_TYPE_MXFP4, weights_f32.data(), weights_mxfp4.data(),
+            type, weights_f32.data(), weights_mxfp4.data(),
             0, mxfp4_n_out * n_expert, mxfp4_n_in, nullptr);
     if (quantized != weights_mxfp4.size()) {
         fprintf(stderr, "%s: unexpected quantized size: %zu != %zu\n",
@@ -1403,8 +1407,13 @@ static bool init_mxfp4_fixture(
     ggml_backend_tensor_set(
             fixture.weights, weights_mxfp4.data(), 0, weights_mxfp4.size());
 
-    const int32_t ids_data[n_used] = { 0, 1 };
-    ggml_backend_tensor_set(ids, ids_data, 0, sizeof(ids_data));
+    std::vector<int32_t> ids_data(used*tokens);
+    for (int64_t token = 0; token < tokens; ++token) {
+        for (int64_t expert = 0; expert < used; ++expert) {
+            ids_data[token*used + expert] = (expert + token) % n_expert;
+        }
+    }
+    ggml_backend_tensor_set(ids, ids_data.data(), 0, ids_data.size()*sizeof(int32_t));
     std::vector<float> activation_data(ggml_nelements(activations));
     for (size_t index = 0; index < activation_data.size(); index++) {
         activation_data[index] =
@@ -1536,6 +1545,103 @@ static bool run_mxfp4_shared_pool(
     printf("cache-mxfp4-shared-pool: %s\n", ok ? "OK" : "FAIL");
     free_mxfp4_fixture(up);
     free_mxfp4_fixture(down);
+    return ok;
+}
+
+static bool run_pq2_cache(ggml_backend_t cuda, ggml_backend_t cpu, log_capture & capture) {
+    bool ok = true;
+    // Exercise actual cache-hit computation, not just admission or byte copies.
+    // Both axes use Mooney's dimensions; dispatch/collect failures must retain
+    // the same CPU reference through the fallback path.
+    for (int tokens : {1, 3, 6})
+    for (bool down : {false, true}) {
+        const int used = tokens == 1 ? 2 : 3; // also exercise odd hit-pair tails
+        printf("cache-pq2-shape: tokens=%d used=%d down=%d\n", tokens, used, down);
+        mxfp4_fixture fixture;
+        if (!init_mxfp4_fixture("cache-pq2", down ? "blk.6.ffn_down_exps.weight" : "blk.6.ffn_up_exps.weight",
+                down ? 640 : 2560, down ? 2560 : 640, cpu, fixture, GGML_TYPE_Q2_0_G128,
+                tokens, used, down ? used : 1)) {
+            return false;
+        }
+        scenario_options options;
+        options.max_batch = "6";
+        options.budget_mb = "32"; // at least the minimum pool of full-sized experts
+        options.dedicated_mmv = "0";
+        ok &= run_scenario("cache-pq2-generic", nullptr,
+                cuda, cpu, fixture.graph, fixture.reference, capture, options);
+        std::vector<float> generic(fixture.reference.size());
+        ggml_backend_tensor_get(fixture.graph.out, generic.data(), 0, generic.size() * sizeof(float));
+        options.dedicated_mmv = "1";
+        options.dedicated_down_mmv = "1";
+        for (const char * failure : {static_cast<const char *>(nullptr), "dispatch", "collect"}) {
+            ok &= run_scenario(down ? "cache-pq2-down" : "cache-pq2-up", failure,
+                    cuda, cpu, fixture.graph, fixture.reference, capture, options);
+            if (!failure) {
+                std::vector<float> dedicated(generic.size());
+                ggml_backend_tensor_get(fixture.graph.out, dedicated.data(), 0, dedicated.size() * sizeof(float));
+                double delta = 0, magnitude = 0;
+                float largest = 0;
+                for (size_t i = 0; i < generic.size(); ++i) {
+                    largest = std::max(largest, std::abs(dedicated[i] - generic[i]));
+                    delta += double(dedicated[i] - generic[i]) * (dedicated[i] - generic[i]);
+                    magnitude += double(generic[i]) * generic[i];
+                }
+                const double nmse = delta / (magnitude + 1e-20);
+                ok &= nmse < 1e-10;
+                printf("cache-pq2-kernel-pair: down=%d max_delta=%.9g nmse=%.9g\n", down, largest, nmse);
+            }
+        }
+        // A separate rotated projection must also hand its resident rows to
+        // the GPU consumer without publishing incomplete host output.
+        for (int scenario = 0; scenario < 6; ++scenario) {
+            const char * failure = scenario == 1 ? "dispatch" : scenario == 2 ? "collect" :
+                                   scenario == 3 ? "collect-retire" : nullptr;
+            configure_cache(failure, "6", "1", "32", "1");
+            auto * ctx = ggml_init({16*ggml_tensor_overhead()+ggml_graph_overhead(), nullptr, true});
+            auto * projection = ggml_mul_mat_id(ctx, fixture.weights,
+                    fixture.graph.out->src[1], fixture.graph.out->src[2]);
+            auto * result = ggml_scale(ctx, projection, .5f);
+            if (scenario == 4) ggml_set_output(projection);
+            ggml_set_output(result);
+            auto * graph = ggml_new_graph(ctx);
+            ggml_build_forward_expand(graph, result);
+            ggml_backend_t backends[] = {cuda, cpu};
+            auto sched = ggml_backend_sched_new(backends, nullptr, 2, GGML_DEFAULT_GRAPH_SIZE,
+                                                scenario == 5, false);
+            ggml_backend_sched_set_tensor_backend(sched, projection, cpu);
+            ggml_backend_sched_set_tensor_backend(sched, result, cuda);
+            bool pass = ggml_backend_sched_alloc_graph(sched, graph);
+            const bool handoff_supported = ggml_moe_cache.output_supported &&
+                ggml_moe_cache.output_supported(cuda, projection);
+            std::vector<float> expected = fixture.reference, actual(expected.size());
+            for (auto & value : expected) value *= .5f;
+            int deferred_failures = 0;
+            for (int step = 0; pass && step < 96; ++step) {
+                // A missing device write must not pass using an earlier result.
+                std::fill(actual.begin(), actual.end(), std::numeric_limits<float>::quiet_NaN());
+                ggml_backend_tensor_set(result, actual.data(), 0, ggml_nbytes(result));
+                const auto status = ggml_backend_sched_graph_compute(sched, graph);
+                if (scenario == 3 && status == GGML_STATUS_FAILED) {
+                    ++deferred_failures;
+                    continue;
+                }
+                pass &= status == GGML_STATUS_SUCCESS;
+                ggml_backend_tensor_get(result, actual.data(), 0, ggml_nbytes(result));
+                pass &= compare_output(expected, actual, 5e-4);
+                if (scenario == 4) {
+                    ggml_backend_tensor_get(projection, actual.data(), 0, ggml_nbytes(projection));
+                    pass &= compare_output(fixture.reference, actual, 5e-4);
+                }
+            }
+            if (scenario == 3 && handoff_supported) pass &= deferred_failures > 0;
+            printf("cache-pq2-device-output: down=%d scenario=%d deferred-failures=%d %s\n",
+                    down, scenario, deferred_failures, pass ? "OK" : "FAIL");
+            ok &= pass;
+            ggml_backend_sched_free(sched);
+            ggml_free(ctx);
+        }
+        free_mxfp4_fixture(fixture);
+    }
     return ok;
 }
 
@@ -3703,12 +3809,14 @@ static bool run_shared_budget(
     size_t total_bytes = 0;
     ggml_backend_dev_memory(cuda->device, &free_bytes, &total_bytes);
     const size_t free_mib = free_bytes >> 20;
-    if (free_mib < 64) {
+    if (free_mib < 128) {
         printf("cache-shared-budget: SKIP (insufficient free VRAM)\n");
         return true;
     }
 
-    const std::string reserve = std::to_string(free_mib - 24);
+    // Leave enough headroom that a few MiB of driver/display allocation churn
+    // does not look like a broken claim split on a display-attached GPU.
+    const std::string reserve = std::to_string(free_mib - 64);
     set_env("GGML_CUDA_MOE_CACHE_BUDGET_MB", nullptr);
     set_env("GGML_CUDA_MOE_CACHE_RESERVE_MB", reserve.c_str());
     capture.clear();
@@ -3750,8 +3858,8 @@ static bool run_shared_budget(
     ggml_moe_cache.session_destroy(first);
 
     const std::string shared_log = capture.get();
-    const bool divided = count_field_at_least(shared_log, "granted=", 8) == 2 &&
-        max_field_value(shared_log, "granted=") <= 16;
+    const bool divided = count_field_at_least(shared_log, "granted=", 24) == 2 &&
+        max_field_value(shared_log, "granted=") <= 40;
 
     capture.clear();
     void * replacement = create_direct_session(cuda, cpu);
@@ -3765,10 +3873,10 @@ static bool run_shared_budget(
         ggml_moe_cache.session_destroy(replacement);
     }
     const std::string replacement_log = capture.get();
-    const bool released = max_field_value(replacement_log, "granted=") >= 20;
+    const bool released = max_field_value(replacement_log, "granted=") >= 56;
 
     capture.clear();
-    const std::string high_reserve = std::to_string(free_mib - 8);
+    const std::string high_reserve = std::to_string(free_mib - 16);
     set_env("GGML_CUDA_MOE_CACHE_RESERVE_MB", high_reserve.c_str());
     void * high = create_direct_session(cuda, cpu);
     set_env("GGML_CUDA_MOE_CACHE_RESERVE_MB", reserve.c_str());
@@ -4070,6 +4178,8 @@ static bool run_pool_limits() {
     for (size_t minimum : { 512u << 10, 1024u << 10 }) {
         ok &= ggml_moe_cache_effective_min_expert_bytes(GGML_TYPE_Q2_0, 0, minimum) == minimum / 2;
         ok &= ggml_moe_cache_effective_min_expert_bytes(GGML_TYPE_Q2_0, 1, minimum) == minimum;
+        ok &= ggml_moe_cache_effective_min_expert_bytes(GGML_TYPE_Q2_0_G128, 0, minimum) == minimum / 2;
+        ok &= ggml_moe_cache_effective_min_expert_bytes(GGML_TYPE_Q2_0_G128, 1, minimum) == minimum;
     }
     const size_t expert_bytes = 400u << 10;
     const size_t exl3_limit = ggml_moe_cache_max_pool_slots(GGML_TYPE_EXL3_2, expert_bytes);
@@ -4895,6 +5005,7 @@ int main(int argc, char ** argv) {
     const bool profile_writer = argc == 6 && std::strcmp(argv[1], "--profile-writer") == 0;
     const bool host_buffer = argc == 2 && std::strcmp(argv[1], "--host-buffer") == 0;
     const bool persistent_pool = argc == 2 && std::strcmp(argv[1], "--cpu-persistent-pool") == 0;
+    const bool pq2_only = argc == 2 && std::strcmp(argv[1], "--pq2") == 0;
     if (!run_pool_limits()) return 1;
     if (argc > 0 && argv[0]) {
         std::error_code ec;
@@ -4945,7 +5056,7 @@ int main(int argc, char ** argv) {
     }
     // Profile writer subprocesses must reach their rendezvous promptly. They
     // exercise profile I/O, not the parent's complete CPU fallback matrix.
-    if (!profile_writer) {
+    if (!profile_writer && !pq2_only) {
         for (int threads : { 1, 2, 4, 6 }) {
             if (set_n_threads) set_n_threads(cpu, threads);
             printf("cache-fused-cpu-fallbacks: threads=%d\n", threads);
@@ -4986,6 +5097,12 @@ int main(int argc, char ** argv) {
         fprintf(stderr, "failed to initialize GPU backend\n");
         ggml_backend_free(cpu);
         return 1;
+    }
+    if (pq2_only) {
+        const bool ok = run_pq2_cache(cuda, cpu, capture);
+        ggml_backend_free(cuda);
+        ggml_backend_free(cpu);
+        return ok ? 0 : 1;
     }
     ggml_init_params static_params = {
         16 * ggml_tensor_overhead(),
@@ -5384,6 +5501,7 @@ int main(int argc, char ** argv) {
             cuda_device, cuda, cpu, weights, gate_weights,
             down_weights, capture);
     ok &= run_mxfp4_shared_pool(cuda, cpu, capture);
+    ok &= run_pq2_cache(cuda, cpu, capture);
     const size_t expert_size = ggml_nbytes(weights) / n_expert;
     ok &= run_precensus_invalidation(
             cuda, cpu, graph, weights,

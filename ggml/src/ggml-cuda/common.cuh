@@ -1281,6 +1281,7 @@ const ggml_cuda_device_info & ggml_cuda_info();
 
 void ggml_cuda_set_device(int device);
 int ggml_cuda_get_device();
+cudaError_t ggml_cuda_device_memory_info(int device, size_t * free, size_t * total);
 
 struct ggml_cuda_pool_alloc_failure : std::exception {
     const char * what() const noexcept override {

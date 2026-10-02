@@ -6965,6 +6965,52 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         }
     }
 
+    // A complete segmented transform can scatter directly to the final row,
+    // avoiding the per-segment temporaries and concatenation launches.
+    if (node->op == GGML_OP_MUL) {
+        static constexpr ggml_op ops[] = {GGML_OP_MUL, GGML_OP_MUL_MAT,
+            GGML_OP_MUL, GGML_OP_MUL_MAT, GGML_OP_CONCAT,
+            GGML_OP_MUL, GGML_OP_MUL_MAT, GGML_OP_CONCAT};
+        for (int segments : {3, 2}) {
+            const int count = segments == 3 ? 10 : 6;
+            const int output = i + count - 1;
+            if (output >= cgraph->n_nodes || cgraph->nodes[i+2]->op != GGML_OP_VIEW ||
+                    (segments == 3 && cgraph->nodes[i+6]->op != GGML_OP_VIEW)) continue;
+            // Input views remain valid; only their materialized consumers are
+            // elided. Including views would falsely require their external
+            // activation producer to be part of this subgraph.
+            const int indices[] = {i, i+1, i+3, i+4, i+5, i+7, i+8, i+9};
+            if (!ggml_can_fuse_subgraph_ext(cgraph, indices, segments == 3 ? 8 : 5, ops, &output, 1)) continue;
+            auto * first_concat = cgraph->nodes[i + 5];
+            auto * out = cgraph->nodes[output];
+            const ggml_tensor * mm[] = {cgraph->nodes[i + 1], cgraph->nodes[i + 4],
+                                       segments == 3 ? cgraph->nodes[i + 8] : nullptr};
+            bool linked = mm[0]->src[1] == node && mm[1]->src[1] == cgraph->nodes[i + 3] &&
+                first_concat->src[0] == mm[0] && first_concat->src[1] == mm[1] &&
+                ggml_get_op_params_i32(first_concat, 0) == 0;
+            if (segments == 3) linked &= mm[2]->src[1] == cgraph->nodes[i + 7] &&
+                out->src[0] == first_concat && out->src[1] == mm[2] && ggml_get_op_params_i32(out, 0) == 0;
+            if (linked && ggml_cuda_check_fusion_memory_ranges(cgraph, i, count, &output, 1) &&
+                    ggml_cuda_op_fwht_segments(*cuda_ctx, mm, segments, out)) return count - 1;
+        }
+    }
+
+    // Segmented rotations already have the transform width, without a reshape.
+    // Read their strided activation views directly during the signed FWHT.
+    if (ggml_can_fuse_subgraph(cgraph, i, { GGML_OP_MUL, GGML_OP_MUL_MAT }, { i + 1 })) {
+        ggml_tensor * mm = cgraph->nodes[i + 1];
+        const ggml_tensor * x = node->src[0];
+        const ggml_tensor * signs = node->src[1];
+        const int output = i + 1;
+        if (mm->src[1] == node && ggml_get_op_params_i32(mm, 1) == GGML_HINT_SRC0_IS_HADAMARD &&
+            signs->ne[0] == x->ne[0] && ggml_nelements(signs) == x->ne[0] &&
+            ggml_are_same_shape(x, mm) && node->type == x->type &&
+            ggml_cuda_check_fusion_memory_ranges(cgraph, i, 2, &output, 1) &&
+            ggml_cuda_op_fwht_signed(*cuda_ctx, x, signs, mm)) {
+            return 1;
+        }
+    }
+
     // Hadamard sign flip + reshape + FWHT-hint matmul: multiply the sign
     // vector during the transform's load instead of a separate full pass
     if (ggml_can_fuse_subgraph(cgraph, i, { GGML_OP_MUL, GGML_OP_RESHAPE, GGML_OP_MUL_MAT }, { i + 2 })) {
@@ -8850,7 +8896,7 @@ static int ggml_cuda_physical_device_share_count(int device) {
     return info.devices[device].physical_share_count;
 }
 
-static cudaError_t ggml_cuda_device_memory_info(int device, size_t * free, size_t * total) {
+cudaError_t ggml_cuda_device_memory_info(int device, size_t * free, size_t * total) {
     ggml_cuda_set_device(device);
     const cudaError_t err = cudaMemGetInfo(free, total);
 #if defined(GGML_USE_HIP) && defined(__linux__)
