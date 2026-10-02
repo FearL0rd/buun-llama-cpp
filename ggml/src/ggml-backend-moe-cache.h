@@ -178,6 +178,11 @@ struct ggml_moe_cache_api {
 
     // Host buffer mutation or teardown notification. Sessions cancel or finish any fill that still reads the supplied range before this call returns.
     void (*invalidate)(const void * base, size_t size);
+
+    // Device routing: backend may run this small-batch MUL_MAT_ID in place on its host experts,
+    // reading cached experts from VRAM and the rest over the bus. The answer depends only on the
+    // op's shape and the session, so a reused graph keeps a valid assignment.
+    int (*route_supported)(void * session, void * backend, const struct ggml_tensor * op);
 };
 
 GGML_API struct ggml_moe_cache_api ggml_moe_cache;

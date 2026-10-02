@@ -990,6 +990,14 @@ static char causes[GGML_DEFAULT_GRAPH_SIZE*16 + GGML_SCHED_MAX_SPLITS_DEBUG*GGML
 #define GET_CAUSE(node) ""
 #endif
 
+// the moe-cache provider lets backend_id read node's host expert weights in place
+static bool ggml_backend_sched_moe_routed(ggml_backend_sched_t sched, const struct ggml_tensor * node,
+        const struct ggml_tensor * src, int backend_id) {
+    return node->op == GGML_OP_MUL_MAT_ID && src == node->src[0] && sched->moe_cache_session &&
+        ggml_moe_cache.route_supported &&
+        ggml_moe_cache.route_supported(sched->moe_cache_session, sched->backends[backend_id], node);
+}
+
 // returns the backend that should be used for the node based on the current locations
 static int ggml_backend_sched_backend_id_from_cur(ggml_backend_sched_t sched, struct ggml_tensor * tensor) {
     // assign pre-allocated nodes to their backend
@@ -1039,6 +1047,15 @@ static int ggml_backend_sched_backend_id_from_cur(ggml_backend_sched_t sched, st
             }
             if (src->buffer != NULL && src->buffer->usage == GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
                 int src_backend_id = ggml_backend_sched_backend_from_buffer(sched, src, tensor);
+                // a moe-cache backend can read host experts in place for small batches
+                if (src_backend_id == sched->n_backends - 1) {
+                    for (int b = 0; b < src_backend_id; b++) {
+                        if (ggml_backend_sched_moe_routed(sched, tensor, src, b)) {
+                            SET_CAUSE(tensor, "1.moe");
+                            return b;
+                        }
+                    }
+                }
                 // check if a backend with higher prio wants to offload the op
                 if (sched->op_offload && src_backend_id == sched->n_backends - 1 && ggml_backend_buffer_is_host(src->buffer)) {
                     for (int b = 0; b < src_backend_id; b++) {
@@ -1406,7 +1423,8 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                     // by starting a new split, the memory of the previously offloaded weights can be reused
                     if (src->buffer != NULL && src->buffer->usage == GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
                         int src_backend_id = tensor_backend_id(src);
-                        if (src_backend_id != cur_backend_id && !ggml_backend_sched_buffer_supported(sched, src, cur_backend_id)) {
+                        if (src_backend_id != cur_backend_id && !ggml_backend_sched_buffer_supported(sched, src, cur_backend_id) &&
+                            !ggml_backend_sched_moe_routed(sched, node, src, cur_backend_id)) {
                             need_new_split = true;
                             break;
                         }
@@ -1469,7 +1487,8 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                     }
                 }
 
-                if (src_backend_id != cur_backend_id && !ggml_backend_sched_buffer_supported(sched, src, cur_backend_id)) {
+                if (src_backend_id != cur_backend_id && !ggml_backend_sched_buffer_supported(sched, src, cur_backend_id) &&
+                    !ggml_backend_sched_moe_routed(sched, node, src, cur_backend_id)) {
                     // create a copy of the input in the split's backend
                     if (tensor_id_copy(src_id, cur_backend_id, 0) == NULL) {
                         ggml_backend_t backend = sched->backends[cur_backend_id];

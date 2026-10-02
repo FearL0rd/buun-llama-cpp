@@ -1,6 +1,7 @@
 #include "mmvq.cuh"
 #include "mmvq-tuning.h"
 #include "moe-cache-mmv-tuning.h"
+#include "moe-cache.cuh"
 #include "quantize.cuh"
 #include "fwht.cuh"
 #include "unary.cuh"
@@ -57,6 +58,12 @@ struct ggml_cuda_mmvq_fusion_args_device : ggml_cuda_mm_fusion_args_device {
     const float * conv_weight = nullptr;
     float * conv_state = nullptr;
     bool prefetch_weights = false; // immutable dense weights only
+    // Device-routed MUL_MAT_ID: per-expert weight pointers (VRAM cache slot or
+    // host memory) and mapped logs of the routed experts for the cache host.
+    const void * const * x_table = nullptr;
+    const void * const * gate_table = nullptr;
+    int32_t * x_route_log = nullptr;
+    int32_t * gate_route_log = nullptr;
 };
 
 typedef float (*vec_dot_q_cuda_t)(const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs);
@@ -2000,17 +2007,44 @@ static __global__ void mul_mat_vec_q_moe(
 
     ggml_cuda_pdl_sync();
     const uint32_t channel_x = ids[route_idx];
+    const uint32_t channel_gate = gate_ids ? gate_ids[route_idx] : channel_x;
+    if constexpr (!flat_hits) {
+        if (fusion.x_route_log && blockIdx.x == 0 && threadIdx.x == 0) {
+            const uint32_t entry = token_idx*gridDim.y + channel_dst;
+            fusion.x_route_log[1 + entry] = channel_x;
+            if (fusion.gate_route_log) {
+                fusion.gate_route_log[1 + entry] = channel_gate;
+            }
+            if (entry == 0) {
+                fusion.x_route_log[0] = gridDim.y*ncols_dst;
+                if (fusion.gate_route_log) {
+                    fusion.gate_route_log[0] = gridDim.y*ncols_dst;
+                }
+            }
+        }
+    }
     if ((int32_t) channel_x < 0) {
         return; // expert on another device (expert-parallel window): the row is zeroed by the caller
     }
-    const uint32_t channel_gate = gate_ids ? gate_ids[route_idx] : channel_x;
     const uint32_t channel_y = act_ids
         ? act_ids[route_idx]
         : fastmodulo(channel_dst, nchannels_y);
 
+    // Routed experts each have their own base pointer, so only the row offset remains.
+    const uint32_t channel_x_offset = fusion.x_table ? 0 : channel_x;
+    const uint32_t channel_gate_offset = fusion.gate_table ? 0 : channel_gate;
+    if (fusion.x_table) {
+        vx = fusion.x_table[channel_x];
+    }
+    if constexpr (has_fusion) {
+        if (fusion.gate_table) {
+            vgate = fusion.gate_table[channel_gate];
+        }
+    }
+
     const block_q8_1 * y = ((const block_q8_1 *) vy) + channel_y*stride_channel_y + token_idx*stride_col_y;
-    const int kbx_offset  = channel_x*stride_channel_x + row0*stride_row_x;
-    const int gate_kbx_offset = channel_gate*stride_channel_x + row0*stride_row_x;
+    const int kbx_offset  = channel_x_offset*stride_channel_x + row0*stride_row_x;
+    const int gate_kbx_offset = channel_gate_offset*stride_channel_x + row0*stride_row_x;
 
     // partial sum for each thread
     float tmp[c_rows_per_block] = {0.0f};
@@ -2340,8 +2374,8 @@ static void mul_mat_vec_q_switch_ncols_dst(
         return idle * 8 <= iters_wide * 2;
     };
 
-    if (has_ids && ncols_dst > 1) {
-        // Multi-token MUL_MAT_ID path - dedicated MoE kernel
+    if (has_ids && (ncols_dst > 1 || fusion.x_table)) {
+        // Multi-token or device-routed MUL_MAT_ID path - dedicated MoE kernel
         mul_mat_vec_q_moe_launch<type>(
             vx, vy, ids, nullptr, nullptr, nullptr, fusion, dst,
             ncols_x, nchannels_y_fd, nrows_x,
@@ -2808,6 +2842,17 @@ static void ggml_cuda_mul_mat_vec_q_impl(
     fusion_local.round_scale = fp8_marker != nullptr ||
         (src0->type == GGML_TYPE_NVFP4 && fusion && fusion->residual &&
             ggml_cuda_info().devices[ctx.device].cc == GGML_CUDA_CC_BLACKWELL);
+
+    ggml_moe_cache_route_table x_route;
+    if (ids && ggml_moe_cache_route_find(src0->data, x_route)) {
+        fusion_local.x_table = x_route.table;
+        fusion_local.x_route_log = x_route.log;
+        ggml_moe_cache_route_table gate_route;
+        if (fusion && fusion->gate && ggml_moe_cache_route_find(fusion->gate->data, gate_route)) {
+            fusion_local.gate_table = gate_route.table;
+            fusion_local.gate_route_log = gate_route.log;
+        }
+    }
 
     // If src0 is a temporary compute buffer, clear any potential padding.
     if (ggml_backend_buffer_get_usage(src0->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE) {
