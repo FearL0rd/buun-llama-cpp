@@ -37,12 +37,14 @@ of the remaining gap; what is left is pipeline-level (chunk overlap, GEMM effici
   production Flash-Next + bigger ubatches needs `ot` tensor rebalancing off the main GPU.
 - Round 7 (mmproj dropped, `-ub 2048`): prefill then hits a pre-existing "Compute error"
   (`ggml_backend_sched_graph_compute_async` -> error -2) ~2-3 s into the 21K-token prompt,
-  in BOTH the off and on arms — i.e. independent of this change. The Flash-Next slot
-  differs from Coder's: n_ctx 262144 (no ctx-size in its config section) and VBR already
-  degraded at load to ~4.46 bpv (turbo4), versus Coder holding 8.125 bpv (turbo8). Suspect:
-  VBR-degrade/turbo interaction with large ubatches on this model; needs its own
-  investigation. Round 3 established that Flash-Next prefill works at `-ub 512`, so round 8
-  runs the A/B there (the production ubatch).
+  in BOTH the off and on arms — i.e. independent of this change. **Root cause confirmed
+  from the logs: `ggml_backend_cuda_graph_compute: CUDA pool allocation failed (out of
+  VRAM)` — the Flash-Next weights pack the 24 GB 3090 (~22 GB; the VBR pool budget there
+  is only ~400 MiB), so a 2048-token ubatch compute buffer does not fit. Not a kernel or
+  VBR bug: the "VBR already degraded to ~4.46 bpv" observation was VBR shrinking its
+  watermark trying to free cells for the failing allocation.** Fix: per-model
+  `tensor-split` giving the 3090 fewer layers (round 9). Until then Flash-Next stays at
+  `-ub 512`, which works.
 
 ## Round 8 (Flash-Next, `-ub 512`, no mmproj — production ubatch)
 
