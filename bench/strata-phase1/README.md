@@ -28,3 +28,18 @@ Decoder for the numbers: prompt = 21,208-token code prompt, `cache-prompt = off`
 
 Strata reference: ~2,100-2,230 t/s on one RTX 5070 — the V100 prefill path was a big part
 of the remaining gap; what is left is pipeline-level (chunk overlap, GEMM efficiency).
+
+## Rounds 6-7 (Flash-Next findings)
+
+- Round 6 (`-ub 2048`): Flash-Next cannot load with mmproj on the 24 GB 3090 at ub > 512 —
+  the 862 MiB vision encoder OOMs after the model + compute buffers (same with the MMQ env
+  off and on; a placement constraint). No `--mmproj-device` placement flag exists, so
+  production Flash-Next + bigger ubatches needs `ot` tensor rebalancing off the main GPU.
+- Round 7 (mmproj dropped, `-ub 2048`): prefill then hits a pre-existing "Compute error"
+  (`ggml_backend_sched_graph_compute_async` -> error -2) ~2-3 s into the 21K-token prompt,
+  in BOTH the off and on arms — i.e. independent of this change. The Flash-Next slot
+  differs from Coder's: n_ctx 262144 (no ctx-size in its config section) and VBR already
+  degraded at load to ~4.46 bpv (turbo4), versus Coder holding 8.125 bpv (turbo8). Suspect:
+  VBR-degrade/turbo interaction with large ubatches on this model; needs its own
+  investigation. Round 3 established that Flash-Next prefill works at `-ub 512`, so round 8
+  runs the A/B there (the production ubatch).
