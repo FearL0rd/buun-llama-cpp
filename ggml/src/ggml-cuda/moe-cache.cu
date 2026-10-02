@@ -3038,14 +3038,24 @@ static void * moe_cache_begin(
     return node.release();
 }
 
+static bool moe_cache_sm86_pq2_projection(const moe_cache_node & node) {
+    // Qualified on Mooney's separate expert projections, including MTP verify.
+    // Do not alter other codecs, fused FFNs or unmeasured GPU architectures.
+    return node.wtype == GGML_TYPE_Q2_0_G128 && node.n_tokens >= 1 && node.n_tokens <= 6 &&
+        node.n_mid == node.n_out &&
+        ((node.n_in == 2560 && node.n_out == 640) ||
+         (node.n_in == 640 && node.n_out == 2560)) &&
+        ggml_cuda_info().devices[node.device->logical].cc == 860;
+}
+
 static int moe_cache_overlap_rows(const moe_cache_node & node, int n_ids) {
     const int configured = node.session->config.overlap_cpu_rows;
     if (configured >= 0) {
         return std::min(configured, std::max(0, n_ids - 1));
     }
-    // EXL3 CPU trellis decoding can take longer than the GPU's entire share.
-    // Keep resident rows on GPU by default; explicit CPU-overlap counts still win.
-    if (ggml_type_is_exl3((ggml_type)node.wtype)) {
+    // EXL3 trellis decoding and the qualified PQ2 projections can make the
+    // CPU share slower than the GPU's whole share. Explicit counts still win.
+    if (ggml_type_is_exl3((ggml_type)node.wtype) || moe_cache_sm86_pq2_projection(node)) {
         return 0;
     }
     if (n_ids <= 1 || node.n_tokens <= 0 || n_ids % node.n_tokens != 0) {
@@ -3521,13 +3531,17 @@ static int moe_cache_dispatch_internal(
                     up_min, up_max, gate_min, gate_max,
                     device.compute_stream);
         } else {
+            // This short down projection underutilizes the generic channel
+            // kernel. Keep its resident rows on the cache's warp-per-row path.
+            const bool dedicated = moe_cache_sm86_pq2_projection(*node) && n_in == 640 &&
+                session.config.dedicated_down_mmv != 0;
             (void)ggml_cuda_moe_cache_mmv(
                     pool.slab, (ggml_type)wtype,
                     (const char *)device.d_act_q8, d_ids,
                     use_activation_map ? d_ids + n_hits : nullptr,
                     device.d_out, n_in, n_out, pool.n_slots,
                     (int64_t)pool.expert_size, n_hits, activation_rows,
-                    false, device.compute_stream);
+                    dedicated, device.compute_stream);
         }
         ok = moe_cache_cuda_ok(
                 device, cudaPeekAtLastError(), "expert matvec launch", true);

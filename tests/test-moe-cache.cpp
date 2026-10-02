@@ -1553,9 +1553,29 @@ static bool run_pq2_cache(ggml_backend_t cuda, ggml_backend_t cpu, log_capture &
         }
         scenario_options options;
         options.budget_mb = "32"; // at least the minimum pool of full-sized experts
+        options.dedicated_mmv = "0";
+        ok &= run_scenario("cache-pq2-generic", nullptr,
+                cuda, cpu, fixture.graph, fixture.reference, capture, options);
+        std::vector<float> generic(fixture.reference.size());
+        ggml_backend_tensor_get(fixture.graph.out, generic.data(), 0, generic.size() * sizeof(float));
+        options.dedicated_mmv = "1";
         for (const char * failure : {static_cast<const char *>(nullptr), "dispatch", "collect"}) {
             ok &= run_scenario(down ? "cache-pq2-down" : "cache-pq2-up", failure,
                     cuda, cpu, fixture.graph, fixture.reference, capture, options);
+            if (!failure) {
+                std::vector<float> dedicated(generic.size());
+                ggml_backend_tensor_get(fixture.graph.out, dedicated.data(), 0, dedicated.size() * sizeof(float));
+                double delta = 0, magnitude = 0;
+                float largest = 0;
+                for (size_t i = 0; i < generic.size(); ++i) {
+                    largest = std::max(largest, std::abs(dedicated[i] - generic[i]));
+                    delta += double(dedicated[i] - generic[i]) * (dedicated[i] - generic[i]);
+                    magnitude += double(generic[i]) * generic[i];
+                }
+                const double nmse = delta / (magnitude + 1e-20);
+                ok &= nmse < 1e-10;
+                printf("cache-pq2-kernel-pair: down=%d max_delta=%.9g nmse=%.9g\n", down, largest, nmse);
+            }
         }
         free_mxfp4_fixture(fixture);
     }
