@@ -2265,8 +2265,8 @@ static __global__ void flash_attn_ext_f16(
     // Skip unused kernel variants for faster compilation:
     static_assert(!indexed || (type_K == GGML_TYPE_F16 && type_V == GGML_TYPE_F16 && !sparse_mask),
         "finite-mask gather uses the F16 loader, independently of the sparse bitmap");
-    static_assert(!ordered_indices || (!use_sparse && DKQ == 256 && DV == 256 && ncols1 == 8 && ncols2 == 1),
-        "ordered indexing preserves dense reduction geometry and has no appended count array");
+    static_assert(!ordered_indices || (!use_sparse && DKQ == 256 && DV == 256 && ncols1 == 1 && ncols2 == 8),
+        "ordered indexing serves one query per sequence and has no appended count array");
     if (use_sparse && !ggml_cuda_flash_attn_ext_mma_f16_may_use_sparse(DKQ, DV, ncols1, ncols2)) {
         NO_DEVICE_CODE;
         return;
