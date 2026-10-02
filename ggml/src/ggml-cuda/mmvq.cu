@@ -2994,6 +2994,7 @@ ggml_cuda_moe_cache_mmv_path ggml_cuda_moe_cache_mmv(
     switch (type0) {
         MOE_CACHE_MMV_CASE(GGML_TYPE_Q1_0);
         MOE_CACHE_MMV_CASE(GGML_TYPE_Q2_0);
+        MOE_CACHE_MMV_CASE(GGML_TYPE_Q2_0_G128);
         MOE_CACHE_MMV_CASE(GGML_TYPE_Q4_0);
         MOE_CACHE_MMV_CASE(GGML_TYPE_Q4_1);
         MOE_CACHE_MMV_CASE(GGML_TYPE_Q5_0);
@@ -3082,6 +3083,7 @@ void ggml_cuda_moe_cache_mmv_fused(
     switch (type0) {
         MOE_CACHE_MMV_FUSED_CASE(GGML_TYPE_Q1_0);
         MOE_CACHE_MMV_FUSED_CASE(GGML_TYPE_Q2_0);
+        MOE_CACHE_MMV_FUSED_CASE(GGML_TYPE_Q2_0_G128);
         MOE_CACHE_MMV_FUSED_CASE(GGML_TYPE_Q4_0);
         MOE_CACHE_MMV_FUSED_CASE(GGML_TYPE_Q4_1);
         MOE_CACHE_MMV_FUSED_CASE(GGML_TYPE_Q5_0);

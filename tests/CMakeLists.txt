@@ -917,6 +917,7 @@ if (NOT LLAMA_USE_SYSTEM_GGML)
 endif()
 
 llama_build_and_test(test-moe-cache-fit.cpp)
+llama_build_and_test(test-mooney-rotation.cpp)
 llama_build_and_test(test-moe-routing.cpp)
 target_include_directories(test-moe-routing PRIVATE ../src ../ggml/src)
 llama_build_and_test(test-qsa-bias.cpp)

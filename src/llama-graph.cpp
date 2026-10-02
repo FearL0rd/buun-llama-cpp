@@ -1887,6 +1887,29 @@ ggml_tensor * llm_graph_context::build_cvec(
     return cvec->apply_to(ctx0, cur, il);
 }
 
+// Contract: W_rot = W blockdiag(D H), so the activation must be blockdiag(H D) x.
+// Keep each segment explicit so existing CPU/GPU Hadamard dispatch remains usable.
+ggml_tensor * llama_hadamard_segments_apply(ggml_context * ctx, ggml_tensor * input,
+                                          const llama_hadamard_transform & transform) {
+    GGML_ASSERT(!transform.segments.empty());
+    const auto & last = transform.segments.back();
+    GGML_ASSERT(last.offset + last.rot->ne[0] == input->ne[0]);
+    ggml_tensor * flat = ggml_is_contiguous(input)
+        ? ggml_reshape_2d(ctx, input, input->ne[0], ggml_nrows(input))
+        : ggml_cont_2d(ctx, input, input->ne[0], ggml_nrows(input));
+    ggml_tensor * result = nullptr;
+    for (const auto & segment : transform.segments) {
+        const int64_t width = segment.rot->ne[0];
+        ggml_tensor * part = ggml_view_2d(ctx, flat, width, flat->ne[1], flat->nb[1],
+                                        segment.offset * flat->nb[0]);
+        part = ggml_mul(ctx, part, segment.signs);
+        part = ggml_mul_mat(ctx, segment.rot, part);
+        ggml_mul_mat_set_hint(part, GGML_HINT_SRC0_IS_HADAMARD);
+        result = result ? ggml_concat(ctx, result, part, 0) : part;
+    }
+    return ggml_reshape_4d(ctx, result, input->ne[0], input->ne[1], input->ne[2], input->ne[3]);
+}
+
 ggml_tensor * llm_graph_context::build_hadamard_input(ggml_tensor * w, ggml_tensor * cur) const {
     if (!hadamard_rotations || hadamard_rotations->empty()) {
         return cur;
@@ -1896,6 +1919,16 @@ ggml_tensor * llm_graph_context::build_hadamard_input(ggml_tensor * w, ggml_tens
         return cur;
     }
     const auto & t = it->second;
+    if (!t.segments.empty()) {
+        const auto key = std::make_pair(cur, w);
+        const auto cached = segmented_inputs.find(key);
+        if (cached != segmented_inputs.end()) {
+            return cached->second;
+        }
+        auto * rotated = llama_hadamard_segments_apply(ctx0, cur, t);
+        segmented_inputs.emplace(key, rotated);
+        return rotated;
+    }
     const hadamard_input_key key { cur, t.rot, t.signs, t.perm_hd, t.perm_nk, t.perm_rep };
     const auto cached = hadamard_inputs.find(key);
     if (cached != hadamard_inputs.end()) {

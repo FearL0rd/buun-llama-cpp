@@ -759,7 +759,7 @@ static bool run_fused_cpu_fallbacks(ggml_backend_t cpu) {
     static int end_calls;
     static int collect_calls;
     bool ok = true;
-    for (ggml_type type : { GGML_TYPE_Q2_0, GGML_TYPE_MXFP4, GGML_TYPE_Q4_K, GGML_TYPE_IQ2_XXS }) {
+    for (ggml_type type : { GGML_TYPE_Q2_0, GGML_TYPE_Q2_0_G128, GGML_TYPE_MXFP4, GGML_TYPE_Q4_K, GGML_TYPE_IQ2_XXS }) {
         for (int tokens : { 1, 2, 3, 4, 8, 16 }) {
             ggml_context * ctx = ggml_init({ 8*ggml_tensor_overhead(), nullptr, true });
             GGML_ASSERT(ctx);
@@ -1352,7 +1352,8 @@ static bool init_mxfp4_fixture(
         int64_t mxfp4_n_in,
         int64_t mxfp4_n_out,
         ggml_backend_t cpu,
-        mxfp4_fixture & fixture) {
+        mxfp4_fixture & fixture,
+        ggml_type type = GGML_TYPE_MXFP4) {
     const ggml_init_params params = {
         8 * ggml_tensor_overhead(),
         nullptr,
@@ -1365,7 +1366,7 @@ static bool init_mxfp4_fixture(
     }
 
     fixture.weights = ggml_new_tensor_3d(
-            fixture.ctx, GGML_TYPE_MXFP4,
+            fixture.ctx, type,
             mxfp4_n_in, mxfp4_n_out, n_expert);
     ggml_tensor * ids = ggml_new_tensor_2d(
             fixture.ctx, GGML_TYPE_I32, n_used, n_tokens);
@@ -1392,7 +1393,7 @@ static bool init_mxfp4_fixture(
     }
     std::vector<uint8_t> weights_mxfp4(ggml_nbytes(fixture.weights));
     const size_t quantized = ggml_quantize_chunk(
-            GGML_TYPE_MXFP4, weights_f32.data(), weights_mxfp4.data(),
+            type, weights_f32.data(), weights_mxfp4.data(),
             0, mxfp4_n_out * n_expert, mxfp4_n_in, nullptr);
     if (quantized != weights_mxfp4.size()) {
         fprintf(stderr, "%s: unexpected quantized size: %zu != %zu\n",
@@ -1536,6 +1537,28 @@ static bool run_mxfp4_shared_pool(
     printf("cache-mxfp4-shared-pool: %s\n", ok ? "OK" : "FAIL");
     free_mxfp4_fixture(up);
     free_mxfp4_fixture(down);
+    return ok;
+}
+
+static bool run_pq2_cache(ggml_backend_t cuda, ggml_backend_t cpu, log_capture & capture) {
+    bool ok = true;
+    // Exercise actual cache-hit computation, not just admission or byte copies.
+    // Both axes use Mooney's dimensions; dispatch/collect failures must retain
+    // the same CPU reference through the fallback path.
+    for (bool down : {false, true}) {
+        mxfp4_fixture fixture;
+        if (!init_mxfp4_fixture("cache-pq2", down ? "blk.6.ffn_down_exps.weight" : "blk.6.ffn_up_exps.weight",
+                down ? 640 : 2560, down ? 2560 : 640, cpu, fixture, GGML_TYPE_Q2_0_G128)) {
+            return false;
+        }
+        scenario_options options;
+        options.budget_mb = "32"; // at least the minimum pool of full-sized experts
+        for (const char * failure : {static_cast<const char *>(nullptr), "dispatch", "collect"}) {
+            ok &= run_scenario(down ? "cache-pq2-down" : "cache-pq2-up", failure,
+                    cuda, cpu, fixture.graph, fixture.reference, capture, options);
+        }
+        free_mxfp4_fixture(fixture);
+    }
     return ok;
 }
 
@@ -4070,6 +4093,8 @@ static bool run_pool_limits() {
     for (size_t minimum : { 512u << 10, 1024u << 10 }) {
         ok &= ggml_moe_cache_effective_min_expert_bytes(GGML_TYPE_Q2_0, 0, minimum) == minimum / 2;
         ok &= ggml_moe_cache_effective_min_expert_bytes(GGML_TYPE_Q2_0, 1, minimum) == minimum;
+        ok &= ggml_moe_cache_effective_min_expert_bytes(GGML_TYPE_Q2_0_G128, 0, minimum) == minimum / 2;
+        ok &= ggml_moe_cache_effective_min_expert_bytes(GGML_TYPE_Q2_0_G128, 1, minimum) == minimum;
     }
     const size_t expert_bytes = 400u << 10;
     const size_t exl3_limit = ggml_moe_cache_max_pool_slots(GGML_TYPE_EXL3_2, expert_bytes);
@@ -5384,6 +5409,7 @@ int main(int argc, char ** argv) {
             cuda_device, cuda, cpu, weights, gate_weights,
             down_weights, capture);
     ok &= run_mxfp4_shared_pool(cuda, cpu, capture);
+    ok &= run_pq2_cache(cuda, cpu, capture);
     const size_t expert_size = ggml_nbytes(weights) / n_expert;
     ok &= run_precensus_invalidation(
             cuda, cpu, graph, weights,
