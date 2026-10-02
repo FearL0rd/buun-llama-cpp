@@ -89,7 +89,10 @@ int main() {
     for (size_t d = 0; d < ggml_backend_dev_count(); ++d) {
         auto * backend = ggml_backend_dev_init(ggml_backend_dev_get(d), nullptr);
         GGML_ASSERT(backend);
-        for (const auto & blocks : {std::vector<int>{1024,1024,512}, std::vector<int>{512,128}, std::vector<int>{128}}) {
+        // The 384-wide layout cannot use the specialized segmented fusion:
+        // it also pins the row stride of the individual signed FWHT fallback.
+        for (const auto & blocks : {std::vector<int>{1024,1024,512}, std::vector<int>{512,128},
+                                   std::vector<int>{256,128}, std::vector<int>{128}}) {
             for (int rows : {1,3,4,20}) {
                 for (bool strided : {false,true}) ok &= check(backend, blocks, rows, strided);
             }

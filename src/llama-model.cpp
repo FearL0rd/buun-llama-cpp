@@ -2652,6 +2652,11 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         };
 
         for (const auto & [weight_name, spec] : segmented_rotation_specs) {
+            // Target-only loads deliberately omit an embedded MTP block.
+            // Only the loader may exempt a weight; unknown names still fail.
+            if (ml.skipped_tensors.count(weight_name)) {
+                continue;
+            }
             const auto * weight = get_tensor(weight_name.c_str());
             if (!weight || !weight->buffer || weight->ne[0] != int64_t(spec.signs.size())) {
                 throw std::runtime_error(format("lowbitflash.rot weight geometry mismatch: %s", weight_name.c_str()));

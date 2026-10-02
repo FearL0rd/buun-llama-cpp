@@ -1353,7 +1353,10 @@ static bool init_mxfp4_fixture(
         int64_t mxfp4_n_out,
         ggml_backend_t cpu,
         mxfp4_fixture & fixture,
-        ggml_type type = GGML_TYPE_MXFP4) {
+        ggml_type type = GGML_TYPE_MXFP4,
+        int64_t tokens = n_tokens,
+        int64_t used = n_used,
+        int64_t activation_rows = 1) {
     const ggml_init_params params = {
         8 * ggml_tensor_overhead(),
         nullptr,
@@ -1369,9 +1372,9 @@ static bool init_mxfp4_fixture(
             fixture.ctx, type,
             mxfp4_n_in, mxfp4_n_out, n_expert);
     ggml_tensor * ids = ggml_new_tensor_2d(
-            fixture.ctx, GGML_TYPE_I32, n_used, n_tokens);
+            fixture.ctx, GGML_TYPE_I32, used, tokens);
     ggml_tensor * activations = ggml_new_tensor_3d(
-            fixture.ctx, GGML_TYPE_F32, mxfp4_n_in, 1, n_tokens);
+            fixture.ctx, GGML_TYPE_F32, mxfp4_n_in, activation_rows, tokens);
     ggml_set_name(fixture.weights, weight_name);
     ggml_set_name(ids, "moe_cache_mxfp4_ids");
     ggml_set_name(activations, "moe_cache_mxfp4_activations");
@@ -1404,8 +1407,13 @@ static bool init_mxfp4_fixture(
     ggml_backend_tensor_set(
             fixture.weights, weights_mxfp4.data(), 0, weights_mxfp4.size());
 
-    const int32_t ids_data[n_used] = { 0, 1 };
-    ggml_backend_tensor_set(ids, ids_data, 0, sizeof(ids_data));
+    std::vector<int32_t> ids_data(used*tokens);
+    for (int64_t token = 0; token < tokens; ++token) {
+        for (int64_t expert = 0; expert < used; ++expert) {
+            ids_data[token*used + expert] = (expert + token) % n_expert;
+        }
+    }
+    ggml_backend_tensor_set(ids, ids_data.data(), 0, ids_data.size()*sizeof(int32_t));
     std::vector<float> activation_data(ggml_nelements(activations));
     for (size_t index = 0; index < activation_data.size(); index++) {
         activation_data[index] =
@@ -1545,13 +1553,18 @@ static bool run_pq2_cache(ggml_backend_t cuda, ggml_backend_t cpu, log_capture &
     // Exercise actual cache-hit computation, not just admission or byte copies.
     // Both axes use Mooney's dimensions; dispatch/collect failures must retain
     // the same CPU reference through the fallback path.
+    for (int tokens : {1, 3, 6})
     for (bool down : {false, true}) {
+        const int used = tokens == 1 ? 2 : 3; // also exercise odd hit-pair tails
+        printf("cache-pq2-shape: tokens=%d used=%d down=%d\n", tokens, used, down);
         mxfp4_fixture fixture;
         if (!init_mxfp4_fixture("cache-pq2", down ? "blk.6.ffn_down_exps.weight" : "blk.6.ffn_up_exps.weight",
-                down ? 640 : 2560, down ? 2560 : 640, cpu, fixture, GGML_TYPE_Q2_0_G128)) {
+                down ? 640 : 2560, down ? 2560 : 640, cpu, fixture, GGML_TYPE_Q2_0_G128,
+                tokens, used, down ? used : 1)) {
             return false;
         }
         scenario_options options;
+        options.max_batch = "6";
         options.budget_mb = "32"; // at least the minimum pool of full-sized experts
         options.dedicated_mmv = "0";
         ok &= run_scenario("cache-pq2-generic", nullptr,
@@ -1559,6 +1572,7 @@ static bool run_pq2_cache(ggml_backend_t cuda, ggml_backend_t cpu, log_capture &
         std::vector<float> generic(fixture.reference.size());
         ggml_backend_tensor_get(fixture.graph.out, generic.data(), 0, generic.size() * sizeof(float));
         options.dedicated_mmv = "1";
+        options.dedicated_down_mmv = "1";
         for (const char * failure : {static_cast<const char *>(nullptr), "dispatch", "collect"}) {
             ok &= run_scenario(down ? "cache-pq2-down" : "cache-pq2-up", failure,
                     cuda, cpu, fixture.graph, fixture.reference, capture, options);
@@ -1582,7 +1596,7 @@ static bool run_pq2_cache(ggml_backend_t cuda, ggml_backend_t cpu, log_capture &
         for (int scenario = 0; scenario < 6; ++scenario) {
             const char * failure = scenario == 1 ? "dispatch" : scenario == 2 ? "collect" :
                                    scenario == 3 ? "collect-retire" : nullptr;
-            configure_cache(failure, "1", "1", "32");
+            configure_cache(failure, "6", "1", "32", "1");
             auto * ctx = ggml_init({16*ggml_tensor_overhead()+ggml_graph_overhead(), nullptr, true});
             auto * projection = ggml_mul_mat_id(ctx, fixture.weights,
                     fixture.graph.out->src[1], fixture.graph.out->src[2]);
@@ -1603,6 +1617,9 @@ static bool run_pq2_cache(ggml_backend_t cuda, ggml_backend_t cpu, log_capture &
             for (auto & value : expected) value *= .5f;
             int deferred_failures = 0;
             for (int step = 0; pass && step < 96; ++step) {
+                // A missing device write must not pass using an earlier result.
+                std::fill(actual.begin(), actual.end(), std::numeric_limits<float>::quiet_NaN());
+                ggml_backend_tensor_set(result, actual.data(), 0, ggml_nbytes(result));
                 const auto status = ggml_backend_sched_graph_compute(sched, graph);
                 if (scenario == 3 && status == GGML_STATUS_FAILED) {
                     ++deferred_failures;
