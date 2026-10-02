@@ -1564,7 +1564,8 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                         previous.graph.nodes + previous.graph.n_nodes,
                         [](const ggml_tensor * node) { return node->op == GGML_OP_MUL_MAT_ID; });
                 auto * source = previous.graph.nodes[previous.graph.n_nodes - 1];
-                if (projections == 3 && !(source->flags & (GGML_TENSOR_FLAG_INPUT | GGML_TENSOR_FLAG_OUTPUT)) &&
+                if ((projections == 3 || projections == 1) &&
+                        !(source->flags & (GGML_TENSOR_FLAG_INPUT | GGML_TENSOR_FLAG_OUTPUT)) &&
                         ggml_node_get_use_count(&previous.graph, previous.graph.n_nodes - 1) == 1) {
                     for (int j = 0; j < split->n_inputs; ++j) {
                         if (split->inputs[j] == source &&

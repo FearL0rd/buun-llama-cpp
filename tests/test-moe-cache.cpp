@@ -1577,6 +1577,52 @@ static bool run_pq2_cache(ggml_backend_t cuda, ggml_backend_t cpu, log_capture &
                 printf("cache-pq2-kernel-pair: down=%d max_delta=%.9g nmse=%.9g\n", down, largest, nmse);
             }
         }
+        // A separate rotated projection must also hand its resident rows to
+        // the GPU consumer without publishing incomplete host output.
+        for (int scenario = 0; scenario < 6; ++scenario) {
+            const char * failure = scenario == 1 ? "dispatch" : scenario == 2 ? "collect" :
+                                   scenario == 3 ? "collect-retire" : nullptr;
+            configure_cache(failure, "1", "1", "32");
+            auto * ctx = ggml_init({16*ggml_tensor_overhead()+ggml_graph_overhead(), nullptr, true});
+            auto * projection = ggml_mul_mat_id(ctx, fixture.weights,
+                    fixture.graph.out->src[1], fixture.graph.out->src[2]);
+            auto * result = ggml_scale(ctx, projection, .5f);
+            if (scenario == 4) ggml_set_output(projection);
+            ggml_set_output(result);
+            auto * graph = ggml_new_graph(ctx);
+            ggml_build_forward_expand(graph, result);
+            ggml_backend_t backends[] = {cuda, cpu};
+            auto sched = ggml_backend_sched_new(backends, nullptr, 2, GGML_DEFAULT_GRAPH_SIZE,
+                                                scenario == 5, false);
+            ggml_backend_sched_set_tensor_backend(sched, projection, cpu);
+            ggml_backend_sched_set_tensor_backend(sched, result, cuda);
+            bool pass = ggml_backend_sched_alloc_graph(sched, graph);
+            const bool handoff_supported = ggml_moe_cache.output_supported &&
+                ggml_moe_cache.output_supported(cuda, projection);
+            std::vector<float> expected = fixture.reference, actual(expected.size());
+            for (auto & value : expected) value *= .5f;
+            int deferred_failures = 0;
+            for (int step = 0; pass && step < 96; ++step) {
+                const auto status = ggml_backend_sched_graph_compute(sched, graph);
+                if (scenario == 3 && status == GGML_STATUS_FAILED) {
+                    ++deferred_failures;
+                    continue;
+                }
+                pass &= status == GGML_STATUS_SUCCESS;
+                ggml_backend_tensor_get(result, actual.data(), 0, ggml_nbytes(result));
+                pass &= compare_output(expected, actual, 5e-4);
+                if (scenario == 4) {
+                    ggml_backend_tensor_get(projection, actual.data(), 0, ggml_nbytes(projection));
+                    pass &= compare_output(fixture.reference, actual, 5e-4);
+                }
+            }
+            if (scenario == 3 && handoff_supported) pass &= deferred_failures > 0;
+            printf("cache-pq2-device-output: down=%d scenario=%d deferred-failures=%d %s\n",
+                    down, scenario, deferred_failures, pass ? "OK" : "FAIL");
+            ok &= pass;
+            ggml_backend_sched_free(sched);
+            ggml_free(ctx);
+        }
         free_mxfp4_fixture(fixture);
     }
     return ok;
@@ -4940,6 +4986,7 @@ int main(int argc, char ** argv) {
     const bool profile_writer = argc == 6 && std::strcmp(argv[1], "--profile-writer") == 0;
     const bool host_buffer = argc == 2 && std::strcmp(argv[1], "--host-buffer") == 0;
     const bool persistent_pool = argc == 2 && std::strcmp(argv[1], "--cpu-persistent-pool") == 0;
+    const bool pq2_only = argc == 2 && std::strcmp(argv[1], "--pq2") == 0;
     if (!run_pool_limits()) return 1;
     if (argc > 0 && argv[0]) {
         std::error_code ec;
@@ -4990,7 +5037,7 @@ int main(int argc, char ** argv) {
     }
     // Profile writer subprocesses must reach their rendezvous promptly. They
     // exercise profile I/O, not the parent's complete CPU fallback matrix.
-    if (!profile_writer) {
+    if (!profile_writer && !pq2_only) {
         for (int threads : { 1, 2, 4, 6 }) {
             if (set_n_threads) set_n_threads(cpu, threads);
             printf("cache-fused-cpu-fallbacks: threads=%d\n", threads);
@@ -5031,6 +5078,12 @@ int main(int argc, char ** argv) {
         fprintf(stderr, "failed to initialize GPU backend\n");
         ggml_backend_free(cpu);
         return 1;
+    }
+    if (pq2_only) {
+        const bool ok = run_pq2_cache(cuda, cpu, capture);
+        ggml_backend_free(cuda);
+        ggml_backend_free(cpu);
+        return ok ? 0 : 1;
     }
     ggml_init_params static_params = {
         16 * ggml_tensor_overhead(),

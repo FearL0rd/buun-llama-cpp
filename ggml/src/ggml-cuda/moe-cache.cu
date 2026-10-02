@@ -3755,7 +3755,9 @@ static int moe_cache_collect(
         return 0;
     }
     auto * frame = moe_cache_output_frame(node->session);
-    if (frame && frame->output.source && node->host_base3 && n_hits <= 64 &&
+    const bool single_projection = frame && frame->output.source && !node->host_base2 &&
+        frame->output.source->src[0] && frame->output.source->src[0]->data == node->host_base;
+    if (frame && frame->output.source && (node->host_base3 || single_projection) && n_hits <= 64 &&
             frame->output.device == node->device->logical && !frame->output.written &&
             frame->output.source->ne[0] == n_out) {
         const auto * source = frame->output.source;
