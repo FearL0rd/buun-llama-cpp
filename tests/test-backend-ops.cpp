@@ -11210,6 +11210,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
 
     test_cases.emplace_back(new test_get_rows(GGML_TYPE_F32, 1, 8, 2, 1, 1, false));
+    // narrow rows, many of them (QSA block-score expansion): thread-per-element path
+    for (ggml_type type : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_I32}) {
+        for (int n : {1, 3, 31}) {
+            test_cases.emplace_back(new test_get_rows(type, n, 1027, 33000, 1, 1, false));
+            test_cases.emplace_back(new test_get_rows(type, n, 17, 300, 2, 3, true, true));
+        }
+    }
     for (bool v : {false, true}) {
         test_cases.emplace_back(new test_get_rows(GGML_TYPE_F8_E4M3, 160, 5, 4, 2, 1, v));
     }
