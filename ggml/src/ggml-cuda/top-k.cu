@@ -450,6 +450,17 @@ static void top_k_radix_cuda(
 
 #endif // Batched radix selection: CUDA with DeviceTopK, or HIP without CUB.
 
+#if defined(GGML_USE_HIP)
+// hipMemcpy2DAsync can reject valid VMM-backed graph suballocations. Pack the
+// selected prefix of each sorted row directly, without changing its ordering.
+static __global__ void top_k_copy_indices(const int * src, int * dst, int64_t ncols, int64_t k, int64_t count) {
+    const int64_t i = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i < count) {
+        dst[i] = src[(i / k) * ncols + i % k];
+    }
+}
+#endif
+
 void ggml_cuda_op_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * src0   = dst->src[0];
     const float *       src0_d = (const float *) src0->data;
@@ -526,8 +537,12 @@ void ggml_cuda_op_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
         ggml_cuda_pool_alloc<int> temp_dst_alloc(pool, ncols * nrows);
         int *                     tmp_dst = temp_dst_alloc.get();
         argsort_f32_i32_cuda_bitonic(src0_d, tmp_dst, ncols, nrows, GGML_SORT_ORDER_DESC, stream);
+#if defined(GGML_USE_HIP)
+        top_k_copy_indices<<<(k * nrows + 255) / 256, 256, 0, stream>>>(tmp_dst, dst_d, ncols, k, k * nrows);
+#else
         CUDA_CHECK(cudaMemcpy2DAsync(dst_d, k * sizeof(int), tmp_dst, ncols * sizeof(int), k * sizeof(int), nrows,
                                      cudaMemcpyDeviceToDevice, stream));
+#endif
 #if defined(GGML_USE_HIP)
     }
 #endif // defined(GGML_USE_HIP)
