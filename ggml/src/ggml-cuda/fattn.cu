@@ -499,9 +499,8 @@ static void ggml_cuda_flash_attn_ext_mma_turbo_switch_ncols1(ggml_backend_cuda_c
     ggml_cuda_flash_attn_ext_mma_turbo_case<DKQ, DV, 4, 8, type_K, type_V>(ctx, dst);
 }
 
-// Turbo MMA fused dispatch: ncols2 selection based on GQA ratio.
-template <int DKQ, int DV, ggml_type type_K, ggml_type type_V>
-static void ggml_cuda_flash_attn_ext_mma_turbo_switch_ncols2(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+// Shared by tile dispatch and eligibility: RDNA has no ncols2=1 MMA kernel.
+static int ggml_cuda_fattn_turbo_ncols2(const ggml_tensor * dst) {
     const ggml_tensor * KQV  = dst;
     const ggml_tensor * Q    = dst->src[0];
     const ggml_tensor * K    = dst->src[1];
@@ -527,21 +526,29 @@ static void ggml_cuda_flash_attn_ext_mma_turbo_switch_ncols2(ggml_backend_cuda_c
     const int gqa_ratio = Q->ne[2] / K->ne[2];
 
     if (use_gqa_opt && gqa_ratio > 4) {
-        ggml_cuda_flash_attn_ext_mma_turbo_switch_ncols1<DKQ, DV, 8, type_K, type_V>(ctx, dst);
-        return;
+        return 8;
     }
 
     if (use_gqa_opt && gqa_ratio > 2) {
-        ggml_cuda_flash_attn_ext_mma_turbo_switch_ncols1<DKQ, DV, 4, type_K, type_V>(ctx, dst);
-        return;
+        return 4;
     }
 
     if (use_gqa_opt && gqa_ratio > 1) {
-        ggml_cuda_flash_attn_ext_mma_turbo_switch_ncols1<DKQ, DV, 2, type_K, type_V>(ctx, dst);
-        return;
+        return 2;
     }
 
-    ggml_cuda_flash_attn_ext_mma_turbo_switch_ncols1<DKQ, DV, 1, type_K, type_V>(ctx, dst);
+    return 1;
+}
+
+template <int DKQ, int DV, ggml_type type_K, ggml_type type_V>
+static void ggml_cuda_flash_attn_ext_mma_turbo_switch_ncols2(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    switch (ggml_cuda_fattn_turbo_ncols2(dst)) {
+        case 8: ggml_cuda_flash_attn_ext_mma_turbo_switch_ncols1<DKQ, DV, 8, type_K, type_V>(ctx, dst); break;
+        case 4: ggml_cuda_flash_attn_ext_mma_turbo_switch_ncols1<DKQ, DV, 4, type_K, type_V>(ctx, dst); break;
+        case 2: ggml_cuda_flash_attn_ext_mma_turbo_switch_ncols1<DKQ, DV, 2, type_K, type_V>(ctx, dst); break;
+        case 1: ggml_cuda_flash_attn_ext_mma_turbo_switch_ncols1<DKQ, DV, 1, type_K, type_V>(ctx, dst); break;
+        default: GGML_ABORT("invalid Turbo attention tile");
+    }
 }
 #endif
 
@@ -2597,8 +2604,10 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
     if (turbo_mma_fused && (turbo_matched || turbo_fused_asym || turbo1_tcq_matched) && Q->ne[1] <= 4 &&
         (Q->ne[0] == 128 || Q->ne[0] == 256) &&
         (turing_mma_available(ggml_cuda_info().devices[ggml_cuda_get_device()].cc) ||
-         // AMD RDNA WMMA: trying D=128 AND D=256 (gemma) after lifting the upstream DKQ<=128 cap.
-         amd_wmma_available(ggml_cuda_info().devices[ggml_cuda_get_device()].cc))) {
+         // Without an eligible grouped-head tile, use the materialize/vector
+         // fallback instead of launching RDNA's NO_DEVICE_CODE specialization.
+         (amd_wmma_available(ggml_cuda_info().devices[ggml_cuda_get_device()].cc) &&
+          ggml_cuda_fattn_turbo_ncols2(dst) > 1))) {
         cudaStream_t stream = ctx.stream();
         int device;
         CUDA_CHECK(cudaGetDevice(&device));
