@@ -65,6 +65,18 @@ the gate is off by default pending broader hardware validation.
 "8192", round 5's "4096", and the production config's 4096). All t/s numbers above stand,
 re-labeled to ubatch 2048. Round 10 tests true `b=ub` 4096/8192.
 
+## Round 11 (Coder CPU experts + moe-cache budget — crash isolates a -b 4096 V100 bug)
+
+`n-cpu-moe = 99` + `moe-cache = 4096` (all accepted; VRAM freed: 3090 15.1 -> 9.4 GB) made
+the true-4096 graph FIT (zero pool-OOM lines) — but the first 21K prefill then died with a
+sticky CUDA illegal access on a V100 (surfaced at `ggml_backend_cuda_get_tensor_async`,
+ggml-cuda.cu:3857). Combined with the production crash at `-b 4096` (illegal access in
+`argsort_f32_i32_cuda_cub` on device 1 after degraded load), the pattern points at the
+MoE-router/batch-4096 path on sm_70 independent of expert placement or memory pressure.
+Round 11b reruns the CPU-experts config at `-b/-ub 2048` to discriminate: if it works,
+the bug is the 4096 batch on V100 (kernel-level investigation target), and we also get
+the CPU-experts prefill number for the honest trade against resident weights at 1,024 t/s.
+
 ## Round 10 (Coder true-ubatch 4096/8192 — blocked by the graph compute buffer)
 
 Both scenarios fail at load: `graph_reserve: n_tokens = 4096` ->
