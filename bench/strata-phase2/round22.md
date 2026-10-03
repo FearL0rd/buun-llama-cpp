@@ -16,14 +16,22 @@ Setup: Coder IQ1_M + MTP sidecar (n=3), short prompt (~32 tok), 384-token decode
 
 Result: the 2-GPU split loses ~5%. The 3-GPU production split stays.
 
-Interpretation: decode wall time is carried by per-GPU layer compute (kernel
-latency), not by dispatch/launch overhead. Dropping the 3090 (the fastest dp4a
-card in the mix) forces each V100 to carry ~14 GB of layers instead of ~10 GB, and
-the extra per-GPU work outweighs the one removed pipeline boundary + backend.
+Interpretation (corrected after cycle-time math): acceptance is identical across
+splits (same model, prompt, and sampling), so the implied spec-cycle time is
+46.0 ms (3 GPU) vs 48.4 ms (2x V100) — only +5% despite each V100 carrying ~40%
+more layer bytes in the 2-GPU split. Decode wall time is therefore NOT carried by
+per-GPU weight-read bandwidth or compute; it matches round 21's profile (GPU busy
+only ~8% of the cycle): the dominant cost is per-op host dispatch + sync structure,
+plus a small bandwidth-sensitive remainder (which is what the 2-GPU split lost).
+The "fewer pipeline boundaries" lever is dead — removing one of three backends
+does not pay.
 
 Consequences for the decode queue:
-- launch-count trimming / further fusion for decode: deprioritized
 - draft depth (verify forward is batch-insensitive): next — round 23
-- MTP head GEMV (20.1% of decode kernel time): draft-vocab restriction candidate
+- decompose the ~42 ms/cycle of non-kernel time: nsys cuda_api_sum + gpu-trace
+  gaps on the existing round-21 capture (decode-r21.sqlite)
+- fusion / op-count reduction for decode: back on the table pending that profile
+- MTP head GEMV: 20.1% of kernel time, but kernel time is only ~8% of the cycle
+  (~1.5% of wall) — draft-vocab restriction parked
 
 Raw data: round22-results.md (also ~/.strata-bench/phase2-round22-results.md on AISERVER).
