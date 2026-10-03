@@ -1281,6 +1281,7 @@ const ggml_cuda_device_info & ggml_cuda_info();
 
 void ggml_cuda_set_device(int device);
 int ggml_cuda_get_device();
+cudaError_t ggml_cuda_device_memory_info(int device, size_t * free, size_t * total);
 
 struct ggml_cuda_pool_alloc_failure : std::exception {
     const char * what() const noexcept override {
@@ -1706,6 +1707,8 @@ struct ggml_backend_cuda_context {
     // entry across those shapes prevents any of them from reaching CUDA graph
     // replay.
     std::unordered_map<uint64_t, std::unique_ptr<ggml_cuda_graph>> cuda_graphs;
+    // Offloaded MoE models can have nearly 100 splits before accounting for
+    // speculative widths. A 64-entry LRU churns even across consecutive steps.
     static constexpr size_t max_cuda_graphs = 256;
 
     int64_t last_graph_eviction_sweep = 0;
