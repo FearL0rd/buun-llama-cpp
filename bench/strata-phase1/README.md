@@ -58,6 +58,13 @@ both models: Coder +50% (`-ub 4096`, 700 -> 1,040 t/s), Flash-Next +48% (`-ub 51
 395 -> 585 t/s). Enable with `GGML_CUDA_MMQ_MOE_ALL_BATCHES=1` in the launch environment;
 the gate is off by default pending broader hardware validation.
 
+## Correction (round 10): earlier "ub 4096/8192" runs were effectively ubatch 2048
+
+`src/llama-context.cpp:376` clamps `n_ubatch` to `n_batch`; every earlier scenario passed
+`-b 2048` with a larger `-ub`, so the effective ubatch was 2048 everywhere (round 4's
+"8192", round 5's "4096", and the production config's 4096). All t/s numbers above stand,
+re-labeled to ubatch 2048. Round 10 tests true `b=ub` 4096/8192.
+
 ## Round 9 (Flash-Next tensor-split rebalance — investigation concluded)
 
 `tensor-split = 0.6,1,1` (accepted, reached the child; ~3090 share 27%->23%) freed the
