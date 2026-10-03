@@ -58,6 +58,18 @@ both models: Coder +50% (`-ub 4096`, 700 -> 1,040 t/s), Flash-Next +48% (`-ub 51
 395 -> 585 t/s). Enable with `GGML_CUDA_MMQ_MOE_ALL_BATCHES=1` in the launch environment;
 the gate is off by default pending broader hardware validation.
 
+## Round 9 (Flash-Next tensor-split rebalance — investigation concluded)
+
+`tensor-split = 0.6,1,1` (accepted, reached the child; ~3090 share 27%->23%) freed the
+3090, but the OOM then surfaced on the V100 (CUDA OOM in `fattn-mma-f16.cuh:2514`
+`cudaFuncSetAttribute` at 30.6/32 GB), and `-ub 4096` failed to load at all. The freed
+3090 space was re-absorbed by the VBR pool re-deriving its budget. Verdict: **Flash-Next
+(77 GB weights in the 88 GB pool) has no headroom for ub >= 2048 anywhere — a capacity
+limit, not a code bug.** Production stance: Flash-Next stays at `-ub 512` (585 t/s with
+the MMQ patch, its practical ceiling on this rig). Any change needs freed VRAM: expert
+offload to RAM via moe-cache (hurts prefill — nearly all experts active per chunk), a
+smaller KV budget, or a lower-bpw model file.
+
 Flash-Next caveats (both pre-existing, independent of this change): mmproj OOM on the 3090
 at ub > 512 (needs `ot` rebalancing to raise the ubatch), and a "Compute error" ~2-3 s into
 long prefills at `-ub >= 2048` (VBR/turbo interaction, untested against this change because
