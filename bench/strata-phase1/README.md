@@ -65,6 +65,25 @@ the gate is off by default pending broader hardware validation.
 "8192", round 5's "4096", and the production config's 4096). All t/s numbers above stand,
 re-labeled to ubatch 2048. Round 10 tests true `b=ub` 4096/8192.
 
+## Round 11b (CPU experts at `-b 2048` — crash reproduced; CPU-expert prefill path is broken)
+
+Same fatal signature as round 11 (sticky CUDA illegal access on device 1, surfaced at the
+D2H `ggml_backend_cuda_get_tensor_async`), at ub 2048, 6.8 s into the first 21K prefill.
+The CPU-expert configuration (`n-cpu-moe = 99` + `moe-cache = 4096` + cpu-overlap auto +
+expert-parallel auto) therefore crashes during prefill at BOTH 2048 and 4096 — a real bug
+in the CPU-expert dispatch/compute path under prefill load for this model, independent of
+the batch-4096 argsort crash (which occurred with resident experts). Two distinct bugs are
+now on record:
+
+1. `-b 4096` + resident experts -> illegal access in `argsort_f32_i32_cuda_cub` (CUB
+   segmented sort, MoE router) on a V100 (production crash + round 5 attempt 1).
+2. CPU experts via moe-cache/n-cpu-moe -> sticky illegal access on a V100 during prefill
+   at 2048 and 4096 (rounds 11/11b).
+
+Consequence: resident weights at effective ubatch 2048 (Coder 1,024 t/s prefill) remains
+the best WORKING configuration; both paths to more (true 4096, expert tiering) are gated
+on kernel-level bug fixes.
+
 ## Round 11 (Coder CPU experts + moe-cache budget — crash isolates a -b 4096 V100 bug)
 
 `n-cpu-moe = 99` + `moe-cache = 4096` (all accepted; VRAM freed: 3090 15.1 -> 9.4 GB) made
