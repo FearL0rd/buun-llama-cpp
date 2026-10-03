@@ -8,6 +8,9 @@
 
 #include <cstdint>
 #include <map>
+#include <string>
+#include <utility>
+#include <vector>
 
 // Read model metadata without allocating model weights. Accepts GGUF files and
 // native safetensors directories; the latter may validate quant auxiliaries and
