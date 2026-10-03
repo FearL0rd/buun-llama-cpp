@@ -4075,9 +4075,13 @@ static bool ggml_cuda_graph_update_required(
     // cgraph->uid fast path right below returns early without walking nodes, and a stale-address
     // graph replayed through it is exactly the hazard this fences.
     const unsigned long long scratch_epoch_now = cuda_ctx->fattn_scratch.epoch;
+    static const bool log_upd = getenv("GGML_CUDA_LOG_GRAPH_UPDATE") != nullptr;
     if (scratch_epoch_now != graph->fattn_scratch_epoch_at_capture) {
         graph->fattn_scratch_epoch_at_capture = scratch_epoch_now;
         res = true;
+        if (log_upd) {
+            GGML_LOG_DEBUG("graph update: reason=fattn_epoch key=%llu\n", (unsigned long long) graph_key);
+        }
     }
 
     if (cgraph->uid != 0 &&
@@ -4091,12 +4095,20 @@ static bool ggml_cuda_graph_update_required(
         // though the ggml-level graph itself is being reused verbatim.
     }
 
+    if (log_upd && !res) {
+        GGML_LOG_DEBUG("graph update: reason=uid prev=%zu new=%zu\n", graph->uid, cgraph->uid);
+    }
+
     graph->uid = cgraph->uid;
 
 
     // Check if the graph size has changed
     if ((int)graph->node_props.size() != cgraph->n_nodes) {
         res = true;
+        if (log_upd) {
+            GGML_LOG_DEBUG("graph update: reason=node_count %zu -> %d\n",
+                    graph->node_props.size(), cgraph->n_nodes);
+        }
         graph->node_props.resize(cgraph->n_nodes);
     }
 
@@ -4113,6 +4125,10 @@ static bool ggml_cuda_graph_update_required(
         }
 
         if (res || memcmp(&graph->node_props[i], &prop, sizeof(prop)) != 0) {
+            if (log_upd && !res) {
+                GGML_LOG_DEBUG("graph update: reason=node_props i=%d op=%s name=%s\n",
+                        i, ggml_op_name(cgraph->nodes[i]->op), cgraph->nodes[i]->name);
+            }
             graph->node_props[i] = prop;
             res = true;
         }
