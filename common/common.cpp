@@ -1533,6 +1533,15 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
         return;
     }
 
+    if (getenv("LLAMA_DUMP_PLACEMENT")) {
+        for (const auto & [name, tensor] : llama_internal_get_tensor_map(model)) {
+            COM_INF("placement: %-56s -> %-12s %10.2f MiB\n",
+                name.c_str(),
+                tensor->buffer ? ggml_backend_buffer_name(tensor->buffer) : "none",
+                ggml_nbytes(tensor) / 1024.0 / 1024.0);
+        }
+    }
+
     pimpl->model.reset(model);
 
     if (model_only) {

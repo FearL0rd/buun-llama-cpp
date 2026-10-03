@@ -160,6 +160,10 @@ LLAMA_API size_t llama_model_get_moe_tensor_info(
 // This is intentionally about resolved placement, not architecture metadata.
 LLAMA_API bool llama_model_has_host_moe_weights(const struct llama_model * model);
 
+// Resolved tensor placement: name -> tensor pairs with their assigned buffers.
+LLAMA_API const std::vector<std::pair<std::string, struct ggml_tensor *>> &
+        llama_internal_get_tensor_map(const struct llama_model * model);
+
 LLAMA_API ggml_backend_dev_t llama_model_get_device(const struct llama_model * model, int i);
 
 LLAMA_API llama_memory_breakdown llama_get_memory_breakdown(const struct llama_context * ctx);
