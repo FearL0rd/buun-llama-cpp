@@ -1699,11 +1699,14 @@ struct ggml_backend_cuda_context {
 #endif
 
 #ifdef USE_CUDA_GRAPH
-    // One entry per split and shape. Speculative verification alternates batch
-    // widths; sharing a single warmup entry across those shapes prevents any of
-    // them from reaching CUDA graph replay.
+    // One entry per split, shape, and input-copy ring slot (the shape key folds
+    // in nodes[0]'s data pointers, so scheduler copy-ring rotation lands in its
+    // own entry instead of recapturing a shared one every rebuild).
+    // Speculative verification alternates batch widths; sharing a single warmup
+    // entry across those shapes prevents any of them from reaching CUDA graph
+    // replay.
     std::unordered_map<uint64_t, std::unique_ptr<ggml_cuda_graph>> cuda_graphs;
-    static constexpr size_t max_cuda_graphs = 64;
+    static constexpr size_t max_cuda_graphs = 256;
 
     int64_t last_graph_eviction_sweep = 0;
 
