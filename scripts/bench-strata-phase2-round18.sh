@@ -95,14 +95,11 @@ run_scenario() { # $1 = scenario, $2 = alias
             # unpin n-gpu-layers (the re-placement aborts on the user pin) and shrink
             # the ctx reserve so the (now fall-through) cache fit sees budget
             case "$scenario" in
-                fitfree262k) ins="ctx-size = 262144" ;;
-                fitfree131k) ins="ctx-size = 131072" ;;
+                fitfree262k) ins="262144" ;;
+                fitfree131k) ins="131072" ;;
             esac
-            awk -v line="$ins" '
-                /^\[ISTA-DASLab\/Qwen3\.8-Flash-Next-GSQ-RCO-Coder-GGUF:IQ1_M\]$/ { print; print line; next }
-                /^\[ISTA-DASLab/{incoder=1} /^\[/{if (!/^\[ISTA/) incoder=0}
-                incoder && /^n-gpu-layers/{next} {print}
-            ' "$WORK/config-r18.ini" > "$WORK/config-r18.tmp" && mv "$WORK/config-r18.tmp" "$WORK/config-r18.ini" ;;
+            python3 ~/buun-llama-cpp/scripts/edit-coder-config.py "$WORK/config-r18.ini" "$WORK/config-r18.tmp" "$ins" \
+                && mv "$WORK/config-r18.tmp" "$WORK/config-r18.ini" || { echo "| $scenario | $alias | CONFIG_EDIT_FAILED | | | | | | |" >> "$RESULTS"; return; } ;;
     esac
     sjs="$WORK/req-std.json"; std_json "$alias" > "$sjs"
     sjl="$WORK/req-long.json"; long_json "$alias" > "$sjl"
