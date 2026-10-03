@@ -512,8 +512,7 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
         std::vector<llama_moe_tensor_info> * moe_tensors = nullptr,
         llama_context * ctx_parent = nullptr,
         bool share_parent_tensors = false,
-        bool optional_if_no_mtp = false,
-        bool * has_host_moe = nullptr) {
+        bool optional_if_no_mtp = false) {
     common_fit_logger_guard logger_guard(log_level);
 
     llama_model_params mparams_copy = *mparams;
@@ -526,9 +525,6 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
     }
     if (optional_if_no_mtp && !llama_model_has_mtp(model.get())) {
         return {};
-    }
-    if (has_host_moe) {
-        *has_host_moe = llama_model_has_host_moe_weights(model.get());
     }
 
     llama_context_params cparams_copy = *cparams;
@@ -975,11 +971,8 @@ static void common_params_fit_impl(
     common_vbr_fit_costs vbr_costs;
     vbr_costs.entry_k = type_k_entry;
     vbr_costs.entry_v = type_v_entry;
-    bool model_has_host_moe = false;
     dmds_t dmds_full = common_get_device_memory_data_impl(path_model, mparams, cparams, devs, hp_ngl, hp_nct, hp_nex, log_level,
-            cparams->vbr_dynamic ? &vbr_costs : nullptr, /*plan_hint=*/true, &moe_tensors,
-            /*ctx_parent=*/nullptr, /*share_parent_tensors=*/false, /*optional_if_no_mtp=*/false,
-            &model_has_host_moe);
+            cparams->vbr_dynamic ? &vbr_costs : nullptr, /*plan_hint=*/true, &moe_tensors);
 
     // saturate instead of overflowing, this also preserves the UINT32_MAX sentinel of n_ctx_min:
     const uint32_t n_ctx_max       = (uint32_t) std::min<uint64_t>(uint64_t(hp_nct)    * n_streams, UINT32_MAX);
@@ -1413,15 +1406,19 @@ static void common_params_fit_impl(
         // Margins met is not residency: with routed experts left host-resident the
         // stock placement keeps the page-streaming status quo and the MoE cache stays
         // disarmed ("resolved=off"), so every chunk re-streams expert pages over
-        // PCIe while the devices hold free VRAM. When a MoE cache is requested (and
-        // the user has not pinned tensor placement), continue to the cache-fit steps
-        // instead of keeping stock.
+        // PCIe while the devices hold free VRAM. The host pseudo-device entry of the
+        // measured breakdown (dmds_full.back().mb.model, the "CPU_Mapped model buffer"
+        // the loader reports) is the resolved host remainder; when it is significant
+        // and a MoE cache is requested (and the user has not pinned tensor
+        // placement), continue to the cache-fit steps instead of keeping stock.
+        const int64_t host_model_bytes = nd >= 1 ? dmds_full.back().mb.model : 0;
         const bool host_moe_needs_fit =
-            model_has_host_moe && moe_cache && moe_cache->mode != COMMON_MOE_CACHE_MODE_OFF &&
+            host_model_bytes > 256*MiB && moe_cache && moe_cache->mode != COMMON_MOE_CACHE_MODE_OFF &&
             !moe_tensors.empty() &&
             (!mparams->tensor_buft_overrides || !mparams->tensor_buft_overrides[0].pattern);
         if (host_moe_needs_fit) {
-            LOG_INF("%s: free-memory targets met, but routed experts are host-resident with a MoE cache requested - continuing to cache fit\n", __func__);
+            LOG_INF("%s: free-memory targets met, but %" PRId64 " MiB of model weights are host-resident with a MoE cache requested - continuing to cache fit\n",
+                __func__, host_model_bytes/MiB);
         }
         if (nd == 1) {
             if (projected_free_per_device[0] >= margins[0]) {
