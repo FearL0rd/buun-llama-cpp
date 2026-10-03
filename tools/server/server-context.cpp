@@ -24104,9 +24104,13 @@ server_mmproj_lifecycle_for_test() {
         !server_mmproj_defer_restore(1, true, media, media.size()) &&
         !server_mmproj_defer_restore(1, true, server_tokens(llama_tokens {1, 2}, true), 2);
 
-    const auto coalesced_counts = [&](size_t n_slots, bool gpu, bool cancel, bool fail_media, bool fail_text) {
+    // This tests the lookahead/guard protocol, not the server's release or
+    // teardown wiring (those need serving-level cancellation/shutdown tests).
+    enum class stop_at { none, cancel, media_error, text_error };
+    const auto coalesced_counts = [&](size_t n_slots, bool gpu, stop_at stop) {
         bool active = false;
         int swaps = 0, restores = 0;
+        bool restored_before_trailing_text = true;
         const auto finish = [&]() {
             if (active) {
                 active = false;
@@ -24122,7 +24126,7 @@ server_mmproj_lifecycle_for_test() {
                 if (active) {
                     server_mmproj_restore_guard guard(finish);
                     guard.arm();
-                    if (fail_media && processed == 10) {
+                    if (stop == stop_at::media_error && processed == 10) {
                         throw std::runtime_error("injected media exception");
                     }
                     if (server_mmproj_defer_restore(n_slots, gpu, media, processed)) {
@@ -24131,10 +24135,13 @@ server_mmproj_lifecycle_for_test() {
                         guard.restore_now();
                     }
                 }
-                if (fail_text) {
+                if (processed == 10) {
+                    restored_before_trailing_text = !active;
+                }
+                if (stop == stop_at::text_error) {
                     throw std::runtime_error("injected intervening text exception");
                 }
-                if (cancel) {
+                if (stop == stop_at::cancel) {
                     break;
                 }
             }
@@ -24144,14 +24151,15 @@ server_mmproj_lifecycle_for_test() {
         // when the media guard already finished the exchange on an exception.
         finish();
         finish();
-        return std::make_pair(swaps, restores);
+        return restored_before_trailing_text
+            ? std::make_pair(swaps, restores) : std::make_pair(-1, -1);
     };
-    result.single_slot_coalesces = coalesced_counts(1, true, false, false, false) == std::make_pair(1, 1);
-    result.multi_slot_unchanged = coalesced_counts(2, true, false, false, false) == std::make_pair(2, 2);
-    result.cpu_fallback_restores = coalesced_counts(1, false, false, false, false) == std::make_pair(2, 2);
-    result.deferred_cancel_restores = coalesced_counts(1, true, true, false, false) == std::make_pair(1, 1);
-    result.deferred_media_error_restores = coalesced_counts(1, true, false, true, false) == std::make_pair(1, 1);
-    result.deferred_text_error_restores = coalesced_counts(1, true, false, false, true) == std::make_pair(1, 1);
+    result.single_slot_coalesces = coalesced_counts(1, true, stop_at::none) == std::make_pair(1, 1);
+    result.multi_slot_unchanged = coalesced_counts(2, true, stop_at::none) == std::make_pair(2, 2);
+    result.cpu_fallback_restores = coalesced_counts(1, false, stop_at::none) == std::make_pair(2, 2);
+    result.deferred_cancel_restores = coalesced_counts(1, true, stop_at::cancel) == std::make_pair(1, 1);
+    result.deferred_media_error_restores = coalesced_counts(1, true, stop_at::media_error) == std::make_pair(1, 1);
+    result.deferred_text_error_restores = coalesced_counts(1, true, stop_at::text_error) == std::make_pair(1, 1);
 
     const auto simulate_shift = [](
             const server_context_shift_capability & capability) {
