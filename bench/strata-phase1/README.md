@@ -65,6 +65,29 @@ the gate is off by default pending broader hardware validation.
 "8192", round 5's "4096", and the production config's 4096). All t/s numbers above stand,
 re-labeled to ubatch 2048. Round 10 tests true `b=ub` 4096/8192.
 
+## Round 10 (Coder true-ubatch 4096/8192 — blocked by the graph compute buffer)
+
+Both scenarios fail at load: `graph_reserve: n_tokens = 4096` ->
+`ggml_gallocr_reserve_n_impl: failed to allocate CUDA0 buffer of size 19115147776`
+(18.2 GiB on the 3090, which has ~9.5 GiB free behind the Coder's weights; the fork's
+vram-demand/donor system retries 3x but cannot free enough in time). The buffer scales at
+~4.66 MB per batch token (activations + full-vocab logits + sampling on the main GPU), so
+`n_batch`/`n_ubatch` is effectively capped at 2048 for the Coder on this rig — exactly
+where production already sits. The ubatch axis is exhausted without graph-level memory
+work (chunked/tiled recurrent prefill states, f16 logits intermediates) or freeing ~9 GiB
+of donor VRAM (e.g. a moe-cache budget that moves some experts to RAM on demand).
+
+## Final prefill state after phase 1
+
+| model | prefill t/s | vs phase-0 baseline |
+|---|---:|---:|
+| Coder (MMQ + fusion + effective ubatch 2048) | 1,024 | 484 -> 1,024 (+112%) |
+| Flash-Next (MMQ + fusion + ubatch 512 — capacity limit) | 585 | 395 -> 585 (+48%) |
+
+Remaining gap to Strata (~2,100-2,230 t/s on one RTX 5070) requires per-op prefill
+profiling and kernel/graph work: the 4.66 MB/token compute buffer, DeltaNet chunk-scan
+prefill efficiency, dense/head GEMM tuning at large M.
+
 ## Round 9 (Flash-Next tensor-split rebalance — investigation concluded)
 
 `tensor-split = 0.6,1,1` (accepted, reached the child; ~3090 share 27%->23%) freed the
