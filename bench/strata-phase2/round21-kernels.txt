@@ -1,0 +1,64 @@
+# Phase 2 round 21 decode profile (Coder, MTP n3, fusion on) - Sat Oct  3 10:39:43 AM CDT 2026
+
+## GPU kernel time (top 40)
+Generating SQLite file /home/cesar/.strata-bench/decode-r21.sqlite from /home/cesar/.strata-bench/decode-r21.nsys-rep
+Processing [/home/cesar/.strata-bench/decode-r21.sqlite] with [/usr/local/cuda-12.8/nsight-systems-2024.6.2/host-linux-x64/reports/cuda_gpu_kern_sum.py]... 
+
+ ** CUDA GPU Kernel Summary (cuda_gpu_kern_sum):
+
++----------+-----------------+-----------+-----------+-----------+----------+-----------+-------------+------------------------------------------------------------------------------------------------------+
+| Time (%) | Total Time (ns) | Instances | Avg (ns)  | Med (ns)  | Min (ns) | Max (ns)  | StdDev (ns) |                                                 Name                                                 |
++----------+-----------------+-----------+-----------+-----------+----------+-----------+-------------+------------------------------------------------------------------------------------------------------+
+|     20.1 |     195,924,972 |       767 | 255,443.2 |  10,176.0 |    3,616 |   868,571 |   386,764.2 | void mul_mat_vec_q<(ggml_type)14, (int)1, (bool)0, (bool)0, (bool)0, (int)0, (bool)0, (bool)0>(cons… |
+|      5.4 |      52,457,136 |       338 | 155,198.6 |  69,440.0 |   50,816 |   879,452 |   241,193.2 | void mul_mat_vec_q_moe<(ggml_type)20, (int)2, (bool)0, (bool)0, (bool)0>(const void *, const void *… |
+|      4.2 |      40,973,161 |       187 | 219,107.8 |  98,496.0 |   55,904 | 1,432,922 |   360,458.7 | void mul_mat_vec_q_moe<(ggml_type)18, (int)2, (bool)1, (bool)0, (bool)0>(const void *, const void *… |
+|      4.2 |      40,926,766 |       220 | 186,030.8 |  96,592.0 |   52,992 | 1,502,010 |   319,109.1 | void mul_mat_vec_q_moe<(ggml_type)22, (int)2, (bool)1, (bool)0, (bool)0>(const void *, const void *… |
+|      3.2 |      31,596,358 |       110 | 287,239.6 | 142,431.5 |  106,623 | 1,770,711 |   470,522.9 | void mul_mat_vec_q_moe<(ggml_type)21, (int)2, (bool)1, (bool)0, (bool)0>(const void *, const void *… |
+|      2.8 |      26,806,361 |       860 |  31,170.2 |  24,320.0 |   23,584 |    53,056 |    12,061.0 | void cub::CUB_200700_700_860_NS::DeviceRadixSortOnesweepKernel<cub::CUB_200700_700_860_NS::DeviceRa… |
+|      2.3 |      22,415,382 |    10,996 |   2,038.5 |   1,792.0 |    1,344 |     8,128 |       554.3 | quantize_q8_1(const float *, void *, long, long, long, long, long, unsigned int, uint3)              |
+|      2.2 |      21,124,095 |     1,591 |  13,277.2 |   6,432.0 |    5,152 |    44,864 |    12,265.4 | void mul_mat_vec_q<(ggml_type)12, (int)3, (bool)0, (bool)0, (bool)0, (int)0, (bool)0, (bool)0>(cons… |
+|      2.1 |      20,174,089 |       849 |  23,762.2 |  12,032.0 |    5,536 |   991,483 |    75,675.7 | void mul_mat_vec_q<(ggml_type)14, (int)3, (bool)0, (bool)0, (bool)0, (int)0, (bool)0, (bool)0>(cons… |
+|      2.0 |      19,666,196 |       217 |  90,627.6 |  87,424.0 |   78,976 |   188,031 |    10,987.5 | void mul_mat_vec_q_moe<(ggml_type)12, (int)2, (bool)1, (bool)0, (bool)0>(const void *, const void *… |
+|      1.8 |      17,961,886 |     1,549 |  11,595.8 |   6,464.0 |    2,976 |    37,472 |    10,979.6 | void mul_mat_vec_q<(ggml_type)12, (int)1, (bool)0, (bool)0, (bool)0, (int)0, (bool)0, (bool)0>(cons… |
+|      1.8 |      17,560,004 |       217 |  80,921.7 |  77,471.0 |   67,455 |   182,111 |    11,627.4 | void mul_mat_vec_q_moe<(ggml_type)8, (int)2, (bool)0, (bool)0, (bool)0>(const void *, const void *,… |
+|      1.7 |      16,233,543 |        86 | 188,762.1 |  25,024.0 |    8,320 |   638,781 |   208,295.1 | void mul_mat_q<(ggml_type)20, (int)32, (bool)0, (ggml_prec)30, (mmq_stream_mode)0>(const char *, co… |
+|      1.6 |      15,615,129 |     1,640 |   9,521.4 |   8,416.0 |    3,360 |    22,688 |     4,549.1 | void mul_mat_vec_f<__nv_bfloat16, float, (int)3, (int)256, (bool)0, (bool)0>(const T1 *, const floa… |
+|      1.5 |      14,261,237 |       454 |  31,412.4 |  31,648.0 |    6,016 | 1,236,985 |    82,571.0 | void mul_mat_vec_q<(ggml_type)14, (int)4, (bool)0, (bool)0, (bool)0, (int)0, (bool)0, (bool)0>(cons… |
+|      1.5 |      14,146,068 |       345 |  41,003.1 |  40,959.0 |   40,288 |    42,304 |       363.8 | void mul_mat_vec_f<__nv_bfloat16, float, (int)3, (int)160, (bool)0, (bool)0>(const T1 *, const floa… |
+|      1.4 |      13,925,492 |       274 |  50,823.0 |  50,751.5 |   50,048 |    52,896 |       468.7 | void mul_mat_vec_f<__nv_bfloat16, float, (int)4, (int)160, (bool)0, (bool)0>(const T1 *, const floa… |
+|      1.4 |      13,737,961 |        34 | 404,057.7 | 415,326.0 |  182,401 |   564,317 |   112,642.5 | void mul_mat_q<(ggml_type)18, (int)32, (bool)0, (ggml_prec)30, (mmq_stream_mode)0>(const char *, co… |
+|      1.4 |      13,593,763 |     1,310 |  10,376.9 |   9,056.0 |    3,456 |    22,560 |     5,004.3 | void mul_mat_vec_f<__nv_bfloat16, float, (int)4, (int)256, (bool)0, (bool)0>(const T1 *, const floa… |
+|      1.3 |      12,324,898 |       297 |  41,498.0 |  41,824.0 |   21,760 |    43,200 |     1,948.1 | void flash_attn_tile<(int)256, (int)256, (int)4, (int)4, (bool)0>(const char *, const char *, const… |
+|      1.2 |      11,809,087 |       596 |  19,813.9 |  23,408.0 |    5,952 |    56,287 |    13,160.6 | void mul_mat_vec_q<(ggml_type)12, (int)4, (bool)0, (bool)0, (bool)0, (int)0, (bool)0, (bool)0>(cons… |
+|      1.2 |      11,787,818 |        40 | 294,695.5 | 228,209.0 |  136,417 |   553,437 |   133,970.5 | void mul_mat_q<(ggml_type)22, (int)32, (bool)0, (ggml_prec)30, (mmq_stream_mode)0>(const char *, co… |
+|      1.2 |      11,765,395 |     6,587 |   1,786.2 |   1,568.0 |    1,216 |     8,480 |       567.8 | scale_f32(const float *, float *, float, float, long)                                                |
+|      1.2 |      11,475,296 |       468 |  24,519.9 |  20,016.0 |    6,976 |    87,072 |    17,562.5 | void gated_delta_net_cuda<(int)128, (bool)0, (bool)1, (bool)1, (bool)0>(const float *, const float … |
+|      1.1 |      10,589,019 |     2,355 |   4,496.4 |   4,544.0 |    3,456 |    10,720 |       530.5 | void rms_norm_f32<(int)1024, (bool)1, (bool)0, (bool)0>(const float *, float *, int, long, long, lo… |
+|      1.0 |      10,182,293 |       437 |  23,300.4 |   7,744.0 |    4,960 |    41,472 |    16,446.0 | void mul_mat_vec_q<(ggml_type)12, (int)1, (bool)1, (bool)0, (bool)0, (int)0, (bool)0, (bool)0>(cons… |
+|      1.0 |       9,384,753 |        20 | 469,237.7 | 454,461.5 |  392,158 |   596,317 |    64,511.2 | void mul_mat_q<(ggml_type)21, (int)32, (bool)0, (ggml_prec)30, (mmq_stream_mode)0>(const char *, co… |
+|      1.0 |       9,297,072 |       216 |  43,042.0 |  42,944.0 |   37,024 |    45,728 |       841.2 | void mul_mat_q<(ggml_type)12, (int)16, (bool)0, (ggml_prec)30, (mmq_stream_mode)0>(const char *, co… |
+|      0.8 |       7,894,860 |       647 |  12,202.3 |  11,552.0 |   10,880 |    14,272 |     1,199.5 | void mul_mat_vec_q<(ggml_type)6, (int)1, (bool)0, (bool)1, (bool)0, (int)0, (bool)0, (bool)0>(const… |
+|      0.8 |       7,707,711 |        94 |  81,996.9 |  37,136.0 |   25,408 |   565,853 |   139,813.5 | void mul_mat_vec_q_moe<(ggml_type)42, (int)2, (bool)0, (bool)0, (bool)0>(const void *, const void *… |
+|      0.8 |       7,625,600 |       576 |  13,238.9 |   7,119.5 |    4,352 |    93,599 |    21,888.2 | void topk_moe_cuda<(int)256, (bool)0>(const float *, float *, int *, float *, int, int, float, floa… |
+|      0.8 |       7,620,682 |     2,116 |   3,601.5 |   3,616.0 |    2,496 |     6,431 |       750.7 | void dsv4_hc_pre_f32<(bool)1>(const float *, const float *, float *, long, long, long, long, long, … |
+|      0.7 |       7,036,093 |       129 |  54,543.4 |  46,720.0 |    6,240 |   150,112 |    39,098.4 | void mul_mat_q<(ggml_type)14, (int)32, (bool)0, (ggml_prec)30, (mmq_stream_mode)0>(const char *, co… |
+|      0.7 |       6,909,329 |       434 |  15,920.1 |   6,080.0 |    4,672 |    28,544 |    11,051.3 | void mul_mat_vec_q<(ggml_type)8, (int)1, (bool)0, (bool)1, (bool)0, (int)0, (bool)0, (bool)0>(const… |
+|      0.7 |       6,779,391 |       320 |  21,185.6 |  25,120.0 |    4,992 |    38,048 |    12,280.9 | void mul_mat_q<(ggml_type)14, (int)8, (bool)0, (ggml_prec)30, (mmq_stream_mode)0>(const char *, con… |
+|      0.7 |       6,655,896 |       364 |  18,285.4 |  18,304.0 |   16,704 |    19,200 |       387.7 | void mul_mat_vec_q<(ggml_type)6, (int)3, (bool)0, (bool)0, (bool)0, (int)0, (bool)0, (bool)0>(const… |
+|      0.7 |       6,498,841 |       230 |  28,255.8 |   6,400.0 |    5,952 |    91,008 |    27,917.3 | void mul_mat_q<(ggml_type)20, (int)8, (bool)0, (ggml_prec)30, (mmq_stream_mode)0>(const char *, con… |
+|      0.6 |       5,877,991 |       327 |  17,975.5 |  20,448.0 |    5,280 |    34,912 |     9,727.0 | void mul_mat_vec_f<__nv_bfloat16, float, (int)7, (int)256, (bool)0, (bool)0>(const T1 *, const floa… |
+|      0.6 |       5,676,132 |       225 |  25,227.3 |  25,440.0 |   13,440 |    26,176 |     1,346.6 | void flash_attn_tile<(int)256, (int)256, (int)1, (int)4, (bool)0>(const char *, const char *, const… |
+|      0.6 |       5,580,158 |       215 |  25,954.2 |  31,072.0 |    6,879 |    37,055 |    10,459.1 | volta_sgemm_64x32_sliced1x4_tn                                                                       |
+|      0.6 |       5,398,762 |     3,583 |   1,506.8 |   1,408.0 |    1,120 |     3,936 |       397.1 | void unary_op_kernel<&op_sigmoid, float>(const T2 *, T2 *, int)                                      |
+|      0.5 |       5,238,029 |     2,116 |   2,475.4 |   2,368.0 |    1,568 |     6,208 |       655.2 | void dsv4_hc_post_f32<(bool)0>(const float *, const float *, const float *, const float *, float *,… |
+|      0.5 |       4,750,345 |       433 |  10,970.8 |  10,976.0 |    8,512 |    11,488 |       220.3 | void topk_moe_cuda<(int)512, (bool)0>(const float *, float *, int *, float *, int, int, float, floa… |
+|      0.5 |       4,572,203 |        68 |  67,238.3 |  67,247.5 |   66,400 |    68,351 |       438.3 | void mul_mat_vec_f<__nv_bfloat16, float, (int)7, (int)160, (bool)0, (bool)0>(const T1 *, const floa… |
+|      0.4 |       4,240,594 |     1,010 |   4,198.6 |   4,208.0 |    2,080 |     8,128 |       922.6 | moe_weighted_reduction_f32(const float *, const float *, const float *, float *, long, int)          |
+|      0.4 |       4,046,027 |       331 |  12,223.6 |   4,320.0 |    1,760 |    28,095 |    11,221.9 | void convert_unary_cont_vec4<__nv_bfloat16, float>(const void *, T2 *, long)                         |
+|      0.4 |       4,018,297 |     1,619 |   2,482.0 |   2,112.0 |    1,408 |    15,520 |     1,991.9 | void k_bin_bcast<&op_mul, float, float, float, const float *>(const T2 *, const T3 *, T4 *, unsigne… |
+
+## Spec cycle stats from server log
+[44329] 0.24.635.591 D srv    post_cycle: spec cycle (1 slots): draft=4.8ms verify=36.7ms accept=2.3ms other=1.6ms total=45.4ms
+[44329] 0.24.682.110 D srv    post_cycle: spec cycle (1 slots): draft=4.8ms verify=38.7ms accept=1.3ms other=1.7ms total=46.5ms
+[44329] 0.24.728.423 D srv    post_cycle: spec cycle (1 slots): draft=4.7ms verify=38.5ms accept=1.3ms other=1.7ms total=46.3ms
+[44329] 0.24.773.969 D srv    post_cycle: spec cycle (1 slots): draft=4.8ms verify=37.0ms accept=2.1ms other=1.7ms total=45.5ms
