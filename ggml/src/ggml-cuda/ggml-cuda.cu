@@ -4126,8 +4126,13 @@ static bool ggml_cuda_graph_update_required(
 
         if (res || memcmp(&graph->node_props[i], &prop, sizeof(prop)) != 0) {
             if (log_upd && !res) {
-                GGML_LOG_DEBUG("graph update: reason=node_props i=%d op=%s name=%s\n",
-                        i, ggml_op_name(cgraph->nodes[i]->op), cgraph->nodes[i]->name);
+                GGML_LOG_DEBUG("graph update: reason=node_props i=%d op=%s name=%s data=%p->%p src0=%p->%p src1=%p->%p\n",
+                        i, ggml_op_name(cgraph->nodes[i]->op), cgraph->nodes[i]->name,
+                        graph->node_props[i].node.data, cgraph->nodes[i]->data,
+                        graph->node_props[i].node_src_data_ptrs[0],
+                        cgraph->nodes[i]->src[0] ? cgraph->nodes[i]->src[0]->data : nullptr,
+                        graph->node_props[i].node_src_data_ptrs[1],
+                        cgraph->nodes[i]->src[1] ? cgraph->nodes[i]->src[1]->data : nullptr);
             }
             graph->node_props[i] = prop;
             res = true;

@@ -107,8 +107,8 @@ for alias in "${ALIASES[@]}"; do
         echo "graph id reused: $(grep -ac 'Graph id' "$WORK/server-current.log")"
         echo "### reason counts:"
         grep -a -o 'reason=[a-z_]*' "$WORK/server-current.log" | sort | uniq -c
-        echo "### first 30 reason lines:"
-        grep -a 'graph update: reason' "$WORK/server-current.log" | head -30 | sed 's/^/    /'
+        echo "### last 40 reason lines:"
+        grep -a 'graph update: reason' "$WORK/server-current.log" | tail -40 | sed 's/^/    /'
     } >> "$RESULTS"
     cp "$WORK/server-current.log" "$WORK/server-r26-diag.log"
     kill_server
