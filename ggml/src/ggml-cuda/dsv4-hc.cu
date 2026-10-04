@@ -518,12 +518,29 @@ void ggml_cuda_op_hc_combine_fused(
 }
 
 // hc_mix: the gated pre-mix of one hyper-connection for a few tokens (decode and MTP verify).
-// Three launches: per-stream RMSNorm, the down + inject matvec, and the up matvec with the
-// sigmoid gate and the stream mean. The bf16 weights are read once for all tokens.
+// Two launches. The down + inject matvec folds in the per-stream RMSNorm: the warps of a block
+// split hc_dim, so the block sees every stream whole and scales its partial dot products by the
+// stream's norm. The up matvec applies the sigmoid gate and the stream mean. The bf16 weights
+// are read once for all tokens.
 
-static constexpr int DSV4_HC_MIX_DOWN_WARPS = 8; // two warps per row, each over half of hc_dim
+static constexpr int DSV4_HC_MIX_DOWN_WARPS = 8; // split hc_dim, DSV4_HC_MIX_DOWN_WARPS/DSV4_HC per stream
+static constexpr int DSV4_HC_MIX_DOWN_ROWS  = 8; // rows per block, sharing each activation load
 static constexpr int DSV4_HC_MIX_UP_WARPS   = 8;
 static constexpr int DSV4_HC_MIX_UP_COLS    = 2; // output columns per warp; hc == 4 rows each
+
+// The down matvec does not saturate DRAM, so it also pulls the first half of the up weights
+// into L2 (the whole of them would not fit).
+static __device__ __forceinline__ void dsv4_hc_prefetch_l2(const char * p, const int64_t n_bytes) {
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= GGML_CUDA_CC_AMPERE
+    const int64_t stride = 128*(int64_t) gridDim.x*blockDim.x;
+    for (int64_t o = 128*((int64_t) blockIdx.x*blockDim.x + threadIdx.x); o < n_bytes; o += stride) {
+        asm volatile("prefetch.global.L2::evict_last [%0];" :: "l"(p + o));
+    }
+#else
+    GGML_UNUSED(p);
+    GGML_UNUSED(n_bytes);
+#endif
+}
 
 static __device__ __forceinline__ void dsv4_hc_bf16x8(const uint4 v, float * f) {
     const uint32_t u[4] = { v.x, v.y, v.z, v.w };
@@ -534,90 +551,139 @@ static __device__ __forceinline__ void dsv4_hc_bf16x8(const uint4 v, float * f) 
     }
 }
 
-static __global__ void dsv4_hc_mix_norm_f32(
-        const float * __restrict__ x, const float * __restrict__ gamma, float * __restrict__ xn,
-        const int n_embd, const int hc, const float eps) {
-    constexpr int block_size = 256;
-    const int ic = blockIdx.x; // stream + hc*token
-
-    x  += (int64_t) ic*n_embd;
-    xn += (int64_t) ic*n_embd;
-    gamma += (ic % hc)*n_embd;
-
-    float tmp = 0.0f;
-    for (int i = threadIdx.x; i < n_embd; i += block_size) {
-        tmp += x[i]*x[i];
-    }
-    __shared__ float s_sum[WARP_SIZE];
-    tmp = block_reduce<block_reduce_method::SUM, block_size>(tmp, s_sum);
-
-    const float s = rsqrtf(tmp/n_embd + eps);
-    for (int i = threadIdx.x; i < n_embd; i += block_size) {
-        xn[i] = s*x[i]*gamma[i];
-    }
-}
-
+// rs gets the [hc, nt] RMSNorm scales for the up matvec's gate product
 template <int nt>
 static __global__ void dsv4_hc_mix_down_bf16(
-        const float * __restrict__ xn, const uint4 * __restrict__ w_down, const uint4 * __restrict__ w_inject,
-        float * __restrict__ lo, float * __restrict__ inject,
-        const int hc_dim, const int r, const int n_rows, const int hc,
-        const int64_t sw_down, const int64_t sw_inject, const float scale) {
-    constexpr int split = 2;
-    const int warp = threadIdx.x / WARP_SIZE;
-    const int lane = threadIdx.x % WARP_SIZE;
-    const int row  = blockIdx.x*(DSV4_HC_MIX_DOWN_WARPS/split) + warp/split;
-    const int part = warp % split;
+        const float * __restrict__ x, const float * __restrict__ gamma,
+        const uint4 * __restrict__ w_down, const uint4 * __restrict__ w_inject,
+        float * __restrict__ lo, float * __restrict__ inject, float * __restrict__ rs,
+        const int n_embd, const int r, const int n_rows,
+        const int64_t sw_down, const int64_t sw_inject, const float eps, const float scale,
+        const char * __restrict__ pf, const int64_t pf_bytes) {
+    constexpr int W     = DSV4_HC_MIX_DOWN_WARPS;
+    constexpr int R     = DSV4_HC_MIX_DOWN_ROWS;
+    constexpr int parts = W/DSV4_HC;
+    dsv4_hc_prefetch_l2(pf, pf_bytes);
 
-    float acc[nt] = {};
-    if (row < n_rows) {
-        const uint4  * w   = row < r ? w_down + row*sw_down : w_inject + (row - r)*sw_inject;
-        const float4 * xn4 = (const float4 *) xn;
-        const int n8 = hc_dim/8;
-        const int j1 = (part + 1)*n8/split;
-#pragma unroll 4
-        for (int j = part*n8/split + lane; j < j1; j += WARP_SIZE) {
-            float wf[8];
-            dsv4_hc_bf16x8(w[j], wf);
+    const int warp   = threadIdx.x / WARP_SIZE;
+    const int lane   = threadIdx.x % WARP_SIZE;
+    const int row0   = blockIdx.x*R;
+    const int hc_dim = DSV4_HC*n_embd;
+    const int n8w    = hc_dim/8/W;
+
+    const uint4 * w[R];
 #pragma unroll
-            for (int t = 0; t < nt; ++t) {
-                const float4 a = xn4[t*(hc_dim/4) + 2*j + 0];
-                const float4 b = xn4[t*(hc_dim/4) + 2*j + 1];
-                acc[t] += wf[0]*a.x + wf[1]*a.y + wf[2]*a.z + wf[3]*a.w
-                        + wf[4]*b.x + wf[5]*b.y + wf[6]*b.z + wf[7]*b.w;
+    for (int k = 0; k < R; ++k) {
+        const int row = min(row0 + k, n_rows - 1); // a short last block repeats its last row
+        w[k] = row < r ? w_down + row*sw_down : w_inject + (row - r)*sw_inject;
+    }
+
+    const float4 * x4 = (const float4 *) x;
+    const float4 * g4 = (const float4 *) gamma;
+    float acc[R][nt] = {};
+    float ss[nt] = {};
+#pragma unroll 2
+    for (int j = warp*n8w + lane; j < (warp + 1)*n8w; j += WARP_SIZE) {
+        float wf[R][8];
+#pragma unroll
+        for (int k = 0; k < R; ++k) {
+            dsv4_hc_bf16x8(w[k][j], wf[k]);
+        }
+        const float4 ga = g4[2*j + 0];
+        const float4 gb = g4[2*j + 1];
+#pragma unroll
+        for (int t = 0; t < nt; ++t) {
+            const float4 a = x4[t*(hc_dim/4) + 2*j + 0];
+            const float4 b = x4[t*(hc_dim/4) + 2*j + 1];
+            ss[t] += a.x*a.x + a.y*a.y + a.z*a.z + a.w*a.w + b.x*b.x + b.y*b.y + b.z*b.z + b.w*b.w;
+            const float xg[8] = { a.x*ga.x, a.y*ga.y, a.z*ga.z, a.w*ga.w, b.x*gb.x, b.y*gb.y, b.z*gb.z, b.w*gb.w };
+#pragma unroll
+            for (int k = 0; k < R; ++k) {
+                acc[k][t] += wf[k][0]*xg[0] + wf[k][1]*xg[1] + wf[k][2]*xg[2] + wf[k][3]*xg[3]
+                           + wf[k][4]*xg[4] + wf[k][5]*xg[5] + wf[k][6]*xg[6] + wf[k][7]*xg[7];
             }
         }
     }
 
-    __shared__ float partial[DSV4_HC_MIX_DOWN_WARPS][nt];
+    __shared__ float s_acc[W][R][nt];
+    __shared__ float s_ss[W][nt];
 #pragma unroll
     for (int t = 0; t < nt; ++t) {
-        acc[t] = warp_reduce_sum(acc[t]);
+#pragma unroll
+        for (int k = 0; k < R; ++k) {
+            acc[k][t] = warp_reduce_sum(acc[k][t]);
+        }
+        ss[t] = warp_reduce_sum(ss[t]);
     }
     if (lane == 0) {
 #pragma unroll
         for (int t = 0; t < nt; ++t) {
-            partial[warp][t] = acc[t];
+#pragma unroll
+            for (int k = 0; k < R; ++k) {
+                s_acc[warp][k][t] = acc[k][t];
+            }
+            s_ss[warp][t] = ss[t];
         }
     }
     __syncthreads();
 
-    if (part != 0 || lane >= nt || row >= n_rows) {
+    if (threadIdx.x >= R*nt) {
         return;
     }
-    const float sum = partial[warp][lane] + partial[warp + 1][lane];
+    const int k = threadIdx.x / nt;
+    const int t = threadIdx.x % nt;
+    float sum = 0.0f;
+#pragma unroll
+    for (int h = 0; h < DSV4_HC; ++h) {
+        float sq = 0.0f;
+        float d  = 0.0f;
+#pragma unroll
+        for (int p = h*parts; p < (h + 1)*parts; ++p) {
+            sq += s_ss[p][t];
+            d  += s_acc[p][k][t];
+        }
+        const float s = rsqrtf(sq/n_embd + eps);
+        sum += s*d;
+        if (blockIdx.x == 0 && k == 0) {
+            rs[t*DSV4_HC + h] = s;
+        }
+    }
+
+    const int row = row0 + k;
     if (row < r) {
         const float v = scale*sum;
-        lo[lane*r + row] = v/(1.0f + expf(-v));
-    } else {
-        inject[lane*hc + row - r] = sum;
+        lo[t*r + row] = v/(1.0f + expf(-v));
+    } else if (row < n_rows) {
+        inject[t*DSV4_HC + row - r] = sum;
     }
 }
 
 template <int nt>
 static __global__ void dsv4_hc_mix_up_bf16(
-        const float * __restrict__ xn, const float * __restrict__ lo, const uint4 * __restrict__ w_up,
+        const float * __restrict__ x, const float * __restrict__ gamma, const float * __restrict__ rs,
+        const float * __restrict__ lo, const uint4 * __restrict__ w_up,
         float * __restrict__ mixed, const int n_embd, const int r, const int64_t sw_up, const float scale) {
+    constexpr int COLS = DSV4_HC_MIX_UP_COLS;
+    const int warp = threadIdx.x / WARP_SIZE;
+    const int lane = threadIdx.x % WARP_SIZE;
+    const int h    = lane / 8; // lanes 8h..8h+7 reduce the gate row of stream h
+    const int sub  = lane % 8;
+    const int hc_dim = DSV4_HC*n_embd;
+    const int i0 = (blockIdx.x*DSV4_HC_MIX_UP_WARPS + warp)*COLS;
+
+    // the gate product's inputs do not depend on the down matvec: load them before waiting on lo
+    float xv[COLS][nt];
+    float gv[COLS];
+#pragma unroll
+    for (int c = 0; c < COLS; ++c) {
+        const int i = min(i0 + c, n_embd - 1) + n_embd*h;
+        gv[c] = gamma[i];
+#pragma unroll
+        for (int t = 0; t < nt; ++t) {
+            xv[c][t] = x[t*hc_dim + i];
+        }
+    }
+
     extern __shared__ float4 lo_s4[]; // [nt][r/4]
     const float4 * lo4 = (const float4 *) lo;
     for (int k = threadIdx.x; k < nt*r/4; k += blockDim.x) {
@@ -625,35 +691,35 @@ static __global__ void dsv4_hc_mix_up_bf16(
     }
     __syncthreads();
 
-    const int warp = threadIdx.x / WARP_SIZE;
-    const int lane = threadIdx.x % WARP_SIZE;
-    const int h    = lane / 8; // lanes 8h..8h+7 reduce the gate row of stream h
-    const int sub  = lane % 8;
-    const int hc_dim = 4*n_embd;
-    const int i0 = (blockIdx.x*DSV4_HC_MIX_UP_WARPS + warp)*DSV4_HC_MIX_UP_COLS;
+    const uint4 * w[COLS];
+#pragma unroll
+    for (int c = 0; c < COLS; ++c) {
+        w[c] = w_up + (int64_t) (min(i0 + c, n_embd - 1) + n_embd*h)*sw_up;
+    }
 
-    float acc[DSV4_HC_MIX_UP_COLS][nt] = {};
+    // all columns' loads of a step are issued before their math to keep enough bytes in flight
+    float acc[COLS][nt] = {};
+#pragma unroll 5
+    for (int j = sub; j < r/8; j += 8) {
+        float wf[COLS][8];
 #pragma unroll
-    for (int c = 0; c < DSV4_HC_MIX_UP_COLS; ++c) {
-        if (i0 + c >= n_embd) {
-            break;
+        for (int c = 0; c < COLS; ++c) {
+            dsv4_hc_bf16x8(w[c][j], wf[c]);
         }
-        const uint4 * w = w_up + (int64_t) (i0 + c + n_embd*h)*sw_up;
-        for (int j = sub; j < r/8; j += 8) {
-            float wf[8];
-            dsv4_hc_bf16x8(w[j], wf);
 #pragma unroll
-            for (int t = 0; t < nt; ++t) {
-                const float4 a = lo_s4[t*(r/4) + 2*j + 0];
-                const float4 b = lo_s4[t*(r/4) + 2*j + 1];
-                acc[c][t] += wf[0]*a.x + wf[1]*a.y + wf[2]*a.z + wf[3]*a.w
-                           + wf[4]*b.x + wf[5]*b.y + wf[6]*b.z + wf[7]*b.w;
+        for (int t = 0; t < nt; ++t) {
+            const float4 a = lo_s4[t*(r/4) + 2*j + 0];
+            const float4 b = lo_s4[t*(r/4) + 2*j + 1];
+#pragma unroll
+            for (int c = 0; c < COLS; ++c) {
+                acc[c][t] += wf[c][0]*a.x + wf[c][1]*a.y + wf[c][2]*a.z + wf[c][3]*a.w
+                           + wf[c][4]*b.x + wf[c][5]*b.y + wf[c][6]*b.z + wf[c][7]*b.w;
             }
         }
     }
 
 #pragma unroll
-    for (int c = 0; c < DSV4_HC_MIX_UP_COLS; ++c) {
+    for (int c = 0; c < COLS; ++c) {
         const int i = i0 + c;
         if (i >= n_embd) {
             break;
@@ -665,7 +731,8 @@ static __global__ void dsv4_hc_mix_up_bf16(
             g += __shfl_xor_sync(0xffffffff, g, 2, 8);
             g += __shfl_xor_sync(0xffffffff, g, 1, 8);
             // same product and stream order as dsv4_hc_pre_f32<true>
-            const float p  = __fmul_rn(xn[t*hc_dim + i + n_embd*h], 1.0f/(1.0f + expf(-g)));
+            const float xn = rs[t*DSV4_HC + h]*xv[c][t]*gv[c];
+            const float p  = __fmul_rn(xn, 1.0f/(1.0f + expf(-g)));
             const float p1 = __shfl_sync(0xffffffff, p,  8, WARP_SIZE);
             const float p2 = __shfl_sync(0xffffffff, p, 16, WARP_SIZE);
             const float p3 = __shfl_sync(0xffffffff, p, 24, WARP_SIZE);
@@ -678,24 +745,25 @@ static __global__ void dsv4_hc_mix_up_bf16(
 
 template <int nt>
 static void dsv4_hc_mix_launch(
-        cudaStream_t stream, const float * xn, const uint4 * w_down, const uint4 * w_inject, const uint4 * w_up,
-        float * lo, float * mixed, float * inject, int n_embd, int hc, int r, int n_inject,
-        int64_t sw_down, int64_t sw_inject, int64_t sw_up, float scale) {
+        cudaStream_t stream, const float * x, const float * gamma, const uint4 * w_down, const uint4 * w_inject,
+        const uint4 * w_up, float * lo, float * rs, float * mixed, float * inject, int n_embd, int r, int n_inject,
+        int64_t sw_down, int64_t sw_inject, int64_t sw_up, float eps, float scale) {
     const int n_rows = r + n_inject;
-    const int rows_per_block = DSV4_HC_MIX_DOWN_WARPS/2;
-    dsv4_hc_mix_down_bf16<nt><<<(n_rows + rows_per_block - 1)/rows_per_block, DSV4_HC_MIX_DOWN_WARPS*WARP_SIZE, 0, stream>>>(
-            xn, w_down, w_inject, lo, inject, hc*n_embd, r, n_rows, hc, sw_down, sw_inject, scale);
+    const int64_t up_bytes = (int64_t) DSV4_HC*n_embd*sw_up*16;
+    dsv4_hc_mix_down_bf16<nt><<<(n_rows + DSV4_HC_MIX_DOWN_ROWS - 1)/DSV4_HC_MIX_DOWN_ROWS, DSV4_HC_MIX_DOWN_WARPS*WARP_SIZE, 0, stream>>>(
+            x, gamma, w_down, w_inject, lo, inject, rs, n_embd, r, n_rows, sw_down, sw_inject, eps, scale,
+            (const char *) w_up, up_bytes/2);
 
     const int cols_per_block = DSV4_HC_MIX_UP_WARPS*DSV4_HC_MIX_UP_COLS;
     dsv4_hc_mix_up_bf16<nt><<<(n_embd + cols_per_block - 1)/cols_per_block, DSV4_HC_MIX_UP_WARPS*WARP_SIZE, nt*r*sizeof(float), stream>>>(
-            xn, lo, w_up, mixed, n_embd, r, sw_up, scale);
+            x, gamma, rs, lo, w_up, mixed, n_embd, r, sw_up, scale);
 }
 
 bool ggml_cuda_dsv4_hc_mix_supported(const ggml_tensor * op) {
     const ggml_tensor * x = op->src[0];
     const int64_t n_embd = x->ne[0];
     const int64_t r      = op->src[2]->ne[1];
-    if (x->ne[1] != DSV4_HC || x->ne[2] > DSV4_HC_MIX_MAX_TOKENS || n_embd % 8 != 0 || r % 8 != 0) {
+    if (x->ne[1] != DSV4_HC || x->ne[2] > DSV4_HC_MIX_MAX_TOKENS || n_embd % 16 != 0 || r % 8 != 0) {
         return false;
     }
     for (int i = 2; i <= 4; ++i) {
@@ -723,20 +791,17 @@ void ggml_cuda_op_dsv4_hc_mix(ggml_backend_cuda_context & ctx, ggml_tensor * dst
     const float scale = ggml_get_op_params_f32(dst, 1);
 
     cudaStream_t stream = ctx.stream();
-    ggml_cuda_pool_alloc<float> xn(ctx.pool(), (size_t) hc*n_embd*nt);
     ggml_cuda_pool_alloc<float> lo(ctx.pool(), (size_t) r*nt);
-
-    dsv4_hc_mix_norm_f32<<<hc*nt, 256, 0, stream>>>(
-            (const float *) x->data, (const float *) w_norm->data, xn.get(), n_embd, hc, eps);
+    ggml_cuda_pool_alloc<float> rs(ctx.pool(), (size_t) hc*nt);
 
     float * mixed  = (float *) dst->data;
     float * inject = mixed + (int64_t) n_embd*nt;
     const uint4 * wi = w_inject ? (const uint4 *) w_inject->data : nullptr;
     const int64_t swi = w_inject ? w_inject->nb[1]/16 : 0;
 
-#define DSV4_HC_MIX_CASE(N) case N: dsv4_hc_mix_launch<N>(stream, xn.get(), (const uint4 *) w_down->data, wi, \
-        (const uint4 *) w_up->data, lo.get(), mixed, inject, n_embd, hc, r, w_inject ? hc : 0, \
-        w_down->nb[1]/16, swi, w_up->nb[1]/16, scale); break;
+#define DSV4_HC_MIX_CASE(N) case N: dsv4_hc_mix_launch<N>(stream, (const float *) x->data, (const float *) w_norm->data, \
+        (const uint4 *) w_down->data, wi, (const uint4 *) w_up->data, lo.get(), rs.get(), mixed, inject, n_embd, r, \
+        w_inject ? hc : 0, w_down->nb[1]/16, swi, w_up->nb[1]/16, eps, scale); break;
     switch (nt) {
         DSV4_HC_MIX_CASE(1)
         DSV4_HC_MIX_CASE(2)
