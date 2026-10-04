@@ -1998,8 +1998,10 @@ static char * moe_cache_map_shared_slab(const moe_cache_device & device, size_t 
     size_t shared_size = 0;
     if (cuMemGetAddressRange(&shared_base, &shared_size, (CUdeviceptr)device.scratch_base) == CUDA_SUCCESS &&
             shared_base == (CUdeviceptr)device.scratch_base) {
+        // Round down: a pool past its budget leaves no room for any node, so every
+        // node that plans through moe_cache_begin would bypass the cache.
         const size_t granularity = ggml_cuda_info().devices[device.logical].vmm_granularity;
-        owned = granularity * ((owned + granularity - 1) / granularity);
+        owned = granularity * (owned / granularity);
         const size_t size = owned + shared_size;
         CUmemAllocationProp prop = {};
         prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
@@ -2010,7 +2012,7 @@ static char * moe_cache_map_shared_slab(const moe_cache_device & device, size_t 
         access.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
         CUmemGenericAllocationHandle handle;
         CUdeviceptr addr = 0;
-        if (cuMemCreate(&handle, owned, &prop, 0) == CUDA_SUCCESS) {
+        if (owned && cuMemCreate(&handle, owned, &prop, 0) == CUDA_SUCCESS) {
             if (cuMemAddressReserve(&addr, size, 0, 0, 0) == CUDA_SUCCESS) {
                 const bool owned_mapped = cuMemMap(addr, owned, 0, handle, 0) == CUDA_SUCCESS;
                 const bool shared_mapped = owned_mapped &&
