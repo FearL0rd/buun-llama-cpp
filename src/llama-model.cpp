@@ -1714,13 +1714,14 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_BLOCK_COUNT,             hparams.n_layer_all);
     GGML_ASSERT(hparams.n_layer_all > 0 && hparams.n_layer_all <= LLAMA_MAX_LAYERS);
 
-    // Resolve model identity for the binary-baked KV affine-tap means (arch-keyed, tap default-on).
-    // MUST be here, before load_arch_hparams() repurposes hparams.n_embd for the qwen35 hybrid.
-    hparams.turbo_meansub_id = ggml_turbo_meansub_model_id(
-            arch_name().c_str(), (int) hparams.n_layer_all, (int) hparams.n_embd);
-
     ml.get_key(LLM_KV_NEXTN_PREDICT_LAYERS,    hparams.n_layer_nextn,   false);
     GGML_ASSERT(hparams.n_layer_nextn <= hparams.n_layer_all);
+
+    // Baked means describe the target trunk, not appended MTP blocks. Resolve
+    // before load_arch_hparams() repurposes n_embd for the qwen35 hybrid.
+    hparams.turbo_meansub_id = ggml_turbo_meansub_model_id(
+            arch_name().c_str(), (int) hparams.n_layer(), (int) hparams.n_embd);
+
     ml.get_key(LLM_KV_EXPERT_COUNT,            hparams.n_expert,        false);
     hparams.n_expert_used_arr.fill(0);
     ml.get_key_or_arr(LLM_KV_EXPERT_USED_COUNT, hparams.n_expert_used_arr, hparams.n_layer_all, false);
