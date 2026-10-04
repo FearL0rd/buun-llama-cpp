@@ -186,6 +186,14 @@ struct ggml_moe_cache_api {
 };
 
 GGML_API struct ggml_moe_cache_api ggml_moe_cache;
+// Set by the CPU backend at init, so a device provider can run part of a routed
+// MoE layer on the host with the CPU's vector kernels without linking them.
+struct ggml_type_traits_cpu;
+GGML_API const struct ggml_type_traits_cpu * (*ggml_moe_cache_cpu_traits)(enum ggml_type type);
+// dst[r][i] = (row i of w) . act[r] for i < rows and r < nr (nr <= 4); acts are in the
+// type's vec_dot_type. Uses the CPU's batched row kernels where the type has them.
+GGML_API void (*ggml_moe_cache_cpu_rows)(enum ggml_type type, int n, float * const * dst,
+        const void * w, size_t stride, int64_t rows, const void * const * act, int nr);
 GGML_API void ggml_moe_cache_unregister(const void * owner);
 GGML_API void ggml_backend_sched_set_moe_cache(
         ggml_backend_sched_t sched, enum ggml_moe_cache_mode mode,

@@ -2,6 +2,7 @@
 #include "mmvq-tuning.h"
 #include "moe-cache-mmv-tuning.h"
 #include "moe-cache.cuh"
+#include "moe-cpu-share.cuh"
 #include "quantize.cuh"
 #include "fwht.cuh"
 #include "unary.cuh"
@@ -64,6 +65,8 @@ struct ggml_cuda_mmvq_fusion_args_device : ggml_cuda_mm_fusion_args_device {
     const void * const * gate_table = nullptr;
     int32_t * x_route_log = nullptr;
     int32_t * gate_route_log = nullptr;
+    // Routed entries computed on the host instead (moe-cpu-share).
+    ggml_moe_cpu_share_args share;
 };
 
 typedef float (*vec_dot_q_cuda_t)(const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs);
@@ -2026,6 +2029,11 @@ static __global__ void mul_mat_vec_q_moe(
     if ((int32_t) channel_x < 0) {
         return; // expert on another device (expert-parallel window): the row is zeroed by the caller
     }
+    if constexpr (!flat_hits) {
+        if (fusion.share.skip && fusion.share.skip[route_idx]) {
+            return; // the host computes this entry; the weighted reduction reads its rows
+        }
+    }
     const uint32_t channel_y = act_ids
         ? act_ids[route_idx]
         : fastmodulo(channel_dst, nchannels_y);
@@ -2851,6 +2859,9 @@ static void ggml_cuda_mul_mat_vec_q_impl(
         if (fusion && fusion->gate && ggml_moe_cache_route_find(fusion->gate->data, gate_route)) {
             fusion_local.gate_table = gate_route.table;
             fusion_local.gate_route_log = gate_route.log;
+            fusion_local.share = ggml_moe_cpu_share_begin(src0, fusion->gate, ids, src1, fusion, stream);
+        } else if (!fusion) {
+            fusion_local.share = ggml_moe_cpu_share_down(src0, ids, dst);
         }
     }
 

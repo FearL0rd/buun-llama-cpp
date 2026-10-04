@@ -25,6 +25,7 @@ bool ggml_moe_cache_route_find(const void * host_base, ggml_moe_cache_route_tabl
 
 #include "common.cuh"
 #include "mmvq.cuh"
+#include "moe-cpu-share.cuh"
 #include "quantize.cuh"
 #include "exl3.cuh"
 #include "ggml-backend-impl.h"
@@ -3641,6 +3642,7 @@ static bool moe_cache_route_register(
         moe_cache_route_free(*route);
         return false;
     }
+    ggml_moe_cpu_share_note(weights, route->device_base, &session);
     device.routes.emplace(route->host_base, std::move(route));
     return true;
 }

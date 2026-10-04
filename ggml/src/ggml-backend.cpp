@@ -16,6 +16,9 @@
 
 // Optional MoE expert cache function table, populated by a supporting backend.
 struct ggml_moe_cache_api ggml_moe_cache = {};
+const struct ggml_type_traits_cpu * (*ggml_moe_cache_cpu_traits)(enum ggml_type type) = nullptr;
+void (*ggml_moe_cache_cpu_rows)(enum ggml_type type, int n, float * const * dst,
+        const void * w, size_t stride, int64_t rows, const void * const * act, int nr) = nullptr;
 
 void ggml_moe_cache_unregister(const void * owner) {
     if (ggml_moe_cache.owner == owner) {
