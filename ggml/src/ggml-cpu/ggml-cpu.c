@@ -2303,7 +2303,8 @@ static void ggml_compute_forward_mul_mat_id_one_chunk(
 #if defined(__AVX2__)
     // Amortize activation preparation over at least one output-column tile.
     const bool prepare_q2 = ne00 <= 16384 && ir0_end - ir0_start >= 16;
-    if (type == GGML_TYPE_Q2_0 && (prepare_q2 || ir1_end - ir1_start > 1)) {
+    if ((type == GGML_TYPE_Q2_0 || type == GGML_TYPE_Q2_0_G128) && (prepare_q2 || ir1_end - ir1_start > 1)) {
+        const int qk = ggml_blck_size(type);
         for (int64_t first = ir1_start; first < ir1_end; first += 4) {
             const int nr = (int) MIN(4, ir1_end - first);
             const void * ys[4];
@@ -2318,12 +2319,12 @@ static void ggml_compute_forward_mul_mat_id_one_chunk(
             if (prepare_q2) {
                 for (int r = 0; r < nr; ++r) outs[r] += ir0_start;
                 ggml_vec_dot_q2_0_q8_0_batch_rows(ne00, outs, src0_cur + ir0_start * nb01,
-                        nb01, ys, nr, ir0_end - ir0_start);
+                        nb01, ys, nr, ir0_end - ir0_start, qk);
                 continue;
             }
             for (int64_t row = ir0_start; row < ir0_end; ++row) {
                 float sums[4];
-                ggml_vec_dot_q2_0_q8_0_batch(ne00, sums, src0_cur + row * nb01, ys, nr);
+                ggml_vec_dot_q2_0_q8_0_batch(ne00, sums, src0_cur + row * nb01, ys, nr, qk);
                 for (int r = 0; r < nr; ++r) outs[r][row] = sums[r];
             }
         }
@@ -5459,8 +5460,8 @@ int ggml_cpu_has_sme2(void) {
 static void ggml_cpu_moe_cache_rows(enum ggml_type type, int n, float * const * dst,
         const void * w, size_t stride, int64_t rows, const void * const * act, int nr) {
 #if defined(__AVX2__)
-    if (type == GGML_TYPE_Q2_0 && n <= 16384) {
-        ggml_vec_dot_q2_0_q8_0_batch_rows(n, dst, w, stride, act, nr, rows);
+    if ((type == GGML_TYPE_Q2_0 || type == GGML_TYPE_Q2_0_G128) && n <= 16384) {
+        ggml_vec_dot_q2_0_q8_0_batch_rows(n, dst, w, stride, act, nr, rows, ggml_blck_size(type));
         return;
     }
 #endif

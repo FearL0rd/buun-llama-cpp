@@ -837,89 +837,124 @@ struct q2_0_prepared_act {
     float scales[512];
 };
 
+// Q2_0 and PQ2 (Q2_0_G128) share the packed codes; a weight block of qk
+// codes holds one fp16 scale followed by qk/32 activation-block slices.
+static inline const uint8_t * q2_0_block(const void * vx, int qk, int i) {
+    return (const uint8_t *) vx + (size_t) i * (sizeof(ggml_half) + qk/4);
+}
+
+static inline float q2_0_block_d(const uint8_t * block) {
+    return GGML_CPU_FP16_TO_FP32(*(const ggml_half *) block);
+}
+
 // Reuse unpacked weights across tokens selecting the same expert, optionally
 // sharing activation metadata across output columns. Preserve FP32 block order.
 static inline void q2_0_batch_impl(int n, float * s, const void * vx, const void * const * vy, int nr,
-                                 const struct q2_0_prepared_act * prepared) {
-    const block_q2_0 * x = vx;
+                                 const struct q2_0_prepared_act * prepared, int qk) {
+    const int kq = qk / QK8_0;
+    const int nb = n / qk;
     for (int r = 0; r < nr; ++r) s[r] = 0.0f;
     int i = 0;
-    for (; i + 4 <= n / QK2_0; i += 4) {
+    for (; i + 4 <= nb; i += 4) {
+        const uint8_t * x0 = q2_0_block(vx, qk, i+0);
+        const uint8_t * x1 = q2_0_block(vx, qk, i+1);
+        const uint8_t * x2 = q2_0_block(vx, qk, i+2);
+        const uint8_t * x3 = q2_0_block(vx, qk, i+3);
         __m128 sums[4];
         for (int r = 0; r < nr; ++r) sums[r] = _mm_setzero_ps();
-        for (int k = 0; k < 2; ++k) {
-            const __m256i c0 = q2_0_unpack32(x[i+0].qs + k*8);
-            const __m256i c1 = q2_0_unpack32(x[i+1].qs + k*8);
-            const __m256i c2 = q2_0_unpack32(x[i+2].qs + k*8);
-            const __m256i c3 = q2_0_unpack32(x[i+3].qs + k*8);
+        for (int k = 0; k < kq; ++k) {
+            const __m256i c0 = q2_0_unpack32(x0 + sizeof(ggml_half) + k*8);
+            const __m256i c1 = q2_0_unpack32(x1 + sizeof(ggml_half) + k*8);
+            const __m256i c2 = q2_0_unpack32(x2 + sizeof(ggml_half) + k*8);
+            const __m256i c3 = q2_0_unpack32(x3 + sizeof(ggml_half) + k*8);
             for (int r = 0; r < nr; ++r) {
                 const block_q8_0 * y = vy[r];
-                const __m256i d0 = prepared ? q2_0_codes_dot(c0, y[2*(i+0)+k].qs) : q2_0_dot32_codes(c0, y[2*(i+0)+k].qs);
-                const __m256i d1 = prepared ? q2_0_codes_dot(c1, y[2*(i+1)+k].qs) : q2_0_dot32_codes(c1, y[2*(i+1)+k].qs);
-                const __m256i d2 = prepared ? q2_0_codes_dot(c2, y[2*(i+2)+k].qs) : q2_0_dot32_codes(c2, y[2*(i+2)+k].qs);
-                const __m256i d3 = prepared ? q2_0_codes_dot(c3, y[2*(i+3)+k].qs) : q2_0_dot32_codes(c3, y[2*(i+3)+k].qs);
+                const __m256i d0 = prepared ? q2_0_codes_dot(c0, y[kq*(i+0)+k].qs) : q2_0_dot32_codes(c0, y[kq*(i+0)+k].qs);
+                const __m256i d1 = prepared ? q2_0_codes_dot(c1, y[kq*(i+1)+k].qs) : q2_0_dot32_codes(c1, y[kq*(i+1)+k].qs);
+                const __m256i d2 = prepared ? q2_0_codes_dot(c2, y[kq*(i+2)+k].qs) : q2_0_dot32_codes(c2, y[kq*(i+2)+k].qs);
+                const __m256i d3 = prepared ? q2_0_codes_dot(c3, y[kq*(i+3)+k].qs) : q2_0_dot32_codes(c3, y[kq*(i+3)+k].qs);
                 const __m256i halves = _mm256_hadd_epi32(
                         _mm256_hadd_epi32(d0, d1), _mm256_hadd_epi32(d2, d3));
                 __m128i dots = _mm_add_epi32(_mm256_castsi256_si128(halves),
                         _mm256_extracti128_si256(halves, 1));
                 if (prepared) {
                     dots = _mm_sub_epi32(dots, _mm_cvtepi16_epi32(_mm_loadl_epi64(
-                            (const __m128i *) (prepared[r].sums + k*(n/QK2_0) + i))));
+                            (const __m128i *) (prepared[r].sums + k*nb + i))));
                 }
-                const __m128 scales = prepared ? _mm_loadu_ps(prepared[r].scales + k*(n/QK2_0) + i) : _mm_setr_ps(
-                        GGML_CPU_FP16_TO_FP32(y[2*(i+0)+k].d),
-                        GGML_CPU_FP16_TO_FP32(y[2*(i+1)+k].d),
-                        GGML_CPU_FP16_TO_FP32(y[2*(i+2)+k].d),
-                        GGML_CPU_FP16_TO_FP32(y[2*(i+3)+k].d));
+                const __m128 scales = prepared ? _mm_loadu_ps(prepared[r].scales + k*nb + i) : _mm_setr_ps(
+                        GGML_CPU_FP16_TO_FP32(y[kq*(i+0)+k].d),
+                        GGML_CPU_FP16_TO_FP32(y[kq*(i+1)+k].d),
+                        GGML_CPU_FP16_TO_FP32(y[kq*(i+2)+k].d),
+                        GGML_CPU_FP16_TO_FP32(y[kq*(i+3)+k].d));
                 sums[r] = _mm_add_ps(sums[r], _mm_mul_ps(scales, _mm_cvtepi32_ps(dots)));
             }
         }
+        const float d[4] = { q2_0_block_d(x0), q2_0_block_d(x1), q2_0_block_d(x2), q2_0_block_d(x3) };
         for (int r = 0; r < nr; ++r) {
             float blocks[4];
             _mm_storeu_ps(blocks, sums[r]);
-            for (int j = 0; j < 4; ++j) s[r] += GGML_CPU_FP16_TO_FP32(x[i+j].d) * blocks[j];
+            for (int j = 0; j < 4; ++j) s[r] += d[j] * blocks[j];
         }
     }
-    for (; i < n / QK2_0; ++i) {
+    for (; i < nb; ++i) {
+        const uint8_t * x = q2_0_block(vx, qk, i);
         float sums[4] = {0};
-        for (int k = 0; k < 2; ++k) {
-            const __m256i codes = q2_0_unpack32(x[i].qs + k*8);
+        for (int k = 0; k < kq; ++k) {
+            const __m256i codes = q2_0_unpack32(x + sizeof(ggml_half) + k*8);
             for (int r = 0; r < nr; ++r) {
                 const block_q8_0 * y = vy[r];
                 const int dot = prepared
-                    ? hsum_i32_8(q2_0_codes_dot(codes, y[2*i+k].qs)) - prepared[r].sums[k*(n/QK2_0)+i]
-                    : hsum_i32_8(q2_0_dot32_codes(codes, y[2*i+k].qs));
-                const float scale = prepared ? prepared[r].scales[k*(n/QK2_0)+i] : GGML_CPU_FP16_TO_FP32(y[2*i+k].d);
+                    ? hsum_i32_8(q2_0_codes_dot(codes, y[kq*i+k].qs)) - prepared[r].sums[k*nb+i]
+                    : hsum_i32_8(q2_0_dot32_codes(codes, y[kq*i+k].qs));
+                const float scale = prepared ? prepared[r].scales[k*nb+i] : GGML_CPU_FP16_TO_FP32(y[kq*i+k].d);
                 sums[r] += scale * dot;
             }
         }
-        for (int r = 0; r < nr; ++r) s[r] += GGML_CPU_FP16_TO_FP32(x[i].d) * sums[r];
+        for (int r = 0; r < nr; ++r) s[r] += q2_0_block_d(x) * sums[r];
     }
 }
 
-void ggml_vec_dot_q2_0_q8_0_batch(int n, float * s, const void * vx, const void * const * vy, int nr) {
-    assert(n % QK2_0 == 0 && nr >= 1 && nr <= 4);
-    // Literal counts let the compiler keep each row's accumulators in registers.
-    switch (nr) {
-        case 1: ggml_vec_dot_q2_0_q8_0(n, s, 0, vx, 0, vy[0], 0, 1); break;
-        case 2: q2_0_batch_impl(n, s, vx, vy, 2, NULL); break;
-        case 3: q2_0_batch_impl(n, s, vx, vy, 3, NULL); break;
-        case 4: q2_0_batch_impl(n, s, vx, vy, 4, NULL); break;
+// Literal row counts and group sizes let the compiler keep each row's
+// accumulators in registers.
+static inline void q2_0_batch_dispatch(int n, float * s, const void * vx, const void * const * vy, int nr,
+                                     const struct q2_0_prepared_act * prepared, int qk) {
+#define Q2_0_BATCH_NR(QK) \
+    switch (nr) { \
+        case 1: q2_0_batch_impl(n, s, vx, vy, 1, prepared, QK); break; \
+        case 2: q2_0_batch_impl(n, s, vx, vy, 2, prepared, QK); break; \
+        case 3: q2_0_batch_impl(n, s, vx, vy, 3, prepared, QK); break; \
+        case 4: q2_0_batch_impl(n, s, vx, vy, 4, prepared, QK); break; \
     }
+    if (qk == QK2_0) {
+        Q2_0_BATCH_NR(QK2_0)
+    } else {
+        Q2_0_BATCH_NR(QK2_0_G128)
+    }
+#undef Q2_0_BATCH_NR
+}
+
+void ggml_vec_dot_q2_0_q8_0_batch(int n, float * s, const void * vx, const void * const * vy, int nr, int qk) {
+    assert((qk == QK2_0 || qk == QK2_0_G128) && n % qk == 0 && nr >= 1 && nr <= 4);
+    if (nr == 1) {
+        (qk == QK2_0 ? ggml_vec_dot_q2_0_q8_0 : ggml_vec_dot_q2_0_g128_q8_0)(n, s, 0, vx, 0, vy[0], 0, 1);
+        return;
+    }
+    q2_0_batch_dispatch(n, s, vx, vy, nr, NULL, qk);
 }
 
 void ggml_vec_dot_q2_0_q8_0_batch_rows(int n, float * const * dst, const void * vx, size_t stride,
-                                    const void * const * vy, int nr, int64_t rows) {
-    assert(n % QK2_0 == 0 && n <= 16384 && nr >= 1 && nr <= 4);
+                                    const void * const * vy, int nr, int64_t rows, int qk) {
+    assert((qk == QK2_0 || qk == QK2_0_G128) && n % qk == 0 && n <= 16384 && nr >= 1 && nr <= 4);
     // Reuse exact signed-byte sums and FP16-to-FP32 scale conversions across
     // output columns. Scratch is bounded at 12 KiB, with no weight repacking.
     struct q2_0_prepared_act prepared[4];
+    const int kq = qk / QK8_0;
     for (int r = 0; r < nr; ++r) {
         const block_q8_0 * y = vy[r];
         for (int b = 0; b < n / QK8_0; ++b) {
-            // Adjacent entries feed adjacent weight blocks in one half-block
+            // Adjacent entries feed adjacent weight blocks in one block-slice
             // pass, so four corrections need one load rather than a gather.
-            const int index = (b%2)*(n/QK2_0)+b/2;
+            const int index = (b%kq)*(n/qk)+b/kq;
             prepared[r].sums[index] = (int16_t) hsum_i32_8(
                     q2_0_codes_dot(_mm256_set1_epi8(1), y[b].qs));
             prepared[r].scales[index] = GGML_CPU_FP16_TO_FP32(y[b].d);
@@ -927,13 +962,7 @@ void ggml_vec_dot_q2_0_q8_0_batch_rows(int n, float * const * dst, const void * 
     }
     for (int64_t row = 0; row < rows; ++row) {
         float sums[4];
-        const void * x = (const char *) vx + row * stride;
-        switch (nr) {
-            case 1: q2_0_batch_impl(n, sums, x, vy, 1, prepared); break;
-            case 2: q2_0_batch_impl(n, sums, x, vy, 2, prepared); break;
-            case 3: q2_0_batch_impl(n, sums, x, vy, 3, prepared); break;
-            case 4: q2_0_batch_impl(n, sums, x, vy, 4, prepared); break;
-        }
+        q2_0_batch_dispatch(n, sums, (const char *) vx + row * stride, vy, nr, prepared, qk);
         for (int r = 0; r < nr; ++r) dst[r][row] = sums[r];
     }
 }

@@ -1246,6 +1246,11 @@ static bool moe_cache_tensor_name_supported(const char * name) {
     return strstr(name, "_exps") || strstr(name, "_chexps");
 }
 
+// Q2_0 and PQ2 (Q2_0_G128) share packed ternary codes and the small-batch tuning below
+static bool moe_cache_type_is_q2(int type) {
+    return type == GGML_TYPE_Q2_0 || type == GGML_TYPE_Q2_0_G128;
+}
+
 static bool moe_cache_type_supported(ggml_type type) {
     if (ggml_type_is_exl3(type)) return true;
     switch (type) {
@@ -2736,7 +2741,7 @@ static int moe_cache_prefill_copy(void * opaque, void * backend_opaque,
 static int moe_cache_prefetch_supported(void * backend_opaque, const ggml_tensor * source) {
     auto backend = (ggml_backend_t) backend_opaque;
     if (!backend || !ggml_backend_is_cuda(backend) || !source || source->view_src ||
-            source->type != GGML_TYPE_Q2_0 || !source->buffer ||
+            !moe_cache_type_is_q2(source->type) || !source->buffer ||
             source->buffer->buft != ggml_backend_cuda_host_buffer_type() ||
             ggml_backend_buffer_get_usage(source->buffer) != GGML_BACKEND_BUFFER_USAGE_WEIGHTS ||
             (source->flags & GGML_TENSOR_FLAG_INPUT) || !ggml_is_contiguous(source) ||
@@ -4199,7 +4204,7 @@ static int moe_cache_dispatch_internal(
         const bool dedicated_down = session.config.dedicated_down_mmv >= 0
             ? session.config.dedicated_down_mmv != 0
             : (down_cc == 860 || down_cc == GGML_CUDA_CC_BLACKWELL) &&
-              down_pool->wtype == GGML_TYPE_Q2_0 && n_out == 640 && node->n_out == 2560;
+              moe_cache_type_is_q2(down_pool->wtype) && n_out == 640 && node->n_out == 2560;
         down_mmv_path = ggml_cuda_moe_cache_mmv(
                 down_pool->slab, (ggml_type)down_pool->wtype,
                 (const char *)device.d_act_q8, d_ids + 2 * n_hits,
@@ -4874,7 +4879,7 @@ static void * moe_cache_fused_plan_expert_parallel(
                 mask |= UINT64_C(1) << row;
             }
             if (stage_experts > 0 && routes.size() == 1 && n_tokens >= 2 && n_tokens <= MMVQ_MAX_BATCH_SIZE &&
-                current.pair_pool == current.down_pool && up->type == GGML_TYPE_Q2_0 &&
+                current.pair_pool == current.down_pool && moe_cache_type_is_q2(up->type) &&
                 down->type == up->type && up->expert_size == down->expert_size && up->expert_size <= 512*1024 &&
                 !current.pair_pool->covers_all_entries &&
                 moe_cache_stream_stage_source(*current.device, up->data) &&
@@ -5159,7 +5164,7 @@ static void * moe_cache_fused_plan(
     // same full-FFN planner for resident and transient experts, without changing
     // the existing multi-device routing or larger prompt-processing batches.
     stream_stage = down && session->devices.size() == 1 && n_tokens <= MMVQ_MAX_BATCH_SIZE &&
-        up->type == GGML_TYPE_Q2_0 && down->type == up->type &&
+        moe_cache_type_is_q2(up->type) && down->type == up->type &&
         up->expert_size == down->expert_size && up->expert_size <= 512*1024 &&
         (ggml_cuda_info().devices[session->devices.front()->logical].cc == 860 ||
          ggml_cuda_info().devices[session->devices.front()->logical].cc == GGML_CUDA_CC_BLACKWELL);
