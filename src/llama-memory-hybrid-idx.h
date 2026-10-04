@@ -128,6 +128,25 @@ private:
         std::vector<uint32_t> gens;
     };
     std::map<uint32_t, qsa_row_keys> qsa_keys;
+
+    // The direct QSA layout of one sequence: position p sits in slot p of block p/ratio, one cell
+    // per slot. Kept across ubatches and patched from the cells' change log, so a decode step costs
+    // the cells it wrote rather than a walk over every cell.
+    struct qsa_layout {
+        uint64_t rev    = 0;     // cells revision this layout reflects; 0 until built
+        int64_t  n_kv   = 0;
+        bool     direct = false; // false: a repeated or out-of-window position, no direct layout
+
+        std::vector<int32_t> slot_cell; // [ratio*n_blocks] cell in each slot, -1 if none
+        std::vector<int32_t> cell_slot; // [n_kv] slot of each cell, -1 if not in the layout
+        std::vector<int32_t> cell_blk;  // [n_kv] block of each cell, n_blocks - 1 if not in the layout
+        std::vector<uint8_t> fill;      // [n_blocks] occupied slots
+    };
+    std::map<std::pair<uint32_t, llama_seq_id>, qsa_layout> qsa_layouts;
+    std::vector<uint32_t> qsa_dirty;
+
+    // nullptr when the cells of seq have no direct layout over the first n_kv cells
+    const qsa_layout * qsa_direct_layout(const llama_kv_cells & cells, llama_seq_id seq, uint32_t ratio, int64_t n_kv);
 };
 
 class llama_memory_hybrid_idx_context : public llama_memory_hybrid_context {
@@ -208,7 +227,6 @@ private:
         int64_t  n_upd    = 0;
         std::vector<int32_t> rows;
         std::vector<int32_t> cells;   // [ratio*rows], -1 for an empty slot of an incomplete block
-        std::vector<int32_t> layout;  // scratch: the cell holding each position, -1 if none
     };
     const qsa_plan & plan_qsa(const llama_ubatch * ubatch, uint32_t ratio, int64_t n_kv) const;
 

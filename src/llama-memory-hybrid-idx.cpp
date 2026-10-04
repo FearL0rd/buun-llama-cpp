@@ -142,6 +142,67 @@ void llama_memory_hybrid_idx::qsa_invalidate() {
     }
 }
 
+const llama_memory_hybrid_idx::qsa_layout * llama_memory_hybrid_idx::qsa_direct_layout(
+        const llama_kv_cells & cells, llama_seq_id seq, uint32_t ratio, int64_t n_kv) {
+    auto & l = qsa_layouts[{ ratio, seq }];
+
+    const uint64_t rev = cells.get_rev();
+    if (l.rev == rev && l.n_kv == n_kv) {
+        return l.direct ? &l : nullptr;
+    }
+
+    const int64_t r = ratio;
+    const int64_t n_blocks = (n_kv + r - 1)/r;
+    const int32_t dead_bid = (int32_t) (n_blocks - 1);
+
+    qsa_dirty.clear();
+    const bool patch = l.rev != 0 && l.direct && l.n_kv == n_kv &&
+        cells.changes_since(l.rev, [this](uint32_t i) { qsa_dirty.push_back(i); });
+
+    if (!patch) {
+        l.slot_cell.assign(r*n_blocks, -1);
+        l.cell_slot.assign(n_kv, -1);
+        l.cell_blk.assign(n_kv, dead_bid);
+        l.fill.assign(n_blocks, 0);
+        qsa_dirty.resize(n_kv);
+        for (int64_t j = 0; j < n_kv; ++j) {
+            qsa_dirty[j] = (uint32_t) j;
+        }
+    }
+
+    l.rev    = rev;
+    l.n_kv   = n_kv;
+    l.direct = true;
+
+    // drop every dirty cell first, so a cell that moved does not collide with its old slot
+    for (const uint32_t j : qsa_dirty) {
+        if (j < n_kv && l.cell_slot[j] >= 0) {
+            const int32_t slot = l.cell_slot[j];
+            l.slot_cell[slot] = -1;
+            l.fill[slot/r]--;
+            l.cell_slot[j] = -1;
+            l.cell_blk[j]  = dead_bid;
+        }
+    }
+    for (const uint32_t j : qsa_dirty) {
+        if (j >= n_kv || l.cell_slot[j] >= 0 || cells.is_empty(j) || !cells.seq_has(j, seq)) {
+            continue;
+        }
+        const llama_pos p = cells.pos_get(j);
+        if (p < 0 || p/r >= n_blocks || l.slot_cell[p] >= 0) {
+            // M-RoPE or an out-of-window position
+            l.direct = false;
+            return nullptr;
+        }
+        l.slot_cell[p] = (int32_t) j;
+        l.cell_slot[j] = p;
+        l.cell_blk[j]  = (int32_t) (p/r);
+        l.fill[p/r]++;
+    }
+
+    return &l;
+}
+
 llama_memory_context_ptr llama_memory_hybrid_idx::init_batch(llama_batch_allocr & balloc, uint32_t n_ubatch, bool embd_all) {
     // note: repeats llama_memory_hybrid::init_batch, as the indexer needs the attention slot infos that the base context hides
     do {
@@ -612,6 +673,40 @@ void llama_memory_hybrid_idx_context::set_input_qsa(
     GGML_ASSERT(n_tokens % n_ns == 0);
     const int64_t n_tps = n_tokens/n_ns;             // tokens per stream
 
+    float * dst_bias = (float *) bias->data;
+
+    // decode over one sequence: the persistent direct layout already holds every cell's block
+    if (n_ns == 1 && blk_bias && n_tps < 32) {
+        const llama_seq_id seq = ubatch->seq_id[0][0];
+        const auto * l = mem->qsa_direct_layout(mem->get_mem_idx()->get_cells(seq), seq, ratio, n_kv);
+        if (l != nullptr) {
+            std::copy(l->cell_blk.begin(), l->cell_blk.end(), (int32_t *) cell_blk->data);
+            if (blk_cells) {
+                int32_t * dst = (int32_t *) blk_cells->data;
+                for (int64_t k = 0; k < r*n_blocks; ++k) {
+                    dst[k] = std::max(l->slot_cell[k], 0);
+                }
+            }
+            if (blk_pos) {
+                int32_t * dst = (int32_t *) blk_pos->data;
+                for (int64_t b = 0; b < n_blocks; ++b) {
+                    dst[b] = dst[n_blocks + b] = dst[2*n_blocks + b] = dst[3*n_blocks + b] = (int32_t) (b*r);
+                }
+            }
+            for (int64_t i = 0; i < n_tokens; ++i) {
+                const int64_t tail_start = (ubatch->pos[i] + 1)/r*r;
+                float * cur = dst_bias + i*n_blocks;
+                for (int64_t b = 0; b < n_blocks; ++b) {
+                    const bool incomplete = l->fill[b] < r;
+                    cur[b] = l->fill[b] == 0 ? -INFINITY :
+                        !causal_attn ? (incomplete ? 1e9f : 0.0f) :
+                        (b*r >= tail_start ? 1e9f : (incomplete ? -INFINITY : 0.0f));
+                }
+            }
+            return;
+        }
+    }
+
     // the pooled-key cache path uploads no gather layout, but the bias still walks it
     std::vector<int32_t> tmp_blk_cells;
     std::vector<int32_t> tmp_blk_pos;
@@ -623,7 +718,6 @@ void llama_memory_hybrid_idx_context::set_input_qsa(
     int32_t * dst_cell_blk  = (int32_t *) cell_blk->data;
     int32_t * dst_blk_cells = blk_cells ? (int32_t *) blk_cells->data : tmp_blk_cells.data();
     int32_t * dst_blk_pos   = blk_pos   ? (int32_t *) blk_pos->data   : tmp_blk_pos.data();
-    float   * dst_bias      = (float   *) bias->data;
 
     GGML_ASSERT(r <= 64);
     GGML_ASSERT(r*n_blocks >= n_kv);
@@ -995,19 +1089,12 @@ const llama_memory_hybrid_idx_context::qsa_plan & llama_memory_hybrid_idx_contex
 
     GGML_ASSERT((size_t) (r*n_blocks) <= keys.cells.size());
 
-    auto & layout = plan.layout;
-    layout.assign(r*n_blocks, -1);
-    for (int64_t j = 0; j < n_kv; ++j) {
-        if (cells.is_empty(j) || !cells.seq_has((uint32_t) j, seq)) {
-            continue;
-        }
-        const llama_pos p = cells.pos_get(j);
-        if (p < 0 || p/r >= n_blocks || layout[p] >= 0) {
-            // M-RoPE or an out-of-window position: set_input_qsa pools every block itself
-            return plan;
-        }
-        layout[p] = (int32_t) j;
+    const auto * l = mem->qsa_direct_layout(cells, seq, ratio, n_kv);
+    if (l == nullptr) {
+        // M-RoPE or an out-of-window position: set_input_qsa pools every block itself
+        return plan;
     }
+    const auto & layout = l->slot_cell;
 
     // a row is reusable when it pooled exactly these cells and none was rewritten since. An
     // incomplete block's empty slots read cell 0, so its row is redone every time.
