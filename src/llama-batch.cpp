@@ -347,6 +347,10 @@ bool llama_batch_allocr::init(
 
     if (memory) {
         for (uint32_t s0 = 0; s0 < n_seq_max; ++s0) {
+            // only sequences in the batch have couplings (n_seq_max is LLAMA_MAX_SEQ for a unified cache)
+            if (seq_pos[s0].empty()) {
+                continue;
+            }
             for (uint32_t s1 = 0; s1 < n_seq_max; ++s1) {
                 if (seq_cpl[s0][s1]) {
                     if (memory->seq_pos_min(s0) != memory->seq_pos_min(s1) ||

@@ -1439,9 +1439,10 @@ extern "C" {
     // Log-probabilities of top-K tokens (available when dflash_sample_temp > 0).
     LLAMA_API float *   llama_get_logits_argmax_probs(struct llama_context * ctx);
     // True when the last decode computed the argmax/top-K tail on a GPU backend.
-    // Only the GPU argmax kernels implement the extended [ids + log-probs] output
-    // layout; a tail scheduled on the CPU backend (e.g. a drafter with -ngld 0)
-    // runs the plain per-row argmax and leaves the extended layout uninitialized.
+    // Only the GPU argmax kernels implement the sampled (temp/seed) extended
+    // [ids + log-probs] output layout; a tail scheduled on the CPU backend (e.g. a
+    // drafter with -ngld 0) fills it only for the noise-free top-K (K > 1), and
+    // otherwise runs the plain per-row argmax and leaves it uninitialized.
     LLAMA_API bool      llama_get_logits_argmax_gpu(struct llama_context * ctx);
 
     // Get all output token embeddings.

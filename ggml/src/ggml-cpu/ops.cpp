@@ -11,6 +11,7 @@
 #include <algorithm>
 #include <cfloat>
 #include <cmath>
+#include <vector>
 
 // ggml_compute_forward_dup
 
@@ -1591,6 +1592,46 @@ static void ggml_compute_forward_argmax_f32(
 
     const size_t nb01 = src0->nb[1];
     const size_t nb0 = dst->nb[0];
+
+    // ggml_topk_ext without sampling noise: the K largest ids per row in descending order,
+    // then their log-probs (the noisy variant is GPU-only)
+    const int32_t k = ggml_get_op_params_i32(dst, 3);
+    const bool noise = ggml_get_op_params_i32(dst, 1) != 0 || ggml_get_op_params_i32(dst, 2) != 0;
+    if (k > 1 && !noise) {
+        const float temp = ggml_get_op_params_f32(dst, 0);
+        const float inv_temp = temp > 0.0f ? 1.0f/temp : 1.0f;
+        int32_t * ids = (int32_t *) dst->data;
+        float * lps = (float *) dst->data + k*ne01;
+        std::vector<std::pair<float, int32_t>> top;
+        for (int64_t i1 = 0; i1 < ne01; i1++) {
+            const float * src = (const float *) ((const char *) src0->data + i1*nb01);
+            top.clear();
+            float vmax = -INFINITY;
+            for (int32_t i0 = 0; i0 < ne00; i0++) {
+                vmax = std::max(vmax, src[i0]*inv_temp);
+                if ((int32_t) top.size() == k && !(src[i0] > top.back().first)) {
+                    continue;
+                }
+                auto it = std::upper_bound(top.begin(), top.end(), src[i0],
+                    [](float v, const std::pair<float, int32_t> & e) { return v > e.first; });
+                top.insert(it, {src[i0], i0});
+                if ((int32_t) top.size() > k) {
+                    top.pop_back();
+                }
+            }
+            double sum = 0.0;
+            for (int32_t i0 = 0; i0 < ne00; i0++) {
+                sum += expf(src[i0]*inv_temp - vmax);
+            }
+            const float lse = vmax + (float) log(sum);
+            for (int32_t j = 0; j < k; j++) {
+                const bool have = j < (int32_t) top.size();
+                ids[i1*k + j] = have ? top[j].second : -1;
+                lps[i1*k + j] = have ? top[j].first*inv_temp - lse : -INFINITY;
+            }
+        }
+        return;
+    }
 
     for (int64_t i1 = 0; i1 < ne01; i1++) {
         float * src = (float *) ((char *) src0->data + i1*nb01);
@@ -11862,6 +11903,10 @@ static void ggml_compute_forward_dsv4_hc_post_f32(
     GGML_TENSOR_LOCALS(size_t, nbp, post,     nb);
     GGML_TENSOR_LOCALS(size_t, nbd, dst,      nb);
 
+    // ggml_dsv4_hc_post_inject: post is the raw injection
+    const bool  from_inject  = ggml_get_op_params_i32(dst, 0) != 0;
+    const float inject_scale = ggml_get_op_params_f32(dst, 1);
+
     const int ith = params->ith;
     const int nth = params->nth;
 
@@ -11876,7 +11921,10 @@ static void ggml_compute_forward_dsv4_hc_post_f32(
         const int64_t it     = ir / (n_embd * hc);
 
         const float xv = *(const float *) ((const char *) x->data    + i0*nbx0 + it*nbx1);
-        const float pv = *(const float *) ((const char *) post->data + idst*nbp0 + it*nbp1);
+        float pv = *(const float *) ((const char *) post->data + idst*nbp0 + it*nbp1);
+        if (from_inject) {
+            pv = 2.0f * (1.0f / (1.0f + expf(-(inject_scale * pv))));
+        }
 
         float sum = xv * pv;
         if (comb) {
@@ -11907,6 +11955,112 @@ void ggml_compute_forward_dsv4_hc_post(
             {
                 GGML_ABORT("fatal error");
             }
+    }
+}
+
+// ggml_compute_forward_dsv4_hc_mix
+
+static void ggml_dsv4_hc_mix_row_f32(const ggml_tensor * w, int64_t row, float * out) {
+    const char * src = (const char *) w->data + row*w->nb[1];
+    if (w->type == GGML_TYPE_F32) {
+        memcpy(out, src, w->ne[0]*sizeof(float));
+    } else {
+        ggml_get_type_traits(w->type)->to_float(src, out, w->ne[0]);
+    }
+}
+
+size_t ggml_compute_forward_dsv4_hc_mix_work_size(const ggml_tensor * dst, int n_tasks) {
+    const int64_t n_tokens = dst->src[0]->ne[2];
+    const int64_t hc       = dst->src[0]->ne[1];
+    const int64_t hc_dim   = dst->src[0]->ne[0]*hc;
+    const int64_t r        = dst->src[2]->ne[1];
+
+    return sizeof(float)*((hc_dim + r)*n_tokens + n_tasks*(hc_dim + hc*n_tokens + CACHE_LINE_SIZE_F32));
+}
+
+void ggml_compute_forward_dsv4_hc_mix(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    const ggml_tensor * x        = dst->src[0];
+    const ggml_tensor * w_norm   = dst->src[1];
+    const ggml_tensor * w_down   = dst->src[2];
+    const ggml_tensor * w_up     = dst->src[3];
+    const ggml_tensor * w_inject = dst->src[4];
+
+    const int64_t n_embd   = x->ne[0];
+    const int64_t hc       = x->ne[1];
+    const int64_t n_tokens = x->ne[2];
+    const int64_t hc_dim   = hc*n_embd;
+    const int64_t r        = w_down->ne[1];
+
+    const float eps   = ggml_get_op_params_f32(dst, 0);
+    const float scale = ggml_get_op_params_f32(dst, 1);
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    // shared: xn [hc_dim, n_tokens], lo [r, n_tokens]; per thread: one weight row and the gate dots
+    float * xn   = (float *) params->wdata;
+    float * lo   = xn + hc_dim*n_tokens;
+    float * row  = lo + r*n_tokens + ith*(hc_dim + hc*n_tokens + CACHE_LINE_SIZE_F32);
+    float * dots = row + hc_dim;
+
+    const float * xd     = (const float *) x->data;
+    const float * gamma  = (const float *) w_norm->data;
+    float       * mixed  = (float *) dst->data;
+    float       * inject = mixed + n_embd*n_tokens;
+
+    for (int64_t ic = ith; ic < hc*n_tokens; ic += nth) {
+        const float * xs = xd + ic*n_embd;
+        float sum = 0.0f;
+        for (int64_t i = 0; i < n_embd; ++i) {
+            sum += xs[i]*xs[i];
+        }
+        const float s = 1.0f/sqrtf(sum/n_embd + eps);
+        const float * g = gamma + (ic % hc)*n_embd;
+        for (int64_t i = 0; i < n_embd; ++i) {
+            xn[ic*n_embd + i] = (xs[i]*s)*g[i];
+        }
+    }
+    ggml_barrier(params->threadpool);
+
+    const int64_t n_rows = r + (w_inject ? hc : 0);
+    for (int64_t ir = ith; ir < n_rows; ir += nth) {
+        ggml_dsv4_hc_mix_row_f32(ir < r ? w_down : w_inject, ir < r ? ir : ir - r, row);
+        for (int64_t it = 0; it < n_tokens; ++it) {
+            float dot = 0.0f;
+            for (int64_t k = 0; k < hc_dim; ++k) {
+                dot += row[k]*xn[it*hc_dim + k];
+            }
+            if (ir < r) {
+                const float v = scale*dot;
+                lo[it*r + ir] = v/(1.0f + expf(-v));
+            } else {
+                inject[it*hc + ir - r] = dot;
+            }
+        }
+    }
+    ggml_barrier(params->threadpool);
+
+    for (int64_t i = ith; i < n_embd; i += nth) {
+        for (int64_t h = 0; h < hc; ++h) {
+            ggml_dsv4_hc_mix_row_f32(w_up, i + n_embd*h, row);
+            for (int64_t it = 0; it < n_tokens; ++it) {
+                float dot = 0.0f;
+                for (int64_t k = 0; k < r; ++k) {
+                    dot += row[k]*lo[it*r + k];
+                }
+                dots[it*hc + h] = dot;
+            }
+        }
+        for (int64_t it = 0; it < n_tokens; ++it) {
+            float sum = 0.0f;
+            for (int64_t h = 0; h < hc; ++h) {
+                const float p = xn[it*hc_dim + h*n_embd + i]*(1.0f/(1.0f + expf(-dots[it*hc + h])));
+                sum = h == 0 ? p : sum + p;
+            }
+            mixed[it*n_embd + i] = scale*sum;
+        }
     }
 }
 

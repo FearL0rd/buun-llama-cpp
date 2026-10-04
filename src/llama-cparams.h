@@ -56,6 +56,7 @@ struct llama_cparams {
     bool fused_dsv4_hc_pre;
     bool fused_dsv4_hc_comb;
     bool fused_dsv4_hc_post;
+    bool fused_dsv4_hc_mix;  // whole HC pre-mix in one op for small batches
     bool auto_fhc;
     bool no_perf;
     bool warmup;             // TODO: remove [TAG_LLAMA_GRAPH_NO_WARMUP]
@@ -98,10 +99,10 @@ struct llama_cparams {
     // default off keeps raw-logits behavior for every other consumer.
     bool dflash_argmax = false;
 
-    // DFlash target verification: append a raw greedy argmax to the ordinary
-    // target graph. Unlike dflash_argmax, this is architecture-independent and
-    // deliberately ignores the drafter's temperature/top-K controls.
-    bool dflash_target_argmax = false;
+    // DFlash target verification: append the raw top-K (K = 1: argmax) of the
+    // logits to the ordinary target graph, 0 = off. Unlike dflash_argmax, this is
+    // architecture-independent and ignores the drafter's temperature/top-K controls.
+    int32_t dflash_target_argmax_k = 0;
 
     // DFlash2 target verification can prefer CUDA's MMA-backed quantized
     // matrix path for one exact width during an explicitly marked verify

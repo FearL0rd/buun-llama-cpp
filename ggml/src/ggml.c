@@ -1434,6 +1434,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "DSV4_HC_COMB",
     "DSV4_HC_PRE",
     "DSV4_HC_POST",
+    "DSV4_HC_MIX",
     "DFLASH2_CONV",
     "GATED_DELTA_NET_TREE",
     "SSM_CONV_TREE",
@@ -1455,7 +1456,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GLU",
 };
 
-static_assert(GGML_OP_COUNT == 106, "GGML_OP_COUNT != 106");
+static_assert(GGML_OP_COUNT == 107, "GGML_OP_COUNT != 107");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1554,6 +1555,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "dsv4_hc_comb(mixes, scale, base)",
     "dsv4_hc_pre(x, weights)",
     "dsv4_hc_post(x, residual, post, comb)",
+    "dsv4_hc_mix(x, w_norm, w_down, w_up, w_inject)",
     "dflash2_conv(hidden, projected, base)",
     "gated_delta_net_tree(q, k, v, g, beta, s)",
     "ssm_conv_tree(x)",
@@ -1575,7 +1577,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "glu(x)",
 };
 
-static_assert(GGML_OP_COUNT == 106, "GGML_OP_COUNT != 106");
+static_assert(GGML_OP_COUNT == 107, "GGML_OP_COUNT != 107");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -7195,6 +7197,68 @@ struct ggml_tensor * ggml_dsv4_hc_post(
     result->src[1] = residual;
     result->src[2] = post;
     result->src[3] = comb;
+
+    return result;
+}
+
+struct ggml_tensor * ggml_dsv4_hc_post_inject(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * x,
+        struct ggml_tensor  * residual,
+        struct ggml_tensor  * inject,
+        float                 scale) {
+    struct ggml_tensor * result = ggml_dsv4_hc_post(ctx, x, residual, inject, NULL);
+
+    // post holds the raw injection; op param 0 flags it, 1 is the scale
+    ggml_set_op_params_i32(result, 0, 1);
+    ggml_set_op_params_f32(result, 1, scale);
+
+    return result;
+}
+
+// ggml_dsv4_hc_mix
+
+struct ggml_tensor * ggml_dsv4_hc_mix(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * x,
+        struct ggml_tensor  * w_norm,
+        struct ggml_tensor  * w_down,
+        struct ggml_tensor  * w_up,
+        struct ggml_tensor  * w_inject,
+        float                 eps,
+        float                 scale) {
+    GGML_ASSERT(x->type == GGML_TYPE_F32);
+    GGML_ASSERT(w_norm->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(x));
+
+    const int64_t n_embd   = x->ne[0];
+    const int64_t hc       = x->ne[1];
+    const int64_t n_tokens = x->ne[2];
+    const int64_t hc_dim   = hc*n_embd;
+    const int64_t r        = w_down->ne[1];
+
+    GGML_ASSERT(x->ne[3] == 1);
+    GGML_ASSERT(w_norm->ne[0] == n_embd && w_norm->ne[1] == hc && ggml_is_contiguous(w_norm));
+    GGML_ASSERT(w_down->ne[0] == hc_dim && w_down->ne[2] == 1 && w_down->ne[3] == 1);
+    GGML_ASSERT(w_up->type == w_down->type);
+    GGML_ASSERT(w_up->ne[0] == r && w_up->ne[1] == hc_dim && w_up->ne[2] == 1 && w_up->ne[3] == 1);
+    if (w_inject) {
+        GGML_ASSERT(w_inject->type == w_down->type);
+        GGML_ASSERT(w_inject->ne[0] == hc_dim && w_inject->ne[1] == hc && w_inject->ne[2] == 1 && w_inject->ne[3] == 1);
+    }
+
+    const int64_t ne = (n_embd + (w_inject ? hc : 0))*n_tokens;
+    struct ggml_tensor * result = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, ne);
+
+    ggml_set_op_params_f32(result, 0, eps);
+    ggml_set_op_params_f32(result, 1, scale);
+
+    result->op     = GGML_OP_DSV4_HC_MIX;
+    result->src[0] = x;
+    result->src[1] = w_norm;
+    result->src[2] = w_down;
+    result->src[3] = w_up;
+    result->src[4] = w_inject;
 
     return result;
 }

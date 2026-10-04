@@ -6572,7 +6572,8 @@ static bool do_ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, cons
                 op->src[2]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 &&
                 op->ne[0] == 4 && op->ne[1] == 4;
         case GGML_OP_DSV4_HC_POST:
-            return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
+            return ggml_get_op_params_i32(op, 0) == 0 &&
+                op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
                 op->src[2]->type == GGML_TYPE_F32 &&
                 (op->src[3] == nullptr || op->src[3]->type == GGML_TYPE_F32) &&
                 op->type == GGML_TYPE_F32;
@@ -6697,9 +6698,11 @@ static bool do_ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, cons
                 ggml_type src0_type = op->src[0]->type;
                 return src0_type == GGML_TYPE_F32;
             }
+        case GGML_OP_ARGMAX:
+            // op param 3 is ggml_topk_ext's K; only CPU and CUDA fill that layout
+            return ggml_get_op_params_i32(op, 3) == 0;
         case GGML_OP_CONCAT:
         case GGML_OP_DUP:
-        case GGML_OP_ARGMAX:
         case GGML_OP_NONE:
         case GGML_OP_RESHAPE:
         case GGML_OP_VIEW:

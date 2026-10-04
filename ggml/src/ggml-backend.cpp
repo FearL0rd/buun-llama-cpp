@@ -16,6 +16,9 @@
 
 // Optional MoE expert cache function table, populated by a supporting backend.
 struct ggml_moe_cache_api ggml_moe_cache = {};
+const struct ggml_type_traits_cpu * (*ggml_moe_cache_cpu_traits)(enum ggml_type type) = nullptr;
+void (*ggml_moe_cache_cpu_rows)(enum ggml_type type, int n, float * const * dst,
+        const void * w, size_t stride, int64_t rows, const void * const * act, int nr) = nullptr;
 
 void ggml_moe_cache_unregister(const void * owner) {
     if (ggml_moe_cache.owner == owner) {
@@ -110,6 +113,24 @@ static void ggml_backend_moe_cache_invalidate_buffer(
     }
     ggml_moe_cache.invalidate(address, size);
 }
+
+// Brackets scheduler compute-buffer allocations (see ggml_moe_cache_api::scratch_alloc_scope).
+struct moe_cache_scratch_scope {
+    void * session;
+
+    explicit moe_cache_scratch_scope(void * session)
+        : session(ggml_moe_cache.scratch_alloc_scope ? session : nullptr) {
+        if (this->session) {
+            ggml_moe_cache.scratch_alloc_scope(this->session, 1);
+        }
+    }
+
+    ~moe_cache_scratch_scope() {
+        if (session) {
+            ggml_moe_cache.scratch_alloc_scope(session, 0);
+        }
+    }
+};
 
 // backend buffer
 
@@ -895,6 +916,7 @@ struct ggml_backend_sched {
 
     struct ggml_context * ctx;
     void * moe_cache_session;
+    bool moe_cache_scratch_prepared; // scratch_prepare already ran for the allocated graph
 
     ggml_backend_sched_eval_callback callback_eval;
     void * callback_eval_user_data;
@@ -990,6 +1012,14 @@ static char causes[GGML_DEFAULT_GRAPH_SIZE*16 + GGML_SCHED_MAX_SPLITS_DEBUG*GGML
 #define GET_CAUSE(node) ""
 #endif
 
+// the moe-cache provider lets backend_id read node's host expert weights in place
+static bool ggml_backend_sched_moe_routed(ggml_backend_sched_t sched, const struct ggml_tensor * node,
+        const struct ggml_tensor * src, int backend_id) {
+    return node->op == GGML_OP_MUL_MAT_ID && src == node->src[0] && sched->moe_cache_session &&
+        ggml_moe_cache.route_supported &&
+        ggml_moe_cache.route_supported(sched->moe_cache_session, sched->backends[backend_id], node);
+}
+
 // returns the backend that should be used for the node based on the current locations
 static int ggml_backend_sched_backend_id_from_cur(ggml_backend_sched_t sched, struct ggml_tensor * tensor) {
     // assign pre-allocated nodes to their backend
@@ -1039,6 +1069,15 @@ static int ggml_backend_sched_backend_id_from_cur(ggml_backend_sched_t sched, st
             }
             if (src->buffer != NULL && src->buffer->usage == GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
                 int src_backend_id = ggml_backend_sched_backend_from_buffer(sched, src, tensor);
+                // a moe-cache backend can read host experts in place for small batches
+                if (src_backend_id == sched->n_backends - 1) {
+                    for (int b = 0; b < src_backend_id; b++) {
+                        if (ggml_backend_sched_moe_routed(sched, tensor, src, b)) {
+                            SET_CAUSE(tensor, "1.moe");
+                            return b;
+                        }
+                    }
+                }
                 // check if a backend with higher prio wants to offload the op
                 if (sched->op_offload && src_backend_id == sched->n_backends - 1 && ggml_backend_buffer_is_host(src->buffer)) {
                     for (int b = 0; b < src_backend_id; b++) {
@@ -1406,7 +1445,8 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                     // by starting a new split, the memory of the previously offloaded weights can be reused
                     if (src->buffer != NULL && src->buffer->usage == GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
                         int src_backend_id = tensor_backend_id(src);
-                        if (src_backend_id != cur_backend_id && !ggml_backend_sched_buffer_supported(sched, src, cur_backend_id)) {
+                        if (src_backend_id != cur_backend_id && !ggml_backend_sched_buffer_supported(sched, src, cur_backend_id) &&
+                            !ggml_backend_sched_moe_routed(sched, node, src, cur_backend_id)) {
                             need_new_split = true;
                             break;
                         }
@@ -1469,7 +1509,8 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                     }
                 }
 
-                if (src_backend_id != cur_backend_id && !ggml_backend_sched_buffer_supported(sched, src, cur_backend_id)) {
+                if (src_backend_id != cur_backend_id && !ggml_backend_sched_buffer_supported(sched, src, cur_backend_id) &&
+                    !ggml_backend_sched_moe_routed(sched, node, src, cur_backend_id)) {
                     // create a copy of the input in the split's backend
                     if (tensor_id_copy(src_id, cur_backend_id, 0) == NULL) {
                         ggml_backend_t backend = sched->backends[cur_backend_id];
@@ -1720,6 +1761,22 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
     }
 }
 
+// Tells the moe-cache how much of each compute buffer the allocated graph uses, once per evaluation:
+// before the inputs are set on a fresh allocation, and before a reused graph runs.
+static void ggml_backend_sched_scratch_prepare(ggml_backend_sched_t sched) {
+    if (!sched->moe_cache_session || !ggml_moe_cache.scratch_prepare || sched->moe_cache_scratch_prepared) {
+        return;
+    }
+    for (int b = 0; b < sched->n_backends; b++) {
+        size_t high_water = 0;
+        ggml_backend_buffer_t buffer = ggml_gallocr_get_plan_buffer(sched->galloc, b, &high_water);
+        if (buffer) {
+            ggml_moe_cache.scratch_prepare(sched->moe_cache_session, sched->backends[b], buffer, high_water);
+        }
+    }
+    sched->moe_cache_scratch_prepared = true;
+}
+
 static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
     bool backend_ids_changed = false;
     for (int i = 0; i < sched->graph.n_nodes; i++) {
@@ -1738,6 +1795,8 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
             }
         }
     }
+
+    moe_cache_scratch_scope scratch_scope(sched->moe_cache_session);
 
     // allocate graph
     if (backend_ids_changed || !ggml_gallocr_alloc_graph(sched->galloc, &sched->graph)) {
@@ -1771,6 +1830,9 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
             return false;
         }
     }
+
+    sched->moe_cache_scratch_prepared = false;
+    ggml_backend_sched_scratch_prepare(sched);
 
     return true;
 }
@@ -2274,6 +2336,7 @@ bool ggml_backend_sched_reserve(ggml_backend_sched_t sched, struct ggml_cgraph *
 
     ggml_backend_sched_split_graph(sched, measure_graph);
 
+    moe_cache_scratch_scope scratch_scope(sched->moe_cache_session);
     if (!ggml_gallocr_reserve_n(sched->galloc, &sched->graph, sched->node_backend_ids, sched->leaf_backend_ids)) {
         return false;
     }
@@ -2319,6 +2382,9 @@ enum ggml_status ggml_backend_sched_graph_compute_async(ggml_backend_sched_t sch
             return GGML_STATUS_ALLOC_FAILED;
         }
     }
+
+    ggml_backend_sched_scratch_prepare(sched);
+    sched->moe_cache_scratch_prepared = false;
 
     return ggml_backend_sched_compute_splits(sched);
 }

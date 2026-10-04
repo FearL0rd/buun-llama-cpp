@@ -316,7 +316,7 @@ struct llama_context {
     float * get_logits_ith(int32_t i);
 
     int32_t * get_logits_argmax();
-    llama_token get_logits_argmax_ith(int32_t i);
+    const int32_t * get_logits_argmax_ith(int32_t i); // the row's K candidate ids
     int32_t   get_logits_argmax_n();
     int32_t   get_logits_argmax_k();
     float   * get_logits_argmax_probs();
@@ -726,7 +726,7 @@ public:
     void set_dflash_topk(int k);
     void set_dflash_block_size(int n);
     void set_dflash_argmax(bool enable);
-    void set_dflash_target_argmax(bool enable);
+    void set_dflash_target_argmax(int32_t k);
     void set_dflash_target_mmq_batch(int32_t n_tokens);
     void set_dflash_fused_inject(bool enable);
 

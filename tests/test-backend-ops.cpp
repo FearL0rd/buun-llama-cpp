@@ -2995,6 +2995,58 @@ struct test_rms_norm_mul_rope : public test_case {
     }
 };
 
+// qwen4exp QSA pooled keys: norm rows laid out as [dim, n, 1], regrouped to one head per position for rope
+struct test_rms_norm_mul_reshape_rope : public test_case {
+    const int64_t dim;
+    const int64_t n;
+    const int mode;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "RMS_NORM_MUL_RESHAPE_ROPE";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override {
+        return VARS_TO_STR3(dim, n, mode);
+    }
+
+    test_rms_norm_mul_reshape_rope(int64_t dim, int64_t n, int mode)
+        : dim(dim), n(n), mode(mode) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, dim, n, 1);
+        ggml_tensor * w = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, dim);
+        a = ggml_mul(ctx, ggml_rms_norm(ctx, a, 1e-6f), w);
+        a = ggml_reshape_3d(ctx, a, dim, 1, n);
+        const bool is_mrope = mode & GGML_ROPE_TYPE_MROPE;
+        ggml_tensor * pos = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n * (is_mrope ? 4 : 1));
+        if (is_mrope) {
+            int sections[4] = { 11, 11, 10, 0 };
+            a = ggml_rope_multi(ctx, a, pos, nullptr, 64, sections, mode, 0, 10000.0f, 1.0f, 0.0f, 1.0f, 32.0f, 1.0f);
+        } else {
+            a = ggml_rope(ctx, a, pos, 64, mode);
+        }
+        ggml_set_name(a, "out");
+        return a;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->type == GGML_TYPE_I32) {
+                std::vector<int32_t> data(ggml_nelements(t));
+                for (int32_t & value : data) {
+                    value = rand() % 512;
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, ggml_nbytes(t));
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
 // GGML_OP_ARGMAX
 struct test_argmax : public test_case {
     const ggml_type type;
@@ -4858,6 +4910,95 @@ struct test_dsv4_hc_post : public test_dsv4_hc {
         }
 
         out = ggml_dsv4_hc_post(ctx, x, residual, post, comb);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
+// post_inject: the 2*sigmoid(post/hc) chain inside the op
+struct test_dsv4_hc_post_inject : public test_dsv4_hc {
+    const int64_t n_embd;
+    const int64_t n_tokens;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "DSV4_HC_POST";
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR2(n_embd, n_tokens) + ",inject=1";
+    }
+
+    test_dsv4_hc_post_inject(int64_t n_embd = 31, int64_t n_tokens = 17)
+        : n_embd(n_embd), n_tokens(n_tokens) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tokens);
+        ggml_set_name(x, "x");
+
+        ggml_tensor * residual = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, hc, n_tokens);
+        ggml_set_name(residual, "residual");
+
+        ggml_tensor * inject = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hc, n_tokens);
+        ggml_set_name(inject, "gate");
+
+        out = ggml_dsv4_hc_post_inject(ctx, x, residual, inject, 1.0f / (float) hc);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
+struct test_dsv4_hc_mix : public test_dsv4_hc {
+    const ggml_type type_w;
+    const int64_t n_embd;
+    const int64_t r;
+    const int64_t n_tokens;
+    const bool    with_inject;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "DSV4_HC_MIX";
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR5(type_w, n_embd, r, n_tokens, with_inject);
+    }
+
+    test_dsv4_hc_mix(ggml_type type_w = GGML_TYPE_BF16, int64_t n_embd = 64, int64_t r = 16,
+                     int64_t n_tokens = 1, bool with_inject = true)
+        : type_w(type_w), n_embd(n_embd), r(r), n_tokens(n_tokens), with_inject(with_inject) {}
+
+    void initialize_tensors(ggml_context * ctx) override {
+        test_dsv4_hc::initialize_tensors(ctx);
+        // small weights keep silu and the sigmoid gate out of saturation
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            const std::string name = ggml_get_name(t);
+            if (name == "w_norm") {
+                init_tensor_uniform(t, 0.5f, 1.5f);
+            } else if (name.rfind("w_", 0) == 0) {
+                init_tensor_uniform(t, -0.05f, 0.05f);
+            }
+        }
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t hc_dim = hc*n_embd;
+        ggml_tensor * x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, hc, n_tokens);
+        ggml_set_name(x, "x");
+
+        ggml_tensor * w_norm = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, hc);
+        ggml_set_name(w_norm, "w_norm");
+        ggml_tensor * w_down = ggml_new_tensor_2d(ctx, type_w, hc_dim, r);
+        ggml_set_name(w_down, "w_down");
+        ggml_tensor * w_up = ggml_new_tensor_2d(ctx, type_w, r, hc_dim);
+        ggml_set_name(w_up, "w_up");
+        ggml_tensor * w_inject = nullptr;
+        if (with_inject) {
+            w_inject = ggml_new_tensor_2d(ctx, type_w, hc_dim, hc);
+            ggml_set_name(w_inject, "w_inject");
+        }
+
+        out = ggml_dsv4_hc_mix(ctx, x, w_norm, w_down, w_up, w_inject, 1e-6f, 1.0f / (float) hc);
         ggml_set_name(out, "out");
         return out;
     }
@@ -11158,6 +11299,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_dsv4_hc_post(31, 17, true, true, n_hc));
         test_cases.emplace_back(new test_dsv4_hc_post(31, 17, false, false, n_hc));
     }
+    test_cases.emplace_back(new test_dsv4_hc_post_inject(31, 17));
+    test_cases.emplace_back(new test_dsv4_hc_post_inject(2560, 3));
+
+    for (int64_t n_tokens : {1, 2, 3, 8, 9}) {
+        test_cases.emplace_back(new test_dsv4_hc_mix(GGML_TYPE_BF16, 64, 16, n_tokens));
+        test_cases.emplace_back(new test_dsv4_hc_mix(GGML_TYPE_BF16, 2560, 320, n_tokens));
+    }
+    test_cases.emplace_back(new test_dsv4_hc_mix(GGML_TYPE_BF16, 2560, 320, 1, false));
+    test_cases.emplace_back(new test_dsv4_hc_mix(GGML_TYPE_F16, 64, 16, 1));
 
     for (ggml_type base_type : {GGML_TYPE_F16, GGML_TYPE_F32}) {
         test_cases.emplace_back(new test_dflash2_conv(base_type, 80,  8, 16,  8, 0));
@@ -11210,6 +11360,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
 
     test_cases.emplace_back(new test_get_rows(GGML_TYPE_F32, 1, 8, 2, 1, 1, false));
+    // narrow rows, many of them (QSA block-score expansion): thread-per-element path
+    for (ggml_type type : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_I32}) {
+        for (int n : {1, 3, 31}) {
+            test_cases.emplace_back(new test_get_rows(type, n, 1027, 33000, 1, 1, false));
+            test_cases.emplace_back(new test_get_rows(type, n, 17, 300, 2, 3, true, true));
+        }
+    }
     for (bool v : {false, true}) {
         test_cases.emplace_back(new test_get_rows(GGML_TYPE_F8_E4M3, 160, 5, 4, 2, 1, v));
     }
@@ -11996,6 +12153,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             }
         }
     }
+    for (int mode : {GGML_ROPE_TYPE_NEOX, GGML_ROPE_TYPE_MROPE, GGML_ROPE_TYPE_IMROPE}) {
+        for (int64_t n : {1, 3, 8256, 65536}) {
+            test_cases.emplace_back(new test_rms_norm_mul_reshape_rope(128, n, mode));
+        }
+    }
     for (int64_t d_conv : {3, 4, 9}) {
         for (int64_t d_inner: {1024, 1536, 2048}) {
             test_cases.emplace_back(new test_ssm_conv(GGML_TYPE_F32, {d_conv, d_inner, 1, 1}, {d_conv, d_inner, 1, 1}));
@@ -12306,6 +12468,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F16, 1, 512, 2048, {1, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 1, 509, 2051, {1, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F16, 1, 509, 2051, {1, 1}, {1, 1}));
+
+    // short rows, many of them (low-rank hyper-connection up projection): warp-per-row mmvf
+    for (ggml_type type : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_BF16}) {
+        for (int64_t n : {1, 2, 4, 8}) {
+            test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, 10240, n, 320, {1, 1}, {1, 1}));
+        }
+        test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, 1027, 1, 256, {2, 3}, {1, 1}));
+    }
 
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 31, 509, 2051, {1, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 32, 509, 2112, {1, 1}, {1, 1}));
@@ -13690,6 +13860,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         }
     }
 
+    // Qwen3.8-Flash-Next hyper-connection pre-mix: decode and MTP verify
+    for (int64_t nt : {1, 4, 8}) {
+        test_cases.emplace_back(new test_dsv4_hc_mix(GGML_TYPE_BF16, 2560, 320, nt));
+    }
+
     // Qwen3.8-Flash-Next decode shape: 512 experts, top-10, hidden 2560, expert width 640.
     // up/gate (k=2560) for every type; down (k=640) only for block-32/64 types (K-quants need k % 256 == 0).
     for (ggml_type type : {GGML_TYPE_Q4_K, GGML_TYPE_Q4_1, GGML_TYPE_Q4_0, GGML_TYPE_Q5_1, GGML_TYPE_Q8_0, GGML_TYPE_MXFP4, GGML_TYPE_NVFP4}) {
@@ -14077,6 +14252,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     for (auto cols : {8192, 32768, 131072}) {
         for (auto nrows : {1, 2, 4, 8, 16, 32}) {
             test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {cols, nrows, 1, 1}, 2048));
+        }
+    }
+    // QSA selection width (2051): decode, MTP verify and prefill rows at 4K/8K/32K cache widths
+    for (auto cols : {4352, 8192, 33024}) {
+        for (auto nrows : {1, 2, 3, 4, 16, 64, 512, 4352}) {
+            test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {cols, nrows, 1, 1}, 2051));
         }
     }
     // backend sampler: one row of the vocab (llama-sampler.cpp top_k)

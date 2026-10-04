@@ -2,6 +2,7 @@
 
 #include "llama-memory-hybrid.h"
 
+#include <map>
 #include <memory>
 #include <vector>
 
@@ -92,7 +93,18 @@ public:
 
     llama_kv_cache * get_mem_idx() const;   // nullptr when the model carries no indexer
 
+    // qwen4exp QSA keeps each block's pooled indexer key, already normed and rotated, across
+    // ubatches, so a step re-pools only the blocks whose members changed (unified cache only).
+    // F32 [idx_dim, max_blocks + 1]: row b holds block b, the last row absorbs padded updates.
+    // nullptr when layer il has no indexer or the cache is not unified.
+    ggml_tensor * get_qsa_pooled(int32_t il) const;
+
 private:
+    friend class llama_memory_hybrid_idx_context;
+
+    // every pooled row is stale from here on: the indexer keys moved or were rewritten in bulk
+    void qsa_invalidate();
+
     // forget seq_id (all of it if seq_id < 0) in every cache at once, so a failed restore cannot leave the caches out of step
     // seq_id < 0 drops the whole context, as the caches themselves do on a failed restore
     void state_drop(llama_seq_id seq_id);
@@ -102,6 +114,39 @@ private:
     llama_hparams hparams_idx;
 
     const std::unique_ptr<llama_kv_cache> mem_idx;
+
+    std::vector<std::pair<ggml_context_ptr, ggml_backend_buffer_ptr>> qsa_ctxs_bufs;
+    std::map<int32_t, ggml_tensor *> qsa_pooled;
+
+    // bumped whenever a cell's indexer key is written, so a pooled row can tell its inputs changed
+    std::vector<uint32_t> qsa_cell_gen;
+
+    // per ratio, the member cells and their generations each pooled row was computed from
+    // a row whose cells are -1 is not valid
+    struct qsa_row_keys {
+        std::vector<int32_t>  cells;
+        std::vector<uint32_t> gens;
+    };
+    std::map<uint32_t, qsa_row_keys> qsa_keys;
+
+    // The direct QSA layout of one sequence: position p sits in slot p of block p/ratio, one cell
+    // per slot. Kept across ubatches and patched from the cells' change log, so a decode step costs
+    // the cells it wrote rather than a walk over every cell.
+    struct qsa_layout {
+        uint64_t rev    = 0;     // cells revision this layout reflects; 0 until built
+        int64_t  n_kv   = 0;
+        bool     direct = false; // false: a repeated or out-of-window position, no direct layout
+
+        std::vector<int32_t> slot_cell; // [ratio*n_blocks] cell in each slot, -1 if none
+        std::vector<int32_t> cell_slot; // [n_kv] slot of each cell, -1 if not in the layout
+        std::vector<int32_t> cell_blk;  // [n_kv] block of each cell, n_blocks - 1 if not in the layout
+        std::vector<uint8_t> fill;      // [n_blocks] occupied slots
+    };
+    std::map<std::pair<uint32_t, llama_seq_id>, qsa_layout> qsa_layouts;
+    std::vector<uint32_t> qsa_dirty;
+
+    // nullptr when the cells of seq have no direct layout over the first n_kv cells
+    const qsa_layout * qsa_direct_layout(const llama_kv_cells & cells, llama_seq_id seq, uint32_t ratio, int64_t n_kv);
 };
 
 class llama_memory_hybrid_idx_context : public llama_memory_hybrid_context {
@@ -162,11 +207,42 @@ public:
                        ggml_tensor * bias, const llama_ubatch * ubatch, uint32_t ratio,
                        bool blk_bias, bool causal_attn) const;
 
+    // pooled rows to recompute this ubatch, or 0 when the graph must pool every block itself.
+    // A step that changes no more than n_tokens/ratio + 2 blocks pads to that, so decode keeps one graph.
+    int64_t qsa_n_upd(const llama_ubatch * ubatch, uint32_t ratio, int64_t n_kv) const;
+
+    // for those rows: upd_rows I32 [n_upd], upd_cells I32 [ratio*n_upd, 1], upd_pos I32 [4*n_upd]
+    // marks the rows valid, so the graph that reads these inputs must run
+    void set_input_qsa_upd(ggml_tensor * upd_rows, ggml_tensor * upd_cells, ggml_tensor * upd_pos,
+                           const llama_ubatch * ubatch, uint32_t ratio, int64_t n_kv) const;
+
+    ggml_tensor * get_qsa_pooled(int32_t il) const;
+
 private:
-    const llama_memory_hybrid_idx * mem = nullptr;
+    // the stale pooled rows and their member cells, computed once per (ubatch, ratio)
+    struct qsa_plan {
+        size_t   i_ubatch = SIZE_MAX;
+        uint32_t ratio    = 0;
+        int64_t  n_kv     = 0;
+        int64_t  n_upd    = 0;
+        std::vector<int32_t> rows;
+        std::vector<int32_t> cells;   // [ratio*rows], -1 for an empty slot of an incomplete block
+    };
+    const qsa_plan & plan_qsa(const llama_ubatch * ubatch, uint32_t ratio, int64_t n_kv) const;
+
+    llama_memory_hybrid_idx * mem = nullptr;
+
+    // a reserve context lays out no real cells; an update context moves them
+    const bool is_full   = false;
+    const bool is_update = false;
+
+    // indexer cells each ubatch writes, for the pooled-row generations (unified cache only)
+    // this and ns_ubatch are declared before ctx_idx, so they read sinfos_idx before it moves
+    const std::vector<std::vector<uint32_t>> written_ubatch;
+
+    mutable qsa_plan plan;
 
     // streams per ubatch, read from the slot infos before ctx_idx takes them
-    // declared first, so it is initialised while sinfos_idx is still intact
     const std::vector<uint32_t> ns_ubatch;
 
     // null unless the model has an indexer

@@ -1115,6 +1115,18 @@ size_t ggml_gallocr_get_buffer_size(ggml_gallocr_t galloc, int buffer_id) {
     return ggml_vbuffer_size(galloc->buffers[buffer_id]);
 }
 
+ggml_backend_buffer_t ggml_gallocr_get_plan_buffer(ggml_gallocr_t galloc, int buffer_id, size_t * high_water) {
+    GGML_ASSERT(buffer_id >= 0 && buffer_id < galloc->n_buffers);
+
+    struct vbuffer * buf = galloc->buffers[buffer_id];
+    struct ggml_dyn_tallocr * talloc = galloc->buf_tallocs[buffer_id];
+    if (buf == NULL || talloc->n_chunks != 1 || buf->chunks[1] != NULL) {
+        return NULL;
+    }
+    *high_water = talloc->chunks[0]->max_size;
+    return buf->chunks[0];
+}
+
 // utils
 
 static void free_buffers(ggml_backend_buffer_t ** buffers, const size_t * n_buffers) {

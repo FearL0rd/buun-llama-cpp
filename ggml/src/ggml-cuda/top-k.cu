@@ -10,11 +10,11 @@ using namespace cub;
 #    endif  // CCCL_MAJOR_VERSION >= 3 && CCCL_MINOR_VERSION >= 2
 #endif      // GGML_CUDA_USE_CUB
 
-#if defined(GGML_CUDA_USE_CUB) && !defined(CUB_TOP_K_AVAILABLE) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+#if defined(GGML_CUDA_USE_CUB) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 namespace {
 // Keep score keys in registers across radix passes, then sort only the survivors.
 // The packed tie key preserves CUB's stable descending order, including signed zeros.
-constexpr int register_top_k_threads=1024, register_top_k_capacity=4096;
+constexpr int register_top_k_threads=1024;
 __host__ __device__ uint32_t register_top_k_ordered(uint32_t b) {
     // CUB treats signed zeros as equivalent. Otherwise preserve radix bit order.
     if (!(b & 0x7fffffffU)) b=0;
@@ -97,7 +97,7 @@ void register_top_k_select(Reader read, uint64_t * selected, int n, int k) {
         int pos=-1;
         if(keys[j]>prefix) pos=bg++;
         else if(keys[j]==prefix) pos=total+be++;
-        if(pos>=0 && pos<k) selected[size_t(row)*register_top_k_capacity+pos]=(uint64_t(keys[j])<<32)|uint32_t(~i);
+        if(pos>=0 && pos<k) selected[size_t(row)*k+pos]=(uint64_t(keys[j])<<32)|uint32_t(~i);
     }
 }
 template<typename Reader>
@@ -113,10 +113,16 @@ __global__ void register_top_k_sort(const uint64_t * selected, int * dst, int k)
     __shared__ Sort::TempStorage tmp;
     uint64_t keys[16];
 #pragma unroll
-    for(int j=0;j<16;++j) {int i=threadIdx.x*16+j;keys[j]=i<k?selected[size_t(blockIdx.x)*register_top_k_capacity+i]:0;}
+    for(int j=0;j<16;++j) {int i=threadIdx.x*16+j;keys[j]=i<k?selected[size_t(blockIdx.x)*k+i]:0;}
     Sort(tmp).SortDescending(keys);
 #pragma unroll
     for(int j=0;j<16;++j) {int i=threadIdx.x*16+j;if(i<k)dst[size_t(blockIdx.x)*k+i]=int(~uint32_t(keys[j]));}
+}
+
+// One block per row: from four rows up this beats a DeviceTopK launch chain per row (25x on
+// 4352-row prefill), while a lone decode row leaves the device idle and stays on DeviceTopK.
+bool register_top_k_wins(int64_t columns, int64_t rows) {
+    return columns >= 4352 && columns <= 40960 && rows >= 4 && rows <= 8192;
 }
 
 } // namespace
@@ -124,7 +130,7 @@ __global__ void register_top_k_sort(const uint64_t * selected, int * dst, int k)
 
 bool ggml_cuda_top_k_qsa(ggml_backend_cuda_context & ctx, ggml_tensor * dst,
         const ggml_tensor * scores, const ggml_tensor * cell_blocks, const ggml_tensor * mask) {
-#if defined(GGML_CUDA_USE_CUB) && !defined(CUB_TOP_K_AVAILABLE) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+#if defined(GGML_CUDA_USE_CUB) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
     if (ggml_cuda_info().devices[ctx.device].cc != 860 || ggml_top_k_is_stable(dst) ||
             scores->type != GGML_TYPE_F32 || cell_blocks->type != GGML_TYPE_I32 ||
             mask->type != GGML_TYPE_F16 || dst->type != GGML_TYPE_I32 ||
@@ -136,9 +142,8 @@ bool ggml_cuda_top_k_qsa(ggml_backend_cuda_context & ctx, ggml_tensor * dst,
             cell_blocks->ne[1] != streams || ggml_nrows(cell_blocks) != streams ||
             ggml_nelements(mask) != columns*rows || dst->ne[1] != queries ||
             dst->ne[2] != streams || dst->ne[3] != 1 || k != 2051 ||
-            columns < 4352 || columns > 40960 ||
-            !((rows >= 4 && rows <= 16) || (rows >= 64 && rows <= 8192 && columns >= 16384))) return false;
-    ggml_cuda_pool_alloc<uint64_t> selected(ctx.pool(), rows*register_top_k_capacity);
+            !register_top_k_wins(columns, rows)) return false;
+    ggml_cuda_pool_alloc<uint64_t> selected(ctx.pool(), rows*k);
     const top_k_qsa_reader read{(const float *) scores->data, (const int32_t *) cell_blocks->data,
         (const half *) mask->data, int(columns), int(queries), int(blocks)};
     register_top_k_launch(read, selected.get(), columns, rows, k, ctx.stream());
@@ -478,13 +483,10 @@ void ggml_cuda_op_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const bool       stable = ggml_top_k_is_stable(dst);
     ggml_cuda_pool & pool  = ctx.pool();
     GGML_ASSERT(!stable || k <= 64);
-#if defined(GGML_CUDA_USE_CUB) && !defined(CUB_TOP_K_AVAILABLE) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
-    // Keep short-column prefill and single-row batches on the faster CUB path.
-    // Wide prefill rows amortize register selection; small K is unchanged.
+#if defined(GGML_CUDA_USE_CUB) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
     if (ggml_cuda_info().devices[ctx.device].cc == 860 && !stable && k == 2051 &&
-            ncols >= 4352 && ncols <= 40960 &&
-            ((nrows >= 4 && nrows <= 16) || (nrows >= 64 && nrows <= 8192 && ncols >= 16384))) {
-        ggml_cuda_pool_alloc<uint64_t> selected(pool, nrows*register_top_k_capacity);
+            register_top_k_wins(ncols, nrows)) {
+        ggml_cuda_pool_alloc<uint64_t> selected(pool, nrows*k);
         register_top_k_launch(top_k_dense_reader{src0_d, int(ncols)}, selected.get(), ncols, nrows, k, stream);
         register_top_k_sort<<<nrows, 256, 0, stream>>>(selected.get(), dst_d, k);
         return;

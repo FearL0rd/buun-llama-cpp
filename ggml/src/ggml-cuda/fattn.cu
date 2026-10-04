@@ -55,7 +55,9 @@ bool ggml_cuda_flash_attn_ext_ordered(ggml_backend_cuda_context & ctx, ggml_tens
     out.src[1] = &k;
     out.src[2] = &v;
     out.src[3] = &mask;
-    ggml_cuda_flash_attn_ext_mma_f16_case<256, 256, 8, 1, false, true>(
+    // Each query is its own sequence with its own selection, so tile over heads: one tile reads
+    // its K/V cells once for 8 query heads instead of once per head.
+    ggml_cuda_flash_attn_ext_mma_f16_case<256, 256, 1, 8, false, true>(
         ctx, &out, (const int32_t *) ids->data);
     return true;
 #endif

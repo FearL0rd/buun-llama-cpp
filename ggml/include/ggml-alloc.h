@@ -72,6 +72,8 @@ GGML_API bool ggml_gallocr_reserve_n(
 GGML_API bool ggml_gallocr_alloc_graph(ggml_gallocr_t galloc, struct ggml_cgraph * graph);
 
 GGML_API size_t ggml_gallocr_get_buffer_size(ggml_gallocr_t galloc, int buffer_id);
+// Single-chunk buffer of buffer_id and the highest offset the current plan uses in it (NULL otherwise)
+GGML_API ggml_backend_buffer_t ggml_gallocr_get_plan_buffer(ggml_gallocr_t galloc, int buffer_id, size_t * high_water);
 
 // Utils
 // Create a buffer and allocate all the tensors in a ggml_context

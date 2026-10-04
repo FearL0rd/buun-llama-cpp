@@ -206,6 +206,12 @@ static const llm_fused_op_probe llm_fused_op_dsv4_hc_post_probe = {
     /*.n_tokens_per_seq =*/ 1,
 };
 
+static const llm_fused_op_probe llm_fused_op_dsv4_hc_mix_probe = {
+    /*.op               =*/ LLM_FUSED_OP_DSV4_HC_MIX,
+    /*.name             =*/ "fused DeepSeek V4 HC mix",
+    /*.n_tokens_per_seq =*/ 1,
+};
+
 llama_context::llama_context(
         const llama_model & model,
               llama_context_params params) :
@@ -380,6 +386,7 @@ llama_context::llama_context(
     cparams.fused_dsv4_hc_pre  = true;
     cparams.fused_dsv4_hc_comb = true;
     cparams.fused_dsv4_hc_post = true;
+    cparams.fused_dsv4_hc_mix  = false; // enabled by its probe, after the ops it replaces
     cparams.auto_fhc           = true;
 
     // with causal attention, the batch size is limited by the context size
@@ -905,6 +912,9 @@ void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint3
         resolve(llm_fused_op_dsv4_hc_pre_probe,  cparams.fused_dsv4_hc_pre);
         resolve(llm_fused_op_dsv4_hc_comb_probe, cparams.fused_dsv4_hc_comb);
         resolve(llm_fused_op_dsv4_hc_post_probe, cparams.fused_dsv4_hc_post);
+        // probed last: while it is on, the probe graphs above would not contain the HC pre ops
+        cparams.fused_dsv4_hc_mix = true;
+        resolve(llm_fused_op_dsv4_hc_mix_probe,  cparams.fused_dsv4_hc_mix);
         cparams.auto_fhc = false;
     }
 }
@@ -1513,7 +1523,7 @@ int32_t * llama_context::get_logits_argmax() {
     return logits_argmax_buf.data();
 }
 
-llama_token llama_context::get_logits_argmax_ith(int32_t i) {
+const int32_t * llama_context::get_logits_argmax_ith(int32_t i) {
     output_reorder();
     try {
         const int64_t row = output_resolve_row(i);
@@ -1521,10 +1531,10 @@ llama_token llama_context::get_logits_argmax_ith(int32_t i) {
         if (logits_argmax_k <= 0 || offset >= logits_argmax_buf.size()) {
             throw std::runtime_error("no GPU argmax result for output row");
         }
-        return (llama_token) logits_argmax_buf[offset];
+        return logits_argmax_buf.data() + offset;
     } catch (const std::exception & err) {
         LLAMA_LOG_ERROR("%s: invalid logits id %d, reason: %s\n", __func__, i, err.what());
-        return LLAMA_TOKEN_NULL;
+        return nullptr;
     }
 }
 
@@ -1972,11 +1982,11 @@ void llama_context::set_dflash_argmax(bool enable) {
     }
 }
 
-void llama_context::set_dflash_target_argmax(bool enable) {
-    if (cparams.dflash_target_argmax == enable) {
+void llama_context::set_dflash_target_argmax(int32_t k) {
+    if (cparams.dflash_target_argmax_k == k) {
         return;
     }
-    cparams.dflash_target_argmax = enable;
+    cparams.dflash_target_argmax_k = k;
     invalidate_graph_results();
 }
 
