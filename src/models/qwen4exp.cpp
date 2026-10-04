@@ -559,6 +559,23 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_mix(
     const int64_t hc_dim = hc * n_embd;
     const int64_t nt     = x->ne[2];
 
+    // the fused op has no LoRA hook, so adapters keep the unfused matmuls
+    if (cparams.fused_dsv4_hc_mix && il >= 0 && nt <= 8 && loras->empty()) {
+        // decode and short verify batches: norm, down, up, gate, mean and inject in one op
+        ggml_tensor * out = ggml_dsv4_hc_mix(ctx0, x, w_norm, w_down, w_up, inject ? w_inject : nullptr,
+                hparams.f_norm_rms_eps, 1.0f / (float) hc);
+        res->add_fused_node({LLM_FUSED_OP_DSV4_HC_MIX, out, il});
+
+        ggml_tensor * mixed = ggml_view_2d(ctx0, out, n_embd, nt, ggml_row_size(out->type, n_embd), 0);
+        cb(mixed, "hc_mixed", il);
+        if (inject) {
+            *inject = ggml_view_2d(ctx0, out, hc, nt, ggml_row_size(out->type, hc),
+                    ggml_row_size(out->type, n_embd*nt));
+            cb(*inject, "hc_inject", il);
+        }
+        return mixed;
+    }
+
     // grouped RMSNorm: reduce over one stream, then apply the [n_embd, hc] gamma
     // the converter folded each gamma to (1 + w)
     ggml_tensor * xn = ggml_mul(ctx0, ggml_rms_norm(ctx0, x, hparams.f_norm_rms_eps), w_norm);
@@ -612,15 +629,15 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_combine(
     const int64_t nt = residual->ne[2];
 
     // 2*sigmoid centres the scatter weights on 1, so a zero injection is a plain residual add
-    ggml_tensor * w = ggml_sigmoid(ctx0, ggml_scale(ctx0, inject, 1.0f / (float) hc));
-    w = ggml_scale(ctx0, w, 2.0f);
-
     ggml_tensor * cur = nullptr;
     if (cparams.fused_dsv4_hc_post && il >= 0) {
         // identity comb: every stream adds the same block output, scaled by its own weight
-        cur = ggml_dsv4_hc_post(ctx0, block_out, residual, w, nullptr);
+        cur = ggml_dsv4_hc_post_inject(ctx0, block_out, residual, inject, 1.0f / (float) hc);
         res->add_fused_node({LLM_FUSED_OP_DSV4_HC_POST, cur, il});
     } else {
+        ggml_tensor * w = ggml_sigmoid(ctx0, ggml_scale(ctx0, inject, 1.0f / (float) hc));
+        w = ggml_scale(ctx0, w, 2.0f);
+
         w = ggml_reshape_3d(ctx0, w, 1, hc, nt);
 
         ggml_tensor * b = ggml_reshape_3d(ctx0, block_out, n_embd, 1, nt);

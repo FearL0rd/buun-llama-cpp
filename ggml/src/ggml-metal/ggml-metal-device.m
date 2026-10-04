@@ -1822,7 +1822,7 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                 ggml_is_contiguous_rows(op->src[0]) &&
                 ggml_is_contiguous_rows(op->src[1]);
         case GGML_OP_DSV4_HC_POST:
-            return has_simdgroup_reduction &&
+            return has_simdgroup_reduction && ggml_get_op_params_i32(op, 0) == 0 &&
                 op->src[0]->type == GGML_TYPE_F32 &&
                 op->src[1]->type == GGML_TYPE_F32 &&
                 op->src[2]->type == GGML_TYPE_F32 &&

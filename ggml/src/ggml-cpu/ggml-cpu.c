@@ -3136,6 +3136,10 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_dsv4_hc_post(params, tensor);
             } break;
+        case GGML_OP_DSV4_HC_MIX:
+            {
+                ggml_compute_forward_dsv4_hc_mix(params, tensor);
+            } break;
         case GGML_OP_DFLASH2_CONV:
             {
                 ggml_compute_forward_dflash2_conv(params, tensor);
@@ -3334,6 +3338,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_DSV4_HC_COMB:
         case GGML_OP_DSV4_HC_PRE:
         case GGML_OP_DSV4_HC_POST:
+        case GGML_OP_DSV4_HC_MIX:
         case GGML_OP_DFLASH2_CONV:
             {
                 n_tasks = n_threads;
@@ -4093,6 +4098,10 @@ struct ggml_cplan ggml_graph_plan(
                 case GGML_OP_TURBO_WHT:
                     {
                         cur = 0;  // no extra workspace needed
+                    } break;
+                case GGML_OP_DSV4_HC_MIX:
+                    {
+                        cur = ggml_compute_forward_dsv4_hc_mix_work_size(node, n_tasks);
                     } break;
                 case GGML_OP_COUNT:
                     {

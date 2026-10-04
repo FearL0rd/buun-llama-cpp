@@ -4915,6 +4915,95 @@ struct test_dsv4_hc_post : public test_dsv4_hc {
     }
 };
 
+// post_inject: the 2*sigmoid(post/hc) chain inside the op
+struct test_dsv4_hc_post_inject : public test_dsv4_hc {
+    const int64_t n_embd;
+    const int64_t n_tokens;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "DSV4_HC_POST";
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR2(n_embd, n_tokens) + ",inject=1";
+    }
+
+    test_dsv4_hc_post_inject(int64_t n_embd = 31, int64_t n_tokens = 17)
+        : n_embd(n_embd), n_tokens(n_tokens) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tokens);
+        ggml_set_name(x, "x");
+
+        ggml_tensor * residual = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, hc, n_tokens);
+        ggml_set_name(residual, "residual");
+
+        ggml_tensor * inject = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hc, n_tokens);
+        ggml_set_name(inject, "gate");
+
+        out = ggml_dsv4_hc_post_inject(ctx, x, residual, inject, 1.0f / (float) hc);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
+struct test_dsv4_hc_mix : public test_dsv4_hc {
+    const ggml_type type_w;
+    const int64_t n_embd;
+    const int64_t r;
+    const int64_t n_tokens;
+    const bool    with_inject;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "DSV4_HC_MIX";
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR5(type_w, n_embd, r, n_tokens, with_inject);
+    }
+
+    test_dsv4_hc_mix(ggml_type type_w = GGML_TYPE_BF16, int64_t n_embd = 64, int64_t r = 16,
+                     int64_t n_tokens = 1, bool with_inject = true)
+        : type_w(type_w), n_embd(n_embd), r(r), n_tokens(n_tokens), with_inject(with_inject) {}
+
+    void initialize_tensors(ggml_context * ctx) override {
+        test_dsv4_hc::initialize_tensors(ctx);
+        // small weights keep silu and the sigmoid gate out of saturation
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            const std::string name = ggml_get_name(t);
+            if (name == "w_norm") {
+                init_tensor_uniform(t, 0.5f, 1.5f);
+            } else if (name.rfind("w_", 0) == 0) {
+                init_tensor_uniform(t, -0.05f, 0.05f);
+            }
+        }
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t hc_dim = hc*n_embd;
+        ggml_tensor * x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, hc, n_tokens);
+        ggml_set_name(x, "x");
+
+        ggml_tensor * w_norm = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, hc);
+        ggml_set_name(w_norm, "w_norm");
+        ggml_tensor * w_down = ggml_new_tensor_2d(ctx, type_w, hc_dim, r);
+        ggml_set_name(w_down, "w_down");
+        ggml_tensor * w_up = ggml_new_tensor_2d(ctx, type_w, r, hc_dim);
+        ggml_set_name(w_up, "w_up");
+        ggml_tensor * w_inject = nullptr;
+        if (with_inject) {
+            w_inject = ggml_new_tensor_2d(ctx, type_w, hc_dim, hc);
+            ggml_set_name(w_inject, "w_inject");
+        }
+
+        out = ggml_dsv4_hc_mix(ctx, x, w_norm, w_down, w_up, w_inject, 1e-6f, 1.0f / (float) hc);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 // GGML_OP_DFLASH2_CONV
 struct test_dflash2_conv : public test_case {
     const ggml_type base_type;
@@ -11210,6 +11299,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_dsv4_hc_post(31, 17, true, true, n_hc));
         test_cases.emplace_back(new test_dsv4_hc_post(31, 17, false, false, n_hc));
     }
+    test_cases.emplace_back(new test_dsv4_hc_post_inject(31, 17));
+    test_cases.emplace_back(new test_dsv4_hc_post_inject(2560, 3));
+
+    for (int64_t n_tokens : {1, 2, 3, 8, 9}) {
+        test_cases.emplace_back(new test_dsv4_hc_mix(GGML_TYPE_BF16, 64, 16, n_tokens));
+        test_cases.emplace_back(new test_dsv4_hc_mix(GGML_TYPE_BF16, 2560, 320, n_tokens));
+    }
+    test_cases.emplace_back(new test_dsv4_hc_mix(GGML_TYPE_BF16, 2560, 320, 1, false));
+    test_cases.emplace_back(new test_dsv4_hc_mix(GGML_TYPE_F16, 64, 16, 1));
 
     for (ggml_type base_type : {GGML_TYPE_F16, GGML_TYPE_F32}) {
         test_cases.emplace_back(new test_dflash2_conv(base_type, 80,  8, 16,  8, 0));

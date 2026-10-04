@@ -4,6 +4,7 @@
 
 static constexpr int DSV4_HC = 4;
 static constexpr int DSV4_HC_POST_TILE_EMBD = 64;
+static constexpr int DSV4_HC_MIX_MAX_TOKENS = 8;
 
 template <bool use_repeated_block>
 static __global__ void hc_combine_f32(
@@ -283,7 +284,9 @@ static __global__ void dsv4_hc_post_f32(
         int64_t sc2,
         int64_t sd0,
         int64_t sd1,
-        int64_t sd2) {
+        int64_t sd2,
+        bool    from_inject,
+        float   inject_scale) {
     ggml_cuda_pdl_lc();
     const int64_t it = (int64_t) blockIdx.x / tiles_per_token;
     const int64_t tile = (int64_t) blockIdx.x - it*tiles_per_token;
@@ -296,7 +299,13 @@ static __global__ void dsv4_hc_post_f32(
         return;
     }
 
-    float sum = __fmul_rn(x[i0*sx0 + it*sx1], post[idst*sp0 + it*sp1]);
+    float pv = post[idst*sp0 + it*sp1];
+    if (from_inject) {
+        // same SCALE -> SIGMOID -> SCALE boundaries as the unfused graph
+        const float scaled = __fmaf_rn(inject_scale, pv, 0.0f);
+        pv = __fmaf_rn(2.0f, 1.0f / (1.0f + expf(-scaled)), 0.0f);
+    }
+    float sum = __fmul_rn(x[i0*sx0 + it*sx1], pv);
     if constexpr (has_comb) {
         for (int64_t isrc = 0; isrc < hc; ++isrc) {
             sum += residual[i0*sr0 + isrc*sr1 + it*sr2] * comb[idst*sc0 + isrc*sc1 + it*sc2];
@@ -464,7 +473,8 @@ void ggml_cuda_op_dsv4_hc_post(ggml_backend_cuda_context & ctx, ggml_tensor * ds
             nbr0 / sizeof(float), nbr1 / sizeof(float), nbr2 / sizeof(float),
             nbp0 / sizeof(float), nbp1 / sizeof(float),
             nbc0 / sizeof(float), nbc1 / sizeof(float), nbc2 / sizeof(float),
-            nbd0 / sizeof(float), nbd1 / sizeof(float), nbd2 / sizeof(float));
+            nbd0 / sizeof(float), nbd1 / sizeof(float), nbd2 / sizeof(float),
+            ggml_get_op_params_i32(dst, 0) != 0, ggml_get_op_params_f32(dst, 1));
 }
 
 void ggml_cuda_op_hc_combine_fused(
@@ -504,5 +514,240 @@ void ggml_cuda_op_hc_combine_fused(
             (const float *) inject->data, (float *) dst->data,
             n_embd, hc, inv_hc);
     }
+    CUDA_CHECK(cudaGetLastError());
+}
+
+// hc_mix: the gated pre-mix of one hyper-connection for a few tokens (decode and MTP verify).
+// Three launches: per-stream RMSNorm, the down + inject matvec, and the up matvec with the
+// sigmoid gate and the stream mean. The bf16 weights are read once for all tokens.
+
+static constexpr int DSV4_HC_MIX_DOWN_WARPS = 8; // two warps per row, each over half of hc_dim
+static constexpr int DSV4_HC_MIX_UP_WARPS   = 8;
+static constexpr int DSV4_HC_MIX_UP_COLS    = 2; // output columns per warp; hc == 4 rows each
+
+static __device__ __forceinline__ void dsv4_hc_bf16x8(const uint4 v, float * f) {
+    const uint32_t u[4] = { v.x, v.y, v.z, v.w };
+#pragma unroll
+    for (int k = 0; k < 4; ++k) {
+        f[2*k + 0] = __uint_as_float(u[k] << 16);
+        f[2*k + 1] = __uint_as_float(u[k] & 0xffff0000u);
+    }
+}
+
+static __global__ void dsv4_hc_mix_norm_f32(
+        const float * __restrict__ x, const float * __restrict__ gamma, float * __restrict__ xn,
+        const int n_embd, const int hc, const float eps) {
+    constexpr int block_size = 256;
+    const int ic = blockIdx.x; // stream + hc*token
+
+    x  += (int64_t) ic*n_embd;
+    xn += (int64_t) ic*n_embd;
+    gamma += (ic % hc)*n_embd;
+
+    float tmp = 0.0f;
+    for (int i = threadIdx.x; i < n_embd; i += block_size) {
+        tmp += x[i]*x[i];
+    }
+    __shared__ float s_sum[WARP_SIZE];
+    tmp = block_reduce<block_reduce_method::SUM, block_size>(tmp, s_sum);
+
+    const float s = rsqrtf(tmp/n_embd + eps);
+    for (int i = threadIdx.x; i < n_embd; i += block_size) {
+        xn[i] = s*x[i]*gamma[i];
+    }
+}
+
+template <int nt>
+static __global__ void dsv4_hc_mix_down_bf16(
+        const float * __restrict__ xn, const uint4 * __restrict__ w_down, const uint4 * __restrict__ w_inject,
+        float * __restrict__ lo, float * __restrict__ inject,
+        const int hc_dim, const int r, const int n_rows, const int hc,
+        const int64_t sw_down, const int64_t sw_inject, const float scale) {
+    constexpr int split = 2;
+    const int warp = threadIdx.x / WARP_SIZE;
+    const int lane = threadIdx.x % WARP_SIZE;
+    const int row  = blockIdx.x*(DSV4_HC_MIX_DOWN_WARPS/split) + warp/split;
+    const int part = warp % split;
+
+    float acc[nt] = {};
+    if (row < n_rows) {
+        const uint4  * w   = row < r ? w_down + row*sw_down : w_inject + (row - r)*sw_inject;
+        const float4 * xn4 = (const float4 *) xn;
+        const int n8 = hc_dim/8;
+        const int j1 = (part + 1)*n8/split;
+#pragma unroll 4
+        for (int j = part*n8/split + lane; j < j1; j += WARP_SIZE) {
+            float wf[8];
+            dsv4_hc_bf16x8(w[j], wf);
+#pragma unroll
+            for (int t = 0; t < nt; ++t) {
+                const float4 a = xn4[t*(hc_dim/4) + 2*j + 0];
+                const float4 b = xn4[t*(hc_dim/4) + 2*j + 1];
+                acc[t] += wf[0]*a.x + wf[1]*a.y + wf[2]*a.z + wf[3]*a.w
+                        + wf[4]*b.x + wf[5]*b.y + wf[6]*b.z + wf[7]*b.w;
+            }
+        }
+    }
+
+    __shared__ float partial[DSV4_HC_MIX_DOWN_WARPS][nt];
+#pragma unroll
+    for (int t = 0; t < nt; ++t) {
+        acc[t] = warp_reduce_sum(acc[t]);
+    }
+    if (lane == 0) {
+#pragma unroll
+        for (int t = 0; t < nt; ++t) {
+            partial[warp][t] = acc[t];
+        }
+    }
+    __syncthreads();
+
+    if (part != 0 || lane >= nt || row >= n_rows) {
+        return;
+    }
+    const float sum = partial[warp][lane] + partial[warp + 1][lane];
+    if (row < r) {
+        const float v = scale*sum;
+        lo[lane*r + row] = v/(1.0f + expf(-v));
+    } else {
+        inject[lane*hc + row - r] = sum;
+    }
+}
+
+template <int nt>
+static __global__ void dsv4_hc_mix_up_bf16(
+        const float * __restrict__ xn, const float * __restrict__ lo, const uint4 * __restrict__ w_up,
+        float * __restrict__ mixed, const int n_embd, const int r, const int64_t sw_up, const float scale) {
+    extern __shared__ float4 lo_s4[]; // [nt][r/4]
+    const float4 * lo4 = (const float4 *) lo;
+    for (int k = threadIdx.x; k < nt*r/4; k += blockDim.x) {
+        lo_s4[k] = lo4[k];
+    }
+    __syncthreads();
+
+    const int warp = threadIdx.x / WARP_SIZE;
+    const int lane = threadIdx.x % WARP_SIZE;
+    const int h    = lane / 8; // lanes 8h..8h+7 reduce the gate row of stream h
+    const int sub  = lane % 8;
+    const int hc_dim = 4*n_embd;
+    const int i0 = (blockIdx.x*DSV4_HC_MIX_UP_WARPS + warp)*DSV4_HC_MIX_UP_COLS;
+
+    float acc[DSV4_HC_MIX_UP_COLS][nt] = {};
+#pragma unroll
+    for (int c = 0; c < DSV4_HC_MIX_UP_COLS; ++c) {
+        if (i0 + c >= n_embd) {
+            break;
+        }
+        const uint4 * w = w_up + (int64_t) (i0 + c + n_embd*h)*sw_up;
+        for (int j = sub; j < r/8; j += 8) {
+            float wf[8];
+            dsv4_hc_bf16x8(w[j], wf);
+#pragma unroll
+            for (int t = 0; t < nt; ++t) {
+                const float4 a = lo_s4[t*(r/4) + 2*j + 0];
+                const float4 b = lo_s4[t*(r/4) + 2*j + 1];
+                acc[c][t] += wf[0]*a.x + wf[1]*a.y + wf[2]*a.z + wf[3]*a.w
+                           + wf[4]*b.x + wf[5]*b.y + wf[6]*b.z + wf[7]*b.w;
+            }
+        }
+    }
+
+#pragma unroll
+    for (int c = 0; c < DSV4_HC_MIX_UP_COLS; ++c) {
+        const int i = i0 + c;
+        if (i >= n_embd) {
+            break;
+        }
+#pragma unroll
+        for (int t = 0; t < nt; ++t) {
+            float g = acc[c][t];
+            g += __shfl_xor_sync(0xffffffff, g, 4, 8);
+            g += __shfl_xor_sync(0xffffffff, g, 2, 8);
+            g += __shfl_xor_sync(0xffffffff, g, 1, 8);
+            // same product and stream order as dsv4_hc_pre_f32<true>
+            const float p  = __fmul_rn(xn[t*hc_dim + i + n_embd*h], 1.0f/(1.0f + expf(-g)));
+            const float p1 = __shfl_sync(0xffffffff, p,  8, WARP_SIZE);
+            const float p2 = __shfl_sync(0xffffffff, p, 16, WARP_SIZE);
+            const float p3 = __shfl_sync(0xffffffff, p, 24, WARP_SIZE);
+            if (lane == 0) {
+                mixed[t*n_embd + i] = scale*__fadd_rn(__fadd_rn(__fadd_rn(p, p1), p2), p3);
+            }
+        }
+    }
+}
+
+template <int nt>
+static void dsv4_hc_mix_launch(
+        cudaStream_t stream, const float * xn, const uint4 * w_down, const uint4 * w_inject, const uint4 * w_up,
+        float * lo, float * mixed, float * inject, int n_embd, int hc, int r, int n_inject,
+        int64_t sw_down, int64_t sw_inject, int64_t sw_up, float scale) {
+    const int n_rows = r + n_inject;
+    const int rows_per_block = DSV4_HC_MIX_DOWN_WARPS/2;
+    dsv4_hc_mix_down_bf16<nt><<<(n_rows + rows_per_block - 1)/rows_per_block, DSV4_HC_MIX_DOWN_WARPS*WARP_SIZE, 0, stream>>>(
+            xn, w_down, w_inject, lo, inject, hc*n_embd, r, n_rows, hc, sw_down, sw_inject, scale);
+
+    const int cols_per_block = DSV4_HC_MIX_UP_WARPS*DSV4_HC_MIX_UP_COLS;
+    dsv4_hc_mix_up_bf16<nt><<<(n_embd + cols_per_block - 1)/cols_per_block, DSV4_HC_MIX_UP_WARPS*WARP_SIZE, nt*r*sizeof(float), stream>>>(
+            xn, lo, w_up, mixed, n_embd, r, sw_up, scale);
+}
+
+bool ggml_cuda_dsv4_hc_mix_supported(const ggml_tensor * op) {
+    const ggml_tensor * x = op->src[0];
+    const int64_t n_embd = x->ne[0];
+    const int64_t r      = op->src[2]->ne[1];
+    if (x->ne[1] != DSV4_HC || x->ne[2] > DSV4_HC_MIX_MAX_TOKENS || n_embd % 8 != 0 || r % 8 != 0) {
+        return false;
+    }
+    for (int i = 2; i <= 4; ++i) {
+        const ggml_tensor * w = op->src[i];
+        if (w && (w->type != GGML_TYPE_BF16 || w->nb[1] % 16 != 0)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+void ggml_cuda_op_dsv4_hc_mix(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * x        = dst->src[0];
+    const ggml_tensor * w_norm   = dst->src[1];
+    const ggml_tensor * w_down   = dst->src[2];
+    const ggml_tensor * w_up     = dst->src[3];
+    const ggml_tensor * w_inject = dst->src[4];
+
+    const int n_embd = x->ne[0];
+    const int hc     = x->ne[1];
+    const int nt     = x->ne[2];
+    const int r      = w_down->ne[1];
+
+    const float eps   = ggml_get_op_params_f32(dst, 0);
+    const float scale = ggml_get_op_params_f32(dst, 1);
+
+    cudaStream_t stream = ctx.stream();
+    ggml_cuda_pool_alloc<float> xn(ctx.pool(), (size_t) hc*n_embd*nt);
+    ggml_cuda_pool_alloc<float> lo(ctx.pool(), (size_t) r*nt);
+
+    dsv4_hc_mix_norm_f32<<<hc*nt, 256, 0, stream>>>(
+            (const float *) x->data, (const float *) w_norm->data, xn.get(), n_embd, hc, eps);
+
+    float * mixed  = (float *) dst->data;
+    float * inject = mixed + (int64_t) n_embd*nt;
+    const uint4 * wi = w_inject ? (const uint4 *) w_inject->data : nullptr;
+    const int64_t swi = w_inject ? w_inject->nb[1]/16 : 0;
+
+#define DSV4_HC_MIX_CASE(N) case N: dsv4_hc_mix_launch<N>(stream, xn.get(), (const uint4 *) w_down->data, wi, \
+        (const uint4 *) w_up->data, lo.get(), mixed, inject, n_embd, hc, r, w_inject ? hc : 0, \
+        w_down->nb[1]/16, swi, w_up->nb[1]/16, scale); break;
+    switch (nt) {
+        DSV4_HC_MIX_CASE(1)
+        DSV4_HC_MIX_CASE(2)
+        DSV4_HC_MIX_CASE(3)
+        DSV4_HC_MIX_CASE(4)
+        DSV4_HC_MIX_CASE(5)
+        DSV4_HC_MIX_CASE(6)
+        DSV4_HC_MIX_CASE(7)
+        DSV4_HC_MIX_CASE(8)
+        default: GGML_ABORT("hc_mix: unsupported token count %d", nt);
+    }
+#undef DSV4_HC_MIX_CASE
     CUDA_CHECK(cudaGetLastError());
 }
