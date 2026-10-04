@@ -437,6 +437,7 @@ static void configure_cache(
     set_env("GGML_CUDA_MOE_CACHE_DOWN_DEDICATED_MMV", dedicated_down_mmv);
     set_env("GGML_CUDA_MOE_CACHE_OVERLAP_CPU_ROWS", "0");
     set_env("GGML_CUDA_MOE_CACHE_FAIL", fail_stage);
+    set_env("GGML_CUDA_MOE_CACHE_LFU", nullptr);
 }
 
 static bool run_capability_queries(
@@ -3680,6 +3681,7 @@ static bool run_exact_shape_inventory(
     set_env("GGML_CUDA_MOE_CACHE_BUDGET_MB", "16");
     set_env("GGML_CUDA_MOE_CACHE_ADMIT_AFTER", nullptr);
     set_env("GGML_CUDA_MOE_CACHE_THROTTLE", "8");
+    set_env("GGML_CUDA_MOE_CACHE_LFU", "0");
     set_env("GGML_CUDA_MOE_CACHE_STATS", "0");
     capture.clear();
 
@@ -4027,6 +4029,7 @@ static bool run_admission_policy_once(
     set_env("GGML_CUDA_MOE_CACHE_BUDGET_MB", "8");
     set_env("GGML_CUDA_MOE_CACHE_ADMIT_AFTER", "2");
     set_env("GGML_CUDA_MOE_CACHE_THROTTLE", "8");
+    set_env("GGML_CUDA_MOE_CACHE_LFU", "0"); // pins the legacy readmit throttle
     set_env("GGML_CUDA_MOE_CACHE_STATS", "0");
     capture.clear();
 

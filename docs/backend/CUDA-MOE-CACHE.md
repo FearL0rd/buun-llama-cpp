@@ -256,6 +256,9 @@ The following environment variables are implementation controls, not a stable co
 | `GGML_CUDA_MOE_CACHE_OVERLAP_CPU_ROWS` | automatic | Rows retained on CPU only when every row is resident; EXL3 defaults to zero, other types use the size-aware policy. An explicit value from `0` through `8` overrides it unless the public CPU-overlap setting is supplied |
 | `GGML_CUDA_MOE_CACHE_MIN_CC` | `700` | Override the minimum compute capability encoded as `major * 100 + minor * 10` |
 | `GGML_CUDA_MOE_ROUTE` | `1` | Small-batch `MUL_MAT_ID` with host-resident experts runs on the GPU through per-expert pointer tables (cached slots or pinned host memory); `0` disables this routing |
+| `GGML_CUDA_MOE_CACHE_LFU` | `1` | A full pool admits a miss only when its aged probe count beats the LRU victim's; `0` restores plain miss-count admission |
+| `GGML_CUDA_MOE_CACHE_LFU_WINDOW` | `10` | LFU aging period: counts halve every `N` x pool slots probes |
+| `GGML_CUDA_MOE_CACHE_LFU_CAP` | `15` | Saturation limit of an expert's probe count |
 
 Directly setting `GGML_CUDA_MOE_CACHE_MODE`, `GGML_CUDA_MOE_CACHE`, or `GGML_CUDA_MOE_CACHE_BUDGET_MB` controls the provider only when a program leaves the mode unspecified. Common applications do this for their implicit `auto` default, so provider settings affect fit and runtime consistently. An explicit `--moe-cache` or `LLAMA_ARG_MOE_CACHE` value takes precedence and also controls the model loader's repacking choice. `llama-bench` applies its selected cache arm before every model instance and overwrites the three raw backend variables; use `--moe-cache` or `LLAMA_ARG_MOE_CACHE` to select its benchmark mode.
 
