@@ -1690,7 +1690,8 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                 op->src[1]->type == GGML_TYPE_I32 &&
                 op->type == GGML_TYPE_I64;
         case GGML_OP_ARGMAX:
-            return has_simdgroup_reduction;
+            // op param 3 is ggml_topk_ext's K; only CPU and CUDA fill that layout
+            return has_simdgroup_reduction && ggml_get_op_params_i32(op, 3) == 0;
         case GGML_OP_NORM:
         case GGML_OP_RMS_NORM:
             return has_simdgroup_reduction && (ggml_is_contiguous_rows(op->src[0]));

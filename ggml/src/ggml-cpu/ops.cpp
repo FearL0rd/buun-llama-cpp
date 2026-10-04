@@ -11,6 +11,7 @@
 #include <algorithm>
 #include <cfloat>
 #include <cmath>
+#include <vector>
 
 // ggml_compute_forward_dup
 
@@ -1591,6 +1592,46 @@ static void ggml_compute_forward_argmax_f32(
 
     const size_t nb01 = src0->nb[1];
     const size_t nb0 = dst->nb[0];
+
+    // ggml_topk_ext without sampling noise: the K largest ids per row in descending order,
+    // then their log-probs (the noisy variant is GPU-only)
+    const int32_t k = ggml_get_op_params_i32(dst, 3);
+    const bool noise = ggml_get_op_params_i32(dst, 1) != 0 || ggml_get_op_params_i32(dst, 2) != 0;
+    if (k > 1 && !noise) {
+        const float temp = ggml_get_op_params_f32(dst, 0);
+        const float inv_temp = temp > 0.0f ? 1.0f/temp : 1.0f;
+        int32_t * ids = (int32_t *) dst->data;
+        float * lps = (float *) dst->data + k*ne01;
+        std::vector<std::pair<float, int32_t>> top;
+        for (int64_t i1 = 0; i1 < ne01; i1++) {
+            const float * src = (const float *) ((const char *) src0->data + i1*nb01);
+            top.clear();
+            float vmax = -INFINITY;
+            for (int32_t i0 = 0; i0 < ne00; i0++) {
+                vmax = std::max(vmax, src[i0]*inv_temp);
+                if ((int32_t) top.size() == k && !(src[i0] > top.back().first)) {
+                    continue;
+                }
+                auto it = std::upper_bound(top.begin(), top.end(), src[i0],
+                    [](float v, const std::pair<float, int32_t> & e) { return v > e.first; });
+                top.insert(it, {src[i0], i0});
+                if ((int32_t) top.size() > k) {
+                    top.pop_back();
+                }
+            }
+            double sum = 0.0;
+            for (int32_t i0 = 0; i0 < ne00; i0++) {
+                sum += expf(src[i0]*inv_temp - vmax);
+            }
+            const float lse = vmax + (float) log(sum);
+            for (int32_t j = 0; j < k; j++) {
+                const bool have = j < (int32_t) top.size();
+                ids[i1*k + j] = have ? top[j].second : -1;
+                lps[i1*k + j] = have ? top[j].first*inv_temp - lse : -INFINITY;
+            }
+        }
+        return;
+    }
 
     for (int64_t i1 = 0; i1 < ne01; i1++) {
         float * src = (float *) ((char *) src0->data + i1*nb01);

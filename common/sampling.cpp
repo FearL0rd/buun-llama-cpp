@@ -112,10 +112,12 @@ struct ring_buffer {
 struct common_sampler {
     common_params_sampling params;
 
-    // True when the configured chain is provably equivalent to selecting the
-    // largest raw model logit. Computed once from the chain configuration at
-    // construction so callers do not have to duplicate sampler semantics.
-    bool raw_argmax_exact;
+    // Number of largest raw model logits that provably contain the sampled
+    // token: 1 when the chain is exactly the raw argmax, n + 1 when its only
+    // change bans n tokens (-inf biases, e.g. ignore_eos), 0 otherwise.
+    // Computed once from the chain configuration at construction so callers do
+    // not have to duplicate sampler semantics.
+    int32_t raw_argmax_k;
 
     struct llama_sampler * grmr;
     struct llama_sampler * rbudget;
@@ -473,7 +475,7 @@ struct common_sampler * common_sampler_init(
 
     auto * result = new common_sampler {
         /* .params  = */ params,
-        /* .raw_argmax_exact = */ false,
+        /* .raw_argmax_k = */ 0,
         /* .grmr    = */ grmr,
         /* .rbudget = */ rbudget,
         /* .chain   = */ chain,
@@ -514,8 +516,7 @@ struct common_sampler * common_sampler_init(
                     break;
             }
         }
-        result->greedy_argmax    = supported && has_greedy_selector;
-        result->raw_argmax_exact = result->greedy_argmax && logit_bias.empty();
+        result->greedy_argmax = supported && has_greedy_selector;
         if (result->greedy_argmax) {
             const int32_t n_vocab = llama_vocab_n_tokens(vocab);
             auto & bias = result->greedy_bias;
@@ -536,14 +537,35 @@ struct common_sampler * common_sampler_init(
                 }
             }
             bias.resize(n);
+
+            // a banned token never wins, so the answer is the best unbanned one,
+            // which ranks within the first n + 1 raw logits (ggml_topk_ext caps K at 64)
+            const bool bans_only = std::all_of(bias.begin(), bias.end(), [](const llama_logit_bias & b) {
+                return b.bias == -INFINITY;
+            });
+            if (bans_only && bias.size() < 64) {
+                result->raw_argmax_k = (int32_t) bias.size() + 1;
+            }
         }
     }
 
     return result;
 }
 
-bool common_sampler_raw_argmax_exact(const struct common_sampler * gsmpl) {
-    return gsmpl != nullptr && gsmpl->raw_argmax_exact;
+int32_t common_sampler_raw_argmax_k(const struct common_sampler * gsmpl) {
+    return gsmpl != nullptr ? gsmpl->raw_argmax_k : 0;
+}
+
+llama_token common_sampler_raw_argmax_pick(const struct common_sampler * gsmpl, const int32_t * cand, int32_t k) {
+    const auto & bias = gsmpl->greedy_bias;
+    for (int32_t i = 0; i < k; ++i) {
+        const bool banned = std::binary_search(bias.begin(), bias.end(), llama_logit_bias{cand[i], 0.0f},
+            [](const llama_logit_bias & a, const llama_logit_bias & b) { return a.token < b.token; });
+        if (cand[i] >= 0 && !banned) {
+            return cand[i];
+        }
+    }
+    return LLAMA_TOKEN_NULL;
 }
 
 void common_sampler_free(struct common_sampler * gsmpl) {
@@ -622,7 +644,7 @@ void common_sampler_reset(struct common_sampler * gsmpl) {
 struct common_sampler * common_sampler_clone(common_sampler * gsmpl) {
     return new common_sampler {
         /* .params  = */ gsmpl->params,
-        /* .raw_argmax_exact = */ gsmpl->raw_argmax_exact,
+        /* .raw_argmax_k = */ gsmpl->raw_argmax_k,
         /* .grmr    = */ llama_sampler_clone(gsmpl->grmr),
         /* .rbudget = */ llama_sampler_clone(gsmpl->rbudget),
         /* .chain   = */ llama_sampler_clone(gsmpl->chain),

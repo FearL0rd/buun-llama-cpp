@@ -3752,13 +3752,15 @@ ggml_cgraph * llama_model::build_graph(const llm_graph_params & params) const {
     llm->build_sampling();
 
     // A speculative target can request raw greedy token IDs for every output
-    // row. This is intentionally separate from the DFlash drafter sampler:
-    // target verification has already proved that no active sampler transform
-    // can change the raw-logit maximum.
-    if (llm->cparams.dflash_target_argmax && llm->res->t_logits) {
+    // row, or the top-K raw candidates when the sampler only bans tokens. This
+    // is intentionally separate from the DFlash drafter sampler: target
+    // verification has already proved that the sampled token is among them.
+    const int32_t target_k = llm->cparams.dflash_target_argmax_k;
+    if (target_k > 0 && llm->res->t_logits) {
         GGML_ASSERT(llm->res->t_logits_argmax == nullptr);
-        llm->res->t_logits_argmax = ggml_argmax(
-                llm->ctx0, llm->res->t_logits);
+        llm->res->t_logits_argmax = target_k == 1 ?
+                ggml_argmax(llm->ctx0, llm->res->t_logits) :
+                ggml_topk_ext(llm->ctx0, llm->res->t_logits, target_k, 0.0f, 0);
         ggml_build_forward_expand(llm->gf, llm->res->t_logits_argmax);
     }
 

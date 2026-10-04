@@ -19501,8 +19501,9 @@ private:
 
     // DFlash tape recording armed for this cycle (turned off in post_cycle())
     bool dflash_tape_active = false;
-    // Target-side argmax for one pure-greedy DFlash verify batch.
-    bool dflash_target_argmax_active = false;
+    // Target-side argmax (top-K candidates when the sampler bans tokens) for one
+    // pure-greedy DFlash verify batch; 0 = off.
+    int32_t dflash_target_argmax_k = 0;
     llama_seq_id dflash_target_argmax_slot = -1;
     bool frontier_logits_sampled_cycle = false;
     // target can replay the tape losslessly on GPU after a partial accept; when false,
@@ -22181,7 +22182,8 @@ private:
         llama_set_tape_recording(ctx_tgt, dflash_tape_active);
 
         // Keep target verification logits on the device for the
-        // single-slot, raw-argmax case. The batch-shape checks prove that every
+        // single-slot, raw-argmax case (or raw top-K when the sampler only bans
+        // tokens, e.g. ignore_eos: the best unbanned candidate is the sample). The batch-shape checks prove that every
         // requested output belongs to this one speculative verification; all
         // other requests retain host sampling and full-logits extraction.
         //
@@ -22190,17 +22192,19 @@ private:
         // DRAFT_DSPARK — its anchor-first block layout only shapes the drafter
         // decode; the target verify batch is built by the shared code above as
         // [sampled, draft...], so the coverage proof is unchanged). All of them
-        // verify through the shared spec_i_batch accept loop below.
+        // verify through the shared spec_i_batch accept loop below. MTP verifies
+        // through the same loop and reads target hidden states, never logits.
         //
         // A recycle impl alongside (types is a list) reads raw target logits in
         // its update_logits(); keep those configurations on host sampling.
-        dflash_target_argmax_active = false;
+        dflash_target_argmax_k = 0;
         dflash_target_argmax_slot = -1;
         const common_speculative_type spec_type = params_base.speculative.type();
         const bool spec_type_target_argmax =
             spec_type == COMMON_SPECULATIVE_TYPE_DFLASH ||
             spec_type == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH ||
-            spec_type == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK;
+            spec_type == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK ||
+            spec_type == COMMON_SPECULATIVE_TYPE_DRAFT_MTP;
         // Tensor split shards result_output across the vocabulary axis. Its Meta
         // backend cannot reduce GGML_OP_ARGMAX across that axis, so keep the ordinary
         // host-logits verifier there; this tail is only an optional transfer shortcut.
@@ -22223,18 +22227,18 @@ private:
             }
             if (verify_slot && verify_slot->task &&
                 verify_slot->spec_i_batch.size() == (size_t) batch.size() &&
-                common_sampler_raw_argmax_exact(verify_slot->smpl.get())) {
+                common_sampler_raw_argmax_k(verify_slot->smpl.get()) > 0) {
                 bool covers_batch = true;
                 for (size_t i = 0; i < verify_slot->spec_i_batch.size(); ++i) {
                     covers_batch &= verify_slot->spec_i_batch[i] == (int32_t) i;
                 }
                 if (covers_batch) {
-                    dflash_target_argmax_active = true;
+                    dflash_target_argmax_k = common_sampler_raw_argmax_k(verify_slot->smpl.get());
                     dflash_target_argmax_slot = verify_slot->id;
                 }
             }
         }
-        ctx_tgt->set_dflash_target_argmax(dflash_target_argmax_active);
+        ctx_tgt->set_dflash_target_argmax(dflash_target_argmax_k);
 
         // DFlash2's target verification is the only workload for which MMQ has
         // beaten Ampere's normal MMVQ choice. Arm the hint for
@@ -22955,11 +22959,11 @@ private:
             }
 
             bool accepted_from_target_argmax = false;
-            if (!accepted_from_synth && dflash_target_argmax_active &&
+            if (!accepted_from_synth && dflash_target_argmax_k > 0 &&
                 dflash_target_argmax_slot == slot.id) {
                 const int32_t * argmax = llama_get_logits_argmax(ctx_tgt);
                 if (argmax != nullptr) {
-                    if (llama_get_logits_argmax_k(ctx_tgt) != 1 ||
+                    if (llama_get_logits_argmax_k(ctx_tgt) != dflash_target_argmax_k ||
                         llama_get_logits_argmax_n(ctx_tgt) !=
                             (int32_t) slot.spec_i_batch.size()) {
                         throw std::runtime_error(
@@ -22969,8 +22973,10 @@ private:
                     llama_tokens sampled;
                     sampled.reserve(slot.spec_i_batch.size());
                     for (size_t i = 0; i < slot.spec_i_batch.size(); ++i) {
-                        const llama_token id = ctx_tgt->get_logits_argmax_ith(
+                        const int32_t * cand = ctx_tgt->get_logits_argmax_ith(
                             slot.spec_i_batch[i]);
+                        const llama_token id = cand == nullptr ? LLAMA_TOKEN_NULL :
+                            common_sampler_raw_argmax_pick(slot.smpl.get(), cand, dflash_target_argmax_k);
                         if (id == LLAMA_TOKEN_NULL) {
                             throw std::runtime_error(
                                 "DFlash target argmax row lookup failed");

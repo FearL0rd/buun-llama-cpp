@@ -6036,7 +6036,8 @@ static bool ggml_hexagon_supported_argmax(const struct ggml_hexagon_session * se
     if (src0->type != GGML_TYPE_F32) {
         return false;
     }
-    if (dst->type != GGML_TYPE_I32) {
+    // op param 3 is ggml_topk_ext's K; only CPU and CUDA fill that layout
+    if (dst->type != GGML_TYPE_I32 || ggml_get_op_params_i32(op, 3) != 0) {
         return false;
     }
 

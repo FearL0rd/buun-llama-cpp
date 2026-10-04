@@ -2620,10 +2620,12 @@ static bool ggml_backend_cann_supports_op(ggml_backend_dev_t dev, const ggml_ten
         case GGML_OP_PAD:
             // TODO: add circular padding support for cann, see https://github.com/ggml-org/llama.cpp/pull/16985
             return ggml_get_op_params_i32(op, 8) == 0;
+        case GGML_OP_ARGMAX:
+            // op param 3 is ggml_topk_ext's K; only CPU and CUDA fill that layout
+            return ggml_get_op_params_i32(op, 3) == 0;
         case GGML_OP_ARANGE:
         case GGML_OP_TIMESTEP_EMBEDDING:
         case GGML_OP_LEAKY_RELU:
-        case GGML_OP_ARGMAX:
         case GGML_OP_COS:
         case GGML_OP_SIN:
         case GGML_OP_LOG:
