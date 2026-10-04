@@ -754,6 +754,52 @@ void llama_mmap::advise_random(size_t first, size_t last, bool enabled) const {
 #endif
 }
 
+void llama_mmap::prefetch(const void * base, ranges & spans) {
+#if defined(_POSIX_MAPPED_FILES) || (defined(_WIN32) && _WIN32_WINNT >= 0x602)
+#if defined(_WIN32)
+    const size_t page = 4096;
+#else
+    const size_t page = sysconf(_SC_PAGESIZE);
+#endif
+    const size_t base_off = (uintptr_t) base % page;
+    for (auto & span : spans) {
+        span.first  = (span.first + base_off) / page * page;
+        span.second = (span.second + base_off + page - 1) / page * page;
+    }
+    std::sort(spans.begin(), spans.end());
+    size_t n = 0;
+    for (const auto & span : spans) {
+        if (n > 0 && span.first <= spans[n - 1].second) {
+            spans[n - 1].second = std::max(spans[n - 1].second, span.second);
+        } else {
+            spans[n++] = span;
+        }
+    }
+    spans.resize(n);
+    const char * start = (const char *) base - base_off;
+#if defined(_WIN32)
+    static const auto pPrefetchVirtualMemory = (BOOL (WINAPI *)(HANDLE, ULONG_PTR, PWIN32_MEMORY_RANGE_ENTRY, ULONG))
+        (void *) GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "PrefetchVirtualMemory");
+    if (!pPrefetchVirtualMemory || spans.empty()) {
+        return;
+    }
+    std::vector<WIN32_MEMORY_RANGE_ENTRY> entries(spans.size());
+    for (size_t i = 0; i < spans.size(); ++i) {
+        entries[i].VirtualAddress = (void *) (start + spans[i].first);
+        entries[i].NumberOfBytes  = (SIZE_T) (spans[i].second - spans[i].first);
+    }
+    pPrefetchVirtualMemory(GetCurrentProcess(), (ULONG_PTR) entries.size(), entries.data(), 0);
+#else
+    for (const auto & span : spans) {
+        posix_madvise((void *) (start + span.first), span.second - span.first, POSIX_MADV_WILLNEED);
+    }
+#endif
+#else
+    GGML_UNUSED(base);
+    GGML_UNUSED(spans);
+#endif
+}
+
 #if defined(_POSIX_MEMLOCK_RANGE) || defined(_WIN32)
 const bool llama_mmap::SUPPORTED  = true;
 #else

@@ -2,6 +2,7 @@
 #include "llama-impl.h"
 #include "llama-memory-hybrid-idx.h"
 #include "llama-memory-recurrent.h"
+#include "llama-mmap.h"
 
 #include <algorithm>
 #include <cinttypes>
@@ -1550,6 +1551,7 @@ public:
 
     // scratch, reused across set_input() calls
     std::vector<llama_token> prev;
+    llama_mmap::ranges spans;
 };
 
 void llm_graph_input_ple::set_input(const llama_ubatch * ubatch) {
@@ -1608,6 +1610,17 @@ void llm_graph_input_ple::set_input(const llama_ubatch * ubatch) {
                     (int32_t) (mixed % hp.ple_head_vocab_sizes[h_i] + hp.ple_head_offsets[h_i]);
             }
         }
+    }
+
+    // the table is ~27 GB and usually a lazily read mapping: issue every row's read at
+    // once rather than faulting the cold pages one at a time inside the gather
+    const ggml_tensor * table = pmodel.per_layer_tok_embd;
+    if (table->buffer && ggml_backend_buffer_is_host(table->buffer)) {
+        spans.resize(idx.size());
+        for (size_t k = 0; k < idx.size(); ++k) {
+            spans[k] = { idx[k] * table->nb[1], idx[k] * table->nb[1] + table->nb[1] };
+        }
+        llama_mmap::prefetch(table->data, spans);
     }
 
     ggml_backend_tensor_set(rows, idx.data(), 0, idx.size()*ggml_element_size(rows));
