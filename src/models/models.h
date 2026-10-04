@@ -2551,6 +2551,13 @@ struct llama_model_qwen4exp : public llama_model_base {
     };
 
     std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;
+
+    ~llama_model_qwen4exp() override;
+
+    // The lazily read PLE table is read row by row from its file rather than through the mapping,
+    // which keeps its pages out of this process's page tables. -1 when the mapping is used instead.
+    int    ple_fd   = -1;
+    size_t ple_offs = 0;
 };
 
 struct llama_model_qwen35moe : public llama_model_base {

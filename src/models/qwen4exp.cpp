@@ -6,6 +6,13 @@
 
 #include <algorithm>
 #include <cinttypes>
+#include <cstring>
+#include <thread>
+
+#ifdef __linux__
+#include <fcntl.h>
+#include <unistd.h>
+#endif
 
 // Malformed model metadata must fail as a recoverable load error, not abort the process.
 static void qwen4exp_require_nonzero(const llama_model_loader & ml, llm_kv kid, uint32_t value) {
@@ -214,6 +221,21 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
                                                  { 1 }, scale_flags);
         per_layer_tok_embd_bias = create_tensor(tn(LLM_TENSOR_PER_LAYER_TOKEN_EMBD, "bias"),
                                                 { hparams.ple_head_dim, hparams.ple_n_heads }, TENSOR_NOT_REQUIRED);
+
+#ifdef __linux__
+        // a fresh open file description, so its random-access hint does not reach the loader's
+        const auto * w = ml.get_weight(ple_name.c_str());
+        const char * io = getenv("LLAMA_PLE_IO");
+        if (w && ml.lazy.has(per_layer_tok_embd) && !(io && strcmp(io, "mmap") == 0)) {
+            const std::string path = "/proc/self/fd/" + std::to_string(ml.files.at(w->idx)->file_id());
+            ple_fd = open(path.c_str(), O_RDONLY | O_CLOEXEC);
+            if (ple_fd >= 0) {
+                posix_fadvise(ple_fd, 0, 0, POSIX_FADV_RANDOM);
+                ple_offs = w->offs;
+                LLAMA_LOG_INFO("%s: %s rows are read from the file\n", __func__, ple_name.c_str());
+            }
+        }
+#endif
     }
 
     // A standalone MTP artifact contains the draft block and shared input/output
@@ -391,6 +413,14 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
             }
         }
     }
+}
+
+llama_model_qwen4exp::~llama_model_qwen4exp() {
+#ifdef __linux__
+    if (ple_fd >= 0) {
+        close(ple_fd);
+    }
+#endif
 }
 
 std::unique_ptr<llm_graph_context> llama_model_qwen4exp::build_arch_graph(const llm_graph_params & params) const {
@@ -1597,10 +1627,13 @@ public:
 
     bool can_reuse(const llm_graph_params & params) override {
         mctx = static_cast<const llama_memory_hybrid_idx_context *>(params.mctx)->get_attn();
-        return rows->ne[0] == (int64_t) pmodel.hparams.ple_n_heads * params.ubatch.n_tokens;
+        const int64_t n = rows ? rows->ne[0] : emb->ne[1];
+        return n == (int64_t) pmodel.hparams.ple_n_heads * params.ubatch.n_tokens;
     }
 
+    // one of the two: the row ids to gather from the mapped table, or the rows already read
     ggml_tensor * rows = nullptr;   // I32 [ple_n_heads * n_tokens]
+    ggml_tensor * emb  = nullptr;   // F32 [ple_head_dim, ple_n_heads * n_tokens]
 
     const llama_model_qwen4exp & pmodel;
 
@@ -1610,7 +1643,59 @@ public:
     // scratch, reused across set_input() calls
     std::vector<llama_token> prev;
     llama_mmap::ranges spans;
+    std::vector<uint8_t> raw;
+
+private:
+    void read_rows(const std::vector<int32_t> & idx);
 };
+
+// pread each row into the emb input, converting it to F32 there
+void llm_graph_input_ple::read_rows(const std::vector<int32_t> & idx) {
+#ifdef __linux__
+    const ggml_tensor * table = pmodel.per_layer_tok_embd;
+    const size_t row_size = table->nb[1];
+    const int64_t n_dim   = table->ne[0];
+    const auto * traits   = ggml_get_type_traits(table->type);
+
+    GGML_ASSERT(ggml_backend_buffer_is_host(emb->buffer));
+    float * dst = (float *) emb->data;
+
+    raw.resize(idx.size()*row_size);
+
+    auto read = [&](size_t k0, size_t k1) {
+        for (size_t k = k0; k < k1; ++k) {
+            uint8_t * buf = raw.data() + k*row_size;
+            const off_t offs = (off_t) (pmodel.ple_offs + (size_t) idx[k]*row_size);
+            for (size_t done = 0; done < row_size; ) {
+                const ssize_t n = pread(pmodel.ple_fd, buf + done, row_size - done, offs + done);
+                if (n <= 0) {
+                    GGML_ABORT("PLE row read failed: %s", n < 0 ? strerror(errno) : "end of file");
+                }
+                done += n;
+            }
+            traits->to_float(buf, dst + k*n_dim, n_dim);
+        }
+    };
+
+    // a prefill ubatch reads thousands of rows, some cold on disk
+    const size_t n_threads = std::min<size_t>(8, idx.size()/256);
+    if (n_threads <= 1) {
+        read(0, idx.size());
+        return;
+    }
+    std::vector<std::thread> workers;
+    const size_t per = (idx.size() + n_threads - 1)/n_threads;
+    for (size_t t = 0; t < n_threads; ++t) {
+        workers.emplace_back(read, t*per, std::min(idx.size(), (t + 1)*per));
+    }
+    for (auto & w : workers) {
+        w.join();
+    }
+#else
+    GGML_UNUSED(idx);
+    GGML_ABORT("PLE row reads need Linux");
+#endif
+}
 
 void llm_graph_input_ple::set_input(const llama_ubatch * ubatch) {
     const auto & hp = pmodel.hparams;
@@ -1668,6 +1753,11 @@ void llm_graph_input_ple::set_input(const llama_ubatch * ubatch) {
                     (int32_t) (mixed % hp.ple_head_vocab_sizes[h_i] + hp.ple_head_offsets[h_i]);
             }
         }
+    }
+
+    if (emb) {
+        read_rows(idx);
+        return;
     }
 
     // the table is ~27 GB and usually a lazily read mapping: issue every row's read at
@@ -1747,13 +1837,19 @@ ggml_tensor * llama_model_qwen4exp::graph::build_inp_ple(
     auto ple_inp = std::make_unique<llm_graph_input_ple>(
             static_cast<const llama_model_qwen4exp &>(model), mctx_hyb->get_attn());
 
-    ple_inp->rows = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_heads * n_tokens);
-    ggml_set_input(ple_inp->rows);
-    ggml_tensor * rows = ple_inp->rows;
+    // gather then flatten the heads: get_rows lays the head dimension out slowest, as the reference does
+    ggml_tensor * emb = nullptr;
+    if (static_cast<const llama_model_qwen4exp &>(model).ple_fd >= 0) {
+        ple_inp->emb = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hparams.ple_head_dim, n_heads * n_tokens);
+        ggml_set_input(ple_inp->emb);
+        emb = ple_inp->emb;
+    } else {
+        ple_inp->rows = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_heads * n_tokens);
+        ggml_set_input(ple_inp->rows);
+        emb = ggml_get_rows(ctx0, model.per_layer_tok_embd, ple_inp->rows);
+    }
     res->add_input(std::move(ple_inp));
 
-    // gather then flatten the heads: get_rows lays the head dimension out slowest, as the reference does
-    ggml_tensor * emb = ggml_get_rows(ctx0, model.per_layer_tok_embd, rows);
     if (model.per_layer_tok_embd_scale) {
         emb = ggml_mul(ctx0, emb, model.per_layer_tok_embd_scale);
     }
