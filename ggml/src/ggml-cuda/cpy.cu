@@ -498,6 +498,13 @@ static bool ggml_cuda_cpy_as_memcpy_2d(const ggml_tensor * src0, const ggml_tens
     spitch = src0->nb[d];
     dpitch = src1->nb[d];
 
+    // the copy engine pays per row: thousands of narrow rows (a 3-column conv state
+    // tail is 10240 rows of 12 bytes) take ~8 us vs ~2 us in the scalar kernel
+    const bool has_kernel = src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16 || src0->type == GGML_TYPE_BF16;
+    if (has_kernel && width < 256) {
+        return false;
+    }
+
     return spitch >= width && dpitch >= width;
 }
 
