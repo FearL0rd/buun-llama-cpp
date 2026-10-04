@@ -1934,7 +1934,7 @@ static __global__ void mul_mat_vec_q(
 // Block: (warp_size, ncols_dst) - each warp handles one token independently.
 // No shared memory reduction needed since each warp works alone.
 template <ggml_type type, int c_rows_per_block, bool has_fusion, bool has_clamp, bool flat_hits = false>
-__launch_bounds__((flat_hits ? 2 : get_mmvq_mmid_max_batch_for_device<type>())*ggml_cuda_get_physical_warp_size(), 1)
+__launch_bounds__((flat_hits ? 4 : get_mmvq_mmid_max_batch_for_device<type>())*ggml_cuda_get_physical_warp_size(), 1)
 static __global__ void mul_mat_vec_q_moe(
         const void * vx_ptr, const void * vy_ptr,
         const int32_t * ids_ptr, const int32_t * act_ids_ptr,
@@ -2011,28 +2011,26 @@ static __global__ void mul_mat_vec_q_moe(
     ggml_cuda_pdl_sync();
     const uint32_t channel_x = ids[route_idx];
     const uint32_t channel_gate = gate_ids ? gate_ids[route_idx] : channel_x;
-    if constexpr (!flat_hits) {
-        if (fusion.x_route_log && blockIdx.x == 0 && threadIdx.x == 0) {
-            const uint32_t entry = token_idx*gridDim.y + channel_dst;
-            fusion.x_route_log[1 + entry] = channel_x;
+    // flat launches carry one token, so its routes are numbered like the strided layout's
+    if (fusion.x_route_log && blockIdx.x == 0 && threadIdx.x == 0) {
+        const uint32_t entry   = flat_hits ? route_idx  : token_idx*gridDim.y + channel_dst;
+        const uint32_t n_entry = flat_hits ? ncols_dst : gridDim.y*ncols_dst;
+        fusion.x_route_log[1 + entry] = channel_x;
+        if (fusion.gate_route_log) {
+            fusion.gate_route_log[1 + entry] = channel_gate;
+        }
+        if (entry == 0) {
+            fusion.x_route_log[0] = n_entry;
             if (fusion.gate_route_log) {
-                fusion.gate_route_log[1 + entry] = channel_gate;
-            }
-            if (entry == 0) {
-                fusion.x_route_log[0] = gridDim.y*ncols_dst;
-                if (fusion.gate_route_log) {
-                    fusion.gate_route_log[0] = gridDim.y*ncols_dst;
-                }
+                fusion.gate_route_log[0] = n_entry;
             }
         }
     }
     if ((int32_t) channel_x < 0) {
         return; // expert on another device (expert-parallel window): the row is zeroed by the caller
     }
-    if constexpr (!flat_hits) {
-        if (fusion.share.skip && fusion.share.skip[route_idx]) {
-            return; // the host computes this entry; the weighted reduction reads its rows
-        }
+    if (fusion.share.skip && fusion.share.skip[route_idx]) {
+        return; // the host computes this entry; the weighted reduction reads its rows
     }
     const uint32_t channel_y = act_ids
         ? act_ids[route_idx]
@@ -2219,24 +2217,38 @@ static void mul_mat_vec_q_moe_launch(
         const float gate_max, cudaStream_t stream) {
 
     constexpr int rows_per_block = 2; // 2 gives best perf based on tuning
+    const bool use_fusion = has_fusion || mmvq_has_existing_fusion(fusion);
     const int64_t nblocks_rows = (nrows_x + rows_per_block - 1) / rows_per_block;
+
+    // n_cols is ncols_dst, or the number of routes for the packed single-token kernel
+    const auto launch = [&](auto kernel, const dim3 block_nums, const dim3 block_dims, const uint32_t n_cols) {
+        ggml_cuda_kernel_launch(kernel, ggml_cuda_kernel_launch_params(block_nums, block_dims, 0, stream),
+            vx, vy, ids, act_ids, gate, gate_ids, fusion, dst, ncols_x, nchannels_y, nrows_x,
+            stride_row_x, stride_col_y, stride_col_dst,
+            stride_channel_x, stride_channel_y, stride_channel_dst,
+            n_cols, ids_stride, up_min, up_max, gate_min, gate_max);
+    };
+
+    // A single token's routes pack 4 warps to a CTA: one-warp CTAs keep too few loads in flight
+    // to reach full bandwidth on an expert's rows.
+    if (ncols_dst == 1) {
+        constexpr int route_pack = 4;
+        const dim3 block_nums(nblocks_rows, (nchannels_dst + route_pack - 1) / route_pack);
+        const dim3 block_dims(warp_size, route_pack);
+        if (use_fusion) {
+            launch(mul_mat_vec_q_moe<type, rows_per_block, true, has_clamp, true>, block_nums, block_dims, nchannels_dst);
+        } else {
+            launch(mul_mat_vec_q_moe<type, rows_per_block, false, false, true>, block_nums, block_dims, nchannels_dst);
+        }
+        return;
+    }
+
     const dim3 block_nums(nblocks_rows, nchannels_dst);
     const dim3 block_dims(warp_size, ncols_dst);
-    const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, 0, stream);
-
-    const bool use_fusion = has_fusion || mmvq_has_existing_fusion(fusion);
     if (use_fusion) {
-        ggml_cuda_kernel_launch(mul_mat_vec_q_moe<type, rows_per_block, true, has_clamp>, launch_params,
-            vx, vy, ids, act_ids, gate, gate_ids, fusion, dst, ncols_x, nchannels_y, nrows_x,
-            stride_row_x, stride_col_y, stride_col_dst,
-            stride_channel_x, stride_channel_y, stride_channel_dst,
-            ncols_dst, ids_stride, up_min, up_max, gate_min, gate_max);
+        launch(mul_mat_vec_q_moe<type, rows_per_block, true, has_clamp>, block_nums, block_dims, ncols_dst);
     } else {
-        ggml_cuda_kernel_launch(mul_mat_vec_q_moe<type, rows_per_block, false, false>, launch_params,
-            vx, vy, ids, act_ids, gate, gate_ids, fusion, dst, ncols_x, nchannels_y, nrows_x,
-            stride_row_x, stride_col_y, stride_col_dst,
-            stride_channel_x, stride_channel_y, stride_channel_dst,
-            ncols_dst, ids_stride, up_min, up_max, gate_min, gate_max);
+        launch(mul_mat_vec_q_moe<type, rows_per_block, false, false>, block_nums, block_dims, ncols_dst);
     }
 }
 
