@@ -114,6 +114,24 @@ static void ggml_backend_moe_cache_invalidate_buffer(
     ggml_moe_cache.invalidate(address, size);
 }
 
+// Brackets scheduler compute-buffer allocations (see ggml_moe_cache_api::scratch_alloc_scope).
+struct moe_cache_scratch_scope {
+    void * session;
+
+    explicit moe_cache_scratch_scope(void * session)
+        : session(ggml_moe_cache.scratch_alloc_scope ? session : nullptr) {
+        if (this->session) {
+            ggml_moe_cache.scratch_alloc_scope(this->session, 1);
+        }
+    }
+
+    ~moe_cache_scratch_scope() {
+        if (session) {
+            ggml_moe_cache.scratch_alloc_scope(session, 0);
+        }
+    }
+};
+
 // backend buffer
 
 ggml_backend_buffer_t ggml_backend_buffer_init(
@@ -898,6 +916,7 @@ struct ggml_backend_sched {
 
     struct ggml_context * ctx;
     void * moe_cache_session;
+    bool moe_cache_scratch_prepared; // scratch_prepare already ran for the allocated graph
 
     ggml_backend_sched_eval_callback callback_eval;
     void * callback_eval_user_data;
@@ -1742,6 +1761,22 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
     }
 }
 
+// Tells the moe-cache how much of each compute buffer the allocated graph uses, once per evaluation:
+// before the inputs are set on a fresh allocation, and before a reused graph runs.
+static void ggml_backend_sched_scratch_prepare(ggml_backend_sched_t sched) {
+    if (!sched->moe_cache_session || !ggml_moe_cache.scratch_prepare || sched->moe_cache_scratch_prepared) {
+        return;
+    }
+    for (int b = 0; b < sched->n_backends; b++) {
+        size_t high_water = 0;
+        ggml_backend_buffer_t buffer = ggml_gallocr_get_plan_buffer(sched->galloc, b, &high_water);
+        if (buffer) {
+            ggml_moe_cache.scratch_prepare(sched->moe_cache_session, sched->backends[b], buffer, high_water);
+        }
+    }
+    sched->moe_cache_scratch_prepared = true;
+}
+
 static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
     bool backend_ids_changed = false;
     for (int i = 0; i < sched->graph.n_nodes; i++) {
@@ -1760,6 +1795,8 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
             }
         }
     }
+
+    moe_cache_scratch_scope scratch_scope(sched->moe_cache_session);
 
     // allocate graph
     if (backend_ids_changed || !ggml_gallocr_alloc_graph(sched->galloc, &sched->graph)) {
@@ -1793,6 +1830,9 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
             return false;
         }
     }
+
+    sched->moe_cache_scratch_prepared = false;
+    ggml_backend_sched_scratch_prepare(sched);
 
     return true;
 }
@@ -2296,6 +2336,7 @@ bool ggml_backend_sched_reserve(ggml_backend_sched_t sched, struct ggml_cgraph *
 
     ggml_backend_sched_split_graph(sched, measure_graph);
 
+    moe_cache_scratch_scope scratch_scope(sched->moe_cache_session);
     if (!ggml_gallocr_reserve_n(sched->galloc, &sched->graph, sched->node_backend_ids, sched->leaf_backend_ids)) {
         return false;
     }
@@ -2341,6 +2382,9 @@ enum ggml_status ggml_backend_sched_graph_compute_async(ggml_backend_sched_t sch
             return GGML_STATUS_ALLOC_FAILED;
         }
     }
+
+    ggml_backend_sched_scratch_prepare(sched);
+    sched->moe_cache_scratch_prepared = false;
 
     return ggml_backend_sched_compute_splits(sched);
 }

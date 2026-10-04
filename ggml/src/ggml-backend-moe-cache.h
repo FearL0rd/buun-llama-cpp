@@ -183,6 +183,13 @@ struct ggml_moe_cache_api {
     // reading cached experts from VRAM and the rest over the bus. The answer depends only on the
     // op's shape and the session, so a reused graph keeps a valid assignment.
     int (*route_supported)(void * session, void * backend, const struct ggml_tensor * op);
+
+    // Scheduler compute buffers. alloc_scope brackets the scheduler's buffer allocations so the
+    // provider can back them with memory it can alias into its pools. Before each evaluation's
+    // inputs are written, prepare reports the bytes of buffer the evaluation uses from its base;
+    // the provider stops caching in [base, base + high_water) and may cache in the rest.
+    void (*scratch_alloc_scope)(void * session, int enter);
+    void (*scratch_prepare)(void * session, void * backend, ggml_backend_buffer_t buffer, size_t high_water);
 };
 
 GGML_API struct ggml_moe_cache_api ggml_moe_cache;

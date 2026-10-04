@@ -97,6 +97,7 @@ enum class moe_cache_slot_state : uint8_t {
     free,
     copying,
     valid,
+    lent, // memory in use by the aliased scheduler compute buffer
 };
 
 struct moe_cache_key {
@@ -144,6 +145,15 @@ struct moe_cache_pool {
     // Compute-stream scratch remains accounted in the slab, outside the resident LRU.
     int stream_stage_slots[moe_cache_stream_stage_slots_max] = {};
     int n_stream_stage_slots = 0;
+
+    // Bytes this pool allocated. A VMM slab maps owned_bytes of its own memory and then
+    // the scheduler compute buffer at shared_base: slots from first_shared on overlap that
+    // buffer, and slots below lent_end are left to it while evaluations use their bytes.
+    size_t owned_bytes = 0;
+    size_t vmm_size = 0;
+    const void * shared_base = nullptr;
+    int first_shared = INT_MAX;
+    int lent_end = 0;
 };
 
 struct moe_cache_shape {
@@ -303,7 +313,15 @@ struct moe_cache_device {
     bool inflight = false;
     const void * inflight_source = nullptr;
     size_t inflight_bytes = 0;
+    int inflight_pool = -1;
+    int inflight_slot = -1;
     std::thread worker;
+
+    // Scheduler compute buffer reported by scratch_prepare
+    const void * scratch_base = nullptr;
+    long long scratch_lends = 0;
+    long long scratch_lent_slots = 0;
+    long long scratch_reclaims = 0;
 
     cudaStream_t compute_stream = nullptr;
     char * h_input = nullptr;
@@ -1753,6 +1771,8 @@ static void moe_cache_worker(moe_cache_session * session, moe_cache_device * dev
             device->inflight = true;
             device->inflight_source = job.source;
             device->inflight_bytes = job.bytes;
+            device->inflight_pool = job.pool;
+            device->inflight_slot = job.slot;
         }
 
         cudaError_t error = cudaSuccess;
@@ -1843,6 +1863,8 @@ static void moe_cache_worker(moe_cache_session * session, moe_cache_device * dev
             device->inflight = false;
             device->inflight_source = nullptr;
             device->inflight_bytes = 0;
+            device->inflight_pool = -1;
+            device->inflight_slot = -1;
 
             if (pool && job.slot >= 0 && job.slot < pool->n_slots) {
                 moe_cache_slot & slot = pool->slots[job.slot];
@@ -1942,6 +1964,70 @@ static bool moe_cache_prepare_budget(
     return available > 0;
 }
 
+static void moe_cache_free_slab(char * slab, size_t vmm_size) {
+#if defined(GGML_USE_VMM) && !defined(GGML_USE_HIP)
+    if (vmm_size) {
+        cudaDeviceSynchronize();
+        cuMemUnmap((CUdeviceptr)slab, vmm_size);
+        cuMemAddressFree((CUdeviceptr)slab, vmm_size);
+        return;
+    }
+#endif
+    GGML_UNUSED(vmm_size);
+    cudaFree(slab);
+}
+
+#if defined(GGML_USE_VMM) && !defined(GGML_USE_HIP)
+// Map owned bytes (rounded up to the VMM granularity) of new memory followed by the
+// scheduler compute buffer at device.scratch_base, which ggml_cuda_compute_vmm_scope
+// allocated as a VMM mapping, so slots past the owned bytes alias that buffer.
+// Lending cache slots to prefill scratch follows Strata (github.com/Niko1221/Strata, MIT).
+static char * moe_cache_map_shared_slab(const moe_cache_device & device, size_t & owned, size_t & vmm_size) {
+    CUmemGenericAllocationHandle shared;
+    if (cuMemRetainAllocationHandle(&shared, (void *)device.scratch_base) != CUDA_SUCCESS) {
+        (void)cudaGetLastError();
+        return nullptr;
+    }
+    char * slab = nullptr;
+    CUdeviceptr shared_base = 0;
+    size_t shared_size = 0;
+    if (cuMemGetAddressRange(&shared_base, &shared_size, (CUdeviceptr)device.scratch_base) == CUDA_SUCCESS &&
+            shared_base == (CUdeviceptr)device.scratch_base) {
+        const size_t granularity = ggml_cuda_info().devices[device.logical].vmm_granularity;
+        owned = granularity * ((owned + granularity - 1) / granularity);
+        const size_t size = owned + shared_size;
+        CUmemAllocationProp prop = {};
+        prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
+        prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+        prop.location.id = device.physical;
+        CUmemAccessDesc access = {};
+        access.location = prop.location;
+        access.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
+        CUmemGenericAllocationHandle handle;
+        CUdeviceptr addr = 0;
+        if (cuMemCreate(&handle, owned, &prop, 0) == CUDA_SUCCESS) {
+            if (cuMemAddressReserve(&addr, size, 0, 0, 0) == CUDA_SUCCESS) {
+                const bool owned_mapped = cuMemMap(addr, owned, 0, handle, 0) == CUDA_SUCCESS;
+                const bool shared_mapped = owned_mapped &&
+                    cuMemMap(addr + owned, shared_size, 0, shared, 0) == CUDA_SUCCESS;
+                if (shared_mapped && cuMemSetAccess(addr, size, &access, 1) == CUDA_SUCCESS) {
+                    slab = (char *)addr;
+                    vmm_size = size;
+                } else {
+                    if (shared_mapped) cuMemUnmap(addr + owned, shared_size);
+                    if (owned_mapped) cuMemUnmap(addr, owned);
+                    cuMemAddressFree(addr, size);
+                }
+            }
+            cuMemRelease(handle);
+        }
+    }
+    cuMemRelease(shared);
+    (void)cudaGetLastError();
+    return slab;
+}
+#endif
+
 static bool moe_cache_allocate_pool(
         moe_cache_session & session, moe_cache_device & device,
         moe_cache_shape & shape, size_t budget) {
@@ -1963,7 +2049,23 @@ static bool moe_cache_allocate_pool(
     ggml_cuda_set_device(device.logical);
     char * slab = nullptr;
     cudaError_t error = cudaSuccess;
-    while (slot_count >= moe_cache_pool_slots_min) {
+    size_t allocated = slot_count * shape.expert_size;
+    size_t vmm_size = 0;
+    int first_shared = INT_MAX;
+#if defined(GGML_USE_VMM) && !defined(GGML_USE_HIP)
+    // The heaviest shape's pool also caches in the compute buffer bytes evaluations leave unused.
+    if (device.pools.empty() && device.scratch_base && (uint64_t)slot_count < shape.n_entries &&
+            !moe_cache_fail(session, "slab")) {
+        slab = moe_cache_map_shared_slab(device, allocated, vmm_size);
+        if (slab) {
+            first_shared = (int)(allocated / shape.expert_size);
+            slot_count = std::min({vmm_size / shape.expert_size,
+                    (size_t)std::min<uint64_t>(shape.n_entries, INT_MAX),
+                    ggml_moe_cache_max_pool_slots(shape.wtype, shape.expert_size)});
+        }
+    }
+#endif
+    while (!slab && slot_count >= moe_cache_pool_slots_min) {
         if (moe_cache_fail(session, "slab")) {
             error = cudaErrorMemoryAllocation;
         } else {
@@ -1980,12 +2082,14 @@ static bool moe_cache_allocate_pool(
                 device.physical, shape.expert_size >> 10);
         return false;
     }
-    const size_t allocated = slot_count * shape.expert_size;
+    if (!vmm_size) {
+        allocated = slot_count * shape.expert_size;
+    }
     moe_cache_budget_allocation(device, allocated, true);
 
     std::unique_ptr<moe_cache_pool> pool(new (std::nothrow) moe_cache_pool());
     if (!pool) {
-        cudaFree(slab);
+        moe_cache_free_slab(slab, vmm_size);
         moe_cache_budget_allocation(device, allocated, false);
         return false;
     }
@@ -1994,16 +2098,27 @@ static bool moe_cache_allocate_pool(
         pool->wtype = shape.wtype;
         pool->slab = slab;
         pool->n_slots = (int)slot_count;
-        pool->covers_all_entries = (uint64_t)slot_count >= shape.n_entries;
+        pool->covers_all_entries = (uint64_t)std::min<size_t>(slot_count, first_shared) >= shape.n_entries;
+        pool->owned_bytes = allocated;
+        pool->vmm_size = vmm_size;
         pool->slots.resize(slot_count);
         pool->free_slots.reserve(slot_count);
         pool->map.reserve(slot_count);
-        for (int index = (int)slot_count - 1; index >= 0; index--) {
+        // Shared slots start lent; the next scratch_prepare returns what evaluations leave unused.
+        if (first_shared < (int)slot_count) {
+            pool->shared_base = device.scratch_base;
+            pool->first_shared = first_shared;
+            pool->lent_end = (int)slot_count;
+            for (int index = first_shared; index < (int)slot_count; index++) {
+                pool->slots[index].state = moe_cache_slot_state::lent;
+            }
+        }
+        for (int index = std::min<int>((int)slot_count, first_shared) - 1; index >= 0; index--) {
             pool->free_slots.push_back(index);
         }
         device.pools.push_back(std::move(pool));
     } catch (...) {
-        cudaFree(slab);
+        moe_cache_free_slab(slab, vmm_size);
         moe_cache_budget_allocation(device, allocated, false);
         return false;
     }
@@ -2012,7 +2127,7 @@ static bool moe_cache_allocate_pool(
     device.allocated_bytes += allocated;
 
     if (!moe_cache_start_worker(session, device)) {
-        cudaFree(device.pools.back()->slab);
+        moe_cache_free_slab(device.pools.back()->slab, vmm_size);
         moe_cache_budget_allocation(device, allocated, false);
         device.pools.back()->slab = nullptr;
         device.pools.pop_back();
@@ -2021,12 +2136,12 @@ static bool moe_cache_allocate_pool(
         return false;
     }
 
-    MOE_CACHE_LOG("[moe-cache] CUDA%d pool[%d]: type=%s expert=%zu KiB slots=%zu entries=%llu coverage=%s total=%zu MiB\n",
+    MOE_CACHE_LOG("[moe-cache] CUDA%d pool[%d]: type=%s expert=%zu KiB slots=%zu entries=%llu coverage=%s total=%zu MiB borrowed=%zu MiB\n",
             device.physical, shape.pool, ggml_type_name((ggml_type)shape.wtype),
             shape.expert_size >> 10, slot_count,
             (unsigned long long)shape.n_entries,
             device.pools.back()->covers_all_entries ? "complete" : "partial",
-            allocated >> 20);
+            allocated >> 20, vmm_size ? (vmm_size - allocated) >> 20 : 0);
     bool expected = false;
     if (session.enabled_announced.compare_exchange_strong(expected, true)) {
         MOE_CACHE_LOG("[moe-cache] enabled: first pool allocated on CUDA%d\n", device.physical);
@@ -2176,8 +2291,9 @@ static void moe_cache_log_stats(moe_cache_device & device) {
     size_t slots = 0;
     for (const auto & pool_ptr : device.pools) {
         const moe_cache_pool & pool = *pool_ptr;
-        slots += pool.n_slots;
-        used += pool.n_slots - pool.free_slots.size();
+        const size_t lent = (size_t)std::max(0, pool.lent_end - std::min(pool.first_shared, pool.n_slots));
+        slots += pool.n_slots - lent;
+        used += pool.n_slots - lent - pool.free_slots.size();
     }
     const long long total = device.hits + device.misses;
     MOE_CACHE_LOG("[moe-cache] CUDA%d hits=%lld/%lld (%.1f%%) used=%zu/%zu enqueued=%lld filled=%lld fill-fail=%lld evictions=%lld skips=%lld admission=%lld queue=%zu jobs/%zu MiB dispatch-fail=%lld collect-fail=%lld act-dedup=%lld cpu-overlap=%lld fusion=%lld/%lld pairs=%lld/%lld/%lld/%lld fusion-attempts=%lld fusion-nodes=%lld full-fusion=%lld/%lld down-mmv-dedicated=%lld bypass=%lld\n",
@@ -2196,6 +2312,10 @@ static void moe_cache_log_stats(moe_cache_device & device) {
             device.full_fused_rows, device.full_fused_nodes,
             device.dedicated_down_mmv_dispatches,
             device.contention_bypasses);
+    if (device.scratch_lends) {
+        MOE_CACHE_LOG("[moe-cache] CUDA%d scratch lends=%lld slots=%lld reclaims=%lld\n",
+                device.physical, device.scratch_lends, device.scratch_lent_slots, device.scratch_reclaims);
+    }
     if (device.stream_stage_experts) {
         MOE_CACHE_LOG("[moe-cache] CUDA%d stream-stage-experts=%lld\n", device.physical, device.stream_stage_experts);
     }
@@ -2432,9 +2552,8 @@ static void moe_cache_free_device(moe_cache_device & device) {
     }
     for (auto & pool_ptr : device.pools) {
         if (pool_ptr->slab) {
-            cudaFree(pool_ptr->slab);
-            moe_cache_budget_allocation(
-                    device, (size_t)pool_ptr->n_slots * pool_ptr->expert_size, false);
+            moe_cache_free_slab(pool_ptr->slab, pool_ptr->vmm_size);
+            moe_cache_budget_allocation(device, pool_ptr->owned_bytes, false);
             pool_ptr->slab = nullptr;
         }
     }
@@ -4414,13 +4533,19 @@ static void moe_cache_retire_pending() {
 static bool moe_cache_stream_stage_reserve(moe_cache_device & device, moe_cache_pool & pool, int count) {
     if (pool.covers_all_entries || count > moe_cache_stream_stage_slots_max || pool.n_slots < 2*count) return false;
     while (pool.n_stream_stage_slots < count) {
+        // Staging outlives scratch_prepare, so it never uses a slot the compute buffer can take back.
         int slot = -1;
-        if (!pool.free_slots.empty()) {
-            slot = pool.free_slots.back();
-            pool.free_slots.pop_back();
-        } else {
+        for (size_t i = pool.free_slots.size(); i-- > 0;) {
+            if (pool.free_slots[i] < pool.first_shared) {
+                slot = pool.free_slots[i];
+                pool.free_slots[i] = pool.free_slots.back();
+                pool.free_slots.pop_back();
+                break;
+            }
+        }
+        if (slot < 0) {
             slot = pool.lru_head;
-            while (slot >= 0 && (pool.slots[slot].readers != 0 ||
+            while (slot >= 0 && (pool.slots[slot].readers != 0 || slot >= pool.first_shared ||
                     moe_cache_route_get(device, pool.slots[slot].key.tensor))) slot = pool.slots[slot].next;
             if (slot < 0) return false;
             moe_cache_slot_reset(pool, slot, false);
@@ -5524,9 +5649,10 @@ static void moe_cache_invalidate_session(
                             ? shape.n_entries - entries : 0;
                         shape.n_tensors = std::max<int64_t>(shape.n_tensors - 1, 0);
                         if (shape.pool >= 0 && shape.pool < (int)device.pools.size()) {
+                            const moe_cache_pool & pool = *device.pools[shape.pool];
                             device.pools[shape.pool]->covers_all_entries =
-                                (uint64_t)(device.pools[shape.pool]->n_slots -
-                                    device.pools[shape.pool]->n_stream_stage_slots) >= shape.n_entries;
+                                (uint64_t)(std::min(pool.n_slots, pool.first_shared) -
+                                    pool.n_stream_stage_slots) >= shape.n_entries;
                         }
                         if (shape.n_tensors == 0 && shape.pool < 0) {
                             shape.finished = false;
@@ -5593,7 +5719,7 @@ static size_t moe_cache_trim_session(
     size_t freed = 0;
     for (const auto & pool_ptr : selected->pools) {
         if (pool_ptr->slab) {
-            freed += (size_t)pool_ptr->n_slots * pool_ptr->expert_size;
+            freed += pool_ptr->owned_bytes;
         }
     }
     freed += selected->d_out_cap + selected->d_input_cap +
@@ -5636,6 +5762,128 @@ extern "C" size_t ggml_moe_cache_trim(int device) {
     return freed;
 }
 
+static void moe_cache_scratch_alloc_scope(void * opaque, int enter) {
+    if (opaque) {
+        ggml_cuda_compute_vmm_scope(enter != 0);
+    }
+}
+
+// Called under dispatch_mu and session.mu. Gives slots [first, last) to the compute buffer.
+static void moe_cache_scratch_lend_locked(
+        moe_cache_session & session, std::unique_lock<std::mutex> & lock, moe_cache_device & device,
+        ggml_backend_t backend, int pool_index, int first, int last) {
+    moe_cache_pool & pool = *device.pools[pool_index];
+    for (auto it = device.queue.begin(); it != device.queue.end();) {
+        if (it->pool == pool_index && it->slot >= first && it->slot < last) {
+            device.queued_bytes = it->bytes <= device.queued_bytes ? device.queued_bytes - it->bytes : 0;
+            moe_cache_slot_reset(pool, it->slot, false);
+            it = device.queue.erase(it);
+        } else {
+            ++it;
+        }
+    }
+    session.idle_cv.wait(lock, [&] {
+        return device.inflight_pool != pool_index || device.inflight_slot < first || device.inflight_slot >= last;
+    });
+    for (int index = first; index < last; index++) {
+        moe_cache_slot & slot = pool.slots[index];
+        GGML_ASSERT(slot.readers == 0);
+        if (slot.state == moe_cache_slot_state::valid) {
+            if (const moe_cache_route * route = moe_cache_route_get(device, slot.key.tensor)) {
+                moe_cache_route_push_locked(device, slot.key,
+                        route->device_base + (size_t)slot.key.expert * route->expert_size);
+            }
+        }
+        if (slot.state != moe_cache_slot_state::free || slot.key.expert >= 0) {
+            moe_cache_slot_reset(pool, index, false);
+        }
+        slot.state = moe_cache_slot_state::lent;
+    }
+    pool.free_slots.erase(std::remove_if(pool.free_slots.begin(), pool.free_slots.end(),
+            [&](int index) { return index >= first && index < last; }), pool.free_slots.end());
+    if (!moe_cache_route_flush_locked(device)) {
+        moe_cache_route_reset_locked(device);
+    }
+    // Earlier evaluations and cache kernels may still read the slots.
+    ggml_backend_synchronize(backend);
+    if (device.compute_stream) {
+        cudaStreamSynchronize(device.compute_stream);
+    }
+    if (device.route_stream) {
+        cudaStreamSynchronize(device.route_stream);
+    }
+    pool.lent_end = last;
+    device.scratch_lends++;
+    device.scratch_lent_slots += last - first;
+}
+
+// Called under dispatch_mu and session.mu. Returns slots [first, lent_end) to the cache.
+static void moe_cache_scratch_reclaim_locked(
+        moe_cache_device & device, ggml_backend_t backend, moe_cache_pool & pool, int first) {
+    // The previous evaluation may still be writing them.
+    ggml_backend_synchronize(backend);
+    for (int index = pool.lent_end - 1; index >= first; index--) {
+        pool.slots[index].state = moe_cache_slot_state::free;
+        pool.free_slots.push_back(index);
+    }
+    pool.lent_end = first;
+    device.scratch_reclaims++;
+}
+
+static void moe_cache_scratch_prepare(void * opaque, void * backend_opaque, ggml_backend_buffer_t buffer, size_t high_water) {
+    auto session = (moe_cache_session *) opaque;
+    auto backend = (ggml_backend_t) backend_opaque;
+    if (!session || session->dormant.load() || !backend || !ggml_backend_is_cuda(backend) || !buffer) {
+        return;
+    }
+    auto * ctx = (ggml_backend_cuda_context *) backend->context;
+    moe_cache_device * selected = nullptr;
+    for (auto & device_ptr : session->devices) {
+        if (device_ptr->logical == ctx->device) {
+            selected = device_ptr.get();
+            break;
+        }
+    }
+    if (!selected) {
+        return;
+    }
+    moe_cache_device & device = *selected;
+    const void * base = ggml_backend_buffer_get_base(buffer);
+
+    std::unique_lock<std::mutex> dispatch_lock(device.dispatch_mu);
+    std::unique_lock<std::mutex> lock(session->mu);
+    if (session->stopping || device.dead.load()) {
+        return;
+    }
+    if (device.scratch_base != base) {
+        // A replaced compute buffer no longer shares the slab's memory: the slab keeps it alone.
+        for (auto & pool_ptr : device.pools) {
+            moe_cache_pool & pool = *pool_ptr;
+            if (pool.shared_base) {
+                moe_cache_scratch_reclaim_locked(device, backend, pool, std::min(pool.first_shared, pool.n_slots));
+                pool.shared_base = nullptr;
+                pool.first_shared = INT_MAX;
+            }
+        }
+        device.scratch_base = base;
+    }
+
+    for (int pool_index = 0; pool_index < (int)device.pools.size(); pool_index++) {
+        moe_cache_pool & pool = *device.pools[pool_index];
+        if (pool.shared_base != base) {
+            continue;
+        }
+        const size_t needed = (pool.owned_bytes + high_water + pool.expert_size - 1) / pool.expert_size;
+        const int target = (int)std::min<size_t>(pool.n_slots, std::max<size_t>(needed, pool.first_shared));
+        if (target > pool.lent_end) {
+            moe_cache_scratch_lend_locked(*session, lock, device, backend, pool_index,
+                    std::max(pool.lent_end, pool.first_shared), target);
+        } else if (target < pool.lent_end) {
+            moe_cache_scratch_reclaim_locked(device, backend, pool, target);
+        }
+    }
+}
+
 void ggml_moe_cache_register(const void * owner) {
     if (ggml_moe_cache.owner && ggml_moe_cache.owner != owner) {
         return;
@@ -5666,6 +5914,8 @@ void ggml_moe_cache_register(const void * owner) {
     ggml_moe_cache.fused_dispatch = moe_cache_fused_dispatch;
     ggml_moe_cache.invalidate = moe_cache_invalidate;
     ggml_moe_cache.route_supported = moe_cache_route_supported;
+    ggml_moe_cache.scratch_alloc_scope = moe_cache_scratch_alloc_scope;
+    ggml_moe_cache.scratch_prepare = moe_cache_scratch_prepare;
 }
 
 #endif

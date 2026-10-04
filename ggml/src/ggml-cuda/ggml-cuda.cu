@@ -879,12 +879,24 @@ struct ggml_backend_cuda_buffer_context {
     }
 #endif
 
+    size_t vmm_size = 0; // nonzero for a VMM mapping (see ggml_cuda_compute_vmm_scope)
+
     ggml_backend_cuda_buffer_context(int device, void * dev_ptr, bool owned = true) :
         device(device), dev_ptr(dev_ptr), owned(owned),
         name(GGML_CUDA_NAME + std::to_string(device)) {
     }
 
     ~ggml_backend_cuda_buffer_context() {
+#if defined(GGML_USE_VMM) && !defined(GGML_USE_HIP)
+        if (vmm_size) {
+            // The physical memory lives on while the MoE cache still maps it.
+            ggml_cuda_set_device(device);
+            CUDA_CHECK(cudaDeviceSynchronize());
+            CU_CHECK(cuMemUnmap((CUdeviceptr)dev_ptr, vmm_size));
+            CU_CHECK(cuMemAddressFree((CUdeviceptr)dev_ptr, vmm_size));
+            return;
+        }
+#endif
         if (owned) {
             CUDA_CHECK(cudaFree(dev_ptr));
         }
@@ -1402,10 +1414,72 @@ static bool ggml_backend_buft_is_cuda(ggml_backend_buffer_type_t buft) {
     return buft->iface.get_name == ggml_backend_cuda_buffer_type_get_name;
 }
 
+#if defined(GGML_USE_VMM) && !defined(GGML_USE_HIP)
+static thread_local int g_compute_vmm_depth = 0;
+
+void ggml_cuda_compute_vmm_scope(bool enter) {
+    const ggml_cuda_device_info & info = ggml_cuda_info();
+    // Peer copies into a VMM mapping need explicit access grants; keep it single-GPU.
+    if (info.device_count != 1 || !info.devices[0].vmm) {
+        return;
+    }
+    g_compute_vmm_depth += enter ? 1 : -1;
+}
+
+static void * ggml_cuda_vmm_malloc(int device, size_t * size) {
+    const int physical = ggml_cuda_get_physical_device(device);
+    const size_t granularity = ggml_cuda_info().devices[device].vmm_granularity;
+    const size_t mapped = granularity * ((*size + granularity - 1) / granularity);
+
+    CUmemAllocationProp prop = {};
+    prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
+    prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+    prop.location.id = physical;
+    CUmemGenericAllocationHandle handle;
+    if (cuMemCreate(&handle, mapped, &prop, 0) != CUDA_SUCCESS) {
+        return nullptr;
+    }
+    CUdeviceptr addr = 0;
+    bool ok = cuMemAddressReserve(&addr, mapped, 0, 0, 0) == CUDA_SUCCESS;
+    bool mapped_ok = ok && cuMemMap(addr, mapped, 0, handle, 0) == CUDA_SUCCESS;
+    cuMemRelease(handle);
+    if (mapped_ok) {
+        CUmemAccessDesc access = {};
+        access.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+        access.location.id = physical;
+        access.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
+        if (cuMemSetAccess(addr, mapped, &access, 1) == CUDA_SUCCESS) {
+            *size = mapped;
+            return (void *)addr;
+        }
+        cuMemUnmap(addr, mapped);
+    }
+    if (ok) {
+        cuMemAddressFree(addr, mapped);
+    }
+    return nullptr;
+}
+#else
+void ggml_cuda_compute_vmm_scope(bool enter) {
+    GGML_UNUSED(enter);
+}
+#endif
+
 static ggml_backend_buffer_t ggml_backend_cuda_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
     ggml_backend_cuda_buffer_type_context * buft_ctx = (ggml_backend_cuda_buffer_type_context *)buft->context;
 
     ggml_cuda_set_device(buft_ctx->device);
+
+#if defined(GGML_USE_VMM) && !defined(GGML_USE_HIP)
+    if (g_compute_vmm_depth > 0) {
+        size_t mapped = size;
+        if (void * vmm_ptr = ggml_cuda_vmm_malloc(buft_ctx->device, &mapped)) {
+            ggml_backend_cuda_buffer_context * ctx = new ggml_backend_cuda_buffer_context(buft_ctx->device, vmm_ptr);
+            ctx->vmm_size = mapped;
+            return ggml_backend_buffer_init(buft, ggml_backend_cuda_buffer_interface, ctx, size);
+        }
+    }
+#endif
 
     void * dev_ptr;
     cudaError_t err = ggml_cuda_device_malloc(&dev_ptr, size, buft_ctx->device);

@@ -28,4 +28,8 @@ struct ggml_moe_cache_route_table {
 
 // False when the host expert tensor at host_base is not device-routed.
 bool ggml_moe_cache_route_find(const void * host_base, ggml_moe_cache_route_table & route);
+
+// CUDA buffers this thread allocates inside the scope are VMM mappings that the
+// cache can alias (cuMemRetainAllocationHandle). No-op without single-GPU VMM.
+void ggml_cuda_compute_vmm_scope(bool enter);
 #endif
