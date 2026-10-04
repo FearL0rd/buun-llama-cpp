@@ -175,6 +175,8 @@ struct moe_cache_job {
     bool wait_route = false;
 };
 
+static constexpr int moe_cache_route_log_max = 512;
+
 // Device-routed expert tensor: table[e] is the expert's cache slot when resident,
 // otherwise its device-accessible host bytes. Kernels log routed experts into log.
 struct moe_cache_route {
@@ -188,6 +190,9 @@ struct moe_cache_route {
     int wtype = -1;
     uint64_t profile_key = 0;
     int pool_index = -1;
+    // Logged ids copied out before an evaluation, drained after its launch.
+    int32_t snap[2*moe_cache_route_log_max];
+    int n_snap = 0;
 };
 
 struct moe_cache_route_update {
@@ -1571,7 +1576,6 @@ static bool moe_cache_grow_host(
     return true;
 }
 
-static constexpr int moe_cache_route_log_max = 512;
 static constexpr int moe_cache_route_batch_max = 32;
 
 struct moe_cache_route_batch {
@@ -2834,6 +2838,7 @@ static int moe_cache_output_copy(void * session, void * backend_opaque,
     return 1;
 }
 
+static void moe_cache_route_snapshot_locked(moe_cache_device & device);
 static void moe_cache_route_drain_locked(moe_cache_session & session);
 
 static void moe_cache_session_enter(void * opaque) {
@@ -2885,8 +2890,10 @@ static void moe_cache_session_enter(void * opaque) {
         return;
     }
     session->active_scopes++;
-    if (g_session_stack.size() == 1 && session->devices.size() == 1) {
-        moe_cache_route_drain_locked(*session);
+    if (g_session_stack.size() == 1 && session->devices.size() == 1 && !session->devices[0]->dead.load()) {
+        moe_cache_route_snapshot_locked(*session->devices[0]);
+        // Fills finished since the last drain reach this evaluation.
+        moe_cache_route_flush_locked(*session->devices[0]);
     }
 }
 
@@ -2909,6 +2916,11 @@ static void moe_cache_session_leave(void * opaque) {
     g_session_stack.erase(std::next(found).base());
     if (active) {
         std::lock_guard<std::mutex> lock(active->mu);
+        // The outermost scope snapshotted the routes at enter; its evaluation
+        // is in flight, so this bookkeeping overlaps GPU work.
+        if (g_session_stack.empty() && active->devices.size() == 1) {
+            moe_cache_route_drain_locked(*active);
+        }
         if (active->active_scopes > 0) {
             active->active_scopes--;
         }
@@ -3507,9 +3519,25 @@ static void moe_cache_profile_seed_locked(
     }
 }
 
-// Called under session.mu before an evaluation. Feed the experts the previous
-// evaluation routed on the device into the same admission, LRU, and heat
-// bookkeeping the CPU path uses, then publish finished fills to the tables.
+// Called under session.mu before an evaluation, while the routed stream is idle:
+// move the ids the previous evaluation logged out of the mapped logs, so the
+// bookkeeping can run after this evaluation is launched.
+static void moe_cache_route_snapshot_locked(moe_cache_device & device) {
+    for (auto & entry : device.routes) {
+        moe_cache_route & route = *entry.second;
+        const int n = std::min({route.log[0], moe_cache_route_log_max,
+                2*moe_cache_route_log_max - route.n_snap});
+        if (n > 0) {
+            std::copy(route.log + 1, route.log + 1 + n, route.snap + route.n_snap);
+            route.n_snap += n;
+        }
+        route.log[0] = 0;
+    }
+}
+
+// Called under session.mu after an evaluation is launched. Feed the snapshotted
+// experts into the same admission, LRU, and heat bookkeeping the CPU path uses,
+// then publish finished fills to the tables (applied after the launched work).
 static void moe_cache_route_drain_locked(moe_cache_session & session) {
     moe_cache_device & device = *session.devices[0];
     if (device.routes.empty() || device.dead.load() ||
@@ -3517,15 +3545,14 @@ static void moe_cache_route_drain_locked(moe_cache_session & session) {
         return;
     }
     bool wake_worker = false;
-    int32_t ids[moe_cache_route_log_max];
     for (auto & entry : device.routes) {
         moe_cache_route & route = *entry.second;
-        const int n = std::min(route.log[0], moe_cache_route_log_max);
+        const int n = route.n_snap;
         if (n <= 0) {
             continue;
         }
-        route.log[0] = 0;
-        std::copy(route.log + 1, route.log + 1 + n, ids);
+        route.n_snap = 0;
+        const int32_t * ids = route.snap;
         device.route_rows += n;
 
         if (route.pool_index < 0) {
