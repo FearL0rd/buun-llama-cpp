@@ -3255,7 +3255,11 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
     if (src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 && !ggml_cuda_is_exl3(src0->type)) {
         static_assert(MMVQ_MAX_BATCH_SIZE == MMVF_MAX_BATCH_SIZE);
         if (ne2 <= MMVQ_MAX_BATCH_SIZE) {
-            if (ggml_cuda_should_use_mmvq(src0->type, cc, ne2)) {
+            // experts in pinned host memory are read by MMVQ (through the moe-cache table when
+            // routed) at any batch it takes: MMQ's crossover is tuned for VRAM-resident weights
+            const bool host_experts = ggml_is_quantized(src0->type) && src0->buffer &&
+                src0->buffer->buft == ggml_backend_cuda_host_buffer_type();
+            if (host_experts || ggml_cuda_should_use_mmvq(src0->type, cc, ne2)) {
                 const int mmvq_mmid_max = get_mmvq_mmid_max_batch(src0->type, cc);
                 if (ne2 <= mmvq_mmid_max) {
                     ggml_cuda_mul_mat_vec_q(ctx, src0, src1, ids, dst);

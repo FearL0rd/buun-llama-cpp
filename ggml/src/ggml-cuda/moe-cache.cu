@@ -3825,11 +3825,11 @@ static int moe_cache_route_supported(void * opaque, void * backend_opaque, const
         ids->ne[0] * ids->ne[1] > moe_cache_route_log_max) {
         return 0;
     }
-    // Mirror ggml_cuda_mul_mat_id's MMVQ selection: only that kernel reads the table.
+    // Mirror ggml_cuda_mul_mat_id's MMVQ selection: only that kernel reads the table. Host
+    // weights take MMVQ up to the mmid cap, past the dense MMVQ/MMQ crossover.
     const int cc = ggml_cuda_info().devices[ctx->device].cc;
     const int64_t n_tokens = op->ne[2];
-    if (n_tokens > MMVQ_MAX_BATCH_SIZE || !ggml_cuda_should_use_mmvq(weights->type, cc, n_tokens) ||
-        n_tokens > get_mmvq_mmid_max_batch(weights->type, cc) ||
+    if (n_tokens > MMVQ_MAX_BATCH_SIZE || n_tokens > get_mmvq_mmid_max_batch(weights->type, cc) ||
         !ggml_backend_supports_op(backend, op)) {
         return 0;
     }
@@ -4873,7 +4873,7 @@ static void * moe_cache_fused_plan_expert_parallel(
                 }
                 mask |= UINT64_C(1) << row;
             }
-            if (stage_experts > 0 && routes.size() == 1 && n_tokens >= 2 && n_tokens <= 4 &&
+            if (stage_experts > 0 && routes.size() == 1 && n_tokens >= 2 && n_tokens <= MMVQ_MAX_BATCH_SIZE &&
                 current.pair_pool == current.down_pool && up->type == GGML_TYPE_Q2_0 &&
                 down->type == up->type && up->expert_size == down->expert_size && up->expert_size <= 512*1024 &&
                 !current.pair_pool->covers_all_entries &&
@@ -5158,7 +5158,7 @@ static void * moe_cache_fused_plan(
     // Small speculative Q2 batches on consumer Ampere and Blackwell use the
     // same full-FFN planner for resident and transient experts, without changing
     // the existing multi-device routing or larger prompt-processing batches.
-    stream_stage = down && session->devices.size() == 1 && n_tokens <= 4 &&
+    stream_stage = down && session->devices.size() == 1 && n_tokens <= MMVQ_MAX_BATCH_SIZE &&
         up->type == GGML_TYPE_Q2_0 && down->type == up->type &&
         up->expert_size == down->expert_size && up->expert_size <= 512*1024 &&
         (ggml_cuda_info().devices[session->devices.front()->logical].cc == 860 ||
