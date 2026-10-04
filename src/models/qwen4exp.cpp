@@ -1258,10 +1258,12 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_gather(
     ggml_tensor * kq_mask = inp->get_kq_mask();
     GGML_ASSERT(kq_mask->nb[3] == kq_mask->nb[1]*n_tps);
 
-    ggml_tensor * mask_cells = ggml_view_3d(ctx0, kq_mask, 1, n_kv, n_q,
-            kq_mask->nb[0], kq_mask->nb[1], 0);
+    if (!qsa_mask_cells || qsa_mask_cells->view_src != kq_mask) {
+        qsa_mask_cells = ggml_view_3d(ctx0, kq_mask, 1, n_kv, n_q, kq_mask->nb[0], kq_mask->nb[1], 0);
+    }
+    GGML_ASSERT(qsa_mask_cells->ne[1] == n_kv && qsa_mask_cells->ne[2] == n_q);
     ggml_tensor * idx_query = ggml_reshape_3d(ctx0, top_k, width, n_q, 1);
-    ggml_tensor * mask = ggml_get_rows(ctx0, mask_cells, idx_query);
+    ggml_tensor * mask = ggml_get_rows(ctx0, qsa_mask_cells, idx_query);
     mask = ggml_cast(ctx0, ggml_reshape_4d(ctx0, mask, width, 1, 1, n_q), GGML_TYPE_F16);
     cb(mask, "qsa_mask_sel", il);
 
