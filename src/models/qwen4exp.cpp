@@ -559,8 +559,10 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_mix(
     const int64_t hc_dim = hc * n_embd;
     const int64_t nt     = x->ne[2];
 
-    // the fused op has no LoRA hook, so adapters keep the unfused matmuls
-    if (cparams.fused_dsv4_hc_mix && il >= 0 && nt <= 8 && loras->empty()) {
+    // the fused op has no LoRA hook, so adapters keep the unfused matmuls;
+    // it also reads all its projections as one type, which mixed quants break
+    const bool same_type = w_up->type == w_down->type && (!inject || w_inject->type == w_down->type);
+    if (cparams.fused_dsv4_hc_mix && il >= 0 && nt <= 8 && loras->empty() && same_type) {
         // decode and short verify batches: norm, down, up, gate, mean and inject in one op
         ggml_tensor * out = ggml_dsv4_hc_mix(ctx0, x, w_norm, w_down, w_up, inject ? w_inject : nullptr,
                 hparams.f_norm_rms_eps, 1.0f / (float) hc);
