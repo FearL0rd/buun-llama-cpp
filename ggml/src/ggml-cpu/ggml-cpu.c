@@ -2302,8 +2302,10 @@ static void ggml_compute_forward_mul_mat_id_one_chunk(
 
 #if defined(__AVX2__)
     // Amortize activation preparation over at least one output-column tile.
-    const bool prepare_q2 = ne00 <= 16384 && ir0_end - ir0_start >= 16;
-    if (ggml_type_is_q2_0(type) && (prepare_q2 || ir1_end - ir1_start > 1)) {
+    const bool is_q2 = ggml_type_is_q2_0(type);
+    const bool prepare_q2 = is_q2 && ne00 <= 16384 && ir0_end - ir0_start >= 16;
+    const ggml_vec_dot_batch_t batch = is_q2 ? NULL : ggml_get_vec_dot_batch(type);
+    if (prepare_q2 || ((is_q2 || batch) && ir1_end - ir1_start > 1)) {
         const int qk = ggml_blck_size(type);
         for (int64_t first = ir1_start; first < ir1_end; first += 4) {
             const int nr = (int) MIN(4, ir1_end - first);
@@ -2324,7 +2326,11 @@ static void ggml_compute_forward_mul_mat_id_one_chunk(
             }
             for (int64_t row = ir0_start; row < ir0_end; ++row) {
                 float sums[4];
-                ggml_vec_dot_q2_0_q8_0_batch(ne00, sums, src0_cur + row * nb01, ys, nr, qk);
+                if (batch) {
+                    batch(ne00, sums, src0_cur + row * nb01, ys, nr);
+                } else {
+                    ggml_vec_dot_q2_0_q8_0_batch(ne00, sums, src0_cur + row * nb01, ys, nr, qk);
+                }
                 for (int r = 0; r < nr; ++r) outs[r][row] = sums[r];
             }
         }
@@ -5462,6 +5468,15 @@ static void ggml_cpu_moe_cache_rows(enum ggml_type type, int n, float * const * 
 #if defined(__AVX2__)
     if (ggml_type_is_q2_0(type) && n <= 16384) {
         ggml_vec_dot_q2_0_q8_0_batch_rows(n, dst, w, stride, act, nr, rows, ggml_blck_size(type));
+        return;
+    }
+    const ggml_vec_dot_batch_t batch = nr > 1 ? ggml_get_vec_dot_batch(type) : NULL;
+    if (batch) {
+        for (int64_t i = 0; i < rows; ++i) {
+            float sums[4];
+            batch(n, sums, (const char *) w + i*stride, act, nr);
+            for (int r = 0; r < nr; ++r) dst[r][i] = sums[r];
+        }
         return;
     }
 #endif
