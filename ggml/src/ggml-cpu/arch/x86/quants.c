@@ -5284,21 +5284,17 @@ static BATCH_INLINE void q4_0_batch_impl(int n, float * s, const void * vx, cons
     const int nb = n / QK8_0;
 
     const __m256i off = _mm256_set1_epi8( 8 );
-    const __m256i ones = _mm256_set1_epi16(1);
 
     __m256 acc[4];
     for (int r = 0; r < nr; ++r) acc[r] = _mm256_setzero_ps();
     for (int ib = 0; ib < nb; ++ib) {
         const float xd = GGML_CPU_FP16_TO_FP32(x[ib].d);
         const __m256i qx = _mm256_sub_epi8(bytes_from_nibbles_32(x[ib].qs), off);
-        // mul_sum_i8_pairs_float split: |x| once, sign(y, x) per row
-        const __m256i ax = _mm256_sign_epi8(qx, qx);
         for (int r = 0; r < nr; ++r) {
             const block_q8_0 * y = &((const block_q8_0 *) vy[r])[ib];
             const __m256 d = _mm256_set1_ps( xd * GGML_CPU_FP16_TO_FP32(y->d) );
             const __m256i qy = _mm256_loadu_si256((const __m256i *)y->qs);
-            const __m256i dot = _mm256_maddubs_epi16(ax, _mm256_sign_epi8(qy, qx));
-            const __m256 q = _mm256_cvtepi32_ps(_mm256_madd_epi16(ones, dot));
+            const __m256 q = mul_sum_i8_pairs_float(qx, qy);
             acc[r] = _mm256_fmadd_ps( d, q, acc[r] );
         }
     }
@@ -5309,20 +5305,16 @@ static BATCH_INLINE void q8_0_batch_impl(int n, float * s, const void * vx, cons
     const block_q8_0 * GGML_RESTRICT x = vx;
     const int nb = n / QK8_0;
 
-    const __m256i ones = _mm256_set1_epi16(1);
-
     __m256 acc[4];
     for (int r = 0; r < nr; ++r) acc[r] = _mm256_setzero_ps();
     for (int ib = 0; ib < nb; ++ib) {
         const float xd = GGML_CPU_FP16_TO_FP32(x[ib].d);
         const __m256i qx = _mm256_loadu_si256((const __m256i *)x[ib].qs);
-        const __m256i ax = _mm256_sign_epi8(qx, qx);
         for (int r = 0; r < nr; ++r) {
             const block_q8_0 * y = &((const block_q8_0 *) vy[r])[ib];
             const __m256 d = _mm256_set1_ps( xd * GGML_CPU_FP16_TO_FP32(y->d) );
             const __m256i qy = _mm256_loadu_si256((const __m256i *)y->qs);
-            const __m256i dot = _mm256_maddubs_epi16(ax, _mm256_sign_epi8(qy, qx));
-            const __m256 q = _mm256_cvtepi32_ps(_mm256_madd_epi16(ones, dot));
+            const __m256 q = mul_sum_i8_pairs_float(qx, qy);
             acc[r] = _mm256_fmadd_ps( d, q, acc[r] );
         }
     }
