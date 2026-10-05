@@ -372,6 +372,7 @@ struct moe_cache_device {
     long long nodes = 0;
     long long stream_stage_experts = 0;
     long long collect_calls = 0;
+    long long route_drains = 0;
     // Dispatch mutex contention that turned a potential cache hit into a
     // complete CPU fallback (try_to_lock failed). Measured first so a bounded
     // wait or per-device FIFO can be justified with data.
@@ -3726,6 +3727,9 @@ static void moe_cache_route_drain_locked(moe_cache_session & session) {
     }
     moe_cache_freq_age_locked(session, device);
     moe_cache_route_flush_locked(device);
+    if (session.config.stats_every > 0 && ++device.route_drains % session.config.stats_every == 0) {
+        moe_cache_log_stats(device);
+    }
     if (wake_worker && moe_cache_start_worker(session, device)) {
         session.cv.notify_all();
     }
