@@ -168,7 +168,7 @@ static bool ggml_backend_meta_device_supports_op(ggml_backend_dev_t dev, const g
 }
 
 // Host-weight ops (CPU-resident experts during prefill) are offloaded when every simple device
-// would offload them; the scheduler's weight copy lands in the compute buffer as MIRRORED.
+// would offload them; calculate_split_state gives the scheduler's weight copy the weight's expert split.
 static bool ggml_backend_meta_device_offload_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
     GGML_ASSERT(ggml_backend_dev_is_meta(dev));
     const ggml_backend_meta_device_context * meta_dev_ctx = (const ggml_backend_meta_device_context *) dev->context;
@@ -929,14 +929,19 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_calculate_split_st
         return {GGML_BACKEND_SPLIT_AXIS_0, {0}, {1}, 1};
     };
 
+    // The model's name-based split rules, as registered on the meta device.
+    auto user_split_state = [&](const ggml_tensor * t) -> ggml_backend_meta_split_state {
+        ggml_backend_dev_t dev = ggml_backend_buft_get_device(ggml_backend_buffer_get_type(tensor->buffer));
+        const ggml_backend_meta_device_context * dev_ctx = (const ggml_backend_meta_device_context *) dev->context;
+        return dev_ctx->get_split_state(t, dev_ctx->get_split_state_ud);
+    };
+
     auto calculate_split_state = [&]() -> ggml_backend_meta_split_state {
         if (ggml_nelements(tensor) == 0) {
             return {GGML_BACKEND_SPLIT_AXIS_UNKNOWN, {0}, {1}, 1};
         }
         if (!ggml_backend_meta_split_state_has_sources(tensor)) {
-            ggml_backend_dev_t dev = ggml_backend_buft_get_device(ggml_backend_buffer_get_type(tensor->buffer));
-            const ggml_backend_meta_device_context * dev_ctx = (const ggml_backend_meta_device_context *) dev->context;
-            ggml_backend_meta_split_state ret = dev_ctx->get_split_state(tensor, dev_ctx->get_split_state_ud);
+            ggml_backend_meta_split_state ret = user_split_state(tensor);
             if (ret.axis >= 0 && ret.axis < GGML_MAX_DIMS) {
                 const int64_t granularity = ret.axis == GGML_BACKEND_SPLIT_AXIS_0 ? ggml_blck_size(tensor->type) : 1;
                 int64_t ne_sum = 0;
@@ -965,11 +970,9 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_calculate_split_st
                 if (first != nullptr && last > first + 1) {
                     ggml_tensor weight = *tensor;
                     snprintf(weight.name, sizeof(weight.name), "%.*s", int(last - first - 1), first + 1);
-                    const ggml_backend_dev_t dev = ggml_backend_buft_get_device(ggml_backend_buffer_get_type(tensor->buffer));
-                    const auto * dev_ctx = (const ggml_backend_meta_device_context *) dev->context;
-                    const ggml_backend_meta_split_state ss = dev_ctx->get_split_state(&weight, dev_ctx->get_split_state_ud);
+                    const ggml_backend_meta_split_state ss = user_split_state(&weight);
                     if (ss.axis == GGML_BACKEND_SPLIT_AXIS_2) {
-                        return ss; // absolute sizes from the weight, not a ratio taken over from a source
+                        return ss; // skip the ratio take-over below: a copy has no split source to take it from
                     }
                 }
             } break;
