@@ -13,6 +13,9 @@
 // Device view of the share handed to a routed matvec or to the weighted reduction.
 struct ggml_moe_cpu_share_args {
     const uint8_t * skip = nullptr;     // per route (indexed like ids): 0 = GPU, else 1 + host entry
+    // per route: the staged VRAM copy of a GPU-streamed miss's weights, or null to read the table
+    const void * const * stage_x = nullptr;
+    const void * const * stage_gate = nullptr;
     int ids_stride = 0;                 // reduction only: ids row stride, in elements
     const float * y = nullptr;          // reduction only: host output rows, one per entry
     const uint32_t * done = nullptr;    // mapped: last ticket the host finished

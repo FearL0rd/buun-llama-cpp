@@ -2040,11 +2040,13 @@ static __global__ void mul_mat_vec_q_moe(
     const uint32_t channel_x_offset = fusion.x_table ? 0 : channel_x;
     const uint32_t channel_gate_offset = fusion.gate_table ? 0 : channel_gate;
     if (fusion.x_table) {
-        vx = fusion.x_table[channel_x];
+        const void * staged = fusion.share.stage_x ? fusion.share.stage_x[route_idx] : nullptr;
+        vx = staged ? staged : fusion.x_table[channel_x];
     }
     if constexpr (has_fusion) {
         if (fusion.gate_table) {
-            vgate = fusion.gate_table[channel_gate];
+            const void * staged = fusion.share.stage_gate ? fusion.share.stage_gate[route_idx] : nullptr;
+            vgate = staged ? staged : fusion.gate_table[channel_gate];
         }
     }
 
