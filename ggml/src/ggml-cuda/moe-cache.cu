@@ -2738,15 +2738,14 @@ static int moe_cache_prefill_copy(void * opaque, void * backend_opaque,
 static int moe_cache_prefetch_supported(void * backend_opaque, const ggml_tensor * source) {
     auto backend = (ggml_backend_t) backend_opaque;
     if (!backend || !ggml_backend_is_cuda(backend) || !source || source->view_src ||
-            !ggml_type_is_q2_0(source->type) || !source->buffer ||
+            !moe_cache_type_supported(source->type) || !source->buffer ||
             source->buffer->buft != ggml_backend_cuda_host_buffer_type() ||
             ggml_backend_buffer_get_usage(source->buffer) != GGML_BACKEND_BUFFER_USAGE_WEIGHTS ||
             (source->flags & GGML_TENSOR_FLAG_INPUT) || !ggml_is_contiguous(source) ||
             source->ne[2] < 1 || source->ne[2] > 512 || source->ne[3] != 1 ||
-            source->nb[2] % sizeof(uint4) || ggml_nbytes(source) > (256ull << 20)) return 0;
+            source->nb[2] % sizeof(uint4) || ggml_nbytes(source) > (1ull << 30)) return 0;
     auto * ctx = (ggml_backend_cuda_context *) backend->context;
-    return !ctx->external_capture && ggml_cuda_info().device_count == 1 &&
-            ggml_cuda_info().devices[ctx->device].cc == 860;
+    return !ctx->external_capture && ggml_cuda_info().device_count == 1;
 }
 
 struct moe_cache_prefetch_job {
