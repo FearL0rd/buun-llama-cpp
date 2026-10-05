@@ -1246,11 +1246,6 @@ static bool moe_cache_tensor_name_supported(const char * name) {
     return strstr(name, "_exps") || strstr(name, "_chexps");
 }
 
-// Q2_0 and PQ2 (Q2_0_G128) share packed ternary codes and the small-batch tuning below
-static bool moe_cache_type_is_q2(int type) {
-    return type == GGML_TYPE_Q2_0 || type == GGML_TYPE_Q2_0_G128;
-}
-
 static bool moe_cache_type_supported(ggml_type type) {
     if (ggml_type_is_exl3(type)) return true;
     switch (type) {
@@ -1983,7 +1978,7 @@ static void moe_cache_free_slab(char * slab, size_t vmm_size) {
 }
 
 #if defined(GGML_USE_VMM) && !defined(GGML_USE_HIP)
-// Map owned bytes (rounded up to the VMM granularity) of new memory followed by the
+// Map owned bytes (rounded down to the VMM granularity) of new memory followed by the
 // scheduler compute buffer at device.scratch_base, which ggml_cuda_compute_vmm_scope
 // allocated as a VMM mapping, so slots past the owned bytes alias that buffer.
 // Lending cache slots to prefill scratch follows Strata (github.com/Niko1221/Strata, MIT).
@@ -2001,7 +1996,7 @@ static char * moe_cache_map_shared_slab(const moe_cache_device & device, size_t 
         // Round down: a pool past its budget leaves no room for any node, so every
         // node that plans through moe_cache_begin would bypass the cache.
         const size_t granularity = ggml_cuda_info().devices[device.logical].vmm_granularity;
-        owned = granularity * (owned / granularity);
+        owned -= owned % granularity;
         const size_t size = owned + shared_size;
         CUmemAllocationProp prop = {};
         prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
@@ -2743,7 +2738,7 @@ static int moe_cache_prefill_copy(void * opaque, void * backend_opaque,
 static int moe_cache_prefetch_supported(void * backend_opaque, const ggml_tensor * source) {
     auto backend = (ggml_backend_t) backend_opaque;
     if (!backend || !ggml_backend_is_cuda(backend) || !source || source->view_src ||
-            !moe_cache_type_is_q2(source->type) || !source->buffer ||
+            !ggml_type_is_q2_0(source->type) || !source->buffer ||
             source->buffer->buft != ggml_backend_cuda_host_buffer_type() ||
             ggml_backend_buffer_get_usage(source->buffer) != GGML_BACKEND_BUFFER_USAGE_WEIGHTS ||
             (source->flags & GGML_TENSOR_FLAG_INPUT) || !ggml_is_contiguous(source) ||
@@ -4206,7 +4201,7 @@ static int moe_cache_dispatch_internal(
         const bool dedicated_down = session.config.dedicated_down_mmv >= 0
             ? session.config.dedicated_down_mmv != 0
             : (down_cc == 860 || down_cc == GGML_CUDA_CC_BLACKWELL) &&
-              moe_cache_type_is_q2(down_pool->wtype) && n_out == 640 && node->n_out == 2560;
+              ggml_type_is_q2_0((ggml_type) down_pool->wtype) && n_out == 640 && node->n_out == 2560;
         down_mmv_path = ggml_cuda_moe_cache_mmv(
                 down_pool->slab, (ggml_type)down_pool->wtype,
                 (const char *)device.d_act_q8, d_ids + 2 * n_hits,
@@ -4881,7 +4876,7 @@ static void * moe_cache_fused_plan_expert_parallel(
                 mask |= UINT64_C(1) << row;
             }
             if (stage_experts > 0 && routes.size() == 1 && n_tokens >= 2 && n_tokens <= MMVQ_MAX_BATCH_SIZE &&
-                current.pair_pool == current.down_pool && moe_cache_type_is_q2(up->type) &&
+                current.pair_pool == current.down_pool && ggml_type_is_q2_0(up->type) &&
                 down->type == up->type && up->expert_size == down->expert_size && up->expert_size <= 512*1024 &&
                 !current.pair_pool->covers_all_entries &&
                 moe_cache_stream_stage_source(*current.device, up->data) &&
@@ -5166,7 +5161,7 @@ static void * moe_cache_fused_plan(
     // same full-FFN planner for resident and transient experts, without changing
     // the existing multi-device routing or larger prompt-processing batches.
     stream_stage = down && session->devices.size() == 1 && n_tokens <= MMVQ_MAX_BATCH_SIZE &&
-        moe_cache_type_is_q2(up->type) && down->type == up->type &&
+        ggml_type_is_q2_0(up->type) && down->type == up->type &&
         up->expert_size == down->expert_size && up->expert_size <= 512*1024 &&
         (ggml_cuda_info().devices[session->devices.front()->logical].cc == 860 ||
          ggml_cuda_info().devices[session->devices.front()->logical].cc == GGML_CUDA_CC_BLACKWELL);

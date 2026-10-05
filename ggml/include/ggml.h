@@ -501,6 +501,10 @@ extern "C" {
     static inline bool ggml_type_is_exl3(enum ggml_type type) {
         return type >= GGML_TYPE_EXL3_1 && type <= GGML_TYPE_EXL3T_8;
     }
+    // Q2_0 and Q2_0_G128 (PQ2) share packed ternary codes and differ only in group size
+    static inline bool ggml_type_is_q2_0(enum ggml_type type) {
+        return type == GGML_TYPE_Q2_0 || type == GGML_TYPE_Q2_0_G128;
+    }
     static inline int ggml_exl3_bits(enum ggml_type type) {
         return ((int) type - (int) GGML_TYPE_EXL3_1) % 8 + 1;
     }

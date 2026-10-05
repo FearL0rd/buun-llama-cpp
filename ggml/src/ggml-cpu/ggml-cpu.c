@@ -2303,7 +2303,7 @@ static void ggml_compute_forward_mul_mat_id_one_chunk(
 #if defined(__AVX2__)
     // Amortize activation preparation over at least one output-column tile.
     const bool prepare_q2 = ne00 <= 16384 && ir0_end - ir0_start >= 16;
-    if ((type == GGML_TYPE_Q2_0 || type == GGML_TYPE_Q2_0_G128) && (prepare_q2 || ir1_end - ir1_start > 1)) {
+    if (ggml_type_is_q2_0(type) && (prepare_q2 || ir1_end - ir1_start > 1)) {
         const int qk = ggml_blck_size(type);
         for (int64_t first = ir1_start; first < ir1_end; first += 4) {
             const int nr = (int) MIN(4, ir1_end - first);
@@ -5460,7 +5460,7 @@ int ggml_cpu_has_sme2(void) {
 static void ggml_cpu_moe_cache_rows(enum ggml_type type, int n, float * const * dst,
         const void * w, size_t stride, int64_t rows, const void * const * act, int nr) {
 #if defined(__AVX2__)
-    if ((type == GGML_TYPE_Q2_0 || type == GGML_TYPE_Q2_0_G128) && n <= 16384) {
+    if (ggml_type_is_q2_0(type) && n <= 16384) {
         ggml_vec_dot_q2_0_q8_0_batch_rows(n, dst, w, stride, act, nr, rows, ggml_blck_size(type));
         return;
     }

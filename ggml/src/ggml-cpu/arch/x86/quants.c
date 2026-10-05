@@ -847,9 +847,21 @@ static inline float q2_0_block_d(const uint8_t * block) {
     return GGML_CPU_FP16_TO_FP32(*(const ggml_half *) block);
 }
 
+static inline const uint8_t * q2_0_block_qs(const uint8_t * block) {
+    return block + sizeof(ggml_half);
+}
+
+// Forced so every (nr, qk) instance folds both to constants; GCC otherwise
+// clones the kernel with a runtime qk.
+#if defined(_MSC_VER)
+#define Q2_0_BATCH_INLINE __forceinline
+#else
+#define Q2_0_BATCH_INLINE inline __attribute__((always_inline))
+#endif
+
 // Reuse unpacked weights across tokens selecting the same expert, optionally
 // sharing activation metadata across output columns. Preserve FP32 block order.
-static inline void q2_0_batch_impl(int n, float * s, const void * vx, const void * const * vy, int nr,
+static Q2_0_BATCH_INLINE void q2_0_batch_impl(int n, float * s, const void * vx, const void * const * vy, int nr,
                                  const struct q2_0_prepared_act * prepared, int qk) {
     const int kq = qk / QK8_0;
     const int nb = n / qk;
@@ -863,10 +875,10 @@ static inline void q2_0_batch_impl(int n, float * s, const void * vx, const void
         __m128 sums[4];
         for (int r = 0; r < nr; ++r) sums[r] = _mm_setzero_ps();
         for (int k = 0; k < kq; ++k) {
-            const __m256i c0 = q2_0_unpack32(x0 + sizeof(ggml_half) + k*8);
-            const __m256i c1 = q2_0_unpack32(x1 + sizeof(ggml_half) + k*8);
-            const __m256i c2 = q2_0_unpack32(x2 + sizeof(ggml_half) + k*8);
-            const __m256i c3 = q2_0_unpack32(x3 + sizeof(ggml_half) + k*8);
+            const __m256i c0 = q2_0_unpack32(q2_0_block_qs(x0) + k*8);
+            const __m256i c1 = q2_0_unpack32(q2_0_block_qs(x1) + k*8);
+            const __m256i c2 = q2_0_unpack32(q2_0_block_qs(x2) + k*8);
+            const __m256i c3 = q2_0_unpack32(q2_0_block_qs(x3) + k*8);
             for (int r = 0; r < nr; ++r) {
                 const block_q8_0 * y = vy[r];
                 const __m256i d0 = prepared ? q2_0_codes_dot(c0, y[kq*(i+0)+k].qs) : q2_0_dot32_codes(c0, y[kq*(i+0)+k].qs);
@@ -900,7 +912,7 @@ static inline void q2_0_batch_impl(int n, float * s, const void * vx, const void
         const uint8_t * x = q2_0_block(vx, qk, i);
         float sums[4] = {0};
         for (int k = 0; k < kq; ++k) {
-            const __m256i codes = q2_0_unpack32(x + sizeof(ggml_half) + k*8);
+            const __m256i codes = q2_0_unpack32(q2_0_block_qs(x) + k*8);
             for (int r = 0; r < nr; ++r) {
                 const block_q8_0 * y = vy[r];
                 const int dot = prepared
@@ -916,7 +928,7 @@ static inline void q2_0_batch_impl(int n, float * s, const void * vx, const void
 
 // Literal row counts and group sizes let the compiler keep each row's
 // accumulators in registers.
-static inline void q2_0_batch_dispatch(int n, float * s, const void * vx, const void * const * vy, int nr,
+static void q2_0_batch_dispatch(int n, float * s, const void * vx, const void * const * vy, int nr,
                                      const struct q2_0_prepared_act * prepared, int qk) {
 #define Q2_0_BATCH_NR(QK) \
     switch (nr) { \
@@ -932,11 +944,16 @@ static inline void q2_0_batch_dispatch(int n, float * s, const void * vx, const 
     }
 #undef Q2_0_BATCH_NR
 }
+#undef Q2_0_BATCH_INLINE
 
 void ggml_vec_dot_q2_0_q8_0_batch(int n, float * s, const void * vx, const void * const * vy, int nr, int qk) {
     assert((qk == QK2_0 || qk == QK2_0_G128) && n % qk == 0 && nr >= 1 && nr <= 4);
     if (nr == 1) {
-        (qk == QK2_0 ? ggml_vec_dot_q2_0_q8_0 : ggml_vec_dot_q2_0_g128_q8_0)(n, s, 0, vx, 0, vy[0], 0, 1);
+        if (qk == QK2_0) {
+            ggml_vec_dot_q2_0_q8_0(n, s, 0, vx, 0, vy[0], 0, 1);
+        } else {
+            ggml_vec_dot_q2_0_g128_q8_0(n, s, 0, vx, 0, vy[0], 0, 1);
+        }
         return;
     }
     q2_0_batch_dispatch(n, s, vx, vy, nr, NULL, qk);
@@ -949,15 +966,18 @@ void ggml_vec_dot_q2_0_q8_0_batch_rows(int n, float * const * dst, const void * 
     // output columns. Scratch is bounded at 12 KiB, with no weight repacking.
     struct q2_0_prepared_act prepared[4];
     const int kq = qk / QK8_0;
+    const int nb = n / qk;
     for (int r = 0; r < nr; ++r) {
         const block_q8_0 * y = vy[r];
-        for (int b = 0; b < n / QK8_0; ++b) {
-            // Adjacent entries feed adjacent weight blocks in one block-slice
-            // pass, so four corrections need one load rather than a gather.
-            const int index = (b%kq)*(n/qk)+b/kq;
-            prepared[r].sums[index] = (int16_t) hsum_i32_8(
-                    q2_0_codes_dot(_mm256_set1_epi8(1), y[b].qs));
-            prepared[r].scales[index] = GGML_CPU_FP16_TO_FP32(y[b].d);
+        // Adjacent entries feed adjacent weight blocks in one block-slice
+        // pass, so four corrections need one load rather than a gather.
+        for (int i = 0; i < nb; ++i) {
+            for (int k = 0; k < kq; ++k) {
+                const block_q8_0 * b = &y[i*kq + k];
+                prepared[r].sums[k*nb + i] = (int16_t) hsum_i32_8(
+                        q2_0_codes_dot(_mm256_set1_epi8(1), b->qs));
+                prepared[r].scales[k*nb + i] = GGML_CPU_FP16_TO_FP32(b->d);
+            }
         }
     }
     for (int64_t row = 0; row < rows; ++row) {
