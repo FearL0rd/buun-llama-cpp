@@ -851,17 +851,17 @@ static inline const uint8_t * q2_0_block_qs(const uint8_t * block) {
     return block + sizeof(ggml_half);
 }
 
-// Forced so every (nr, qk) instance folds both to constants; GCC otherwise
-// clones the kernel with a runtime qk.
+// Forced on every *_batch_impl so each literal (nr, qk) instance folds to
+// constants; GCC otherwise clones the kernel with a runtime nr or qk.
 #if defined(_MSC_VER)
-#define Q2_0_BATCH_INLINE __forceinline
+#define BATCH_INLINE __forceinline
 #else
-#define Q2_0_BATCH_INLINE inline __attribute__((always_inline))
+#define BATCH_INLINE inline __attribute__((always_inline))
 #endif
 
 // Reuse unpacked weights across tokens selecting the same expert, optionally
 // sharing activation metadata across output columns. Preserve FP32 block order.
-static Q2_0_BATCH_INLINE void q2_0_batch_impl(int n, float * s, const void * vx, const void * const * vy, int nr,
+static BATCH_INLINE void q2_0_batch_impl(int n, float * s, const void * vx, const void * const * vy, int nr,
                                  const struct q2_0_prepared_act * prepared, int qk) {
     const int kq = qk / QK8_0;
     const int nb = n / qk;
@@ -944,47 +944,61 @@ static void q2_0_batch_dispatch(int n, float * s, const void * vx, const void * 
     }
 #undef Q2_0_BATCH_NR
 }
-#undef Q2_0_BATCH_INLINE
 
-void ggml_vec_dot_q2_0_q8_0_batch(int n, float * s, const void * vx, const void * const * vy, int nr, int qk) {
+static void q2_0_batch_rows(int n, float * const * dst, const void * vx, size_t stride,
+                            const void * const * vy, int nr, int64_t rows, int qk) {
     assert((qk == QK2_0 || qk == QK2_0_G128) && n % qk == 0 && nr >= 1 && nr <= 4);
-    if (nr == 1) {
-        if (qk == QK2_0) {
-            ggml_vec_dot_q2_0_q8_0(n, s, 0, vx, 0, vy[0], 0, 1);
-        } else {
-            ggml_vec_dot_q2_0_g128_q8_0(n, s, 0, vx, 0, vy[0], 0, 1);
+    // Amortize activation preparation over at least one output-column tile.
+    if (n <= 16384 && rows >= 16) {
+        // Reuse exact signed-byte sums and FP16-to-FP32 scale conversions across
+        // output columns. Scratch is bounded at 12 KiB, with no weight repacking.
+        struct q2_0_prepared_act prepared[4];
+        const int kq = qk / QK8_0;
+        const int nb = n / qk;
+        for (int r = 0; r < nr; ++r) {
+            const block_q8_0 * y = vy[r];
+            // Adjacent entries feed adjacent weight blocks in one block-slice
+            // pass, so four corrections need one load rather than a gather.
+            for (int i = 0; i < nb; ++i) {
+                for (int k = 0; k < kq; ++k) {
+                    const block_q8_0 * b = &y[i*kq + k];
+                    prepared[r].sums[k*nb + i] = (int16_t) hsum_i32_8(
+                            q2_0_codes_dot(_mm256_set1_epi8(1), b->qs));
+                    prepared[r].scales[k*nb + i] = GGML_CPU_FP16_TO_FP32(b->d);
+                }
+            }
+        }
+        for (int64_t row = 0; row < rows; ++row) {
+            float sums[4];
+            q2_0_batch_dispatch(n, sums, (const char *) vx + row * stride, vy, nr, prepared, qk);
+            for (int r = 0; r < nr; ++r) dst[r][row] = sums[r];
         }
         return;
     }
-    q2_0_batch_dispatch(n, s, vx, vy, nr, NULL, qk);
-}
-
-void ggml_vec_dot_q2_0_q8_0_batch_rows(int n, float * const * dst, const void * vx, size_t stride,
-                                    const void * const * vy, int nr, int64_t rows, int qk) {
-    assert((qk == QK2_0 || qk == QK2_0_G128) && n % qk == 0 && n <= 16384 && nr >= 1 && nr <= 4);
-    // Reuse exact signed-byte sums and FP16-to-FP32 scale conversions across
-    // output columns. Scratch is bounded at 12 KiB, with no weight repacking.
-    struct q2_0_prepared_act prepared[4];
-    const int kq = qk / QK8_0;
-    const int nb = n / qk;
-    for (int r = 0; r < nr; ++r) {
-        const block_q8_0 * y = vy[r];
-        // Adjacent entries feed adjacent weight blocks in one block-slice
-        // pass, so four corrections need one load rather than a gather.
-        for (int i = 0; i < nb; ++i) {
-            for (int k = 0; k < kq; ++k) {
-                const block_q8_0 * b = &y[i*kq + k];
-                prepared[r].sums[k*nb + i] = (int16_t) hsum_i32_8(
-                        q2_0_codes_dot(_mm256_set1_epi8(1), b->qs));
-                prepared[r].scales[k*nb + i] = GGML_CPU_FP16_TO_FP32(b->d);
-            }
-        }
-    }
     for (int64_t row = 0; row < rows; ++row) {
+        const void * x = (const char *) vx + row * stride;
+        if (nr == 1) {
+            if (qk == QK2_0) {
+                ggml_vec_dot_q2_0_q8_0(n, dst[0] + row, 0, x, 0, vy[0], 0, 1);
+            } else {
+                ggml_vec_dot_q2_0_g128_q8_0(n, dst[0] + row, 0, x, 0, vy[0], 0, 1);
+            }
+            continue;
+        }
         float sums[4];
-        q2_0_batch_dispatch(n, sums, (const char *) vx + row * stride, vy, nr, prepared, qk);
+        q2_0_batch_dispatch(n, sums, x, vy, nr, NULL, qk);
         for (int r = 0; r < nr; ++r) dst[r][row] = sums[r];
     }
+}
+
+static void q2_0_rows(int n, float * const * dst, const void * vx, size_t stride,
+                      const void * const * vy, int nr, int64_t rows) {
+    q2_0_batch_rows(n, dst, vx, stride, vy, nr, rows, QK2_0);
+}
+
+static void q2_0_g128_rows(int n, float * const * dst, const void * vx, size_t stride,
+                           const void * const * vy, int nr, int64_t rows) {
+    q2_0_batch_rows(n, dst, vx, stride, vy, nr, rows, QK2_0_G128);
 }
 #endif
 
@@ -4398,17 +4412,11 @@ void ggml_vec_dot_iq4_xs_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const v
 }
 
 #if defined(__AVX2__)
-#if defined(_MSC_VER)
-#define VEC_DOT_BATCH_INLINE __forceinline
-#else
-#define VEC_DOT_BATCH_INLINE inline __attribute__((always_inline))
-#endif
-
 // Batched forms of the AVX2 vec_dots above: each weight sub-block is decoded
 // once and dotted against nr <= 4 activation rows. Every row keeps its own
 // accumulators in the single-row op order, so s[r] is bit-identical to vec_dot.
 
-static VEC_DOT_BATCH_INLINE void iq2_xxs_batch_impl(int n, float * s, const void * vx, const void * const * vy, int nr) {
+static BATCH_INLINE void iq2_xxs_batch_impl(int n, float * s, const void * vx, const void * const * vy, int nr) {
     const block_iq2_xxs * GGML_RESTRICT x = vx;
     const int nb = n / QK_K;
     const uint64_t * signs64 = (const uint64_t *)keven_signs_q2xs;
@@ -4449,7 +4457,7 @@ static VEC_DOT_BATCH_INLINE void iq2_xxs_batch_impl(int n, float * s, const void
     for (int r = 0; r < nr; ++r) s[r] = 0.125f * hsum_float_8(accumf[r]);
 }
 
-static VEC_DOT_BATCH_INLINE void iq2_xs_batch_impl(int n, float * s, const void * vx, const void * const * vy, int nr) {
+static BATCH_INLINE void iq2_xs_batch_impl(int n, float * s, const void * vx, const void * const * vy, int nr) {
     const block_iq2_xs * GGML_RESTRICT x = vx;
     const int nb = n / QK_K;
 
@@ -4553,7 +4561,7 @@ static VEC_DOT_BATCH_INLINE void iq2_xs_batch_impl(int n, float * s, const void 
     for (int r = 0; r < nr; ++r) s[r] = 0.125f * hsum_float_8(accumf[r]);
 }
 
-static VEC_DOT_BATCH_INLINE void iq2_s_batch_impl(int n, float * s, const void * vx, const void * const * vy, int nr) {
+static BATCH_INLINE void iq2_s_batch_impl(int n, float * s, const void * vx, const void * const * vy, int nr) {
     const block_iq2_s * GGML_RESTRICT x = vx;
     const int nb = n / QK_K;
 
@@ -4624,7 +4632,7 @@ static VEC_DOT_BATCH_INLINE void iq2_s_batch_impl(int n, float * s, const void *
     for (int r = 0; r < nr; ++r) s[r] = 0.125f * hsum_float_8(accumf[r]);
 }
 
-static VEC_DOT_BATCH_INLINE void iq4_nl_batch_impl(int n, float * s, const void * vx, const void * const * vy, int nr) {
+static BATCH_INLINE void iq4_nl_batch_impl(int n, float * s, const void * vx, const void * const * vy, int nr) {
     const block_iq4_nl * GGML_RESTRICT x = vx;
     const int nb = n / QK4_NL;
 
@@ -4673,7 +4681,7 @@ static VEC_DOT_BATCH_INLINE void iq4_nl_batch_impl(int n, float * s, const void 
     }
 }
 
-static VEC_DOT_BATCH_INLINE void iq3_xxs_batch_impl(int n, float * s, const void * vx, const void * const * vy, int nr) {
+static BATCH_INLINE void iq3_xxs_batch_impl(int n, float * s, const void * vx, const void * const * vy, int nr) {
     const block_iq3_xxs * GGML_RESTRICT x = vx;
     const int nb = n / QK_K;
     const uint64_t * signs64 = (const uint64_t *)keven_signs_q2xs;
@@ -4718,7 +4726,7 @@ static VEC_DOT_BATCH_INLINE void iq3_xxs_batch_impl(int n, float * s, const void
     for (int r = 0; r < nr; ++r) s[r] = 0.25f * hsum_float_8(accumf[r]);
 }
 
-static VEC_DOT_BATCH_INLINE void iq3_s_batch_impl(int n, float * s, const void * vx, const void * const * vy, int nr) {
+static BATCH_INLINE void iq3_s_batch_impl(int n, float * s, const void * vx, const void * const * vy, int nr) {
     const block_iq3_s * GGML_RESTRICT x = vx;
     const int nb = n / QK_K;
 
@@ -4793,7 +4801,7 @@ static VEC_DOT_BATCH_INLINE void iq3_s_batch_impl(int n, float * s, const void *
     for (int r = 0; r < nr; ++r) s[r] = hsum_float_8(accumf[r]);
 }
 
-static VEC_DOT_BATCH_INLINE void q4_K_batch_impl(int n, float * s, const void * vx, const void * const * vy, int nr) {
+static BATCH_INLINE void q4_K_batch_impl(int n, float * s, const void * vx, const void * const * vy, int nr) {
     const block_q4_K * GGML_RESTRICT x = vx;
     const int nb = n / QK_K;
 
@@ -4865,7 +4873,7 @@ static VEC_DOT_BATCH_INLINE void q4_K_batch_impl(int n, float * s, const void * 
     }
 }
 
-static VEC_DOT_BATCH_INLINE void q3_K_batch_impl(int n, float * s, const void * vx, const void * const * vy, int nr) {
+static BATCH_INLINE void q3_K_batch_impl(int n, float * s, const void * vx, const void * const * vy, int nr) {
     const block_q3_K * GGML_RESTRICT x = vx;
     const int nb = n / QK_K;
 
@@ -4968,7 +4976,7 @@ static VEC_DOT_BATCH_INLINE void q3_K_batch_impl(int n, float * s, const void * 
     for (int r = 0; r < nr; ++r) s[r] = hsum_float_8(acc[r]);
 }
 
-static VEC_DOT_BATCH_INLINE void q5_K_batch_impl(int n, float * s, const void * vx, const void * const * vy, int nr) {
+static BATCH_INLINE void q5_K_batch_impl(int n, float * s, const void * vx, const void * const * vy, int nr) {
     const block_q5_K * GGML_RESTRICT x = vx;
     const int nb = n / QK_K;
 
@@ -5063,7 +5071,7 @@ static VEC_DOT_BATCH_INLINE void q5_K_batch_impl(int n, float * s, const void * 
     for (int r = 0; r < nr; ++r) s[r] = hsum_float_8(acc[r]) + summs[r];
 }
 
-static VEC_DOT_BATCH_INLINE void q6_K_batch_impl(int n, float * s, const void * vx, const void * const * vy, int nr) {
+static BATCH_INLINE void q6_K_batch_impl(int n, float * s, const void * vx, const void * const * vy, int nr) {
     const block_q6_K * GGML_RESTRICT x = vx;
     const int nb = n / QK_K;
 
@@ -5142,7 +5150,7 @@ static VEC_DOT_BATCH_INLINE void q6_K_batch_impl(int n, float * s, const void * 
     for (int r = 0; r < nr; ++r) s[r] = hsum_float_8(acc[r]);
 }
 
-static VEC_DOT_BATCH_INLINE void q2_K_batch_impl(int n, float * s, const void * vx, const void * const * vy, int nr) {
+static BATCH_INLINE void q2_K_batch_impl(int n, float * s, const void * vx, const void * const * vy, int nr) {
     const block_q2_K * GGML_RESTRICT x = vx;
     const int nb = n / QK_K;
 
@@ -5221,7 +5229,7 @@ static VEC_DOT_BATCH_INLINE void q2_K_batch_impl(int n, float * s, const void * 
     for (int r = 0; r < nr; ++r) s[r] = hsum_float_8(acc[r]);
 }
 
-static VEC_DOT_BATCH_INLINE void iq4_xs_batch_impl(int n, float * s, const void * vx, const void * const * vy, int nr) {
+static BATCH_INLINE void iq4_xs_batch_impl(int n, float * s, const void * vx, const void * const * vy, int nr) {
     const block_iq4_xs * GGML_RESTRICT x = vx;
     const int nb = n / QK_K;
 
@@ -5271,7 +5279,7 @@ static VEC_DOT_BATCH_INLINE void iq4_xs_batch_impl(int n, float * s, const void 
     for (int r = 0; r < nr; ++r) s[r] = hsum_float_8(accum[r]);
 }
 
-static VEC_DOT_BATCH_INLINE void q4_0_batch_impl(int n, float * s, const void * vx, const void * const * vy, int nr) {
+static BATCH_INLINE void q4_0_batch_impl(int n, float * s, const void * vx, const void * const * vy, int nr) {
     const block_q4_0 * GGML_RESTRICT x = vx;
     const int nb = n / QK8_0;
 
@@ -5297,7 +5305,7 @@ static VEC_DOT_BATCH_INLINE void q4_0_batch_impl(int n, float * s, const void * 
     for (int r = 0; r < nr; ++r) s[r] = hsum_float_8(acc[r]);
 }
 
-static VEC_DOT_BATCH_INLINE void q8_0_batch_impl(int n, float * s, const void * vx, const void * const * vy, int nr) {
+static BATCH_INLINE void q8_0_batch_impl(int n, float * s, const void * vx, const void * const * vy, int nr) {
     const block_q8_0 * GGML_RESTRICT x = vx;
     const int nb = n / QK8_0;
 
@@ -5321,7 +5329,7 @@ static VEC_DOT_BATCH_INLINE void q8_0_batch_impl(int n, float * s, const void * 
     for (int r = 0; r < nr; ++r) s[r] = hsum_float_8(acc[r]);
 }
 
-static VEC_DOT_BATCH_INLINE void mxfp4_batch_impl(int n, float * s, const void * vx, const void * const * vy, int nr) {
+static BATCH_INLINE void mxfp4_batch_impl(int n, float * s, const void * vx, const void * const * vy, int nr) {
     const block_mxfp4 * GGML_RESTRICT x = vx;
     const int nb = n / QK_MXFP4;
 
@@ -5376,52 +5384,68 @@ static VEC_DOT_BATCH_INLINE void mxfp4_batch_impl(int n, float * s, const void *
     }
 }
 
-// Literal row counts let the compiler keep each row's accumulators in registers.
-#define VEC_DOT_BATCH_DEFINE(NAME) \
-    static void NAME##_batch(int n, float * s, const void * vx, const void * const * vy, int nr) { \
+// Literal row counts let the compiler keep each row's accumulators in registers;
+// a single row goes straight to vec_dot.
+#define VEC_DOT_BATCH_ROWS(NAME, NR) \
+    for (int64_t row = 0; row < rows; ++row) { \
+        float sums[4]; \
+        NAME##_batch_impl(n, sums, (const char *) vx + row * stride, vy, NR); \
+        for (int r = 0; r < NR; ++r) dst[r][row] = sums[r]; \
+    }
+#define VEC_DOT_BATCH_DEFINE(NAME, VEC_DOT_TYPE) \
+    static void NAME##_rows(int n, float * const * dst, const void * vx, size_t stride, \
+                            const void * const * vy, int nr, int64_t rows) { \
         switch (nr) { \
-            case 1: NAME##_batch_impl(n, s, vx, vy, 1); break; \
-            case 2: NAME##_batch_impl(n, s, vx, vy, 2); break; \
-            case 3: NAME##_batch_impl(n, s, vx, vy, 3); break; \
-            case 4: NAME##_batch_impl(n, s, vx, vy, 4); break; \
+            case 1: \
+                for (int64_t row = 0; row < rows; ++row) { \
+                    ggml_vec_dot_##NAME##_##VEC_DOT_TYPE(n, dst[0] + row, 0, (const char *) vx + row * stride, 0, vy[0], 0, 1); \
+                } \
+                break; \
+            case 2: VEC_DOT_BATCH_ROWS(NAME, 2) break; \
+            case 3: VEC_DOT_BATCH_ROWS(NAME, 3) break; \
+            case 4: VEC_DOT_BATCH_ROWS(NAME, 4) break; \
+            default: assert(false); \
         } \
     }
-VEC_DOT_BATCH_DEFINE(iq2_xxs)
-VEC_DOT_BATCH_DEFINE(iq2_xs)
-VEC_DOT_BATCH_DEFINE(iq2_s)
-VEC_DOT_BATCH_DEFINE(iq3_xxs)
-VEC_DOT_BATCH_DEFINE(iq3_s)
-VEC_DOT_BATCH_DEFINE(iq4_nl)
-VEC_DOT_BATCH_DEFINE(q4_K)
-VEC_DOT_BATCH_DEFINE(q3_K)
-VEC_DOT_BATCH_DEFINE(q5_K)
-VEC_DOT_BATCH_DEFINE(q6_K)
-VEC_DOT_BATCH_DEFINE(q2_K)
-VEC_DOT_BATCH_DEFINE(iq4_xs)
-VEC_DOT_BATCH_DEFINE(q4_0)
-VEC_DOT_BATCH_DEFINE(q8_0)
-VEC_DOT_BATCH_DEFINE(mxfp4)
+VEC_DOT_BATCH_DEFINE(q4_0,    q8_0)
+VEC_DOT_BATCH_DEFINE(q8_0,    q8_0)
+VEC_DOT_BATCH_DEFINE(q2_K,    q8_K)
+VEC_DOT_BATCH_DEFINE(q3_K,    q8_K)
+VEC_DOT_BATCH_DEFINE(q4_K,    q8_K)
+VEC_DOT_BATCH_DEFINE(q5_K,    q8_K)
+VEC_DOT_BATCH_DEFINE(q6_K,    q8_K)
+VEC_DOT_BATCH_DEFINE(iq2_xxs, q8_K)
+VEC_DOT_BATCH_DEFINE(iq2_xs,  q8_K)
+VEC_DOT_BATCH_DEFINE(iq3_xxs, q8_K)
+VEC_DOT_BATCH_DEFINE(iq4_nl,  q8_0)
+VEC_DOT_BATCH_DEFINE(iq3_s,   q8_K)
+VEC_DOT_BATCH_DEFINE(iq2_s,   q8_K)
+VEC_DOT_BATCH_DEFINE(iq4_xs,  q8_K)
+VEC_DOT_BATCH_DEFINE(mxfp4,   q8_0)
 #undef VEC_DOT_BATCH_DEFINE
-#undef VEC_DOT_BATCH_INLINE
+#undef VEC_DOT_BATCH_ROWS
+#undef BATCH_INLINE
 
-ggml_vec_dot_batch_t ggml_get_vec_dot_batch(enum ggml_type type) {
+ggml_vec_dot_batch_rows_t ggml_get_vec_dot_batch_rows(enum ggml_type type) {
     switch (type) {
-        case GGML_TYPE_IQ2_XXS: return iq2_xxs_batch;
-        case GGML_TYPE_IQ2_XS:  return iq2_xs_batch;
-        case GGML_TYPE_IQ2_S:   return iq2_s_batch;
-        case GGML_TYPE_IQ3_XXS: return iq3_xxs_batch;
-        case GGML_TYPE_IQ3_S:   return iq3_s_batch;
-        case GGML_TYPE_IQ4_NL:  return iq4_nl_batch;
-        case GGML_TYPE_Q4_K:    return q4_K_batch;
-        case GGML_TYPE_Q3_K:    return q3_K_batch;
-        case GGML_TYPE_Q5_K:    return q5_K_batch;
-        case GGML_TYPE_Q6_K:    return q6_K_batch;
-        case GGML_TYPE_Q2_K:    return q2_K_batch;
-        case GGML_TYPE_IQ4_XS:  return iq4_xs_batch;
-        case GGML_TYPE_Q4_0:    return q4_0_batch;
-        case GGML_TYPE_Q8_0:    return q8_0_batch;
-        case GGML_TYPE_MXFP4:   return mxfp4_batch;
-        default:                return NULL;
+        case GGML_TYPE_Q4_0:      return q4_0_rows;
+        case GGML_TYPE_Q8_0:      return q8_0_rows;
+        case GGML_TYPE_Q2_K:      return q2_K_rows;
+        case GGML_TYPE_Q3_K:      return q3_K_rows;
+        case GGML_TYPE_Q4_K:      return q4_K_rows;
+        case GGML_TYPE_Q5_K:      return q5_K_rows;
+        case GGML_TYPE_Q6_K:      return q6_K_rows;
+        case GGML_TYPE_IQ2_XXS:   return iq2_xxs_rows;
+        case GGML_TYPE_IQ2_XS:    return iq2_xs_rows;
+        case GGML_TYPE_IQ3_XXS:   return iq3_xxs_rows;
+        case GGML_TYPE_IQ4_NL:    return iq4_nl_rows;
+        case GGML_TYPE_IQ3_S:     return iq3_s_rows;
+        case GGML_TYPE_IQ2_S:     return iq2_s_rows;
+        case GGML_TYPE_IQ4_XS:    return iq4_xs_rows;
+        case GGML_TYPE_MXFP4:     return mxfp4_rows;
+        case GGML_TYPE_Q2_0:      return q2_0_rows;
+        case GGML_TYPE_Q2_0_G128: return q2_0_g128_rows;
+        default:                  return NULL;
     }
 }
 #endif

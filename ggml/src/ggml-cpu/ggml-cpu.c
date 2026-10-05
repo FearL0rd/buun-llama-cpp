@@ -2300,13 +2300,8 @@ static void ggml_compute_forward_mul_mat_id_one_chunk(
     ggml_vec_dot_t    const vec_dot      = type_traits_cpu[type].vec_dot;
     enum ggml_type    const vec_dot_type = type_traits_cpu[type].vec_dot_type;
 
-#if defined(__AVX2__)
-    // Amortize activation preparation over at least one output-column tile.
-    const bool is_q2 = ggml_type_is_q2_0(type);
-    const bool prepare_q2 = is_q2 && ne00 <= 16384 && ir0_end - ir0_start >= 16;
-    const ggml_vec_dot_batch_t batch = is_q2 ? NULL : ggml_get_vec_dot_batch(type);
-    if (prepare_q2 || ((is_q2 || batch) && ir1_end - ir1_start > 1)) {
-        const int qk = ggml_blck_size(type);
+    const ggml_vec_dot_batch_rows_t batch_rows = ggml_get_vec_dot_batch_rows(type);
+    if (batch_rows) {
         for (int64_t first = ir1_start; first < ir1_end; first += 4) {
             const int nr = (int) MIN(4, ir1_end - first);
             const void * ys[4];
@@ -2316,27 +2311,12 @@ static void ggml_compute_forward_mul_mat_id_one_chunk(
                 const int64_t i11 = rm.i1 % ne11;
                 ys[r] = (const char *) wdata + (src1_cont || src1->type != vec_dot_type
                     ? (i11 + rm.i2 * ne11) * row_size : i11 * nb11 + rm.i2 * nb12);
-                outs[r] = (float *) ((char *) dst->data + rm.i1 * nb1 + rm.i2 * nb2);
+                outs[r] = (float *) ((char *) dst->data + rm.i1 * nb1 + rm.i2 * nb2) + ir0_start;
             }
-            if (prepare_q2) {
-                for (int r = 0; r < nr; ++r) outs[r] += ir0_start;
-                ggml_vec_dot_q2_0_q8_0_batch_rows(ne00, outs, src0_cur + ir0_start * nb01,
-                        nb01, ys, nr, ir0_end - ir0_start, qk);
-                continue;
-            }
-            for (int64_t row = ir0_start; row < ir0_end; ++row) {
-                float sums[4];
-                if (batch) {
-                    batch(ne00, sums, src0_cur + row * nb01, ys, nr);
-                } else {
-                    ggml_vec_dot_q2_0_q8_0_batch(ne00, sums, src0_cur + row * nb01, ys, nr, qk);
-                }
-                for (int r = 0; r < nr; ++r) outs[r][row] = sums[r];
-            }
+            batch_rows(ne00, outs, src0_cur + ir0_start * nb01, nb01, ys, nr, ir0_end - ir0_start);
         }
         return;
     }
-#endif
 
     const int64_t blck_0 = 16;
     const int64_t blck_1 = 16;
@@ -5465,21 +5445,11 @@ int ggml_cpu_has_sme2(void) {
 
 static void ggml_cpu_moe_cache_rows(enum ggml_type type, int n, float * const * dst,
         const void * w, size_t stride, int64_t rows, const void * const * act, int nr) {
-#if defined(__AVX2__)
-    if (ggml_type_is_q2_0(type) && n <= 16384) {
-        ggml_vec_dot_q2_0_q8_0_batch_rows(n, dst, w, stride, act, nr, rows, ggml_blck_size(type));
+    const ggml_vec_dot_batch_rows_t batch_rows = ggml_get_vec_dot_batch_rows(type);
+    if (batch_rows) {
+        batch_rows(n, dst, w, stride, act, nr, rows);
         return;
     }
-    const ggml_vec_dot_batch_t batch = nr > 1 ? ggml_get_vec_dot_batch(type) : NULL;
-    if (batch) {
-        for (int64_t i = 0; i < rows; ++i) {
-            float sums[4];
-            batch(n, sums, (const char *) w + i*stride, act, nr);
-            for (int r = 0; r < nr; ++r) dst[r][i] = sums[r];
-        }
-        return;
-    }
-#endif
     const ggml_vec_dot_t vec_dot = type_traits_cpu[type].vec_dot;
     for (int64_t i = 0; i < rows; ++i) {
         for (int r = 0; r < nr; ++r) {
