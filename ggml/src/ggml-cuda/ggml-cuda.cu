@@ -4199,10 +4199,11 @@ static bool ggml_cuda_graph_update_required(
 
 // A large prefill executable holds ~100 MiB of device memory. When VRAM is fully committed (e.g. a
 // MoE cache sized to free memory), trade older cached executables for this one instead of aborting.
-static void ggml_cuda_graph_instantiate(ggml_backend_cuda_context * cuda_ctx, ggml_cuda_graph * graph) {
+static void ggml_cuda_graph_instantiate(ggml_backend_cuda_context * cuda_ctx, ggml_cuda_graph * graph,
+        cudaGraphExec_t & instance, cudaGraph_t source) {
     bool synced = false;
     cudaError_t err;
-    while ((err = cudaGraphInstantiate(&graph->instance, graph->graph, NULL, NULL, 0)) == cudaErrorMemoryAllocation) {
+    while ((err = cudaGraphInstantiate(&instance, source, NULL, NULL, 0)) == cudaErrorMemoryAllocation) {
         (void) cudaGetLastError();
         if (cuda_ctx->release_lru_cuda_graph_instance(graph)) {
             continue;
@@ -4217,16 +4218,19 @@ static void ggml_cuda_graph_instantiate(ggml_backend_cuda_context * cuda_ctx, gg
     CUDA_CHECK(err);
 }
 
-static void ggml_cuda_graph_update_executable(ggml_backend_cuda_context * cuda_ctx, uint64_t graph_key) {
-    ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
-
+static void ggml_cuda_graph_update_executable(ggml_backend_cuda_context * cuda_ctx, ggml_cuda_graph * graph,
+        cudaGraphExec_t & instance, cudaGraph_t source) {
+    if (instance == nullptr) {
+        ggml_cuda_graph_instantiate(cuda_ctx, graph, instance, source);
+        return;
+    }
 #if CUDART_VERSION >= 12000
     cudaGraphExecUpdateResultInfo result_info;
-    cudaError_t stat = cudaGraphExecUpdate(graph->instance, graph->graph, &result_info);
+    cudaError_t stat = cudaGraphExecUpdate(instance, source, &result_info);
 #else
     cudaGraphNode_t errorNode;
     cudaGraphExecUpdateResult result_info;
-    cudaError_t stat = cudaGraphExecUpdate(graph->instance, graph->graph, &errorNode, &result_info);
+    cudaError_t stat = cudaGraphExecUpdate(instance, source, &errorNode, &result_info);
 #endif // CUDART_VERSION >= 12000
 
     if (stat == cudaErrorGraphExecUpdateFailure) {
@@ -4237,9 +4241,9 @@ static void ggml_cuda_graph_update_executable(ggml_backend_cuda_context * cuda_c
         // The pre-existing graph exec cannot be updated due to violated constraints
         // so instead clear error and re-instantiate
         (void)cudaGetLastError();
-        CUDA_CHECK(cudaGraphExecDestroy(graph->instance));
-        graph->instance = nullptr;
-        ggml_cuda_graph_instantiate(cuda_ctx, graph);
+        CUDA_CHECK(cudaGraphExecDestroy(instance));
+        instance = nullptr;
+        ggml_cuda_graph_instantiate(cuda_ctx, graph, instance, source);
     } else {
         GGML_ASSERT(stat == cudaSuccess);
     }
@@ -8336,6 +8340,18 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
         }
     };
 
+    // segmented capture: see ggml_cuda_graph::head
+    int seg_every = 0;
+    int seg_next  = 0;
+    size_t n_head = 0;
+#ifdef USE_CUDA_GRAPH
+    static const int n_segments = getenv("GGML_CUDA_GRAPH_SEGMENTS") ? atoi(getenv("GGML_CUDA_GRAPH_SEGMENTS")) : 1;
+    if (use_cuda_graph && cuda_graph_update_required && n_segments > 1 && cgraph->n_nodes >= 1000) {
+        seg_every = cgraph->n_nodes / n_segments;
+        seg_next  = seg_every;
+    }
+#endif
+
     while (!graph_evaluated_or_captured) {
         // Only perform the graph execution if CUDA graphs are not enabled, or we are capturing the graph.
         // With the use of CUDA graphs, the execution will be performed by the graph launch.
@@ -8406,6 +8422,22 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
 
             for (int i = 0; i < cgraph->n_nodes; i++) {
                 ggml_tensor * node = cgraph->nodes[i];
+#ifdef USE_CUDA_GRAPH
+                if (seg_every > 0 && i >= seg_next && !is_concurrent_event_active) {
+                    ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
+                    cudaGraph_t seg = nullptr;
+                    CUDA_CHECK(cudaStreamEndCapture(cuda_ctx->stream(), &seg));
+                    if (n_head < graph->head.size()) {
+                        CUDA_CHECK(cudaGraphDestroy(graph->head[n_head].graph));
+                        graph->head[n_head].graph = seg;
+                    } else {
+                        graph->head.push_back({seg, nullptr});
+                    }
+                    n_head++;
+                    CUDA_CHECK(cudaStreamBeginCapture(cuda_ctx->stream(), cudaStreamCaptureModeRelaxed));
+                    seg_next += seg_every;
+                }
+#endif
                 if (is_concurrent_event_active) {
                     GGML_ASSERT(concurrent_event);
 
@@ -8497,6 +8529,13 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
 
             CUDA_CHECK(cudaStreamEndCapture(cuda_ctx->stream(), &graph->graph));
             graph_evaluated_or_captured = true; // CUDA graph has been captured
+            for (size_t s = n_head; s < graph->head.size(); s++) {
+                if (graph->head[s].instance != nullptr) {
+                    CUDA_CHECK(cudaGraphExecDestroy(graph->head[s].instance));
+                }
+                CUDA_CHECK(cudaGraphDestroy(graph->head[s].graph));
+            }
+            graph->head.resize(n_head);
 
             std::lock_guard<std::mutex> lock(ggml_cuda_lock);
             if (ggml_cuda_lock_counter.fetch_sub(1, std::memory_order_relaxed) == 1) {
@@ -8509,13 +8548,16 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
 
     if (use_cuda_graph) {
         ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
-        if (graph->instance == nullptr) { // Create executable graph from captured graph.
-            ggml_cuda_graph_instantiate(cuda_ctx, graph);
-        }
-        if (cuda_graph_update_required) { // Update graph executable
-            ggml_cuda_graph_update_executable(cuda_ctx, graph_key);
+        if (cuda_graph_update_required || graph->instance == nullptr) {
+            for (auto & seg : graph->head) {
+                ggml_cuda_graph_update_executable(cuda_ctx, graph, seg.instance, seg.graph);
+            }
+            ggml_cuda_graph_update_executable(cuda_ctx, graph, graph->instance, graph->graph);
         }
         // Launch graph
+        for (auto & seg : graph->head) {
+            CUDA_CHECK(cudaGraphLaunch(seg.instance, cuda_ctx->stream()));
+        }
         CUDA_CHECK(cudaGraphLaunch(graph->instance, cuda_ctx->stream()));
 #else
         GGML_UNUSED(graph_key);
