@@ -4876,7 +4876,7 @@ static void * moe_cache_fused_plan_expert_parallel(
                 mask |= UINT64_C(1) << row;
             }
             if (stage_experts > 0 && routes.size() == 1 && n_tokens >= 2 && n_tokens <= MMVQ_MAX_BATCH_SIZE &&
-                current.pair_pool == current.down_pool && ggml_type_is_q2_0(up->type) &&
+                current.pair_pool == current.down_pool && ggml_type_is_q2_0((ggml_type) up->type) &&
                 down->type == up->type && up->expert_size == down->expert_size && up->expert_size <= 512*1024 &&
                 !current.pair_pool->covers_all_entries &&
                 moe_cache_stream_stage_source(*current.device, up->data) &&
@@ -5161,7 +5161,7 @@ static void * moe_cache_fused_plan(
     // same full-FFN planner for resident and transient experts, without changing
     // the existing multi-device routing or larger prompt-processing batches.
     stream_stage = down && session->devices.size() == 1 && n_tokens <= MMVQ_MAX_BATCH_SIZE &&
-        ggml_type_is_q2_0(up->type) && down->type == up->type &&
+        ggml_type_is_q2_0((ggml_type) up->type) && down->type == up->type &&
         up->expert_size == down->expert_size && up->expert_size <= 512*1024 &&
         (ggml_cuda_info().devices[session->devices.front()->logical].cc == 860 ||
          ggml_cuda_info().devices[session->devices.front()->logical].cc == GGML_CUDA_CC_BLACKWELL);
