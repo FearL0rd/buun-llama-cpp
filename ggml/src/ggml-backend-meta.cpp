@@ -958,6 +958,20 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_calculate_split_st
         switch (tensor->op) {
             case GGML_OP_NONE: {
                 split_state = {GGML_BACKEND_SPLIT_AXIS_MIRRORED, {0}, {1}, 1};
+                // A scheduler copy of a host-resident expert weight ("<backend>#<weight>#<n>") keeps the
+                // weight's expert split, so each device uploads and runs only its own experts.
+                const char * first = strchr(tensor->name, '#');
+                const char * last  = strrchr(tensor->name, '#');
+                if (first != nullptr && last > first + 1) {
+                    ggml_tensor weight = *tensor;
+                    snprintf(weight.name, sizeof(weight.name), "%.*s", int(last - first - 1), first + 1);
+                    const ggml_backend_dev_t dev = ggml_backend_buft_get_device(ggml_backend_buffer_get_type(tensor->buffer));
+                    const auto * dev_ctx = (const ggml_backend_meta_device_context *) dev->context;
+                    const ggml_backend_meta_split_state ss = dev_ctx->get_split_state(&weight, dev_ctx->get_split_state_ud);
+                    if (ss.axis == GGML_BACKEND_SPLIT_AXIS_2) {
+                        return ss; // absolute sizes from the weight, not a ratio taken over from a source
+                    }
+                }
             } break;
             case GGML_OP_DUP: {
                 split_state = handle_generic(src_ss, /*scalar_only =*/ true);
