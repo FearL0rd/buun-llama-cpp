@@ -167,11 +167,28 @@ static bool ggml_backend_meta_device_supports_op(ggml_backend_dev_t dev, const g
         [op](ggml_backend_dev_t simple_dev) { return ggml_backend_dev_supports_op(simple_dev, op); });
 }
 
-// Host-weight ops (CPU-resident experts during prefill) are offloaded when every simple device
-// would offload them; calculate_split_state gives the scheduler's weight copy the weight's expert split.
+// Host-weight expert matmuls (CPU-resident experts during prefill) are offloaded when every simple
+// device would offload them; calculate_split_state gives the scheduler's weight copy the weight's
+// expert split, found by name. Dense weights, sidecar operands (src[3]+, e.g. EXL3 scales) and copy
+// names that GGML_MAX_NAME would truncate have no split rule for their copy, so they stay on the host.
 static bool ggml_backend_meta_device_offload_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
     GGML_ASSERT(ggml_backend_dev_is_meta(dev));
     const ggml_backend_meta_device_context * meta_dev_ctx = (const ggml_backend_meta_device_context *) dev->context;
+    if (op->op != GGML_OP_MUL_MAT_ID || op->src[3] != nullptr) {
+        return false;
+    }
+    // The copy is named "Meta(<dev>,<dev>...)#<weight>#<n>", as the meta backend names itself. Size the
+    // weight as the layer's longest expert name, so gate/up/down of one layer all offload or none do.
+    const char * weight = op->src[0]->name;
+    const char * ffn    = strstr(weight, "ffn_");
+    size_t name_len = strlen("Meta()") + meta_dev_ctx->simple_devs.size() - 1 + strlen("##0") +
+        (ffn ? size_t(ffn - weight) + strlen("ffn_gate_up_exps.weight") : strlen(weight));
+    for (ggml_backend_dev_t simple_dev : meta_dev_ctx->simple_devs) {
+        name_len += strlen(ggml_backend_dev_name(simple_dev));
+    }
+    if (name_len >= GGML_MAX_NAME) {
+        return false;
+    }
     return std::all_of(meta_dev_ctx->simple_devs.begin(), meta_dev_ctx->simple_devs.end(),
         [op](ggml_backend_dev_t simple_dev) { return ggml_backend_dev_offload_op(simple_dev, op); });
 }
