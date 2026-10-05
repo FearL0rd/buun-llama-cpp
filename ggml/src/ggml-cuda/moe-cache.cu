@@ -2029,6 +2029,25 @@ static char * moe_cache_map_shared_slab(const moe_cache_device & device, size_t 
     (void)cudaGetLastError();
     return slab;
 }
+
+// Bytes of the compute buffer the heaviest pool will alias, or 0 when nothing is lent.
+static size_t moe_cache_lend_size(const moe_cache_device & device) {
+    static const bool enabled = [] {
+        const char * env = getenv("GGML_CUDA_MOE_CACHE_LEND_BUDGET");
+        return !env || atoi(env) != 0;
+    }();
+    if (!enabled || !device.pools.empty() || !device.scratch_base) {
+        return 0;
+    }
+    CUdeviceptr base = 0;
+    size_t size = 0;
+    if (cuMemGetAddressRange(&base, &size, (CUdeviceptr)device.scratch_base) != CUDA_SUCCESS ||
+            base != (CUdeviceptr)device.scratch_base) {
+        (void)cudaGetLastError();
+        return 0;
+    }
+    return size;
+}
 #endif
 
 static bool moe_cache_allocate_pool(
@@ -2180,6 +2199,15 @@ static void moe_cache_build_pending(
         return;
     }
 
+    // The heaviest pool also aliases the compute buffer. Count those slots in the
+    // split so every expert tensor of a layer keeps the same coverage; a routed
+    // expert hits only when its up, gate and down are all resident.
+    size_t lend = 0;
+#if defined(GGML_USE_VMM) && !defined(GGML_USE_HIP)
+    lend = moe_cache_lend_size(device);
+    remaining = lend <= SIZE_MAX - remaining ? remaining + lend : SIZE_MAX;
+#endif
+
     std::vector<moe_cache_shape *> pending;
     long double total_weight = 0.0;
     size_t minimum_remaining = 0;
@@ -2221,9 +2249,13 @@ static void moe_cache_build_pending(
         } else if (share < minimum && remaining >= minimum) {
             share = minimum;
         }
+        if (lend) {
+            share = share > lend + minimum ? share - lend : minimum;
+        }
         const size_t before = device.allocated_bytes;
         moe_cache_allocate_pool(session, device, *shape, share);
-        const size_t consumed = device.allocated_bytes - before;
+        const size_t consumed = device.allocated_bytes - before + lend;
+        lend = 0;
         remaining = consumed <= remaining ? remaining - consumed : 0;
         total_weight -= weight;
         if (complete_pools) {
