@@ -8938,10 +8938,23 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
                     }
                     return false;
                 };
+                // an in-place node must not overwrite what the reduction still reads
+                auto read_by_reduction = [&](const ggml_tensor * t) {
+                    for (int k = i; k < end; ++k) {
+                        for (int s = 0; s < GGML_MAX_SRC; ++s) {
+                            const ggml_tensor * src = cgraph->nodes[k]->src[s];
+                            if (src && (src == t || src->view_src == t)) {
+                                return true;
+                            }
+                        }
+                    }
+                    return false;
+                };
                 for (; stop < cgraph->n_nodes && stop < end + 64; ++stop) {
-                    bool dependent = false;
+                    const ggml_tensor * node = cgraph->nodes[stop];
+                    bool dependent = node->view_src && read_by_reduction(node->view_src);
                     for (int s = 0; s < GGML_MAX_SRC && !dependent; ++s) {
-                        dependent = in_reduction(cgraph->nodes[stop]->src[s]);
+                        dependent = in_reduction(node->src[s]);
                     }
                     if (dependent) {
                         break;
