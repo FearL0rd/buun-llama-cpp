@@ -40,6 +40,7 @@
 #include "ggml-cuda/exl3.cuh"
 #include "ggml-cuda/mmvq-post-silu-match.h"
 #include "ggml-cuda/moe-weighted-reduction.cuh"
+#include "ggml-cuda/moe-cpu-share.cuh"
 #include "ggml-cuda/norm.cuh"
 #include "ggml-cuda/opt-step-adamw.cuh"
 #include "ggml-cuda/opt-step-sgd.cuh"
@@ -8777,7 +8778,31 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
                 params->add_alloc_dep(
                     params->user_data, const_cast<ggml_tensor *>(match.expert_scale), match.dst);
             }
-            i += match.node_count - 1;
+            // A reduction merging host-computed experts waits for the host: run the
+            // independent nodes that follow it (the shared expert) before it instead.
+            const int end = i + match.node_count;
+            int stop = end;
+            if (ggml_moe_cpu_share_hoist(match.dst->ne[1])) {
+                auto in_reduction = [&](const ggml_tensor * t) {
+                    for (int k = i; t && k < end; ++k) {
+                        if (cgraph->nodes[k] == t || cgraph->nodes[k] == t->view_src) {
+                            return true;
+                        }
+                    }
+                    return false;
+                };
+                for (; stop < cgraph->n_nodes && stop < end + 64; ++stop) {
+                    bool dependent = false;
+                    for (int s = 0; s < GGML_MAX_SRC && !dependent; ++s) {
+                        dependent = in_reduction(cgraph->nodes[stop]->src[s]);
+                    }
+                    if (dependent) {
+                        break;
+                    }
+                }
+                std::rotate(cgraph->nodes + i, cgraph->nodes + end, cgraph->nodes + stop);
+            }
+            i = stop - 1;
         }
     }
 

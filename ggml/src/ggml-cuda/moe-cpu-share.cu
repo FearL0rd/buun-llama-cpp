@@ -14,6 +14,10 @@ ggml_moe_cpu_share_args ggml_moe_cpu_share_down(const ggml_tensor *, const ggml_
     return {};
 }
 
+bool ggml_moe_cpu_share_hoist(int64_t) {
+    return false;
+}
+
 ggml_moe_cpu_share_args ggml_moe_cpu_share_merge(const ggml_tensor *) {
     return {};
 }
@@ -746,6 +750,11 @@ ggml_moe_cpu_share_args ggml_moe_cpu_share_down(const ggml_tensor * down, const 
         args.stage_x = h.st->stage[2];
     }
     return args;
+}
+
+bool ggml_moe_cpu_share_hoist(int64_t n_tok) {
+    static const bool off = getenv("GGML_CUDA_MOE_SHARE_HOIST") && atoi(getenv("GGML_CUDA_MOE_SHARE_HOIST")) == 0;
+    return !off && share_gpu_fraction() >= 0.0f && n_tok <= share_max_tokens;
 }
 
 ggml_moe_cpu_share_args ggml_moe_cpu_share_merge(const ggml_tensor * experts) {

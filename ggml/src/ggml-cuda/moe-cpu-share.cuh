@@ -33,5 +33,8 @@ ggml_moe_cpu_share_args ggml_moe_cpu_share_begin(
 // Down launch of the layer opened by begin; skip is null otherwise.
 ggml_moe_cpu_share_args ggml_moe_cpu_share_down(const ggml_tensor * down, const ggml_tensor * ids, const ggml_tensor * dst);
 
+// Whether graph optimization should run the nodes after a weighted reduction of n_tok tokens before it.
+bool ggml_moe_cpu_share_hoist(int64_t n_tok);
+
 // Weighted reduction over experts: the merge view when experts is a shared down's output.
 ggml_moe_cpu_share_args ggml_moe_cpu_share_merge(const ggml_tensor * experts);
