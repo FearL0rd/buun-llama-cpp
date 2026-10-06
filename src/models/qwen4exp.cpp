@@ -226,7 +226,8 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
         // a fresh open file description, so its random-access hint does not reach the loader's
         const auto * w = ml.get_weight(ple_name.c_str());
         const char * io = getenv("LLAMA_PLE_IO");
-        if (w && ml.lazy.has(per_layer_tok_embd) && !(io && strcmp(io, "mmap") == 0)) {
+        if (w && ml.lazy.has(per_layer_tok_embd) && ggml_get_type_traits(per_layer_tok_embd->type)->to_float &&
+                !(io && strcmp(io, "mmap") == 0)) {
             const std::string path = "/proc/self/fd/" + std::to_string(ml.files.at(w->idx)->file_id());
             ple_fd = open(path.c_str(), O_RDONLY | O_CLOEXEC);
             if (ple_fd >= 0) {
