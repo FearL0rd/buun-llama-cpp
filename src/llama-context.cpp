@@ -5593,13 +5593,11 @@ llm_graph_result * llama_context::get_gf_res_reserve() const {
     return static_cast<llm_graph_result *>(gf_res_reserve.get());
 }
 
-// Batches without outputs share slot 0; with outputs, small batches (decode, speculative verify and
-// draft sizes) get a slot per token count and larger ones share the last slot.
+// Small batches (decode, speculative verify, draft catch-up) get a slot per token count and larger
+// ones share one, separately for batches with and without outputs.
 int llama_context::graph_slot(const llama_ubatch & ubatch) const {
-    if (n_outputs == 0) {
-        return 0;
-    }
-    return (int) std::min<uint32_t>(ubatch.n_tokens, GGML_SCHED_MAX_GRAPH_SLOTS - 1);
+    const int half = GGML_SCHED_MAX_GRAPH_SLOTS / 2;
+    return (n_outputs > 0 ? half : 0) + (int) std::min<uint32_t>(ubatch.n_tokens - 1, half - 1);
 }
 
 llm_graph_result * llama_context::get_gf_res_prev(int slot) {
