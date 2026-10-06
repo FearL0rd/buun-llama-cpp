@@ -4288,8 +4288,12 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
 // Captured graphs hard-code tensor shapes. Keep alternating speculative verify
 // widths in separate cache entries without walking every graph node on the hot
 // path. A residual collision is safe: the normal update check recaptures it.
+// Graphs that can never be captured (prefill widths) share one key, so they don't fill the cache
+// with an entry per split and shape that pushes the decode graphs out before they warm up.
+static constexpr uint64_t ggml_cuda_graph_uncapturable_key = 0;
+
 static uint64_t ggml_cuda_graph_get_key(ggml_cgraph * cgraph) {
-    return ggml_cuda_graph_shape_key(cgraph);
+    return ggml_cuda_graph_check_compability(cgraph) ? ggml_cuda_graph_shape_key(cgraph) : ggml_cuda_graph_uncapturable_key;
 }
 
 static bool ggml_cuda_graph_update_required(
@@ -8802,9 +8806,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
 
     ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
     if (graph->is_enabled()) {
-        const bool graph_compatible = ggml_cuda_graph_check_compability(cgraph);
-        graph->incompatible = !graph_compatible;
-        if (graph_compatible) {
+        if (graph_key != ggml_cuda_graph_uncapturable_key) {
             const bool properties_changed = ggml_cuda_graph_update_required(cuda_ctx, cgraph, graph_key);
 
             if (!graph->warmup_complete) {

@@ -1392,7 +1392,6 @@ struct ggml_cuda_graph {
     std::vector<cudaGraphNode_t> nodes;
     bool disable_due_to_gpu_arch = false;
     bool warmup_complete = false;
-    bool incompatible = false; // last evaluation could not use a graph (e.g. a prefill ubatch)
     uint64_t uid = 0;
     int64_t last_used_time = 0;
     struct node_properties {
@@ -1750,14 +1749,9 @@ struct ggml_backend_cuda_context {
         auto it = cuda_graphs.find(graph_key);
         if (it == cuda_graphs.end()) {
             while (cuda_graphs.size() >= max_cuda_graphs) {
-                // Prefill creates an entry per split and ubatch shape that can never be captured;
-                // evict those before the decode graphs they would push out. Everything else stays
-                // LRU: a decode shape needs its entry to survive until it warms up.
                 auto lru = cuda_graphs.begin();
                 for (auto current = cuda_graphs.begin(); current != cuda_graphs.end(); ++current) {
-                    const bool cur_dead = current->second->incompatible;
-                    const bool lru_dead = lru->second->incompatible;
-                    if (cur_dead != lru_dead ? cur_dead : current->second->last_used_time < lru->second->last_used_time) {
+                    if (current->second->last_used_time < lru->second->last_used_time) {
                         lru = current;
                     }
                 }
