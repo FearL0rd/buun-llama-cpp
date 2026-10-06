@@ -406,6 +406,20 @@ bool repack(const std::string &          source_path,
     return true;
 }
 
+// the balanced map's target token ids below n_vocab, ascending
+template <typename T>
+void qwen27b_map_ids(int64_t n_vocab, std::vector<T> & ids) {
+    ids.clear();
+    ids.reserve(QWEN_DRAFT_VOCAB_SIZE);
+    for (int64_t token = 0; token < n_vocab; ++token) {
+        const size_t word = static_cast<size_t>(token) / 64;
+        const size_t bit  = static_cast<size_t>(token) % 64;
+        if (word < QWEN27B_BALANCED_VOCAB.size() && (QWEN27B_BALANCED_VOCAB[word] & (UINT64_C(1) << bit)) != 0) {
+            ids.push_back(static_cast<T>(token));
+        }
+    }
+}
+
 bool get_u32(const gguf_context * ctx, const char * key, uint32_t & value) {
     const int64_t id = gguf_find_key(ctx, key);
     if (id < 0 || gguf_get_kv_type(ctx, id) != GGUF_TYPE_UINT32) {
@@ -487,15 +501,7 @@ bool qwen27b_map(const std::string & source_path,
         reason = "the Qwen-27B public balanced map has exactly 32768 entries";
         return false;
     }
-    admission.map.clear();
-    admission.map.reserve(QWEN_DRAFT_VOCAB_SIZE);
-    for (int64_t token = 0; token < n_vocab; ++token) {
-        const size_t word = static_cast<size_t>(token) / 64;
-        const size_t bit  = static_cast<size_t>(token) % 64;
-        if (word < QWEN27B_BALANCED_VOCAB.size() && (QWEN27B_BALANCED_VOCAB[word] & (UINT64_C(1) << bit)) != 0) {
-            admission.map.push_back(token);
-        }
-    }
+    qwen27b_map_ids(n_vocab, admission.map);
     admission.output_type = output_type;
     admission.tensors.clear();
     admission.tensors.reserve(static_cast<size_t>(gguf_get_n_tensors(source.get())));
@@ -624,15 +630,7 @@ bool common_mtp_vocab_trim_ids(const std::string & gguf_path, uint32_t draft_voc
     if (!tokenizer_matches(source.get(), reason)) {
         return false;
     }
-    ids.clear();
-    ids.reserve(QWEN_DRAFT_VOCAB_SIZE);
-    for (int32_t token = 0; token < static_cast<int32_t>(QWEN_TOKENIZER_SIZE); ++token) {
-        const size_t word = static_cast<size_t>(token) / 64;
-        const size_t bit  = static_cast<size_t>(token) % 64;
-        if (word < QWEN27B_BALANCED_VOCAB.size() && (QWEN27B_BALANCED_VOCAB[word] & (UINT64_C(1) << bit)) != 0) {
-            ids.push_back(token);
-        }
-    }
+    qwen27b_map_ids(static_cast<int64_t>(QWEN_TOKENIZER_SIZE), ids);
     return ids.size() == draft_vocab_size;
 }
 

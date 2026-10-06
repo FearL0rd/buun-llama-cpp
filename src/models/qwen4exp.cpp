@@ -457,7 +457,7 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
     // the device stages and writes its argmax token and next hidden row back.
     const bool chain = cparams.mtp_chain_tok && n_tokens == 1 && n_outputs == 1;
 
-    ggml_tensor * tokens = cparams.mtp_chain_tok;
+    ggml_tensor * tokens = chain ? cparams.mtp_chain_tok : nullptr;
     ggml_tensor * h      = chain ? ggml_reshape_2d(ctx0, cparams.mtp_chain_h, hparams.n_embd_out(), 1) : nullptr;
     if (!chain) {
         auto inp = std::make_unique<llm_graph_input_embd_h>(hparams.n_embd_out());
@@ -581,12 +581,14 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
     ggml_tensor * head_in_s = layer.nextn.shared_head_head ? layer.nextn.shared_head_head_in_s : model.output_in_s;
     cur = build_lora_mm(head_w, cur, head_s, head_in_s);
     cb(cur, "result_output", -1);
+    // a trimmed target head maps its rows back to target token ids
+    const bool d2t_head = model.d2t && head_w == model.output;
     if (chain) {
         // the draft's own inputs are ancestors of both copies, so overwriting the stages is safe
         const int64_t n_vocab_head = cur->ne[0];
         ggml_tensor * head_tok = ggml_argmax(ctx0, cur);
         ggml_tensor * tok = head_tok;
-        if (model.d2t && head_w == model.output) {
+        if (d2t_head) {
             tok = ggml_get_rows(ctx0, ggml_reshape_2d(ctx0, model.d2t, 1, n_vocab_head), tok);
         }
         ggml_build_forward_expand(gf, ggml_cpy(ctx0, tok, cparams.mtp_chain_tok));
@@ -604,7 +606,7 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
         ggml_build_forward_expand(gf, ggml_cpy(ctx0, flat_out, cparams.mtp_chain_h));
         return;
     }
-    if (model.d2t && head_w == model.output) {
+    if (d2t_head) {
         cur = build_d2t_logits(cur, model.d2t, (int64_t) model.vocab.n_tokens());
     }
     res->t_logits = cur;

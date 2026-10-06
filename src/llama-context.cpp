@@ -4087,12 +4087,7 @@ bool llama_context::set_mtp_draft_chain(bool enable) {
         }
         // the stages live with the MTP block so its graph reads and writes them in place
         ggml_backend_dev_t dev = model.dev_layer(hparams.n_layer());
-        for (auto & backend : backends) {
-            if (ggml_backend_get_device(backend.get()) == dev) {
-                mtp_chain_backend = backend.get();
-                break;
-            }
-        }
+        mtp_chain_backend = backend_for_device(dev);
         if (!mtp_chain_backend) {
             return false;
         }
@@ -4134,11 +4129,12 @@ bool llama_context::set_mtp_draft_chain(bool enable) {
             ggml_backend_tensor_get(model.d2t, ids.data(), 0, ggml_nbytes(model.d2t));
             const size_t row = embd_w->nb[1];
             std::vector<uint8_t> rows(ggml_nbytes(embd));
-            for (size_t i = 0; i < ids.size(); ++i) {
-                ggml_backend_tensor_get(embd_w, rows.data() + i * row, (size_t) ids[i] * row, row);
+            // the ids ascend, so read each run of consecutive rows at once
+            for (size_t i = 0, j; i < ids.size(); i = j) {
+                for (j = i + 1; j < ids.size() && ids[j] == ids[j - 1] + 1; ++j) {}
+                ggml_backend_tensor_get(embd_w, rows.data() + i * row, (size_t) ids[i] * row, (j - i) * row);
             }
             ggml_backend_tensor_set(embd, rows.data(), 0, rows.size());
-            mtp_chain_embd_src = embd_w;
         }
 
         // pinned so the per-draft readback stays asynchronous
@@ -4162,8 +4158,6 @@ bool llama_context::set_mtp_draft_chain(bool enable) {
     cparams.mtp_chain_p    = enable ? mtp_chain_p    : nullptr;
     cparams.mtp_chain_e    = enable ? mtp_chain_e    : nullptr;
     cparams.mtp_chain_embd = enable ? mtp_chain_embd : nullptr;
-    // the chained draft graph has a different topology and the reuse check does not compare cparams
-    invalidate_graph_results();
     return true;
 }
 
@@ -4173,7 +4167,8 @@ void llama_context::mtp_draft_chain_seed(llama_token token, const float * h) {
     ggml_backend_tensor_set(mtp_chain_h, h, 0, ggml_nbytes(mtp_chain_h));
     if (mtp_chain_e) {
         // the seed is a target token, possibly outside the head vocabulary: dequantize its row here
-        const ggml_tensor * src = mtp_chain_embd_src;
+        const auto & layer = model.layers[model.hparams.n_layer()];
+        const ggml_tensor * src = layer.nextn.embed_tokens ? layer.nextn.embed_tokens : model.tok_embd;
         std::vector<uint8_t> row(src->nb[1]);
         std::vector<float> e(src->ne[0]);
         ggml_backend_tensor_get(src, row.data(), (size_t) token * src->nb[1], src->nb[1]);

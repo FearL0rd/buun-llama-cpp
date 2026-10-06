@@ -2606,16 +2606,13 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         auto * ctx_dft = params.ctx_dft;
         // chained draft graphs emit no logits, so the backend sampler must be detached
         if (enable) {
-            if (backend_chains[0]) {
-                llama_set_sampler(ctx_dft, 0, nullptr);
-            }
             if (!llama_set_mtp_draft_chain(ctx_dft, true)) {
                 SPC_WRN("%s", "MTP draft chain unsupported; drafting step by step\n");
                 draft_chain_supported = false;
-                if (backend_chains[0]) {
-                    llama_set_sampler(ctx_dft, 0, backend_chains[0]);
-                }
                 return;
+            }
+            if (backend_chains[0]) {
+                llama_set_sampler(ctx_dft, 0, nullptr);
             }
         } else {
             llama_set_mtp_draft_chain(ctx_dft, false);

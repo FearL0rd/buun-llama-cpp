@@ -997,6 +997,7 @@ struct llm_graph_params {
             cparams.dflash_inject_stage     == other.cparams.dflash_inject_stage     &&
             cparams.dflash_oneg_n_inject    == other.cparams.dflash_oneg_n_inject    &&
             cparams.dflash_target_mmq_batch == other.cparams.dflash_target_mmq_batch &&
+            cparams.mtp_chain_tok           == other.cparams.mtp_chain_tok           &&
             arch  == other.arch  &&
             gtype == other.gtype &&
             cvec  == other.cvec  &&

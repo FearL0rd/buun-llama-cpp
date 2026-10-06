@@ -1847,14 +1847,16 @@ static void ggml_backend_sched_scratch_prepare(ggml_backend_sched_t sched) {
     }
     const uint32_t generation = ggml_gallocr_get_generation(sched->galloc);
     for (int b = 0; b < sched->n_backends; b++) {
-        size_t high_water = 0;
-        ggml_backend_buffer_t buffer = ggml_gallocr_get_plan_buffer(sched->galloc, b, &high_water);
+        size_t plan_high_water = 0; // the last planned graph's, not the max over the slots
+        ggml_backend_buffer_t buffer = ggml_gallocr_get_plan_buffer(sched->galloc, b, &plan_high_water);
         if (buffer) {
-            high_water = sched->alloc_high_water[b];
-            for (int s = 0; sched->graph_slots && s < GGML_SCHED_MAX_GRAPH_SLOTS; s++) {
-                const ggml_backend_sched_graph_state & state = sched->graph_slots[s];
-                if (state.is_alloc && state.alloc_generation == generation) {
-                    high_water = std::max(high_water, state.alloc_high_water[b]);
+            size_t high_water = sched->alloc_high_water[b];
+            if (sched->graph_slots) {
+                for (int s = 0; s < GGML_SCHED_MAX_GRAPH_SLOTS; s++) {
+                    const ggml_backend_sched_graph_state & state = sched->graph_slots[s];
+                    if (state.is_alloc && state.alloc_generation == generation) {
+                        high_water = std::max(high_water, state.alloc_high_water[b]);
+                    }
                 }
             }
             ggml_moe_cache.scratch_prepare(sched->moe_cache_session, sched->backends[b], buffer, high_water);

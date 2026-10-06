@@ -579,8 +579,7 @@ static bool share_init(share_host & h, int n_embd) {
 
 // Called with h.mu held, outside any graph capture, on the device whose route is registered.
 static bool share_dev_init(share_host & h) {
-    int id;
-    CUDA_CHECK(cudaGetDevice(&id));
+    const int id = ggml_cuda_get_device();
     share_dev & d = h.devs[id];
     if (d.st) {
         return true;

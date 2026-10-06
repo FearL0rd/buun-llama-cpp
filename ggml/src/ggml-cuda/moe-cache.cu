@@ -425,6 +425,15 @@ struct moe_cache_session {
     std::unordered_map<const void *, active_source> active_sources;
 };
 
+static moe_cache_device * moe_cache_device_for(const moe_cache_session & session, int logical) {
+    for (const auto & device : session.devices) {
+        if (device->logical == logical) {
+            return device.get();
+        }
+    }
+    return nullptr;
+}
+
 struct moe_cache_pin {
     moe_cache_pool * pool = nullptr;
     int slot = -1;
@@ -2762,11 +2771,9 @@ static int moe_cache_prefill_copy(void * opaque, void * backend_opaque,
     auto & session = *(moe_cache_session *) opaque;
     std::unique_lock<std::mutex> lock(session.mu);
     if (session.stopping || session.dormant || session.active_scopes == 0) return false;
-    const auto local = std::find_if(session.devices.begin(), session.devices.end(), [&](const auto & device) {
-        return device->logical == ctx->device;
-    });
-    if (local == session.devices.end() || (*local)->dead) return false;
-    auto & device = **local;
+    moe_cache_device * local = moe_cache_device_for(session, ctx->device);
+    if (!local || local->dead) return false;
+    auto & device = *local;
     const int pool_index = moe_cache_find_pool(device, expert_size, source->type);
     if (pool_index < 0) return false;
     const auto & pool = *device.pools[pool_index];
@@ -3975,12 +3982,11 @@ static int moe_cache_route_supported(void * opaque, void * backend_opaque, const
         return 0;
     }
     auto * ctx = (ggml_backend_cuda_context *) backend->context;
-    auto owner = std::find_if(session->devices.begin(), session->devices.end(),
-            [&](const auto & device) { return device->logical == ctx->device; });
-    if (owner == session->devices.end()) {
+    moe_cache_device * owner = moe_cache_device_for(*session, ctx->device);
+    if (!owner) {
         return 0;
     }
-    moe_cache_device & device = **owner;
+    moe_cache_device & device = *owner;
     const ggml_tensor * weights = op->src[0];
     const ggml_tensor * ids = op->src[2];
     if (ctx->external_capture || device.dead.load() ||
@@ -6016,13 +6022,7 @@ static void moe_cache_scratch_prepare(void * opaque, void * backend_opaque, ggml
         return;
     }
     auto * ctx = (ggml_backend_cuda_context *) backend->context;
-    moe_cache_device * selected = nullptr;
-    for (auto & device_ptr : session->devices) {
-        if (device_ptr->logical == ctx->device) {
-            selected = device_ptr.get();
-            break;
-        }
-    }
+    moe_cache_device * selected = moe_cache_device_for(*session, ctx->device);
     if (!selected) {
         return;
     }
