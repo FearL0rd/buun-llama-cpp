@@ -4331,10 +4331,16 @@ static bool ggml_cuda_graph_update_required(
     for (int i = 0; i < cgraph->n_nodes; i++) {
         ggml_cuda_graph::node_properties prop = {};
         memcpy(&prop.node, cgraph->nodes[i], sizeof(ggml_tensor));
+        // Tensor object identity is not baked into the captured kernels, and a ggml graph rebuild
+        // (or scheduler re-split) re-creates identical nodes at new addresses. Compare what the
+        // kernels consume instead: data pointers, shapes, strides and types.
+        std::fill(std::begin(prop.node.src), std::end(prop.node.src), nullptr);
+        prop.node.view_src = nullptr;
 
         for (int j = 0; j < GGML_MAX_SRC; ++j) {
             if (cgraph->nodes[i]->src[j]) {
                 prop.node_src_data_ptrs[j] = cgraph->nodes[i]->src[j]->data;
+                prop.node_src_type[j]      = cgraph->nodes[i]->src[j]->type;
                 memcpy(prop.node_src_ne[j], cgraph->nodes[i]->src[j]->ne, sizeof(prop.node_src_ne[j]));
                 memcpy(prop.node_src_nb[j], cgraph->nodes[i]->src[j]->nb, sizeof(prop.node_src_nb[j]));
             }
