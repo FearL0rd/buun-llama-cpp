@@ -114,8 +114,15 @@
 #include <cstdio>
 #include <cstdlib>
 #include <string>
+#include <thread>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
+#ifdef __linux__
+#include <pthread.h>
+#include <sched.h>
+#include <sys/mman.h>
+#endif
 
 static_assert(sizeof(half) == sizeof(ggml_fp16_t), "wrong fp16 size");
 
@@ -2081,13 +2088,147 @@ static bool ggml_backend_buft_is_cuda_host(ggml_backend_buffer_type_t buft) {
     return buft->iface.get_name == ggml_backend_cuda_host_buffer_type_name;
 }
 
+#ifdef __linux__
+// On hosts with 2+ NUMA nodes, large pinned buffers are first-touched in 2 MiB stripes by one
+// thread per node, so CPU reads of them (moe cpu share) draw on every node's memory channels
+// instead of the one node the allocating thread ran on. GGML_CUDA_HOST_NUMA_SPREAD=0 disables it.
+static std::mutex g_numa_spread_mu;
+static std::unordered_map<void *, size_t> g_numa_spread;
+
+// Logs where the kernel actually placed [ptr, ptr + size): a stripe only helps if first touch
+// was honoured (a node short on free memory takes less, the rest falls to its neighbours).
+static void ggml_cuda_host_log_numa_placement(const void * ptr, size_t size, size_t n_nodes) {
+    FILE * f = fopen("/proc/self/numa_maps", "r");
+    if (!f) {
+        return;
+    }
+    std::vector<double> mib(n_nodes, 0.0);
+    char line[4096];
+    while (fgets(line, sizeof(line), f)) {
+        if (strtoull(line, nullptr, 16) != (uintptr_t) ptr) {
+            continue;
+        }
+        double page_kib = 4.0;
+        if (const char * kp = strstr(line, "kernelpagesize_kB=")) {
+            page_kib = atof(kp + strlen("kernelpagesize_kB="));
+        }
+        for (const char * t = strstr(line, " N"); t; t = strstr(t + 1, " N")) {
+            size_t node, pages;
+            if (sscanf(t, " N%zu=%zu", &node, &pages) == 2 && node < n_nodes) {
+                mib[node] = pages*page_kib/1024.0;
+            }
+        }
+        break;
+    }
+    fclose(f);
+    std::string msg;
+    double total = 0.0, most = 0.0;
+    for (size_t n = 0; n < n_nodes; ++n) {
+        char part[64];
+        snprintf(part, sizeof(part), " N%zu=%.0f", n, mib[n]);
+        msg += part;
+        total += mib[n];
+        most = std::max(most, mib[n]);
+    }
+    if (total > 0.0 && most > 1.5*total/n_nodes) {
+        GGML_LOG_WARN("%s: %.2f MiB pinned, NUMA stripe skewed (MiB per node:%s); free page cache on the full nodes\n",
+            __func__, size/1024.0/1024.0, msg.c_str());
+    } else {
+        GGML_LOG_INFO("%s: %.2f MiB pinned, striped over NUMA nodes (MiB per node:%s)\n", __func__, size/1024.0/1024.0, msg.c_str());
+    }
+}
+
+static void * ggml_cuda_host_malloc_numa_spread(size_t size) {
+    static const bool enabled = !getenv("GGML_CUDA_HOST_NUMA_SPREAD") || atoi(getenv("GGML_CUDA_HOST_NUMA_SPREAD")) != 0;
+    if (!enabled || size < ((size_t) 1 << 30)) {
+        return nullptr;
+    }
+    std::vector<cpu_set_t> nodes;
+    for (int n = 0; ; ++n) {
+        FILE * f = fopen(("/sys/devices/system/node/node" + std::to_string(n) + "/cpulist").c_str(), "r");
+        if (!f) {
+            break;
+        }
+        cpu_set_t set;
+        CPU_ZERO(&set);
+        for (int lo, hi; fscanf(f, "%d", &lo) == 1; ) {
+            hi = lo;
+            if (fscanf(f, "-%d", &hi) != 1) {
+                hi = lo;
+            }
+            for (int c = lo; c <= hi; ++c) {
+                CPU_SET(c, &set);
+            }
+            if (fgetc(f) != ',') {
+                break;
+            }
+        }
+        fclose(f);
+        nodes.push_back(set);
+    }
+    if (nodes.size() < 2) {
+        return nullptr;
+    }
+    void * ptr = mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (ptr == MAP_FAILED) {
+        return nullptr;
+    }
+    const size_t stripe = (size_t) 2 << 20;
+    std::vector<std::thread> touch;
+    for (size_t n = 0; n < nodes.size(); ++n) {
+        touch.emplace_back([&, n] {
+            pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &nodes[n]);
+            for (size_t off = n*stripe; off < size; off += nodes.size()*stripe) {
+                memset((char *) ptr + off, 0, std::min(stripe, size - off));
+            }
+        });
+    }
+    for (auto & t : touch) {
+        t.join();
+    }
+    if (cudaHostRegister(ptr, size, cudaHostRegisterPortable | cudaHostRegisterMapped) != cudaSuccess) {
+        (void) cudaGetLastError();
+        munmap(ptr, size);
+        return nullptr;
+    }
+    std::lock_guard<std::mutex> lock(g_numa_spread_mu);
+    g_numa_spread[ptr] = size;
+    ggml_cuda_host_log_numa_placement(ptr, size, nodes.size());
+    return ptr;
+}
+
+static bool ggml_cuda_host_free_numa_spread(void * ptr) {
+    size_t size;
+    {
+        std::lock_guard<std::mutex> lock(g_numa_spread_mu);
+        auto it = g_numa_spread.find(ptr);
+        if (it == g_numa_spread.end()) {
+            return false;
+        }
+        size = it->second;
+        g_numa_spread.erase(it);
+    }
+    CUDA_CHECK(cudaHostUnregister(ptr));
+    munmap(ptr, size);
+    return true;
+}
+#else
+static void * ggml_cuda_host_malloc_numa_spread(size_t) { return nullptr; }
+static bool ggml_cuda_host_free_numa_spread(void *) { return false; }
+#endif
+
 static void ggml_backend_cuda_host_buffer_free_buffer(ggml_backend_buffer_t buffer) {
-    CUDA_CHECK(cudaFreeHost(buffer->context));
+    if (!ggml_cuda_host_free_numa_spread(buffer->context)) {
+        CUDA_CHECK(cudaFreeHost(buffer->context));
+    }
 }
 
 static void * ggml_cuda_host_malloc(size_t size) {
     if (getenv("GGML_CUDA_NO_PINNED") != nullptr) {
         return nullptr;
+    }
+    if (void * spread = ggml_cuda_host_malloc_numa_spread(size)) {
+        return spread;
     }
 
     void * ptr = nullptr;
