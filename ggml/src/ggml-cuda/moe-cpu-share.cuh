@@ -13,6 +13,9 @@
 // Device view of the share handed to a routed matvec or to the weighted reduction.
 struct ggml_moe_cpu_share_args {
     const uint8_t * skip = nullptr;     // per route (indexed like ids): 0 = GPU, else 1 + host entry
+    // per route: the staged VRAM copy of a GPU-streamed miss's weights, or null to read the table
+    const void * const * stage_x = nullptr;
+    const void * const * stage_gate = nullptr;
     int ids_stride = 0;                 // reduction only: ids row stride, in elements
     const float * y = nullptr;          // reduction only: host output rows, one per entry
     const uint32_t * done = nullptr;    // mapped: last ticket the host finished
@@ -29,6 +32,9 @@ ggml_moe_cpu_share_args ggml_moe_cpu_share_begin(
 
 // Down launch of the layer opened by begin; skip is null otherwise.
 ggml_moe_cpu_share_args ggml_moe_cpu_share_down(const ggml_tensor * down, const ggml_tensor * ids, const ggml_tensor * dst);
+
+// Whether graph optimization should run the nodes after a weighted reduction of n_tok tokens before it.
+bool ggml_moe_cpu_share_hoist(int64_t n_tok);
 
 // Weighted reduction over experts: the merge view when experts is a shared down's output.
 ggml_moe_cpu_share_args ggml_moe_cpu_share_merge(const ggml_tensor * experts);

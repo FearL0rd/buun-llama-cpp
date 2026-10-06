@@ -12,11 +12,12 @@ static inline size_t ggml_moe_cache_effective_min_expert_bytes(
     if (explicit_minimum) return default_minimum;
     // EXL3's CPU trellis decode is costlier than ordinary vector dots.
     if (ggml_type_is_exl3((enum ggml_type)wtype)) return 128u << 10;
-    // Q2_0 stores twice as many weights per byte as Q4_0. A 450 KiB
-    // Q2_0 expert should not miss the ordinary 512 KiB floor merely because
-    // its codes are more compact; retain the same minimum weight count.
-    if (ggml_type_is_q2_0((enum ggml_type)wtype)) return default_minimum / 2;
-    return default_minimum;
+    // The floor counts weights at Q4_0 density: a low-bit expert (Q2_0, IQ2_*)
+    // must not miss it merely because its codes are more compact.
+    const enum ggml_type type = (enum ggml_type)wtype;
+    const size_t q4_bytes = ggml_type_size(GGML_TYPE_Q4_0) * ggml_blck_size(type);
+    const size_t type_bytes = ggml_type_size(type) * ggml_blck_size(GGML_TYPE_Q4_0);
+    return type_bytes < q4_bytes ? (size_t)((uint64_t)default_minimum * type_bytes / q4_bytes) : default_minimum;
 }
 
 // Slot IDs remain int32. Ordinary kernels also index quant blocks with int32;

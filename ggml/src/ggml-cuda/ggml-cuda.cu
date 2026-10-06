@@ -40,6 +40,7 @@
 #include "ggml-cuda/exl3.cuh"
 #include "ggml-cuda/mmvq-post-silu-match.h"
 #include "ggml-cuda/moe-weighted-reduction.cuh"
+#include "ggml-cuda/moe-cpu-share.cuh"
 #include "ggml-cuda/norm.cuh"
 #include "ggml-cuda/opt-step-adamw.cuh"
 #include "ggml-cuda/opt-step-sgd.cuh"
@@ -113,8 +114,15 @@
 #include <cstdio>
 #include <cstdlib>
 #include <string>
+#include <thread>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
+#ifdef __linux__
+#include <pthread.h>
+#include <sched.h>
+#include <sys/mman.h>
+#endif
 
 static_assert(sizeof(half) == sizeof(ggml_fp16_t), "wrong fp16 size");
 
@@ -857,6 +865,11 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
 
 // cuda buffer
 
+#if !defined(GGML_USE_HIP)
+// Set once any weight is uploaded in a Marlin layout; until then no graph can need canonicalizing.
+static std::atomic<bool> ggml_cuda_marlin_any_repacked{false};
+#endif
+
 struct ggml_backend_cuda_buffer_context {
     int device;
     void * dev_ptr = nullptr;
@@ -1022,6 +1035,9 @@ static bool ggml_cuda_marlin_owner_is_repacked(const ggml_tensor * tensor) {
 // canonical layout once, before graph capture, and say so.
 static void ggml_cuda_canonicalize_unserved_marlin_weights(
         ggml_backend_cuda_context * cuda_ctx, const ggml_cgraph * cgraph) {
+    if (!ggml_cuda_marlin_any_repacked.load(std::memory_order_relaxed)) {
+        return;
+    }
     const int cc = ggml_cuda_info().devices[cuda_ctx->device].cc;
     bool restored = false;
     for (int i = 0; i < cgraph->n_nodes; ++i) {
@@ -1204,6 +1220,7 @@ static void ggml_backend_cuda_buffer_set_tensor(ggml_backend_buffer_t buffer, gg
             int(ggml_cuda_info().devices[ctx->device].smpbo),
             ggml_cuda_info().devices[ctx->device].nsm, cudaStreamPerThread);
         ctx->marlin_q4_a32_repacked.insert(tensor->data);
+        ggml_cuda_marlin_any_repacked.store(true, std::memory_order_relaxed);
         return;
     }
     if (ggml_cuda_marlin_q8_g128_enabled() && full_tensor && tensor->type == GGML_TYPE_Q8_0_G128 &&
@@ -1216,6 +1233,7 @@ static void ggml_backend_cuda_buffer_set_tensor(ggml_backend_buffer_t buffer, gg
             int(ggml_cuda_info().devices[ctx->device].smpbo),
             ggml_cuda_info().devices[ctx->device].nsm, cudaStreamPerThread);
         ctx->marlin_q8_g128_repacked.insert(tensor->data);
+        ggml_cuda_marlin_any_repacked.store(true, std::memory_order_relaxed);
         return;
     }
 #endif
@@ -2070,13 +2088,147 @@ static bool ggml_backend_buft_is_cuda_host(ggml_backend_buffer_type_t buft) {
     return buft->iface.get_name == ggml_backend_cuda_host_buffer_type_name;
 }
 
+#ifdef __linux__
+// On hosts with 2+ NUMA nodes, large pinned buffers are first-touched in 2 MiB stripes by one
+// thread per node, so CPU reads of them (moe cpu share) draw on every node's memory channels
+// instead of the one node the allocating thread ran on. GGML_CUDA_HOST_NUMA_SPREAD=0 disables it.
+static std::mutex g_numa_spread_mu;
+static std::unordered_map<void *, size_t> g_numa_spread;
+
+// Logs where the kernel actually placed [ptr, ptr + size): a stripe only helps if first touch
+// was honoured (a node short on free memory takes less, the rest falls to its neighbours).
+static void ggml_cuda_host_log_numa_placement(const void * ptr, size_t size, size_t n_nodes) {
+    FILE * f = fopen("/proc/self/numa_maps", "r");
+    if (!f) {
+        return;
+    }
+    std::vector<double> mib(n_nodes, 0.0);
+    char line[4096];
+    while (fgets(line, sizeof(line), f)) {
+        if (strtoull(line, nullptr, 16) != (uintptr_t) ptr) {
+            continue;
+        }
+        double page_kib = 4.0;
+        if (const char * kp = strstr(line, "kernelpagesize_kB=")) {
+            page_kib = atof(kp + strlen("kernelpagesize_kB="));
+        }
+        for (const char * t = strstr(line, " N"); t; t = strstr(t + 1, " N")) {
+            size_t node, pages;
+            if (sscanf(t, " N%zu=%zu", &node, &pages) == 2 && node < n_nodes) {
+                mib[node] = pages*page_kib/1024.0;
+            }
+        }
+        break;
+    }
+    fclose(f);
+    std::string msg;
+    double total = 0.0, most = 0.0;
+    for (size_t n = 0; n < n_nodes; ++n) {
+        char part[64];
+        snprintf(part, sizeof(part), " N%zu=%.0f", n, mib[n]);
+        msg += part;
+        total += mib[n];
+        most = std::max(most, mib[n]);
+    }
+    if (total > 0.0 && most > 1.5*total/n_nodes) {
+        GGML_LOG_WARN("%s: %.2f MiB pinned, NUMA stripe skewed (MiB per node:%s); free page cache on the full nodes\n",
+            __func__, size/1024.0/1024.0, msg.c_str());
+    } else {
+        GGML_LOG_INFO("%s: %.2f MiB pinned, striped over NUMA nodes (MiB per node:%s)\n", __func__, size/1024.0/1024.0, msg.c_str());
+    }
+}
+
+static void * ggml_cuda_host_malloc_numa_spread(size_t size) {
+    static const bool enabled = !getenv("GGML_CUDA_HOST_NUMA_SPREAD") || atoi(getenv("GGML_CUDA_HOST_NUMA_SPREAD")) != 0;
+    if (!enabled || size < ((size_t) 1 << 30)) {
+        return nullptr;
+    }
+    std::vector<cpu_set_t> nodes;
+    for (int n = 0; ; ++n) {
+        FILE * f = fopen(("/sys/devices/system/node/node" + std::to_string(n) + "/cpulist").c_str(), "r");
+        if (!f) {
+            break;
+        }
+        cpu_set_t set;
+        CPU_ZERO(&set);
+        for (int lo, hi; fscanf(f, "%d", &lo) == 1; ) {
+            hi = lo;
+            if (fscanf(f, "-%d", &hi) != 1) {
+                hi = lo;
+            }
+            for (int c = lo; c <= hi; ++c) {
+                CPU_SET(c, &set);
+            }
+            if (fgetc(f) != ',') {
+                break;
+            }
+        }
+        fclose(f);
+        nodes.push_back(set);
+    }
+    if (nodes.size() < 2) {
+        return nullptr;
+    }
+    void * ptr = mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (ptr == MAP_FAILED) {
+        return nullptr;
+    }
+    const size_t stripe = (size_t) 2 << 20;
+    std::vector<std::thread> touch;
+    for (size_t n = 0; n < nodes.size(); ++n) {
+        touch.emplace_back([&, n] {
+            pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &nodes[n]);
+            for (size_t off = n*stripe; off < size; off += nodes.size()*stripe) {
+                memset((char *) ptr + off, 0, std::min(stripe, size - off));
+            }
+        });
+    }
+    for (auto & t : touch) {
+        t.join();
+    }
+    if (cudaHostRegister(ptr, size, cudaHostRegisterPortable | cudaHostRegisterMapped) != cudaSuccess) {
+        (void) cudaGetLastError();
+        munmap(ptr, size);
+        return nullptr;
+    }
+    std::lock_guard<std::mutex> lock(g_numa_spread_mu);
+    g_numa_spread[ptr] = size;
+    ggml_cuda_host_log_numa_placement(ptr, size, nodes.size());
+    return ptr;
+}
+
+static bool ggml_cuda_host_free_numa_spread(void * ptr) {
+    size_t size;
+    {
+        std::lock_guard<std::mutex> lock(g_numa_spread_mu);
+        auto it = g_numa_spread.find(ptr);
+        if (it == g_numa_spread.end()) {
+            return false;
+        }
+        size = it->second;
+        g_numa_spread.erase(it);
+    }
+    CUDA_CHECK(cudaHostUnregister(ptr));
+    munmap(ptr, size);
+    return true;
+}
+#else
+static void * ggml_cuda_host_malloc_numa_spread(size_t) { return nullptr; }
+static bool ggml_cuda_host_free_numa_spread(void *) { return false; }
+#endif
+
 static void ggml_backend_cuda_host_buffer_free_buffer(ggml_backend_buffer_t buffer) {
-    CUDA_CHECK(cudaFreeHost(buffer->context));
+    if (!ggml_cuda_host_free_numa_spread(buffer->context)) {
+        CUDA_CHECK(cudaFreeHost(buffer->context));
+    }
 }
 
 static void * ggml_cuda_host_malloc(size_t size) {
     if (getenv("GGML_CUDA_NO_PINNED") != nullptr) {
         return nullptr;
+    }
+    if (void * spread = ggml_cuda_host_malloc_numa_spread(size)) {
+        return spread;
     }
 
     void * ptr = nullptr;
@@ -4136,8 +4288,12 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
 // Captured graphs hard-code tensor shapes. Keep alternating speculative verify
 // widths in separate cache entries without walking every graph node on the hot
 // path. A residual collision is safe: the normal update check recaptures it.
+// Graphs that can never be captured (prefill widths) share one key, so they don't fill the cache
+// with an entry per split and shape that pushes the decode graphs out before they warm up.
+static constexpr uint64_t ggml_cuda_graph_uncapturable_key = 0;
+
 static uint64_t ggml_cuda_graph_get_key(ggml_cgraph * cgraph) {
-    return ggml_cuda_graph_shape_key(cgraph);
+    return ggml_cuda_graph_check_compability(cgraph) ? ggml_cuda_graph_shape_key(cgraph) : ggml_cuda_graph_uncapturable_key;
 }
 
 static bool ggml_cuda_graph_update_required(
@@ -4179,10 +4335,16 @@ static bool ggml_cuda_graph_update_required(
     for (int i = 0; i < cgraph->n_nodes; i++) {
         ggml_cuda_graph::node_properties prop = {};
         memcpy(&prop.node, cgraph->nodes[i], sizeof(ggml_tensor));
+        // Tensor object identity is not baked into the captured kernels, and a ggml graph rebuild
+        // (or scheduler re-split) re-creates identical nodes at new addresses. Compare what the
+        // kernels consume instead: data pointers, shapes, strides and types.
+        std::fill(std::begin(prop.node.src), std::end(prop.node.src), nullptr);
+        prop.node.view_src = nullptr;
 
         for (int j = 0; j < GGML_MAX_SRC; ++j) {
             if (cgraph->nodes[i]->src[j]) {
                 prop.node_src_data_ptrs[j] = cgraph->nodes[i]->src[j]->data;
+                prop.node_src_type[j]      = cgraph->nodes[i]->src[j]->type;
                 memcpy(prop.node_src_ne[j], cgraph->nodes[i]->src[j]->ne, sizeof(prop.node_src_ne[j]));
                 memcpy(prop.node_src_nb[j], cgraph->nodes[i]->src[j]->nb, sizeof(prop.node_src_nb[j]));
             }
@@ -4199,10 +4361,11 @@ static bool ggml_cuda_graph_update_required(
 
 // A large prefill executable holds ~100 MiB of device memory. When VRAM is fully committed (e.g. a
 // MoE cache sized to free memory), trade older cached executables for this one instead of aborting.
-static void ggml_cuda_graph_instantiate(ggml_backend_cuda_context * cuda_ctx, ggml_cuda_graph * graph) {
+static void ggml_cuda_graph_instantiate(ggml_backend_cuda_context * cuda_ctx, ggml_cuda_graph * graph,
+        cudaGraphExec_t & instance, cudaGraph_t source) {
     bool synced = false;
     cudaError_t err;
-    while ((err = cudaGraphInstantiate(&graph->instance, graph->graph, NULL, NULL, 0)) == cudaErrorMemoryAllocation) {
+    while ((err = cudaGraphInstantiate(&instance, source, NULL, NULL, 0)) == cudaErrorMemoryAllocation) {
         (void) cudaGetLastError();
         if (cuda_ctx->release_lru_cuda_graph_instance(graph)) {
             continue;
@@ -4217,16 +4380,19 @@ static void ggml_cuda_graph_instantiate(ggml_backend_cuda_context * cuda_ctx, gg
     CUDA_CHECK(err);
 }
 
-static void ggml_cuda_graph_update_executable(ggml_backend_cuda_context * cuda_ctx, uint64_t graph_key) {
-    ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
-
+static void ggml_cuda_graph_update_executable(ggml_backend_cuda_context * cuda_ctx, ggml_cuda_graph * graph,
+        cudaGraphExec_t & instance, cudaGraph_t source) {
+    if (instance == nullptr) {
+        ggml_cuda_graph_instantiate(cuda_ctx, graph, instance, source);
+        return;
+    }
 #if CUDART_VERSION >= 12000
     cudaGraphExecUpdateResultInfo result_info;
-    cudaError_t stat = cudaGraphExecUpdate(graph->instance, graph->graph, &result_info);
+    cudaError_t stat = cudaGraphExecUpdate(instance, source, &result_info);
 #else
     cudaGraphNode_t errorNode;
     cudaGraphExecUpdateResult result_info;
-    cudaError_t stat = cudaGraphExecUpdate(graph->instance, graph->graph, &errorNode, &result_info);
+    cudaError_t stat = cudaGraphExecUpdate(instance, source, &errorNode, &result_info);
 #endif // CUDART_VERSION >= 12000
 
     if (stat == cudaErrorGraphExecUpdateFailure) {
@@ -4237,9 +4403,9 @@ static void ggml_cuda_graph_update_executable(ggml_backend_cuda_context * cuda_c
         // The pre-existing graph exec cannot be updated due to violated constraints
         // so instead clear error and re-instantiate
         (void)cudaGetLastError();
-        CUDA_CHECK(cudaGraphExecDestroy(graph->instance));
-        graph->instance = nullptr;
-        ggml_cuda_graph_instantiate(cuda_ctx, graph);
+        CUDA_CHECK(cudaGraphExecDestroy(instance));
+        instance = nullptr;
+        ggml_cuda_graph_instantiate(cuda_ctx, graph, instance, source);
     } else {
         GGML_ASSERT(stat == cudaSuccess);
     }
@@ -8336,6 +8502,18 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
         }
     };
 
+    // segmented capture: see ggml_cuda_graph::head
+    int seg_every = 0;
+    int seg_next  = 0;
+    size_t n_head = 0;
+#ifdef USE_CUDA_GRAPH
+    static const int n_segments = getenv("GGML_CUDA_GRAPH_SEGMENTS") ? atoi(getenv("GGML_CUDA_GRAPH_SEGMENTS")) : 1;
+    if (use_cuda_graph && cuda_graph_update_required && n_segments > 1 && cgraph->n_nodes >= 1000) {
+        seg_every = cgraph->n_nodes / n_segments;
+        seg_next  = seg_every;
+    }
+#endif
+
     while (!graph_evaluated_or_captured) {
         // Only perform the graph execution if CUDA graphs are not enabled, or we are capturing the graph.
         // With the use of CUDA graphs, the execution will be performed by the graph launch.
@@ -8406,6 +8584,22 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
 
             for (int i = 0; i < cgraph->n_nodes; i++) {
                 ggml_tensor * node = cgraph->nodes[i];
+#ifdef USE_CUDA_GRAPH
+                if (seg_every > 0 && i >= seg_next && !is_concurrent_event_active) {
+                    ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
+                    cudaGraph_t seg = nullptr;
+                    CUDA_CHECK(cudaStreamEndCapture(cuda_ctx->stream(), &seg));
+                    if (n_head < graph->head.size()) {
+                        CUDA_CHECK(cudaGraphDestroy(graph->head[n_head].graph));
+                        graph->head[n_head].graph = seg;
+                    } else {
+                        graph->head.push_back({seg, nullptr});
+                    }
+                    n_head++;
+                    CUDA_CHECK(cudaStreamBeginCapture(cuda_ctx->stream(), cudaStreamCaptureModeRelaxed));
+                    seg_next += seg_every;
+                }
+#endif
                 if (is_concurrent_event_active) {
                     GGML_ASSERT(concurrent_event);
 
@@ -8497,6 +8691,13 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
 
             CUDA_CHECK(cudaStreamEndCapture(cuda_ctx->stream(), &graph->graph));
             graph_evaluated_or_captured = true; // CUDA graph has been captured
+            for (size_t s = n_head; s < graph->head.size(); s++) {
+                if (graph->head[s].instance != nullptr) {
+                    CUDA_CHECK(cudaGraphExecDestroy(graph->head[s].instance));
+                }
+                CUDA_CHECK(cudaGraphDestroy(graph->head[s].graph));
+            }
+            graph->head.resize(n_head);
 
             std::lock_guard<std::mutex> lock(ggml_cuda_lock);
             if (ggml_cuda_lock_counter.fetch_sub(1, std::memory_order_relaxed) == 1) {
@@ -8509,13 +8710,16 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
 
     if (use_cuda_graph) {
         ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
-        if (graph->instance == nullptr) { // Create executable graph from captured graph.
-            ggml_cuda_graph_instantiate(cuda_ctx, graph);
-        }
-        if (cuda_graph_update_required) { // Update graph executable
-            ggml_cuda_graph_update_executable(cuda_ctx, graph_key);
+        if (cuda_graph_update_required || graph->instance == nullptr) {
+            for (auto & seg : graph->head) {
+                ggml_cuda_graph_update_executable(cuda_ctx, graph, seg.instance, seg.graph);
+            }
+            ggml_cuda_graph_update_executable(cuda_ctx, graph, graph->instance, graph->graph);
         }
         // Launch graph
+        for (auto & seg : graph->head) {
+            CUDA_CHECK(cudaGraphLaunch(seg.instance, cuda_ctx->stream()));
+        }
         CUDA_CHECK(cudaGraphLaunch(graph->instance, cuda_ctx->stream()));
 #else
         GGML_UNUSED(graph_key);
@@ -8602,8 +8806,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
 
     ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
     if (graph->is_enabled()) {
-        const bool graph_compatible = ggml_cuda_graph_check_compability(cgraph);
-        if (graph_compatible) {
+        if (graph_key != ggml_cuda_graph_uncapturable_key) {
             const bool properties_changed = ggml_cuda_graph_update_required(cuda_ctx, cgraph, graph_key);
 
             if (!graph->warmup_complete) {
@@ -8725,7 +8928,44 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
                 params->add_alloc_dep(
                     params->user_data, const_cast<ggml_tensor *>(match.expert_scale), match.dst);
             }
-            i += match.node_count - 1;
+            // A reduction merging host-computed experts waits for the host: run the
+            // independent nodes that follow it (the shared expert) before it instead.
+            const int end = i + match.node_count;
+            int stop = end;
+            if (ggml_moe_cpu_share_hoist(match.dst->ne[1])) {
+                auto in_reduction = [&](const ggml_tensor * t) {
+                    for (int k = i; t && k < end; ++k) {
+                        if (cgraph->nodes[k] == t || cgraph->nodes[k] == t->view_src) {
+                            return true;
+                        }
+                    }
+                    return false;
+                };
+                // an in-place node must not overwrite what the reduction still reads
+                auto read_by_reduction = [&](const ggml_tensor * t) {
+                    for (int k = i; k < end; ++k) {
+                        for (int s = 0; s < GGML_MAX_SRC; ++s) {
+                            const ggml_tensor * src = cgraph->nodes[k]->src[s];
+                            if (src && (src == t || src->view_src == t)) {
+                                return true;
+                            }
+                        }
+                    }
+                    return false;
+                };
+                for (; stop < cgraph->n_nodes && stop < end + 64; ++stop) {
+                    const ggml_tensor * node = cgraph->nodes[stop];
+                    bool dependent = node->view_src && read_by_reduction(node->view_src);
+                    for (int s = 0; s < GGML_MAX_SRC && !dependent; ++s) {
+                        dependent = in_reduction(node->src[s]);
+                    }
+                    if (dependent) {
+                        break;
+                    }
+                }
+                std::rotate(cgraph->nodes + i, cgraph->nodes + end, cgraph->nodes + stop);
+            }
+            i = stop - 1;
         }
     }
 

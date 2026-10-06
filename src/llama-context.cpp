@@ -677,7 +677,10 @@ llama_context::llama_context(
 
         // TODO: move these checks to ggml_backend_sched
         // enabling pipeline parallelism in the scheduler increases memory usage, so it is only done when necessary
+        // MTP drafters decode at most 1+n_draft tokens and alternate graph shapes; every rebuild would
+        // rotate the input copies, so their CUDA graphs would never replay
         bool pipeline_parallel =
+            cparams.ctx_type != LLAMA_CONTEXT_TYPE_MTP &&
             model.n_devices() > 1 &&
             model.n_gpu_layers() > model.hparams.n_layer_all &&
             model.split_mode() == LLAMA_SPLIT_MODE_LAYER &&
@@ -1119,7 +1122,7 @@ void llama_context::sched_reserve() {
         gf_res_reserve->reset();
     } else {
         for (auto & res : gf_res_prev) { res.reset(); }
-        gf_res_prev_active = nullptr;
+        gf_res_prev_alloc.fill(false);
         gf_res_reserve.reset(new llm_graph_result(max_nodes));
     }
     if (reuse_sched) {
@@ -4073,6 +4076,124 @@ void llama_context::set_nextn_layer_offset(int32_t offset) {
     cparams.nextn_layer_offset = offset;
 }
 
+bool llama_context::set_mtp_draft_chain(bool enable) {
+    if (enable == (cparams.mtp_chain_tok != nullptr)) {
+        return true;
+    }
+    if (enable && !mtp_chain_tok) {
+        const auto & hparams = model.hparams;
+        // only the qwen4exp MTP graph reads and writes the chain stages
+        if (model.arch != LLM_ARCH_QWEN4EXP || model.split_mode() == LLAMA_SPLIT_MODE_TENSOR ||
+                hparams.n_layer_nextn != 1) {
+            return false;
+        }
+        // the stages live with the MTP block so its graph reads and writes them in place
+        ggml_backend_dev_t dev = model.dev_layer(hparams.n_layer());
+        mtp_chain_backend = backend_for_device(dev);
+        if (!mtp_chain_backend) {
+            return false;
+        }
+
+        ggml_init_params ip = { 5 * ggml_tensor_overhead(), nullptr, true };
+        ggml_context_ptr chain_ctx { ggml_init(ip) };
+        ggml_tensor * tok = ggml_new_tensor_1d(chain_ctx.get(), GGML_TYPE_I32, 1);
+        ggml_tensor * h   = ggml_new_tensor_1d(chain_ctx.get(), GGML_TYPE_F32, hparams.n_embd_out());
+        ggml_tensor * p   = ggml_new_tensor_1d(chain_ctx.get(), GGML_TYPE_F32, 1);
+        ggml_set_name(tok, "mtp_chain_tok");
+        ggml_set_name(h,   "mtp_chain_h");
+        ggml_set_name(p,   "mtp_chain_p");
+
+        // a host token embedding would put each draft's gather on the CPU behind a readback of
+        // the previous draft's token; a trimmed head only ever proposes its own vocabulary, so
+        // keep just those rows on the device
+        const auto & layer = model.layers[hparams.n_layer()];
+        ggml_tensor * embd_w = layer.nextn.embed_tokens ? layer.nextn.embed_tokens : model.tok_embd;
+        ggml_tensor * head_w = layer.nextn.shared_head_head ? layer.nextn.shared_head_head : model.output;
+        ggml_tensor * e    = nullptr;
+        ggml_tensor * embd = nullptr;
+        if (embd_w && embd_w->buffer && ggml_backend_buffer_is_host(embd_w->buffer) && ggml_is_contiguous(embd_w) &&
+                ggml_get_type_traits(embd_w->type)->to_float &&
+                model.d2t && model.d2t->type == GGML_TYPE_I32 && head_w == model.output) {
+            e    = ggml_new_tensor_1d(chain_ctx.get(), GGML_TYPE_F32, embd_w->ne[0]);
+            embd = ggml_new_tensor_2d(chain_ctx.get(), embd_w->type, embd_w->ne[0], model.d2t->ne[0]);
+            ggml_set_name(e,    "mtp_chain_e");
+            ggml_set_name(embd, "mtp_chain_embd");
+        }
+
+        ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(chain_ctx.get(), ggml_backend_dev_buffer_type(dev));
+        if (!buf) {
+            return false;
+        }
+        mtp_chain_buf.reset(buf);
+
+        if (embd) {
+            std::vector<int32_t> ids(embd->ne[1]);
+            ggml_backend_tensor_get(model.d2t, ids.data(), 0, ggml_nbytes(model.d2t));
+            const size_t row = embd_w->nb[1];
+            std::vector<uint8_t> rows(ggml_nbytes(embd));
+            // the ids ascend, so read each run of consecutive rows at once
+            for (size_t i = 0, j; i < ids.size(); i = j) {
+                for (j = i + 1; j < ids.size() && ids[j] == ids[j - 1] + 1; ++j) {}
+                ggml_backend_tensor_get(embd_w, rows.data() + i * row, (size_t) ids[i] * row, (j - i) * row);
+            }
+            ggml_backend_tensor_set(embd, rows.data(), 0, rows.size());
+        }
+
+        // pinned so the per-draft readback stays asynchronous
+        ggml_backend_buffer_type_t hist_buft = ggml_backend_dev_host_buffer_type(dev);
+        mtp_chain_hist_buf.reset(ggml_backend_buft_alloc_buffer(hist_buft ? hist_buft : ggml_backend_cpu_buffer_type(),
+                mtp_chain_hist_max * (sizeof(llama_token) + sizeof(float))));
+        if (!mtp_chain_hist_buf) {
+            mtp_chain_buf.reset();
+            return false;
+        }
+
+        mtp_chain_ctx = std::move(chain_ctx);
+        mtp_chain_tok = tok;
+        mtp_chain_h   = h;
+        mtp_chain_p   = p;
+        mtp_chain_e    = e;
+        mtp_chain_embd = embd;
+    }
+    cparams.mtp_chain_tok  = enable ? mtp_chain_tok  : nullptr;
+    cparams.mtp_chain_h    = enable ? mtp_chain_h    : nullptr;
+    cparams.mtp_chain_p    = enable ? mtp_chain_p    : nullptr;
+    cparams.mtp_chain_e    = enable ? mtp_chain_e    : nullptr;
+    cparams.mtp_chain_embd = enable ? mtp_chain_embd : nullptr;
+    return true;
+}
+
+void llama_context::mtp_draft_chain_seed(llama_token token, const float * h) {
+    GGML_ASSERT(cparams.mtp_chain_tok);
+    ggml_backend_tensor_set(mtp_chain_tok, &token, 0, sizeof(token));
+    ggml_backend_tensor_set(mtp_chain_h, h, 0, ggml_nbytes(mtp_chain_h));
+    if (mtp_chain_e) {
+        // the seed is a target token, possibly outside the head vocabulary: dequantize its row here
+        const auto & layer = model.layers[model.hparams.n_layer()];
+        const ggml_tensor * src = layer.nextn.embed_tokens ? layer.nextn.embed_tokens : model.tok_embd;
+        std::vector<uint8_t> row(src->nb[1]);
+        std::vector<float> e(src->ne[0]);
+        ggml_backend_tensor_get(src, row.data(), (size_t) token * src->nb[1], src->nb[1]);
+        ggml_get_type_traits(src->type)->to_float(row.data(), e.data(), src->ne[0]);
+        ggml_backend_tensor_set(mtp_chain_e, e.data(), 0, ggml_nbytes(mtp_chain_e));
+    }
+}
+
+void llama_context::mtp_draft_chain_record(int32_t i) {
+    GGML_ASSERT(cparams.mtp_chain_tok && i >= 0 && i < mtp_chain_hist_max);
+    auto * toks  = (llama_token *) ggml_backend_buffer_get_base(mtp_chain_hist_buf.get());
+    auto * probs = (float *) (toks + mtp_chain_hist_max);
+    ggml_backend_tensor_get_async(mtp_chain_backend, mtp_chain_tok, toks  + i, 0, sizeof(llama_token));
+    ggml_backend_tensor_get_async(mtp_chain_backend, mtp_chain_p,   probs + i, 0, sizeof(float));
+}
+
+const llama_token * llama_context::mtp_draft_chain_tokens(const float ** probs) {
+    synchronize();
+    auto * toks = (const llama_token *) ggml_backend_buffer_get_base(mtp_chain_hist_buf.get());
+    *probs = (const float *) (toks + mtp_chain_hist_max);
+    return toks;
+}
+
 void llama_context::set_causal_attn(bool value) {
     LLAMA_LOG_DEBUG("%s: value = %d\n", __func__, value);
 
@@ -4278,14 +4399,17 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         return nullptr;
     }
 
-    auto * res = get_gf_res_prev();
+    const int slot = graph_slot(ubatch);
+    auto * res = get_gf_res_prev(slot);
     auto * gf  = res->get_gf();
+    // the sched also checks the slot still holds this graph: other graphs (e.g. KV shifts) may have used it
+    const bool slot_alloc = ggml_backend_sched_set_graph_slot(sched.get(), slot, gf) && gf_res_prev_alloc[slot];
 
     // the new graph parameters
     // in order to correctly reuse a graph, it's full topology has to be uniquely determined by these parameters
     const auto gparams = graph_params(res, ubatch, mctx, gtype);
 
-    if (!graph_reuse_disable && gf_res_prev_active == res && res->can_reuse(gparams)) {
+    if (!graph_reuse_disable && slot_alloc && res->can_reuse(gparams)) {
         //LLAMA_LOG_DEBUG("%s: reusing previous graph\n", __func__);
 
         // with pipeline parallelism, the previous graph_compute_async may still be running
@@ -4297,7 +4421,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
         n_reused++;
     } else {
-        gf_res_prev_active = nullptr;
+        gf_res_prev_alloc[slot] = false;
         res->reset();
 
         ggml_backend_sched_reset(sched.get());
@@ -4317,7 +4441,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             return nullptr;
         }
 
-        gf_res_prev_active = res;
+        gf_res_prev_alloc[slot] = true;
     }
 
     // Staged DFlash decodes answer every eval-callback ask with "no" (hiddens are
@@ -5587,8 +5711,20 @@ llm_graph_result * llama_context::get_gf_res_reserve() const {
     return static_cast<llm_graph_result *>(gf_res_reserve.get());
 }
 
-llm_graph_result * llama_context::get_gf_res_prev() {
-    auto & res = gf_res_prev[n_outputs > 0];
+// Small batches (decode, speculative verify, draft catch-up) get a slot per token count and larger
+// ones share one, separately for batches with and without outputs.
+int llama_context::graph_slot(const llama_ubatch & ubatch) const {
+    // the meta backend keeps the external-view mappings of only its last two graphs, so a graph
+    // parked in another slot would come back with unmapped views; one slot stays within that window
+    if (model.split_mode() == LLAMA_SPLIT_MODE_TENSOR) {
+        return 0;
+    }
+    const int half = GGML_SCHED_MAX_GRAPH_SLOTS / 2;
+    return (n_outputs > 0 ? half : 0) + (int) std::min<uint32_t>(ubatch.n_tokens - 1, half - 1);
+}
+
+llm_graph_result * llama_context::get_gf_res_prev(int slot) {
+    auto & res = gf_res_prev[slot];
     if (!res) {
         res.reset(new llm_graph_result(gf_res_reserve->get_max_nodes()));
     }
@@ -5599,7 +5735,7 @@ void llama_context::invalidate_graph_results() {
     for (auto & res : gf_res_prev) {
         if (res) { res->reset(); }
     }
-    gf_res_prev_active = nullptr;
+    gf_res_prev_alloc.fill(false);
 }
 
 // pack sampler outputs into as few sequences as possible before using sequences without samplers
@@ -7331,12 +7467,13 @@ void llama_context::opt_epoch_iter(
                 break;
             }
 
-            auto * res = get_gf_res_prev();
+            const int slot = graph_slot(ubatch);
+            auto * res = get_gf_res_prev(slot);
 
             const auto gparams = graph_params(res, ubatch, mctx.get(), ctx_type_to_graph_type(cparams.ctx_type));
 
             // the optimizer graph is allocated outside sched, so the next decode must rebuild
-            gf_res_prev_active = nullptr;
+            gf_res_prev_alloc[slot] = false;
             res->reset();
 
             auto * gf = model.build_graph(gparams);
@@ -7837,6 +7974,22 @@ void llama_set_embeddings_layer_inp(llama_context * ctx, uint32_t lid, bool valu
 
 void llama_set_nextn_layer_offset(llama_context * ctx, int32_t offset) {
     ctx->set_nextn_layer_offset(offset);
+}
+
+bool llama_set_mtp_draft_chain(llama_context * ctx, bool enable) {
+    return ctx->set_mtp_draft_chain(enable);
+}
+
+void llama_mtp_draft_chain_seed(llama_context * ctx, llama_token token, const float * h) {
+    ctx->mtp_draft_chain_seed(token, h);
+}
+
+void llama_mtp_draft_chain_record(llama_context * ctx, int32_t i) {
+    ctx->mtp_draft_chain_record(i);
+}
+
+const llama_token * llama_mtp_draft_chain_tokens(llama_context * ctx, const float ** probs) {
+    return ctx->mtp_draft_chain_tokens(probs);
 }
 
 llama_memory_t llama_get_memory(const struct llama_context * ctx) {

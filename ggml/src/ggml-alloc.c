@@ -493,6 +493,8 @@ struct ggml_gallocr {
 
     struct leaf_alloc * leaf_allocs; // [n_leafs]
     int n_leafs;
+
+    uint32_t generation;
 };
 
 ggml_gallocr_t ggml_gallocr_new_n(ggml_backend_buffer_type_t * bufts, int n_bufs) {
@@ -933,6 +935,7 @@ static bool ggml_gallocr_reserve_n_impl(
             }
 #endif
             ggml_vbuffer_free(galloc->buffers[i]);
+            galloc->generation++;
             if (no_alloc) {
                 galloc->buffers[i] = NULL;
             } else {
@@ -1125,6 +1128,10 @@ ggml_backend_buffer_t ggml_gallocr_get_plan_buffer(ggml_gallocr_t galloc, int bu
     }
     *high_water = talloc->chunks[0]->max_size;
     return buf->chunks[0];
+}
+
+uint32_t ggml_gallocr_get_generation(ggml_gallocr_t galloc) {
+    return galloc->generation;
 }
 
 // utils

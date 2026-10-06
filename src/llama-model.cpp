@@ -3865,6 +3865,64 @@ bool llama_model_has_mtp(const llama_model * model) {
     return model->hparams.has_mtp();
 }
 
+bool llama_model_set_draft_vocab(llama_model * model, const int32_t * ids, int32_t n_ids) {
+    const ggml_tensor * src = model->output;
+    const int64_t n_vocab = model->vocab.n_tokens();
+    // only the qwen4exp MTP graph maps a trimmed shared head back through d2t
+    if (model->arch != LLM_ARCH_QWEN4EXP ||
+            src == nullptr || model->d2t != nullptr || model->output_s != nullptr || model->output_in_s != nullptr ||
+            model->hparams.n_layer_nextn == 0 || model->hparams.no_alloc || n_ids <= 0 || n_ids >= n_vocab ||
+            ggml_n_dims(src) != 2 || src->ne[1] != n_vocab || !ggml_is_contiguous(src)) {
+        LLAMA_LOG_WARN("%s: this model's LM head cannot be trimmed to a draft vocabulary\n", __func__);
+        return false;
+    }
+    for (int32_t i = 0; i < n_ids; ++i) {
+        if (ids[i] < 0 || ids[i] >= n_vocab || (i > 0 && ids[i] <= ids[i - 1])) {
+            LLAMA_LOG_WARN("%s: draft vocabulary ids must be ascending target token ids\n", __func__);
+            return false;
+        }
+    }
+
+    // the trimmed head lives where the drafter computes its logits
+    ggml_backend_dev_t dev = model->dev_output();
+    ggml_backend_buffer_type_t buft = dev ? ggml_backend_dev_buffer_type(dev) : ggml_backend_cpu_buffer_type();
+
+    ggml_init_params ip = { /*.mem_size =*/ 2*ggml_tensor_overhead(), /*.mem_buffer =*/ nullptr, /*.no_alloc =*/ true };
+    ggml_context_ptr ctx_ptr { ggml_init(ip) };
+    ggml_tensor * head = ggml_new_tensor_2d(ctx_ptr.get(), src->type, src->ne[0], n_ids);
+    ggml_tensor * d2t  = ggml_new_tensor_1d(ctx_ptr.get(), GGML_TYPE_I32, n_ids);
+    ggml_set_name(head, "output.weight.draft_vocab");
+    ggml_set_name(d2t, "d2t");
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx_ptr.get(), buft);
+    if (buf == nullptr) {
+        LLAMA_LOG_WARN("%s: failed to allocate the trimmed LM head on %s\n", __func__, ggml_backend_buft_name(buft));
+        return false;
+    }
+    ggml_backend_buffer_set_usage(buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+
+    // copy runs of consecutive ids at once; get_tensor also reassembles meta-split heads
+    const size_t row = src->nb[1];
+    std::vector<uint8_t> host((size_t) n_ids * row);
+    for (int32_t i = 0; i < n_ids; ) {
+        int32_t j = i + 1;
+        while (j < n_ids && ids[j] == ids[j - 1] + 1) {
+            ++j;
+        }
+        ggml_backend_tensor_get(src, host.data() + (size_t) i * row, (size_t) ids[i] * row, (size_t) (j - i) * row);
+        i = j;
+    }
+    ggml_backend_tensor_set(head, host.data(), 0, host.size());
+    ggml_backend_tensor_set(d2t, ids, 0, (size_t) n_ids * sizeof(int32_t));
+
+    model->output = head;
+    model->d2t    = d2t;
+    model->adopt_buffer(std::move(ctx_ptr), ggml_backend_buffer_ptr(buf));
+
+    LLAMA_LOG_INFO("%s: LM head trimmed to %d of %" PRId64 " tokens on %s (%.1f MiB)\n",
+            __func__, n_ids, n_vocab, ggml_backend_buft_name(buft), ggml_nbytes(head) / 1024.0 / 1024.0);
+    return true;
+}
+
 int32_t llama_model_dflash_selector_top_k(const llama_model * model) {
     return model->hparams.dflash_selector_top_k;
 }

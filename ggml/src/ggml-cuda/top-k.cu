@@ -121,8 +121,14 @@ __global__ void register_top_k_sort(const uint64_t * selected, int * dst, int k)
 
 // One block per row: from four rows up this beats a DeviceTopK launch chain per row (25x on
 // 4352-row prefill), while a lone decode row leaves the device idle and stays on DeviceTopK.
-bool register_top_k_wins(int64_t columns, int64_t rows) {
-    return columns >= 4352 && columns <= 40960 && rows >= 4 && rows <= 8192;
+// Without DeviceTopK (CCCL < 3.2) the fallback is a full segmented argsort, which loses at any row count.
+bool register_top_k_wins(int cc, int64_t columns, int64_t rows, int64_t k) {
+#ifdef CUB_TOP_K_AVAILABLE
+    return cc == 860 && k == 2051 && columns >= 4352 && columns <= 40960 && rows >= 4 && rows <= 8192;
+#else
+    GGML_UNUSED(cc);
+    return columns > 1024 && columns <= 40960 && rows >= 1 && rows <= 8192 && k >= 1 && k <= 4096 && k <= columns;
+#endif
 }
 
 } // namespace
@@ -131,7 +137,7 @@ bool register_top_k_wins(int64_t columns, int64_t rows) {
 bool ggml_cuda_top_k_qsa(ggml_backend_cuda_context & ctx, ggml_tensor * dst,
         const ggml_tensor * scores, const ggml_tensor * cell_blocks, const ggml_tensor * mask) {
 #if defined(GGML_CUDA_USE_CUB) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
-    if (ggml_cuda_info().devices[ctx.device].cc != 860 || ggml_top_k_is_stable(dst) ||
+    if (ggml_top_k_is_stable(dst) ||
             scores->type != GGML_TYPE_F32 || cell_blocks->type != GGML_TYPE_I32 ||
             mask->type != GGML_TYPE_F16 || dst->type != GGML_TYPE_I32 ||
             !ggml_is_contiguous(scores) || !ggml_is_contiguous(cell_blocks) ||
@@ -141,8 +147,8 @@ bool ggml_cuda_top_k_qsa(ggml_backend_cuda_context & ctx, ggml_tensor * dst,
     if (queries < 1 || blocks < 1 || blocks > INT_MAX || streams < 1 || scores->ne[3] != 1 ||
             cell_blocks->ne[1] != streams || ggml_nrows(cell_blocks) != streams ||
             ggml_nelements(mask) != columns*rows || dst->ne[1] != queries ||
-            dst->ne[2] != streams || dst->ne[3] != 1 || k != 2051 ||
-            !register_top_k_wins(columns, rows)) return false;
+            dst->ne[2] != streams || dst->ne[3] != 1 ||
+            !register_top_k_wins(ggml_cuda_info().devices[ctx.device].cc, columns, rows, k)) return false;
     ggml_cuda_pool_alloc<uint64_t> selected(ctx.pool(), rows*k);
     const top_k_qsa_reader read{(const float *) scores->data, (const int32_t *) cell_blocks->data,
         (const half *) mask->data, int(columns), int(queries), int(blocks)};
@@ -484,8 +490,7 @@ void ggml_cuda_op_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     ggml_cuda_pool & pool  = ctx.pool();
     GGML_ASSERT(!stable || k <= 64);
 #if defined(GGML_CUDA_USE_CUB) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
-    if (ggml_cuda_info().devices[ctx.device].cc == 860 && !stable && k == 2051 &&
-            register_top_k_wins(ncols, nrows)) {
+    if (!stable && register_top_k_wins(ggml_cuda_info().devices[ctx.device].cc, ncols, nrows, k)) {
         ggml_cuda_pool_alloc<uint64_t> selected(pool, nrows*k);
         register_top_k_launch(top_k_dense_reader{src0_d, int(ncols)}, selected.get(), ncols, nrows, k, stream);
         register_top_k_sort<<<nrows, 256, 0, stream>>>(selected.get(), dst_d, k);

@@ -997,6 +997,7 @@ struct llm_graph_params {
             cparams.dflash_inject_stage     == other.cparams.dflash_inject_stage     &&
             cparams.dflash_oneg_n_inject    == other.cparams.dflash_oneg_n_inject    &&
             cparams.dflash_target_mmq_batch == other.cparams.dflash_target_mmq_batch &&
+            cparams.mtp_chain_tok           == other.cparams.mtp_chain_tok           &&
             arch  == other.arch  &&
             gtype == other.gtype &&
             cvec  == other.cvec  &&
@@ -1219,6 +1220,12 @@ struct llm_graph_context {
               ggml_tensor * cur,
               ggml_tensor * w_s = nullptr,
               ggml_tensor * in_s = nullptr) const;
+
+    // FR-Spec draft-vocab head: map logits over d2t's draft rows back to the target vocab
+    ggml_tensor * build_d2t_logits(
+              ggml_tensor * cur,
+              ggml_tensor * d2t,
+                  int64_t   n_vocab) const;
 
     // do mat_mul_id, while optionally apply lora and per-expert scale
     ggml_tensor * build_lora_mm_id(

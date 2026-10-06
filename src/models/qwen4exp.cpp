@@ -6,6 +6,13 @@
 
 #include <algorithm>
 #include <cinttypes>
+#include <cstring>
+#include <thread>
+
+#ifdef __linux__
+#include <fcntl.h>
+#include <unistd.h>
+#endif
 
 // Malformed model metadata must fail as a recoverable load error, not abort the process.
 static void qwen4exp_require_nonzero(const llama_model_loader & ml, llm_kv kid, uint32_t value) {
@@ -214,6 +221,22 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
                                                  { 1 }, scale_flags);
         per_layer_tok_embd_bias = create_tensor(tn(LLM_TENSOR_PER_LAYER_TOKEN_EMBD, "bias"),
                                                 { hparams.ple_head_dim, hparams.ple_n_heads }, TENSOR_NOT_REQUIRED);
+
+#ifdef __linux__
+        // a fresh open file description, so its random-access hint does not reach the loader's
+        const auto * w = ml.get_weight(ple_name.c_str());
+        const char * io = getenv("LLAMA_PLE_IO");
+        if (w && ml.lazy.has(per_layer_tok_embd) && ggml_get_type_traits(per_layer_tok_embd->type)->to_float &&
+                !(io && strcmp(io, "mmap") == 0)) {
+            const std::string path = "/proc/self/fd/" + std::to_string(ml.files.at(w->idx)->file_id());
+            ple_fd = open(path.c_str(), O_RDONLY | O_CLOEXEC);
+            if (ple_fd >= 0) {
+                posix_fadvise(ple_fd, 0, 0, POSIX_FADV_RANDOM);
+                ple_offs = w->offs;
+                LLAMA_LOG_INFO("%s: %s rows are read from the file\n", __func__, ple_name.c_str());
+            }
+        }
+#endif
     }
 
     // A standalone MTP artifact contains the draft block and shared input/output
@@ -393,6 +416,14 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
     }
 }
 
+llama_model_qwen4exp::~llama_model_qwen4exp() {
+#ifdef __linux__
+    if (ple_fd >= 0) {
+        close(ple_fd);
+    }
+#endif
+}
+
 std::unique_ptr<llm_graph_context> llama_model_qwen4exp::build_arch_graph(const llm_graph_params & params) const {
     if (params.gtype == LLM_GRAPH_TYPE_DECODER_MTP) {
         return std::make_unique<graph_mtp>(*this, params);
@@ -423,24 +454,35 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
     int sections[4];
     std::copy(std::begin(hparams.rope_sections), std::begin(hparams.rope_sections) + 4, sections);
 
-    auto inp = std::make_unique<llm_graph_input_embd_h>(hparams.n_embd_out());
+    // Greedy draft chain: a 1-token draft step reads its token and hidden row from
+    // the device stages and writes its argmax token and next hidden row back.
+    const bool chain = cparams.mtp_chain_tok && n_tokens == 1 && n_outputs == 1;
 
-    inp->tokens = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens);
-    ggml_set_input(inp->tokens);
+    ggml_tensor * tokens = chain ? cparams.mtp_chain_tok : nullptr;
+    ggml_tensor * h      = chain ? ggml_reshape_2d(ctx0, cparams.mtp_chain_h, hparams.n_embd_out(), 1) : nullptr;
+    if (!chain) {
+        auto inp = std::make_unique<llm_graph_input_embd_h>(hparams.n_embd_out());
 
-    inp->embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hparams.n_embd_out(), n_tokens);
-    ggml_set_input(inp->embd);
+        inp->tokens = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens);
+        ggml_set_input(inp->tokens);
 
-    inp->h = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hparams.n_embd_out(), n_tokens);
-    ggml_set_input(inp->h);
-    ggml_set_name(inp->h, "mtp_h_input");
+        inp->embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hparams.n_embd_out(), n_tokens);
+        ggml_set_input(inp->embd);
+
+        inp->h = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hparams.n_embd_out(), n_tokens);
+        ggml_set_input(inp->h);
+        ggml_set_name(inp->h, "mtp_h_input");
+
+        tokens = inp->tokens;
+        h      = inp->h;
+        res->add_input(std::move(inp));
+    }
 
     ggml_tensor * tok_embd_w = layer.nextn.embed_tokens ? layer.nextn.embed_tokens : model.tok_embd;
-    ggml_tensor * tok_embd = ggml_get_rows(ctx0, tok_embd_w, inp->tokens);
+    ggml_tensor * tok_embd = chain && cparams.mtp_chain_e
+            ? ggml_reshape_2d(ctx0, cparams.mtp_chain_e, n_embd, 1)
+            : ggml_get_rows(ctx0, tok_embd_w, tokens);
     cb(tok_embd, "mtp_tok_embd", il);
-
-    ggml_tensor * h = inp->h;
-    res->add_input(std::move(inp));
 
     ggml_tensor * inp_pos = build_inp_pos();
     auto * inp_attn = build_attn_inp_kv();
@@ -517,7 +559,7 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
         res->t_embd = flat_out;
     }
 
-    if (cparams.embeddings_nextn) {
+    if (cparams.embeddings_nextn && !chain) {
         ggml_tensor * h_nextn = cparams.embeddings_nextn_masked ? flat_out : flat;
         cb(h_nextn, "h_nextn", -1);
         res->t_h_nextn = h_nextn;
@@ -540,6 +582,34 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
     ggml_tensor * head_in_s = layer.nextn.shared_head_head ? layer.nextn.shared_head_head_in_s : model.output_in_s;
     cur = build_lora_mm(head_w, cur, head_s, head_in_s);
     cb(cur, "result_output", -1);
+    // a trimmed target head maps its rows back to target token ids
+    const bool d2t_head = model.d2t && head_w == model.output;
+    if (chain) {
+        // the draft's own inputs are ancestors of both copies, so overwriting the stages is safe
+        const int64_t n_vocab_head = cur->ne[0];
+        ggml_tensor * head_tok = ggml_argmax(ctx0, cur);
+        ggml_tensor * tok = head_tok;
+        if (d2t_head) {
+            tok = ggml_get_rows(ctx0, ggml_reshape_2d(ctx0, model.d2t, 1, n_vocab_head), tok);
+        }
+        ggml_build_forward_expand(gf, ggml_cpy(ctx0, tok, cparams.mtp_chain_tok));
+        if (cparams.mtp_chain_e) {
+            // the embedding rows are in head order
+            ggml_build_forward_expand(gf, ggml_cpy(ctx0, ggml_get_rows(ctx0, cparams.mtp_chain_embd, head_tok), cparams.mtp_chain_e));
+        }
+
+        // confidence as the step-by-step drafter's top-10 sampler reports it
+        const int64_t n_cand = std::min<int64_t>(10, n_vocab_head);
+        ggml_tensor * cand = ggml_get_rows(ctx0, ggml_reshape_2d(ctx0, cur, 1, n_vocab_head), ggml_top_k(ctx0, cur, n_cand));
+        cand = ggml_soft_max(ctx0, ggml_reshape_2d(ctx0, cand, n_cand, 1));
+        ggml_tensor * p = ggml_get_rows(ctx0, ggml_reshape_2d(ctx0, cand, 1, n_cand), ggml_argmax(ctx0, cand));
+        ggml_build_forward_expand(gf, ggml_cpy(ctx0, p, cparams.mtp_chain_p));
+        ggml_build_forward_expand(gf, ggml_cpy(ctx0, flat_out, cparams.mtp_chain_h));
+        return;
+    }
+    if (d2t_head) {
+        cur = build_d2t_logits(cur, model.d2t, (int64_t) model.vocab.n_tokens());
+    }
     res->t_logits = cur;
 
     ggml_build_forward_expand(gf, cur);
@@ -559,8 +629,10 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_mix(
     const int64_t hc_dim = hc * n_embd;
     const int64_t nt     = x->ne[2];
 
-    // the fused op has no LoRA hook, so adapters keep the unfused matmuls
-    if (cparams.fused_dsv4_hc_mix && il >= 0 && nt <= 8 && loras->empty()) {
+    // the fused op has no LoRA hook, so adapters keep the unfused matmuls;
+    // it also reads all its projections as one type, which mixed quants break
+    const bool same_type = w_up->type == w_down->type && (!inject || w_inject->type == w_down->type);
+    if (cparams.fused_dsv4_hc_mix && il >= 0 && nt <= 8 && loras->empty() && same_type) {
         // decode and short verify batches: norm, down, up, gate, mean and inject in one op
         ggml_tensor * out = ggml_dsv4_hc_mix(ctx0, x, w_norm, w_down, w_up, inject ? w_inject : nullptr,
                 hparams.f_norm_rms_eps, 1.0f / (float) hc);
@@ -1558,10 +1630,13 @@ public:
 
     bool can_reuse(const llm_graph_params & params) override {
         mctx = static_cast<const llama_memory_hybrid_idx_context *>(params.mctx)->get_attn();
-        return rows->ne[0] == (int64_t) pmodel.hparams.ple_n_heads * params.ubatch.n_tokens;
+        const int64_t n = rows ? rows->ne[0] : emb->ne[1];
+        return n == (int64_t) pmodel.hparams.ple_n_heads * params.ubatch.n_tokens;
     }
 
+    // one of the two: the row ids to gather from the mapped table, or the rows already read
     ggml_tensor * rows = nullptr;   // I32 [ple_n_heads * n_tokens]
+    ggml_tensor * emb  = nullptr;   // F32 [ple_head_dim, ple_n_heads * n_tokens]
 
     const llama_model_qwen4exp & pmodel;
 
@@ -1571,7 +1646,59 @@ public:
     // scratch, reused across set_input() calls
     std::vector<llama_token> prev;
     llama_mmap::ranges spans;
+    std::vector<uint8_t> raw;
+
+private:
+    void read_rows(const std::vector<int32_t> & idx);
 };
+
+// pread each row into the emb input, converting it to F32 there
+void llm_graph_input_ple::read_rows(const std::vector<int32_t> & idx) {
+#ifdef __linux__
+    const ggml_tensor * table = pmodel.per_layer_tok_embd;
+    const size_t row_size = table->nb[1];
+    const int64_t n_dim   = table->ne[0];
+    const auto * traits   = ggml_get_type_traits(table->type);
+
+    GGML_ASSERT(ggml_backend_buffer_is_host(emb->buffer));
+    float * dst = (float *) emb->data;
+
+    raw.resize(idx.size()*row_size);
+
+    auto read = [&](size_t k0, size_t k1) {
+        for (size_t k = k0; k < k1; ++k) {
+            uint8_t * buf = raw.data() + k*row_size;
+            const off_t offs = (off_t) (pmodel.ple_offs + (size_t) idx[k]*row_size);
+            for (size_t done = 0; done < row_size; ) {
+                const ssize_t n = pread(pmodel.ple_fd, buf + done, row_size - done, offs + done);
+                if (n <= 0) {
+                    GGML_ABORT("PLE row read failed: %s", n < 0 ? strerror(errno) : "end of file");
+                }
+                done += n;
+            }
+            traits->to_float(buf, dst + k*n_dim, n_dim);
+        }
+    };
+
+    // a prefill ubatch reads thousands of rows, some cold on disk
+    const size_t n_threads = std::min<size_t>(8, idx.size()/256);
+    if (n_threads <= 1) {
+        read(0, idx.size());
+        return;
+    }
+    std::vector<std::thread> workers;
+    const size_t per = (idx.size() + n_threads - 1)/n_threads;
+    for (size_t t = 0; t < n_threads; ++t) {
+        workers.emplace_back(read, t*per, std::min(idx.size(), (t + 1)*per));
+    }
+    for (auto & w : workers) {
+        w.join();
+    }
+#else
+    GGML_UNUSED(idx);
+    GGML_ABORT("PLE row reads need Linux");
+#endif
+}
 
 void llm_graph_input_ple::set_input(const llama_ubatch * ubatch) {
     const auto & hp = pmodel.hparams;
@@ -1629,6 +1756,11 @@ void llm_graph_input_ple::set_input(const llama_ubatch * ubatch) {
                     (int32_t) (mixed % hp.ple_head_vocab_sizes[h_i] + hp.ple_head_offsets[h_i]);
             }
         }
+    }
+
+    if (emb) {
+        read_rows(idx);
+        return;
     }
 
     // the table is ~27 GB and usually a lazily read mapping: issue every row's read at
@@ -1708,13 +1840,19 @@ ggml_tensor * llama_model_qwen4exp::graph::build_inp_ple(
     auto ple_inp = std::make_unique<llm_graph_input_ple>(
             static_cast<const llama_model_qwen4exp &>(model), mctx_hyb->get_attn());
 
-    ple_inp->rows = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_heads * n_tokens);
-    ggml_set_input(ple_inp->rows);
-    ggml_tensor * rows = ple_inp->rows;
+    // gather then flatten the heads: get_rows lays the head dimension out slowest, as the reference does
+    ggml_tensor * emb = nullptr;
+    if (static_cast<const llama_model_qwen4exp &>(model).ple_fd >= 0) {
+        ple_inp->emb = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hparams.ple_head_dim, n_heads * n_tokens);
+        ggml_set_input(ple_inp->emb);
+        emb = ple_inp->emb;
+    } else {
+        ple_inp->rows = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_heads * n_tokens);
+        ggml_set_input(ple_inp->rows);
+        emb = ggml_get_rows(ctx0, model.per_layer_tok_embd, ple_inp->rows);
+    }
     res->add_input(std::move(ple_inp));
 
-    // gather then flatten the heads: get_rows lays the head dimension out slowest, as the reference does
-    ggml_tensor * emb = ggml_get_rows(ctx0, model.per_layer_tok_embd, rows);
     if (model.per_layer_tok_embd_scale) {
         emb = ggml_mul(ctx0, emb, model.per_layer_tok_embd_scale);
     }

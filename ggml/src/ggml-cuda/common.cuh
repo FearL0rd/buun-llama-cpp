@@ -1359,6 +1359,10 @@ struct ggml_tensor_extra_gpu {
 struct ggml_cuda_graph {
 #ifdef USE_CUDA_GRAPH
     ~ggml_cuda_graph() {
+        release_head_instances();
+        for (auto & seg : head) {
+            CUDA_CHECK(cudaGraphDestroy(seg.graph));
+        }
         if (instance != nullptr) {
             CUDA_CHECK(cudaGraphExecDestroy(instance));
         }
@@ -1366,8 +1370,24 @@ struct ggml_cuda_graph {
             CUDA_CHECK(cudaGraphDestroy(graph));
         }
     }
+    void release_head_instances() {
+        for (auto & seg : head) {
+            if (seg.instance != nullptr) {
+                CUDA_CHECK(cudaGraphExecDestroy(seg.instance));
+                seg.instance = nullptr;
+            }
+        }
+    }
     cudaGraph_t graph = nullptr;
     cudaGraphExec_t instance = nullptr;
+    // Large graphs are captured as segments launched back to back: cudaGraphLaunch costs ~1.5 us per
+    // kernel node on the host and the GPU starts only when it returns, so the GPU runs head[0] while
+    // the host submits the rest. graph/instance hold the last segment.
+    struct segment {
+        cudaGraph_t graph = nullptr;
+        cudaGraphExec_t instance = nullptr;
+    };
+    std::vector<segment> head;
     size_t num_nodes = 0;
     std::vector<cudaGraphNode_t> nodes;
     bool disable_due_to_gpu_arch = false;
@@ -1377,6 +1397,7 @@ struct ggml_cuda_graph {
     struct node_properties {
         ggml_tensor node;
         void *   node_src_data_ptrs[GGML_MAX_SRC];
+        int32_t  node_src_type[GGML_MAX_SRC];
         int64_t  node_src_ne[GGML_MAX_SRC][GGML_MAX_DIMS];
         size_t   node_src_nb[GGML_MAX_SRC][GGML_MAX_DIMS];
     };
@@ -1756,6 +1777,7 @@ struct ggml_backend_cuda_context {
         }
         CUDA_CHECK(cudaGraphExecDestroy(lru->instance));
         lru->instance = nullptr;
+        lru->release_head_instances();
         return true;
     }
 
