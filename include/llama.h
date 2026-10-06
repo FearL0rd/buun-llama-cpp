@@ -668,6 +668,12 @@ extern "C" {
     LLAMA_API int32_t llama_model_n_layer      (const struct llama_model * model);
     LLAMA_API int32_t llama_model_n_layer_nextn(const struct llama_model * model);
     LLAMA_API bool    llama_model_has_mtp      (const struct llama_model * model);
+
+    // Restrict an MTP draft model's LM head to the ascending target token ids `ids`
+    // (FR-Spec style): gathers those rows of its output head into a draft-owned copy
+    // and maps draft logits back through d2t. Call after loading, before creating a
+    // context. Returns false (model unchanged) when the head cannot be trimmed.
+    LLAMA_API bool    llama_model_set_draft_vocab(struct llama_model * model, const int32_t * ids, int32_t n_ids);
     LLAMA_API int32_t llama_model_n_head       (const struct llama_model * model);
     LLAMA_API int32_t llama_model_n_head_kv    (const struct llama_model * model);
 

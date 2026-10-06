@@ -1220,6 +1220,12 @@ struct llm_graph_context {
               ggml_tensor * w_s = nullptr,
               ggml_tensor * in_s = nullptr) const;
 
+    // FR-Spec draft-vocab head: map logits over d2t's draft rows back to the target vocab
+    ggml_tensor * build_d2t_logits(
+              ggml_tensor * cur,
+              ggml_tensor * d2t,
+                  int64_t   n_vocab) const;
+
     // do mat_mul_id, while optionally apply lora and per-expert scale
     ggml_tensor * build_lora_mm_id(
               ggml_tensor * w,   // ggml_tensor * as

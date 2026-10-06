@@ -10124,6 +10124,20 @@ private:
                 return false;
             }
 
+            // MTP sidecars that borrow the target's LM head have no on-disk
+            // derivative; trim the head in memory to the same balanced map.
+            if (params_base.speculative.has_type(COMMON_SPECULATIVE_TYPE_DRAFT_MTP) &&
+                params_base.speculative.draft.mtp_vocab_size > 0) {
+                std::vector<int32_t> ids;
+                std::string reason;
+                if (!common_mtp_vocab_trim_ids(params_dft.model.path,
+                            params_base.speculative.draft.mtp_vocab_size, ids, reason)) {
+                    SRV_WRN("[spec] MTP LM-head trim unavailable: %s\n", reason.c_str());
+                } else if (!llama_model_set_draft_vocab(model_dft.get(), ids.data(), (int32_t) ids.size())) {
+                    SRV_INF("%s", "[spec] MTP LM head left untrimmed (already trimmed or unsupported)\n");
+                }
+            }
+
             // DFlash2 uses the shared block-diffusion driver, which owns the
             // final per-sequence adaptive-depth controller. Normalize the older
             // fork `dflash` spelling after inspecting the sidecar so there is no

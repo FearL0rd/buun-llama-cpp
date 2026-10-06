@@ -606,6 +606,36 @@ bool cached_file_valid(const std::string & path, const source_identity & identit
 
 }  // namespace
 
+bool common_mtp_vocab_trim_ids(const std::string & gguf_path, uint32_t draft_vocab_size,
+                               std::vector<int32_t> & ids, std::string & reason) {
+    if (draft_vocab_size != QWEN_DRAFT_VOCAB_SIZE) {
+        reason = "the balanced map has exactly 32768 entries";
+        return false;
+    }
+    gguf_init_params params = {
+        /* .no_alloc = */ true,
+        /* .ctx      = */ nullptr,
+    };
+    gguf_ptr source(gguf_init_from_file(gguf_path.c_str(), params), gguf_free);
+    if (!source) {
+        reason = "unreadable GGUF metadata";
+        return false;
+    }
+    if (!tokenizer_matches(source.get(), reason)) {
+        return false;
+    }
+    ids.clear();
+    ids.reserve(QWEN_DRAFT_VOCAB_SIZE);
+    for (int32_t token = 0; token < static_cast<int32_t>(QWEN_TOKENIZER_SIZE); ++token) {
+        const size_t word = static_cast<size_t>(token) / 64;
+        const size_t bit  = static_cast<size_t>(token) % 64;
+        if (word < QWEN27B_BALANCED_VOCAB.size() && (QWEN27B_BALANCED_VOCAB[word] & (UINT64_C(1) << bit)) != 0) {
+            ids.push_back(token);
+        }
+    }
+    return ids.size() == draft_vocab_size;
+}
+
 bool common_mtp_vocab_trim_repack_for_test(const std::string &          source_path,
                                            const std::string &          destination_path,
                                            const std::vector<int64_t> & draft_to_target,

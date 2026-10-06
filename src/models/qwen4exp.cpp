@@ -540,6 +540,9 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
     ggml_tensor * head_in_s = layer.nextn.shared_head_head ? layer.nextn.shared_head_head_in_s : model.output_in_s;
     cur = build_lora_mm(head_w, cur, head_s, head_in_s);
     cb(cur, "result_output", -1);
+    if (model.d2t && head_w == model.output) {
+        cur = build_d2t_logits(cur, model.d2t, (int64_t) model.vocab.n_tokens());
+    }
     res->t_logits = cur;
 
     ggml_build_forward_expand(gf, cur);
