@@ -127,6 +127,8 @@ struct moe_cache_slot {
     int next = -1;
     int readers = 0;
     uint16_t freq = 0; // aged probe count while resident (LFU admission)
+    // Freed from a routed table: the next fill waits for this event, recorded after the repoint.
+    cudaEvent_t wait_event = nullptr;
     moe_cache_slot_state state = moe_cache_slot_state::free;
 };
 
@@ -139,6 +141,9 @@ struct moe_cache_pool {
 
     std::vector<moe_cache_slot> slots;
     std::vector<int> free_slots;
+    // Evicted ahead of demand by a drain; refills wait only for that drain's repoint.
+    std::vector<int> cooled;
+    int cool_used = 0; // full-pool admissions since the last drain
     std::unordered_map<moe_cache_key, int, moe_cache_key_hash> map;
     int lru_head = -1;
     int lru_tail = -1;
@@ -182,7 +187,7 @@ struct moe_cache_job {
     size_t bytes = 0;
     // The slot was evicted from a device-routed table: wait until the routed
     // stream has passed the table repoint before overwriting it.
-    bool wait_route = false;
+    cudaEvent_t wait_event = nullptr;
 };
 
 static constexpr int moe_cache_route_log_max = 512;
@@ -238,6 +243,9 @@ struct moe_cache_config {
     bool lfu = true;
     int lfu_window = 10;
     int lfu_cap = 15;
+    // Most slots per pool a drain evicts ahead of demand, so refills need not wait
+    // for the evaluation in flight to stop reading the victims.
+    int cool = 0;
     int queue_max = 128;
     size_t queue_mb = 512;
     int stats_every = 0;
@@ -346,6 +354,10 @@ struct moe_cache_device {
     bool route_flush_deferred = false;
     cudaStream_t route_stream = nullptr;
     cudaEvent_t route_event = nullptr;
+    // Recorded after each cooling drain's flush, round robin: a fill waiting on a
+    // reused event waits for a later repoint, which is only slower.
+    cudaEvent_t cool_events[4] = {};
+    int cool_next = 0;
     long long route_rows = 0;
 
     // hits and misses count tensor-expert probes; fusion counters count row pairs.
@@ -779,6 +791,9 @@ static moe_cache_config moe_cache_read_config() {
     if (moe_cache_env_i64("GGML_CUDA_MOE_CACHE_THROTTLE", 1, 1024, value)) {
         config.readmit_after = (int)value;
         config.readmit_after_explicit = true;
+    }
+    if (moe_cache_env_i64("GGML_CUDA_MOE_CACHE_COOL", 0, 4096, value)) {
+        config.cool = (int)value;
     }
     if (moe_cache_env_i64("GGML_CUDA_MOE_CACHE_LFU", 0, 1, value)) {
         config.lfu = value != 0;
@@ -1330,6 +1345,7 @@ static void moe_cache_slot_reset(moe_cache_pool & pool, int index, bool add_to_f
     slot.generation++;
     slot.readers = 0;
     slot.freq = 0;
+    slot.wait_event = nullptr;
     slot.state = moe_cache_slot_state::free;
     slot.prev = -1;
     slot.next = -1;
@@ -1743,6 +1759,12 @@ static void moe_cache_route_destroy(moe_cache_device & device) {
         cudaEventDestroy(device.route_event);
         device.route_event = nullptr;
     }
+    for (cudaEvent_t & event : device.cool_events) {
+        if (event) {
+            cudaEventDestroy(event);
+            event = nullptr;
+        }
+    }
     device.route_stream = nullptr;
 }
 
@@ -1834,8 +1856,8 @@ static void moe_cache_worker(moe_cache_session * session, moe_cache_device * dev
             if (session->config.serial_fill) {
                 fill_lock.lock();
             }
-            if (error == cudaSuccess && job.wait_route) {
-                error = cudaStreamWaitEvent(stream, device->route_event, 0);
+            if (error == cudaSuccess && job.wait_event) {
+                error = cudaStreamWaitEvent(stream, job.wait_event, 0);
             }
             if (error == cudaSuccess) {
 #if defined(GGML_USE_HIP)
@@ -3469,6 +3491,53 @@ static int moe_cache_overlap_rows(const moe_cache_node & node, int n_ids) {
     return std::min(rows, n_ids - 1);
 }
 
+// Evicts the least recently used slot no kernel holds and queues its table repoint.
+// Returns the reset slot (on no list), -1 when none can go, or -2 when an LFU contest
+// keeps the victim. A routed victim's fill must wait for wait_event.
+static int moe_cache_evict_lru_locked(
+        const moe_cache_session & session, moe_cache_device & device, moe_cache_pool & pool,
+        bool contest, uint16_t freq, cudaEvent_t & wait_event) {
+    // A routed victim's table entry must leave the slot before it is refilled,
+    // which cannot be ordered into a stream that is being captured.
+    const bool route_blocked = !device.routes.empty() && moe_cache_route_capturing(device);
+    int candidate = pool.lru_head;
+    while (candidate >= 0 && (pool.slots[candidate].readers > 0 ||
+            (route_blocked && moe_cache_route_get(device, pool.slots[candidate].key.tensor)))) {
+        candidate = pool.slots[candidate].next;
+    }
+    if (candidate < 0) {
+        return -1;
+    }
+    const uint16_t victim_freq = pool.slots[candidate].freq;
+    if (contest && victim_freq >= freq) {
+        return -2;
+    }
+    const moe_cache_key victim = pool.slots[candidate].key;
+    wait_event = nullptr;
+    if (const moe_cache_route * route = moe_cache_route_get(device, victim.tensor)) {
+        try {
+            moe_cache_route_push_locked(device, victim,
+                    route->device_base + (size_t)victim.expert * route->expert_size);
+        } catch (...) {
+            return -1;
+        }
+        if (!moe_cache_route_flush_locked(device)) {
+            device.route_pending.pop_back();
+            return -1;
+        }
+        wait_event = device.route_event;
+    }
+    moe_cache_slot_reset(pool, candidate, false);
+    device.evictions++;
+    if (session.config.lfu && victim_freq > 0) {
+        try {
+            device.demand_count[victim] = {victim_freq, pool.expert_size};
+        } catch (...) {
+        }
+    }
+    return candidate;
+}
+
 static bool moe_cache_enqueue_locked(
         moe_cache_session & session, moe_cache_device & device,
         moe_cache_pool & pool, int pool_index, const void * host_base,
@@ -3483,53 +3552,23 @@ static bool moe_cache_enqueue_locked(
     }
 
     int slot_index = -1;
-    bool wait_route = false;
+    cudaEvent_t wait_event = nullptr;
     if (!pool.free_slots.empty()) {
         slot_index = pool.free_slots.back();
         pool.free_slots.pop_back();
+        wait_event = pool.slots[slot_index].wait_event;
+    } else if (allow_eviction && !pool.cooled.empty()) {
+        slot_index = pool.cooled.back();
+        pool.cooled.pop_back();
+        wait_event = pool.slots[slot_index].wait_event;
+        pool.cool_used++;
     } else if (allow_eviction) {
-        // A routed victim's table entry must leave the slot before it is refilled,
-        // which cannot be ordered into a stream that is being captured.
-        const bool route_blocked = !device.routes.empty() && moe_cache_route_capturing(device);
-        int candidate = pool.lru_head;
-        while (candidate >= 0 && (pool.slots[candidate].readers > 0 ||
-                (route_blocked && moe_cache_route_get(device, pool.slots[candidate].key.tensor)))) {
-            candidate = pool.slots[candidate].next;
-        }
-        if (candidate < 0) {
-            device.insert_skips++;
+        slot_index = moe_cache_evict_lru_locked(session, device, pool, contest, freq, wait_event);
+        if (slot_index < 0) {
+            (slot_index == -2 ? device.admission_skips : device.insert_skips)++;
             return false;
         }
-        const uint16_t victim_freq = pool.slots[candidate].freq;
-        if (contest && victim_freq >= freq) {
-            device.admission_skips++;
-            return false;
-        }
-        const moe_cache_key victim = pool.slots[candidate].key;
-        if (const moe_cache_route * route = moe_cache_route_get(device, victim.tensor)) {
-            try {
-                moe_cache_route_push_locked(device, victim,
-                        route->device_base + (size_t)victim.expert * route->expert_size);
-            } catch (...) {
-                device.insert_skips++;
-                return false;
-            }
-            if (!moe_cache_route_flush_locked(device)) {
-                device.route_pending.pop_back();
-                device.insert_skips++;
-                return false;
-            }
-            wait_route = true;
-        }
-        slot_index = candidate;
-        moe_cache_slot_reset(pool, slot_index, false);
-        device.evictions++;
-        if (session.config.lfu && victim_freq > 0) {
-            try {
-                device.demand_count[victim] = {victim_freq, expert_size};
-            } catch (...) {
-            }
-        }
+        pool.cool_used++;
     } else {
         return false;
     }
@@ -3552,7 +3591,7 @@ static bool moe_cache_enqueue_locked(
             (const char *)host_base + (size_t)expert * expert_size;
         device.queue.push_back({
                 pool_index, slot_index, slot.generation,
-                key, source, expert_size, wait_route});
+                key, source, expert_size, wait_event});
         device.queued_bytes += expert_size;
     } catch (...) {
         moe_cache_slot_reset(pool, slot_index, true);
@@ -3691,6 +3730,46 @@ static void moe_cache_route_snapshot_locked(moe_cache_device & device) {
     }
 }
 
+// Called in a drain before its closing flush: evict each pool's LRU tail ahead of
+// demand, as many slots as its full-pool admissions took since the last drain.
+// Returns the event the closing flush must record when a routed slot was cooled.
+static cudaEvent_t moe_cache_cool_locked(const moe_cache_session & session, moe_cache_device & device) {
+    if (session.config.cool <= 0) {
+        return nullptr;
+    }
+    cudaEvent_t & event = device.cool_events[device.cool_next];
+    if (!event && !moe_cache_cuda_ok(device, cudaEventCreateWithFlags(
+            &event, cudaEventDisableTiming), "cool event", false)) {
+        event = nullptr;
+        return nullptr;
+    }
+    bool routed = false;
+    for (auto & entry : device.pools) {
+        moe_cache_pool & pool = *entry;
+        const int target = std::min(pool.cool_used, session.config.cool);
+        pool.cool_used = 0;
+        if (!pool.slab || (int)pool.cooled.size() >= target) {
+            continue;
+        }
+        try {
+            pool.cooled.reserve(target);
+        } catch (...) {
+            continue;
+        }
+        while ((int)pool.cooled.size() < target) {
+            cudaEvent_t wait_event = nullptr;
+            const int index = moe_cache_evict_lru_locked(session, device, pool, false, 0, wait_event);
+            if (index < 0) {
+                break;
+            }
+            pool.slots[index].wait_event = wait_event ? event : nullptr;
+            routed |= wait_event != nullptr;
+            pool.cooled.push_back(index);
+        }
+    }
+    return routed ? event : nullptr;
+}
+
 // Called under session.mu after an evaluation is launched. Feed the snapshotted
 // experts into the same admission, LRU, and heat bookkeeping the CPU path uses,
 // then publish finished fills to the tables (applied after the launched work).
@@ -3763,10 +3842,20 @@ static void moe_cache_route_drain_locked(moe_cache_session & session) {
         }
     }
     moe_cache_freq_age_locked(session, device);
+    cudaEvent_t cool_event = moe_cache_cool_locked(session, device);
     device.route_flush_deferred = false;
     if (!moe_cache_route_flush_locked(device) && evictions_before != device.evictions) {
         // refills of evicted slots are queued: repoint every table synchronously first
         moe_cache_route_reset_locked(device);
+        cudaStreamSynchronize(device.route_stream);
+    } else if (cool_event) {
+        if (cudaEventRecord(cool_event, device.route_stream) == cudaSuccess) {
+            device.cool_next = (device.cool_next + 1) % (int)std::size(device.cool_events);
+        } else {
+            // the cooled slots' event still holds an older repoint
+            (void)cudaGetLastError();
+            cudaStreamSynchronize(device.route_stream);
+        }
     }
     if (session.config.stats_every > 0 && ++device.route_drains % session.config.stats_every == 0) {
         moe_cache_log_stats(device);
@@ -5847,6 +5936,8 @@ static void moe_cache_scratch_lend_locked(
     }
     pool.free_slots.erase(std::remove_if(pool.free_slots.begin(), pool.free_slots.end(),
             [&](int index) { return index >= first && index < last; }), pool.free_slots.end());
+    pool.cooled.erase(std::remove_if(pool.cooled.begin(), pool.cooled.end(),
+            [&](int index) { return index >= first && index < last; }), pool.cooled.end());
     if (!moe_cache_route_flush_locked(device)) {
         moe_cache_route_reset_locked(device);
     }
