@@ -857,6 +857,11 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
 
 // cuda buffer
 
+#if !defined(GGML_USE_HIP)
+// Set once any weight is uploaded in a Marlin layout; until then no graph can need canonicalizing.
+static std::atomic<bool> ggml_cuda_marlin_any_repacked{false};
+#endif
+
 struct ggml_backend_cuda_buffer_context {
     int device;
     void * dev_ptr = nullptr;
@@ -1022,6 +1027,9 @@ static bool ggml_cuda_marlin_owner_is_repacked(const ggml_tensor * tensor) {
 // canonical layout once, before graph capture, and say so.
 static void ggml_cuda_canonicalize_unserved_marlin_weights(
         ggml_backend_cuda_context * cuda_ctx, const ggml_cgraph * cgraph) {
+    if (!ggml_cuda_marlin_any_repacked.load(std::memory_order_relaxed)) {
+        return;
+    }
     const int cc = ggml_cuda_info().devices[cuda_ctx->device].cc;
     bool restored = false;
     for (int i = 0; i < cgraph->n_nodes; ++i) {
@@ -1204,6 +1212,7 @@ static void ggml_backend_cuda_buffer_set_tensor(ggml_backend_buffer_t buffer, gg
             int(ggml_cuda_info().devices[ctx->device].smpbo),
             ggml_cuda_info().devices[ctx->device].nsm, cudaStreamPerThread);
         ctx->marlin_q4_a32_repacked.insert(tensor->data);
+        ggml_cuda_marlin_any_repacked.store(true, std::memory_order_relaxed);
         return;
     }
     if (ggml_cuda_marlin_q8_g128_enabled() && full_tensor && tensor->type == GGML_TYPE_Q8_0_G128 &&
@@ -1216,6 +1225,7 @@ static void ggml_backend_cuda_buffer_set_tensor(ggml_backend_buffer_t buffer, gg
             int(ggml_cuda_info().devices[ctx->device].smpbo),
             ggml_cuda_info().devices[ctx->device].nsm, cudaStreamPerThread);
         ctx->marlin_q8_g128_repacked.insert(tensor->data);
+        ggml_cuda_marlin_any_repacked.store(true, std::memory_order_relaxed);
         return;
     }
 #endif
