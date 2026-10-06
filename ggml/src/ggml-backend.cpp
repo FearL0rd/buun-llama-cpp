@@ -1932,8 +1932,23 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             }
         }
 
-        // copy the input tensors to the split backend
-        for (int input_id = 0; input_id < split->n_inputs; input_id++) {
+        // without input copy events, the split backend has to be idle before its inputs are
+        // overwritten; once is enough, the copies below do not use the previous inputs
+        bool split_backend_idle = false;
+        auto sync_split_backend = [&]() {
+            if (!split_backend_idle) {
+                ggml_backend_synchronize(split_backend);
+                split_backend_idle = true;
+            }
+        };
+
+        // copy the input tensors to the split backend, host sources first: their copies are
+        // synchronous and would otherwise wait for the device-to-device copies queued here
+        // (and with them the whole previous split on the other device) before the split launches
+        for (int input_n = 0; input_n < 2*split->n_inputs; input_n++) {
+            const int input_id = input_n % split->n_inputs;
+            const bool host_src = ggml_backend_buffer_is_host(split->inputs[input_id]->buffer);
+            if (host_src != (input_n < split->n_inputs)) continue;
             if (prefetched && input_id == split->prefetch_input) continue;
             ggml_backend_t input_backend = ggml_backend_sched_get_tensor_backend(sched, split->inputs[input_id]);
             struct ggml_tensor * input = split->inputs[input_id];
@@ -1944,7 +1959,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
                     ggml_backend_event_synchronize(sched->events[split_backend_id][sched->cur_copy]);
                 } else {
-                    ggml_backend_synchronize(split_backend);
+                    sync_split_backend();
                 }
                 ggml_backend_tensor_copy(input, input_cpy);
             } else {
@@ -1952,7 +1967,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
                     ggml_backend_event_wait(split_backend, sched->events[split_backend_id][sched->cur_copy]);
                 } else {
-                    ggml_backend_synchronize(split_backend);
+                    sync_split_backend();
                 }
 
                 if (input_id == split->device_output_input) {
@@ -2070,7 +2085,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
                             ggml_backend_event_synchronize(sched->events[split_backend_id][sched->cur_copy]);
                         } else {
-                            ggml_backend_synchronize(split_backend);
+                            sync_split_backend();
                         }
                         ggml_backend_tensor_copy(input, input_cpy);
                     }
