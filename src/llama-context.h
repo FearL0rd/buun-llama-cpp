@@ -543,7 +543,8 @@ private:
     // Choose a synthetic reserve shape that both the configured context and the
     // current physical memory context can represent. Returns zero when unavailable.
     uint32_t effective_reserve_n_seqs(const llama_memory_context_i * mctx) const;
-    llm_graph_result * get_gf_res_prev();
+    int graph_slot(const llama_ubatch & ubatch) const;
+    llm_graph_result * get_gf_res_prev(int slot);
     void invalidate_graph_results();
 
     llm_graph_params graph_params(
@@ -671,13 +672,14 @@ private:
     std::vector<ggml_backend_buffer_type_t> backend_buft;
     std::vector<size_t>                     backend_buf_exp_size; // expected buffer sizes
 
-    // Separate arenas give batches with and without outputs distinct CUDA graph cache keys.
-    std::array<llm_graph_result_ptr, 2> gf_res_prev;
+    // One graph per sched graph slot (see graph_slot()), so alternating batch shapes each stay built
+    // and allocated. gf_res_prev_alloc marks the slots whose graph the sched allocated.
+    std::array<llm_graph_result_ptr, GGML_SCHED_MAX_GRAPH_SLOTS> gf_res_prev;
+    std::array<bool, GGML_SCHED_MAX_GRAPH_SLOTS> gf_res_prev_alloc = {};
     llm_graph_result_ptr gf_res_reserve;
 
     // one-time Hadamard transform-coverage check on the first built graph
     bool hadamard_verified = false;
-    llm_graph_result * gf_res_prev_active = nullptr;
 
     // host buffer for the model output (logits and embeddings)
     ggml_backend_buffer_ptr buf_output;

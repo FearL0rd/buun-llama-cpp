@@ -34,6 +34,7 @@ void ggml_moe_cache_unregister(const void * owner) {
 #include <string.h>
 #include <algorithm>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #ifdef __APPLE__
@@ -933,7 +934,67 @@ struct ggml_backend_sched {
     int debug_realloc;
     int debug_graph_size;
     int debug_prev_graph_size;
+
+    // allocation record of the active slot's graph
+    const struct ggml_cgraph * alloc_src_graph;
+    uint32_t alloc_generation;
+    size_t alloc_high_water[GGML_SCHED_MAX_BACKENDS];
+
+    // parked per-graph state of the inactive slots; entry cur_graph_slot is always empty
+    struct ggml_backend_sched_graph_state * graph_slots; // [GGML_SCHED_MAX_GRAPH_SLOTS]
+    int cur_graph_slot;
+    int galloc_graph_slot; // slot whose graph the galloc planned last
+    size_t graph_size;
 };
+
+// the fields of ggml_backend_sched that describe one split and allocated graph
+struct ggml_backend_sched_graph_state {
+    bool is_reset;
+    bool is_alloc;
+    struct ggml_hash_set hash_set;
+    int * hv_tensor_backend_ids;
+    struct ggml_tensor ** hv_tensor_copies;
+    int * node_backend_ids;
+    int * leaf_backend_ids;
+    int * prev_node_backend_ids;
+    int * prev_leaf_backend_ids;
+    struct ggml_cgraph graph;
+    struct ggml_backend_sched_split * splits;
+    int n_splits;
+    int splits_capacity;
+    struct ggml_tensor ** graph_inputs;
+    int n_graph_inputs;
+    int graph_inputs_capacity;
+    struct ggml_context * ctx;
+    char * context_buffer;
+    const struct ggml_cgraph * alloc_src_graph;
+    uint32_t alloc_generation;
+    size_t alloc_high_water[GGML_SCHED_MAX_BACKENDS];
+};
+
+static void ggml_backend_sched_swap_graph_state(ggml_backend_sched_t sched, ggml_backend_sched_graph_state & s) {
+    std::swap(sched->is_reset,              s.is_reset);
+    std::swap(sched->is_alloc,              s.is_alloc);
+    std::swap(sched->hash_set,              s.hash_set);
+    std::swap(sched->hv_tensor_backend_ids, s.hv_tensor_backend_ids);
+    std::swap(sched->hv_tensor_copies,      s.hv_tensor_copies);
+    std::swap(sched->node_backend_ids,      s.node_backend_ids);
+    std::swap(sched->leaf_backend_ids,      s.leaf_backend_ids);
+    std::swap(sched->prev_node_backend_ids, s.prev_node_backend_ids);
+    std::swap(sched->prev_leaf_backend_ids, s.prev_leaf_backend_ids);
+    std::swap(sched->graph,                 s.graph);
+    std::swap(sched->splits,                s.splits);
+    std::swap(sched->n_splits,              s.n_splits);
+    std::swap(sched->splits_capacity,       s.splits_capacity);
+    std::swap(sched->graph_inputs,          s.graph_inputs);
+    std::swap(sched->n_graph_inputs,        s.n_graph_inputs);
+    std::swap(sched->graph_inputs_capacity, s.graph_inputs_capacity);
+    std::swap(sched->ctx,                   s.ctx);
+    std::swap(sched->context_buffer,        s.context_buffer);
+    std::swap(sched->alloc_src_graph,       s.alloc_src_graph);
+    std::swap(sched->alloc_generation,      s.alloc_generation);
+    std::swap(sched->alloc_high_water,      s.alloc_high_water);
+}
 
 #define hash_id(tensor) ggml_hash_find_or_insert(&sched->hash_set, tensor)
 #define tensor_backend_id(tensor) sched->hv_tensor_backend_ids[hash_id(tensor)]
@@ -1779,14 +1840,23 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
 
 // Tells the moe-cache how much of each compute buffer the allocated graph uses, once per evaluation:
 // before the inputs are set on a fresh allocation, and before a reused graph runs.
+// Every slot still holding an allocated graph keeps its part of the buffer.
 static void ggml_backend_sched_scratch_prepare(ggml_backend_sched_t sched) {
     if (!sched->moe_cache_session || !ggml_moe_cache.scratch_prepare || sched->moe_cache_scratch_prepared) {
         return;
     }
+    const uint32_t generation = ggml_gallocr_get_generation(sched->galloc);
     for (int b = 0; b < sched->n_backends; b++) {
         size_t high_water = 0;
         ggml_backend_buffer_t buffer = ggml_gallocr_get_plan_buffer(sched->galloc, b, &high_water);
         if (buffer) {
+            high_water = sched->alloc_high_water[b];
+            for (int s = 0; sched->graph_slots && s < GGML_SCHED_MAX_GRAPH_SLOTS; s++) {
+                const ggml_backend_sched_graph_state & state = sched->graph_slots[s];
+                if (state.is_alloc && state.alloc_generation == generation) {
+                    high_water = std::max(high_water, state.alloc_high_water[b]);
+                }
+            }
             ggml_moe_cache.scratch_prepare(sched->moe_cache_session, sched->backends[b], buffer, high_water);
         }
     }
@@ -1794,8 +1864,10 @@ static void ggml_backend_sched_scratch_prepare(ggml_backend_sched_t sched) {
 }
 
 static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
-    bool backend_ids_changed = false;
-    for (int i = 0; i < sched->graph.n_nodes; i++) {
+    // the galloc plan reused by index only matches graphs of the slot that made it
+    bool backend_ids_changed = sched->galloc_graph_slot != sched->cur_graph_slot;
+    sched->galloc_graph_slot = sched->cur_graph_slot;
+    for (int i = 0; !backend_ids_changed && i < sched->graph.n_nodes; i++) {
         if (sched->node_backend_ids[i] != sched->prev_node_backend_ids[i] &&
             sched->bufts[sched->node_backend_ids[i]] != sched->bufts[sched->prev_node_backend_ids[i]]) {
             backend_ids_changed = true;
@@ -1845,6 +1917,12 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
             GGML_LOG_ERROR("%s: failed to allocate graph\n", __func__);
             return false;
         }
+    }
+
+    sched->alloc_generation = ggml_gallocr_get_generation(sched->galloc);
+    for (int b = 0; b < sched->n_backends; b++) {
+        sched->alloc_high_water[b] = 0;
+        ggml_gallocr_get_plan_buffer(sched->galloc, b, &sched->alloc_high_water[b]);
     }
 
     sched->moe_cache_scratch_prepared = false;
@@ -2178,6 +2256,52 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     return GGML_STATUS_SUCCESS;
 }
 
+// allocates the active per-graph state for graphs of up to sched->graph_size nodes
+static void ggml_backend_sched_init_graph_state(ggml_backend_sched_t sched) {
+    const size_t graph_size = sched->graph_size;
+
+    // initialize hash table
+    // FIXME: needs to be size*2 to account for leafs (do it in graph_split instead)
+    sched->hash_set    = ggml_hash_set_new(graph_size);
+    sched->hv_tensor_backend_ids = (int *) malloc(sched->hash_set.size * sizeof(sched->hv_tensor_backend_ids[0]));
+    sched->hv_tensor_copies      = (ggml_tensor **) malloc(sched->hash_set.size * sched->n_backends * sched->n_copies * sizeof(struct ggml_tensor *));
+
+    const size_t ggml_sched_max_splits = graph_size; // at most there is one split for each node in the graph
+    const size_t nodes_size = graph_size + ggml_sched_max_splits*GGML_SCHED_MAX_SPLIT_INPUTS*2;
+    sched->node_backend_ids = (int *) calloc(nodes_size, sizeof(sched->node_backend_ids[0]));
+    sched->leaf_backend_ids = (int *) calloc(nodes_size, sizeof(sched->leaf_backend_ids[0]));
+    sched->prev_node_backend_ids = (int *) calloc(nodes_size, sizeof(sched->prev_node_backend_ids[0]));
+    sched->prev_leaf_backend_ids = (int *) calloc(nodes_size, sizeof(sched->prev_leaf_backend_ids[0]));
+
+    sched->context_buffer = (char *) malloc(sched->context_buffer_size);
+
+    const int initial_splits_capacity = 16;
+    sched->splits = (ggml_backend_sched_split *) calloc(initial_splits_capacity, sizeof(sched->splits[0]));
+    sched->splits_capacity = initial_splits_capacity;
+
+    sched->graph_inputs_capacity = GGML_SCHED_MAX_SPLIT_INPUTS;
+    sched->graph_inputs = (struct ggml_tensor **) calloc(sched->graph_inputs_capacity, sizeof(struct ggml_tensor *));
+}
+
+static void ggml_backend_sched_free_graph_state(ggml_backend_sched_t sched) {
+    ggml_free(sched->ctx);
+    ggml_hash_set_free(&sched->hash_set);
+    for (int i = 0; i < sched->splits_capacity; i++) {
+        free(sched->splits[i].inputs);
+    }
+    free(sched->splits);
+    free(sched->graph_inputs);
+    free(sched->hv_tensor_backend_ids);
+    free(sched->hv_tensor_copies);
+    free(sched->node_backend_ids);
+    free(sched->leaf_backend_ids);
+    free(sched->prev_node_backend_ids);
+    free(sched->prev_leaf_backend_ids);
+    free(sched->context_buffer);
+    free(sched->graph.nodes);
+    free(sched->graph.leafs);
+}
+
 ggml_backend_sched_t ggml_backend_sched_new(
         ggml_backend_t * backends,
         ggml_backend_buffer_type_t * bufts,
@@ -2203,32 +2327,15 @@ ggml_backend_sched_t ggml_backend_sched_new(
 
     sched->n_backends = n_backends;
     sched->n_copies = parallel ? GGML_SCHED_MAX_COPIES : 1;
-
-    // initialize hash table
-    // FIXME: needs to be size*2 to account for leafs (do it in graph_split instead)
-    sched->hash_set    = ggml_hash_set_new(graph_size);
-    sched->hv_tensor_backend_ids = (int *) malloc(sched->hash_set.size * sizeof(sched->hv_tensor_backend_ids[0]));
-    sched->hv_tensor_copies      = (ggml_tensor **) malloc(sched->hash_set.size * sched->n_backends * sched->n_copies * sizeof(struct ggml_tensor *));
-
-    const size_t ggml_sched_max_splits = graph_size; // at most there is one split for each node in the graph
-    const size_t nodes_size = graph_size + ggml_sched_max_splits*GGML_SCHED_MAX_SPLIT_INPUTS*2;
-    sched->node_backend_ids = (int *) calloc(nodes_size, sizeof(sched->node_backend_ids[0]));
-    sched->leaf_backend_ids = (int *) calloc(nodes_size, sizeof(sched->leaf_backend_ids[0]));
-    sched->prev_node_backend_ids = (int *) calloc(nodes_size, sizeof(sched->prev_node_backend_ids[0]));
-    sched->prev_leaf_backend_ids = (int *) calloc(nodes_size, sizeof(sched->prev_leaf_backend_ids[0]));
+    sched->graph_size = graph_size;
 
     sched->debug_graph_size = 0;
     sched->debug_prev_graph_size = 0;
 
+    const size_t ggml_sched_max_splits = graph_size; // at most there is one split for each node in the graph
     sched->context_buffer_size = ggml_sched_max_splits*GGML_SCHED_MAX_SPLIT_INPUTS*2*sizeof(struct ggml_tensor) + ggml_graph_overhead_custom(graph_size, false);
-    sched->context_buffer = (char *) malloc(sched->context_buffer_size);
 
-    const int initial_splits_capacity = 16;
-    sched->splits = (ggml_backend_sched_split *) calloc(initial_splits_capacity, sizeof(sched->splits[0]));
-    sched->splits_capacity = initial_splits_capacity;
-
-    sched->graph_inputs_capacity = GGML_SCHED_MAX_SPLIT_INPUTS;
-    sched->graph_inputs = (struct ggml_tensor **) calloc(sched->graph_inputs_capacity, sizeof(struct ggml_tensor *));
+    ggml_backend_sched_init_graph_state(sched);
 
     for (int b = 0; b < n_backends; b++) {
         sched->backends[b] = backends[b];
@@ -2314,23 +2421,35 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
         }
     }
     ggml_gallocr_free(sched->galloc);
-    ggml_free(sched->ctx);
-    ggml_hash_set_free(&sched->hash_set);
-    for (int i = 0; i < sched->splits_capacity; i++) {
-        free(sched->splits[i].inputs);
+    ggml_backend_sched_free_graph_state(sched);
+    for (int s = 0; sched->graph_slots && s < GGML_SCHED_MAX_GRAPH_SLOTS; s++) {
+        if (sched->graph_slots[s].context_buffer) {
+            ggml_backend_sched_swap_graph_state(sched, sched->graph_slots[s]);
+            ggml_backend_sched_free_graph_state(sched);
+        }
     }
-    free(sched->splits);
-    free(sched->graph_inputs);
-    free(sched->hv_tensor_backend_ids);
-    free(sched->hv_tensor_copies);
-    free(sched->node_backend_ids);
-    free(sched->leaf_backend_ids);
-    free(sched->prev_node_backend_ids);
-    free(sched->prev_leaf_backend_ids);
-    free(sched->context_buffer);
-    free(sched->graph.nodes);
-    free(sched->graph.leafs);
+    free(sched->graph_slots);
     free(sched);
+}
+
+bool ggml_backend_sched_set_graph_slot(ggml_backend_sched_t sched, int slot, const struct ggml_cgraph * graph) {
+    GGML_ASSERT(sched);
+    GGML_ASSERT(slot >= 0 && slot < GGML_SCHED_MAX_GRAPH_SLOTS);
+    if (slot != sched->cur_graph_slot) {
+        if (!sched->graph_slots) {
+            sched->graph_slots = (ggml_backend_sched_graph_state *) calloc(GGML_SCHED_MAX_GRAPH_SLOTS, sizeof(ggml_backend_sched_graph_state));
+        }
+        // park the active state in its empty entry, then take the target's, leaving that entry empty
+        ggml_backend_sched_swap_graph_state(sched, sched->graph_slots[sched->cur_graph_slot]);
+        ggml_backend_sched_swap_graph_state(sched, sched->graph_slots[slot]);
+        sched->cur_graph_slot = slot;
+        if (!sched->context_buffer) {
+            ggml_backend_sched_init_graph_state(sched);
+            ggml_backend_sched_reset(sched);
+        }
+    }
+    return sched->is_alloc && graph && sched->alloc_src_graph == graph &&
+           sched->alloc_generation == ggml_gallocr_get_generation(sched->galloc);
 }
 
 void ggml_backend_sched_reset(ggml_backend_sched_t sched) {
@@ -2356,6 +2475,7 @@ void ggml_backend_sched_reserve_size(ggml_backend_sched_t sched, struct ggml_cgr
 
     ggml_backend_sched_split_graph(sched, measure_graph);
 
+    sched->galloc_graph_slot = sched->cur_graph_slot;
     ggml_gallocr_reserve_n_size(sched->galloc, &sched->graph, sched->node_backend_ids, sched->leaf_backend_ids, sizes);
 }
 
@@ -2368,6 +2488,7 @@ bool ggml_backend_sched_reserve(ggml_backend_sched_t sched, struct ggml_cgraph *
     ggml_backend_sched_split_graph(sched, measure_graph);
 
     moe_cache_scratch_scope scratch_scope(sched->moe_cache_session);
+    sched->galloc_graph_slot = sched->cur_graph_slot;
     if (!ggml_gallocr_reserve_n(sched->galloc, &sched->graph, sched->node_backend_ids, sched->leaf_backend_ids)) {
         return false;
     }
@@ -2392,6 +2513,7 @@ bool ggml_backend_sched_alloc_graph(ggml_backend_sched_t sched, struct ggml_cgra
     }
 
     sched->is_alloc = true;
+    sched->alloc_src_graph = graph;
 
     return true;
 }

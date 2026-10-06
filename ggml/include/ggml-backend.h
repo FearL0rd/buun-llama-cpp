@@ -361,6 +361,12 @@ extern "C" {
     // The correct way to use this API is to discard the deallocated tensors and create new ones.
     GGML_API void                 ggml_backend_sched_reset(ggml_backend_sched_t sched);
 
+    // Switch to one of GGML_SCHED_MAX_GRAPH_SLOTS independent split/alloc states (slot 0 is the default), so
+    // graphs of alternating shapes can each stay allocated. All slots share the compute buffers.
+    // Returns true if the slot still holds `graph` allocated and ready to compute without a reset.
+#define GGML_SCHED_MAX_GRAPH_SLOTS 16
+    GGML_API bool                 ggml_backend_sched_set_graph_slot(ggml_backend_sched_t sched, int slot, const struct ggml_cgraph * graph);
+
     // Set a callback to be called for each resulting node during graph compute
     GGML_API void                 ggml_backend_sched_set_eval_callback(ggml_backend_sched_t sched, ggml_backend_sched_eval_callback callback, void * user_data);
 
