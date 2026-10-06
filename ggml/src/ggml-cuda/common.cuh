@@ -1749,9 +1749,13 @@ struct ggml_backend_cuda_context {
         auto it = cuda_graphs.find(graph_key);
         if (it == cuda_graphs.end()) {
             while (cuda_graphs.size() >= max_cuda_graphs) {
+                // Prefill creates an entry per split and ubatch shape that never stabilizes into an
+                // executable; evict those before the instantiated decode graphs they would push out.
                 auto lru = cuda_graphs.begin();
                 for (auto current = cuda_graphs.begin(); current != cuda_graphs.end(); ++current) {
-                    if (current->second->last_used_time < lru->second->last_used_time) {
+                    const bool cur_live = current->second->instance != nullptr;
+                    const bool lru_live = lru->second->instance != nullptr;
+                    if (cur_live != lru_live ? !cur_live : current->second->last_used_time < lru->second->last_used_time) {
                         lru = current;
                     }
                 }
