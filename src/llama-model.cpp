@@ -3868,7 +3868,9 @@ bool llama_model_has_mtp(const llama_model * model) {
 bool llama_model_set_draft_vocab(llama_model * model, const int32_t * ids, int32_t n_ids) {
     const ggml_tensor * src = model->output;
     const int64_t n_vocab = model->vocab.n_tokens();
-    if (src == nullptr || model->d2t != nullptr || model->output_s != nullptr || model->output_in_s != nullptr ||
+    // only the qwen4exp MTP graph maps a trimmed shared head back through d2t
+    if (model->arch != LLM_ARCH_QWEN4EXP ||
+            src == nullptr || model->d2t != nullptr || model->output_s != nullptr || model->output_in_s != nullptr ||
             model->hparams.n_layer_nextn == 0 || model->hparams.no_alloc || n_ids <= 0 || n_ids >= n_vocab ||
             ggml_n_dims(src) != 2 || src->ne[1] != n_vocab || !ggml_is_contiguous(src)) {
         LLAMA_LOG_WARN("%s: this model's LM head cannot be trimmed to a draft vocabulary\n", __func__);
