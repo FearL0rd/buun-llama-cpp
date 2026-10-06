@@ -341,6 +341,9 @@ struct moe_cache_device {
     // Invalidated routes; captured graphs may still hold their tables until destroy.
     std::vector<std::unique_ptr<moe_cache_route>> retired_routes;
     std::vector<moe_cache_route_update> route_pending;
+    // Set while a drain holds session.mu: the worker cannot take its refills before
+    // the drain's closing flush, so victim repoints batch into that one flush.
+    bool route_flush_deferred = false;
     cudaStream_t route_stream = nullptr;
     cudaEvent_t route_event = nullptr;
     long long route_rows = 0;
@@ -1651,7 +1654,7 @@ static bool moe_cache_route_capturing(const moe_cache_device & device) {
 // Called under session.mu. Apply queued repoints on the routed stream, then mark
 // route_event so slot refills wait for every kernel launched before the repoint.
 static bool moe_cache_route_flush_locked(moe_cache_device & device) {
-    if (device.route_pending.empty()) {
+    if (device.route_pending.empty() || device.route_flush_deferred) {
         return true;
     }
     if (moe_cache_route_capturing(device)) {
@@ -3698,6 +3701,8 @@ static void moe_cache_route_drain_locked(moe_cache_session & session) {
         return;
     }
     bool wake_worker = false;
+    const long long evictions_before = device.evictions;
+    device.route_flush_deferred = true;
     for (auto & entry : device.routes) {
         moe_cache_route & route = *entry.second;
         const int n = route.n_snap;
@@ -3758,7 +3763,11 @@ static void moe_cache_route_drain_locked(moe_cache_session & session) {
         }
     }
     moe_cache_freq_age_locked(session, device);
-    moe_cache_route_flush_locked(device);
+    device.route_flush_deferred = false;
+    if (!moe_cache_route_flush_locked(device) && evictions_before != device.evictions) {
+        // refills of evicted slots are queued: repoint every table synchronously first
+        moe_cache_route_reset_locked(device);
+    }
     if (session.config.stats_every > 0 && ++device.route_drains % session.config.stats_every == 0) {
         moe_cache_log_stats(device);
     }
