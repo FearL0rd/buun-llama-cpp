@@ -965,6 +965,7 @@ struct ggml_backend_sched_graph_state {
     struct ggml_tensor ** graph_inputs;
     int n_graph_inputs;
     int graph_inputs_capacity;
+    int cur_copy; // the input copies the split graph was bound to
     struct ggml_context * ctx;
     char * context_buffer;
     const struct ggml_cgraph * alloc_src_graph;
@@ -989,7 +990,8 @@ static void ggml_backend_sched_swap_graph_state(ggml_backend_sched_t sched, ggml
     std::swap(sched->graph_inputs,          s.graph_inputs);
     std::swap(sched->n_graph_inputs,        s.n_graph_inputs);
     std::swap(sched->graph_inputs_capacity, s.graph_inputs_capacity);
-    std::swap(sched->ctx,                   s.ctx);
+    std::swap(sched->cur_copy,              s.cur_copy);
+    std::swap(sched->ctx,                  s.ctx);
     std::swap(sched->context_buffer,        s.context_buffer);
     std::swap(sched->alloc_src_graph,       s.alloc_src_graph);
     std::swap(sched->alloc_generation,      s.alloc_generation);
