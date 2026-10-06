@@ -53,6 +53,10 @@ static constexpr int share_max_experts = 16;   // host experts per layer
 static constexpr int share_max_routes  = 8192; // ids index space: row stride * tokens
 static constexpr int share_max_layers  = 512;
 static constexpr int share_max_staged  = 8;    // GPU-streamed experts staged in VRAM per layer
+// Each device's tickets stay in their own residue class, so devices that take turns on the
+// one mailbox never repeat each other's ticket.
+static constexpr uint32_t share_ticket_step = GGML_CUDA_MAX_DEVICES;
+static_assert((share_ticket_step & (share_ticket_step - 1)) == 0, "ticket step must divide 2^32");
 
 // Mapped host memory. The GPU writes the job then seq; the host writes y then done.
 struct share_mailbox {
@@ -219,7 +223,7 @@ static __global__ void share_doorbell(const share_doorbell_args a) {
             }
         }
         if (n_entry) {
-            st->ticket++;
+            st->ticket += share_ticket_step;
             mb->layer = a.layer;
             mb->n_tok = a.n_tok;
             mb->n_expert = n_pick;
@@ -294,6 +298,13 @@ static __global__ void share_stage_copy(const share_state * st) {
     }
 }
 
+// Per-device state: devices of a layer split take turns on the host share, one layer at a time.
+struct share_dev {
+    share_state * st = nullptr;
+    char * stage = nullptr;
+    size_t stage_stride = 0;
+};
+
 struct share_host {
     std::mutex mu;
     std::unordered_map<const void *, std::pair<int, share_tensor>> tensors; // host base -> (layer, tensor)
@@ -305,15 +316,13 @@ struct share_host {
     float * y = nullptr;
     float * d_x = nullptr;
     float * d_y = nullptr;
-    share_state * st = nullptr;
-    int device = -1; // st and stage live here; routed layers on other devices skip the share
-    char * stage = nullptr;
-    size_t stage_stride = 0;
+    share_dev devs[GGML_CUDA_MAX_DEVICES];
     int n_embd = 0;
     int n_threads = 0;
 
     // launch-time pairing of a layer's gate/up and down
     const void * pending_ids = nullptr;
+    int pending_device = -1;
     int pending_layer = -1;
     int pending_ids_stride = 0;
     // launch-time pairing of a layer's down and the weighted reduction that merges it
@@ -541,15 +550,13 @@ static bool share_init(share_host & h, int n_embd) {
     const size_t bytes = header + (size_t)(share_max_tokens + share_max_entries)*n_embd*sizeof(float);
     char * host = nullptr;
     char * device = nullptr;
-    if (cudaHostAlloc((void **) &host, bytes, cudaHostAllocMapped) != cudaSuccess ||
-        cudaHostGetDevicePointer((void **) &device, host, 0) != cudaSuccess ||
-        cudaMalloc((void **) &h.st, sizeof(share_state)) != cudaSuccess ||
-        cudaMemset(h.st, 0, sizeof(share_state)) != cudaSuccess) {
+    // portable: under unified addressing every device sees the mailbox at the same address
+    if (cudaHostAlloc((void **) &host, bytes, cudaHostAllocMapped | cudaHostAllocPortable) != cudaSuccess ||
+        cudaHostGetDevicePointer((void **) &device, host, 0) != cudaSuccess) {
         (void) cudaGetLastError();
         GGML_LOG_WARN("%s: moe cpu share disabled: mailbox allocation failed\n", __func__);
         return false;
     }
-    CUDA_CHECK(cudaGetDevice(&h.device));
     memset(host, 0, bytes);
     h.mb = (share_mailbox *) host;
     h.d_mb = (share_mailbox *) device;
@@ -567,6 +574,27 @@ static bool share_init(share_host & h, int n_embd) {
     }
     GGML_LOG_INFO("%s: moe cpu share: GPU keeps %.0f%% of routed misses, %d host threads\n",
         __func__, 100.0f*share_gpu_fraction(), h.n_threads);
+    return true;
+}
+
+// Called with h.mu held, outside any graph capture, on the device whose route is registered.
+static bool share_dev_init(share_host & h) {
+    int id;
+    CUDA_CHECK(cudaGetDevice(&id));
+    share_dev & d = h.devs[id];
+    if (d.st) {
+        return true;
+    }
+    const uint32_t ticket = (uint32_t) id;
+    if (cudaMalloc((void **) &d.st, sizeof(share_state)) != cudaSuccess ||
+        cudaMemset(d.st, 0, sizeof(share_state)) != cudaSuccess ||
+        cudaMemcpy(&d.st->ticket, &ticket, sizeof(ticket), cudaMemcpyHostToDevice) != cudaSuccess) {
+        (void) cudaGetLastError();
+        cudaFree(d.st);
+        d.st = nullptr;
+        GGML_LOG_WARN("%s: moe cpu share disabled on device %d: state allocation failed\n", __func__, id);
+        return false;
+    }
     return true;
 }
 
@@ -604,7 +632,7 @@ void ggml_moe_cpu_share_note(const ggml_tensor * weights, const void * device_ba
         l.owner_host = t.host;
     }
     h.tensors[weights->data] = { layer, t };
-    if (strstr(weights->name, "ffn_down_exps") && share_init(h, (int) weights->ne[1])) {
+    if (strstr(weights->name, "ffn_down_exps") && share_init(h, (int) weights->ne[1]) && share_dev_init(h)) {
         l.down = t;
     }
 }
@@ -622,7 +650,9 @@ ggml_moe_cpu_share_args ggml_moe_cpu_share_begin(
         const ggml_tensor * up, const ggml_tensor * gate, const ggml_tensor * ids,
         const ggml_tensor * x, const ggml_cuda_mm_fusion_args_host * fusion, cudaStream_t stream) {
     share_host & h = g_share;
-    if (share_gpu_fraction() < 0.0f || !h.mb || ggml_cuda_get_device() != h.device) {
+    const int device = ggml_cuda_get_device();
+    share_dev & d = h.devs[device];
+    if (share_gpu_fraction() < 0.0f || !h.mb || !d.st) {
         return {};
     }
     // the next doorbell relies on the previous shared layer's merge having waited for the host
@@ -661,18 +691,18 @@ ggml_moe_cpu_share_args ggml_moe_cpu_share_begin(
         reg.gate = found_gate->second.second;
         l = reg;
         // sized once by the largest routed expert; graph capture is relaxed, so this may run inside one
-        if (!h.stage && getenv("GGML_CUDA_MOE_STAGE_OFF") == nullptr) {
+        if (!d.stage && getenv("GGML_CUDA_MOE_STAGE_OFF") == nullptr) {
             size_t stride = 0;
             for (const auto & t : h.tensors) {
                 stride = std::max(stride, GGML_PAD(t.second.second.nb2, 256));
             }
-            if (cudaMalloc((void **) &h.stage, (size_t) share_max_staged*3*stride) == cudaSuccess) {
-                h.stage_stride = stride;
+            if (cudaMalloc((void **) &d.stage, (size_t) share_max_staged*3*stride) == cudaSuccess) {
+                d.stage_stride = stride;
                 GGML_LOG_INFO("%s: moe miss staging: %d experts x %.2f MiB per layer\n",
                     __func__, share_max_staged, 3.0*stride/(1024.0*1024.0));
             } else {
                 (void) cudaGetLastError();
-                h.stage = nullptr;
+                d.stage = nullptr;
             }
         }
     }
@@ -706,28 +736,29 @@ ggml_moe_cpu_share_args ggml_moe_cpu_share_begin(
         const bool aligned = tensors[i]->nb2 % 16 == 0 && (uintptr_t) tensors[i]->device % 16 == 0;
         a.nb2[i] = aligned ? tensors[i]->nb2 : SIZE_MAX;
     }
-    a.stage = h.stage;
-    a.stage_stride = h.stage_stride;
+    a.stage = d.stage;
+    a.stage_stride = d.stage_stride;
     a.layer = layer;
     a.gpu_num = (int) lroundf(share_gpu_fraction()*256.0f);
     a.mb = h.d_mb;
     a.mb_x = h.d_x;
-    a.st = h.st;
+    a.st = d.st;
     share_doorbell<<<1, 256, 0, stream>>>(a);
     CUDA_CHECK(cudaGetLastError());
-    if (h.stage) {
-        share_stage_copy<<<2*ggml_cuda_info().devices[ggml_cuda_get_device()].nsm, 256, 0, stream>>>(h.st);
+    if (d.stage) {
+        share_stage_copy<<<2*ggml_cuda_info().devices[device].nsm, 256, 0, stream>>>(d.st);
         CUDA_CHECK(cudaGetLastError());
     }
 
     h.pending_ids = ids->data;
+    h.pending_device = device;
     h.pending_layer = layer;
     h.pending_ids_stride = (int) ids_stride;
     ggml_moe_cpu_share_args args;
-    args.skip = h.st->skip;
-    if (h.stage) {
-        args.stage_x = h.st->stage[0];
-        args.stage_gate = h.st->stage[1];
+    args.skip = d.st->skip;
+    if (d.stage) {
+        args.stage_x = d.st->stage[0];
+        args.stage_gate = d.st->stage[1];
     }
     return args;
 }
@@ -746,10 +777,11 @@ ggml_moe_cpu_share_args ggml_moe_cpu_share_down(const ggml_tensor * down, const 
     GGML_ASSERT(ids->data == h.pending_ids && "moe cpu share: down routed by different ids");
     h.pending_ids = nullptr;
     h.merge_experts = dst->data;
+    const share_dev & d = h.devs[h.pending_device];
     ggml_moe_cpu_share_args args;
-    args.skip = h.st->skip;
-    if (h.stage) {
-        args.stage_x = h.st->stage[2];
+    args.skip = d.st->skip;
+    if (d.stage) {
+        args.stage_x = d.st->stage[2];
     }
     return args;
 }
@@ -765,12 +797,13 @@ ggml_moe_cpu_share_args ggml_moe_cpu_share_merge(const ggml_tensor * experts) {
         return {};
     }
     h.merge_experts = nullptr;
+    const share_dev & d = h.devs[h.pending_device];
     ggml_moe_cpu_share_args args;
-    args.skip = h.st->skip;
+    args.skip = d.st->skip;
     args.ids_stride = h.pending_ids_stride;
     args.y = h.d_y;
     args.done = (const uint32_t *) &h.d_mb->done;
-    args.ticket = &h.st->ticket;
+    args.ticket = &d.st->ticket;
     return args;
 }
 
