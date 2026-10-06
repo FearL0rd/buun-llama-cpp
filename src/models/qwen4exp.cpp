@@ -423,24 +423,33 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
     int sections[4];
     std::copy(std::begin(hparams.rope_sections), std::begin(hparams.rope_sections) + 4, sections);
 
-    auto inp = std::make_unique<llm_graph_input_embd_h>(hparams.n_embd_out());
+    // Greedy draft chain: a 1-token draft step reads its token and hidden row from
+    // the device stages and writes its argmax token and next hidden row back.
+    const bool chain = cparams.mtp_chain_tok && n_tokens == 1 && n_outputs == 1;
 
-    inp->tokens = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens);
-    ggml_set_input(inp->tokens);
+    ggml_tensor * tokens = cparams.mtp_chain_tok;
+    ggml_tensor * h      = chain ? ggml_reshape_2d(ctx0, cparams.mtp_chain_h, hparams.n_embd_out(), 1) : nullptr;
+    if (!chain) {
+        auto inp = std::make_unique<llm_graph_input_embd_h>(hparams.n_embd_out());
 
-    inp->embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hparams.n_embd_out(), n_tokens);
-    ggml_set_input(inp->embd);
+        inp->tokens = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens);
+        ggml_set_input(inp->tokens);
 
-    inp->h = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hparams.n_embd_out(), n_tokens);
-    ggml_set_input(inp->h);
-    ggml_set_name(inp->h, "mtp_h_input");
+        inp->embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hparams.n_embd_out(), n_tokens);
+        ggml_set_input(inp->embd);
+
+        inp->h = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hparams.n_embd_out(), n_tokens);
+        ggml_set_input(inp->h);
+        ggml_set_name(inp->h, "mtp_h_input");
+
+        tokens = inp->tokens;
+        h      = inp->h;
+        res->add_input(std::move(inp));
+    }
 
     ggml_tensor * tok_embd_w = layer.nextn.embed_tokens ? layer.nextn.embed_tokens : model.tok_embd;
-    ggml_tensor * tok_embd = ggml_get_rows(ctx0, tok_embd_w, inp->tokens);
+    ggml_tensor * tok_embd = ggml_get_rows(ctx0, tok_embd_w, tokens);
     cb(tok_embd, "mtp_tok_embd", il);
-
-    ggml_tensor * h = inp->h;
-    res->add_input(std::move(inp));
 
     ggml_tensor * inp_pos = build_inp_pos();
     auto * inp_attn = build_attn_inp_kv();
@@ -517,7 +526,7 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
         res->t_embd = flat_out;
     }
 
-    if (cparams.embeddings_nextn) {
+    if (cparams.embeddings_nextn && !chain) {
         ggml_tensor * h_nextn = cparams.embeddings_nextn_masked ? flat_out : flat;
         cb(h_nextn, "h_nextn", -1);
         res->t_h_nextn = h_nextn;
@@ -540,6 +549,24 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
     ggml_tensor * head_in_s = layer.nextn.shared_head_head ? layer.nextn.shared_head_head_in_s : model.output_in_s;
     cur = build_lora_mm(head_w, cur, head_s, head_in_s);
     cb(cur, "result_output", -1);
+    if (chain) {
+        // the draft's own inputs are ancestors of both copies, so overwriting the stages is safe
+        const int64_t n_vocab_head = cur->ne[0];
+        ggml_tensor * tok = ggml_argmax(ctx0, cur);
+        if (model.d2t && head_w == model.output) {
+            tok = ggml_get_rows(ctx0, ggml_reshape_2d(ctx0, model.d2t, 1, n_vocab_head), tok);
+        }
+        ggml_build_forward_expand(gf, ggml_cpy(ctx0, tok, cparams.mtp_chain_tok));
+
+        // confidence as the step-by-step drafter's top-10 sampler reports it
+        const int64_t n_cand = std::min<int64_t>(10, n_vocab_head);
+        ggml_tensor * cand = ggml_get_rows(ctx0, ggml_reshape_2d(ctx0, cur, 1, n_vocab_head), ggml_top_k(ctx0, cur, n_cand));
+        cand = ggml_soft_max(ctx0, ggml_reshape_2d(ctx0, cand, n_cand, 1));
+        ggml_tensor * p = ggml_get_rows(ctx0, ggml_reshape_2d(ctx0, cand, 1, n_cand), ggml_argmax(ctx0, cand));
+        ggml_build_forward_expand(gf, ggml_cpy(ctx0, p, cparams.mtp_chain_p));
+        ggml_build_forward_expand(gf, ggml_cpy(ctx0, flat_out, cparams.mtp_chain_h));
+        return;
+    }
     if (model.d2t && head_w == model.output) {
         cur = build_d2t_logits(cur, model.d2t, (int64_t) model.vocab.n_tokens());
     }

@@ -121,6 +121,13 @@ struct llama_cparams {
     ggml_tensor *        dflash_draft_stage = nullptr;
     std::vector<int32_t> dflash_draft_stage_layers;
 
+    // Greedy MTP draft chain: device-resident token [1], hidden row [n_embd_out] and
+    // top-1 confidence [1] that 1-token draft graphs read and overwrite
+    // (see llama_set_mtp_draft_chain).
+    ggml_tensor * mtp_chain_tok = nullptr;
+    ggml_tensor * mtp_chain_h   = nullptr;
+    ggml_tensor * mtp_chain_p   = nullptr;
+
     // Upstream drafter staged injection (DRAFTER context): the fused inject graph
     // gathers its feature rows from this tensor (the target's stage) via a per-decode
     // row-index input instead of a host embd upload.

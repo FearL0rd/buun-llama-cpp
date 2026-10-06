@@ -4076,6 +4076,84 @@ void llama_context::set_nextn_layer_offset(int32_t offset) {
     cparams.nextn_layer_offset = offset;
 }
 
+bool llama_context::set_mtp_draft_chain(bool enable) {
+    if (enable == (cparams.mtp_chain_tok != nullptr)) {
+        return true;
+    }
+    if (enable && !mtp_chain_tok) {
+        const auto & hparams = model.hparams;
+        if (model.split_mode() == LLAMA_SPLIT_MODE_TENSOR || hparams.n_layer_nextn != 1) {
+            return false;
+        }
+        // the stages live with the MTP block so its graph reads and writes them in place
+        ggml_backend_dev_t dev = model.dev_layer(hparams.n_layer());
+        for (auto & backend : backends) {
+            if (ggml_backend_get_device(backend.get()) == dev) {
+                mtp_chain_backend = backend.get();
+                break;
+            }
+        }
+        if (!mtp_chain_backend) {
+            return false;
+        }
+
+        ggml_init_params ip = { 3 * ggml_tensor_overhead(), nullptr, true };
+        ggml_context_ptr chain_ctx { ggml_init(ip) };
+        ggml_tensor * tok = ggml_new_tensor_1d(chain_ctx.get(), GGML_TYPE_I32, 1);
+        ggml_tensor * h   = ggml_new_tensor_1d(chain_ctx.get(), GGML_TYPE_F32, hparams.n_embd_out());
+        ggml_tensor * p   = ggml_new_tensor_1d(chain_ctx.get(), GGML_TYPE_F32, 1);
+        ggml_set_name(tok, "mtp_chain_tok");
+        ggml_set_name(h,   "mtp_chain_h");
+        ggml_set_name(p,   "mtp_chain_p");
+        ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(chain_ctx.get(), ggml_backend_dev_buffer_type(dev));
+        if (!buf) {
+            return false;
+        }
+        mtp_chain_buf.reset(buf);
+
+        // pinned so the per-draft readback stays asynchronous
+        ggml_backend_buffer_type_t hist_buft = ggml_backend_dev_host_buffer_type(dev);
+        mtp_chain_hist_buf.reset(ggml_backend_buft_alloc_buffer(hist_buft ? hist_buft : ggml_backend_cpu_buffer_type(),
+                mtp_chain_hist_max * (sizeof(llama_token) + sizeof(float))));
+        if (!mtp_chain_hist_buf) {
+            mtp_chain_buf.reset();
+            return false;
+        }
+
+        mtp_chain_ctx = std::move(chain_ctx);
+        mtp_chain_tok = tok;
+        mtp_chain_h   = h;
+        mtp_chain_p   = p;
+    }
+    cparams.mtp_chain_tok = enable ? mtp_chain_tok : nullptr;
+    cparams.mtp_chain_h   = enable ? mtp_chain_h   : nullptr;
+    cparams.mtp_chain_p   = enable ? mtp_chain_p   : nullptr;
+    // the chained draft graph has a different topology and the reuse check does not compare cparams
+    invalidate_graph_results();
+    return true;
+}
+
+void llama_context::mtp_draft_chain_seed(llama_token token, const float * h) {
+    GGML_ASSERT(cparams.mtp_chain_tok);
+    ggml_backend_tensor_set(mtp_chain_tok, &token, 0, sizeof(token));
+    ggml_backend_tensor_set(mtp_chain_h, h, 0, ggml_nbytes(mtp_chain_h));
+}
+
+void llama_context::mtp_draft_chain_record(int32_t i) {
+    GGML_ASSERT(cparams.mtp_chain_tok && i >= 0 && i < mtp_chain_hist_max);
+    auto * toks  = (llama_token *) ggml_backend_buffer_get_base(mtp_chain_hist_buf.get());
+    auto * probs = (float *) (toks + mtp_chain_hist_max);
+    ggml_backend_tensor_get_async(mtp_chain_backend, mtp_chain_tok, toks  + i, 0, sizeof(llama_token));
+    ggml_backend_tensor_get_async(mtp_chain_backend, mtp_chain_p,   probs + i, 0, sizeof(float));
+}
+
+const llama_token * llama_context::mtp_draft_chain_tokens(const float ** probs) {
+    synchronize();
+    auto * toks = (const llama_token *) ggml_backend_buffer_get_base(mtp_chain_hist_buf.get());
+    *probs = (const float *) (toks + mtp_chain_hist_max);
+    return toks;
+}
+
 void llama_context::set_causal_attn(bool value) {
     LLAMA_LOG_DEBUG("%s: value = %d\n", __func__, value);
 
@@ -7851,6 +7929,22 @@ void llama_set_embeddings_layer_inp(llama_context * ctx, uint32_t lid, bool valu
 
 void llama_set_nextn_layer_offset(llama_context * ctx, int32_t offset) {
     ctx->set_nextn_layer_offset(offset);
+}
+
+bool llama_set_mtp_draft_chain(llama_context * ctx, bool enable) {
+    return ctx->set_mtp_draft_chain(enable);
+}
+
+void llama_mtp_draft_chain_seed(llama_context * ctx, llama_token token, const float * h) {
+    ctx->mtp_draft_chain_seed(token, h);
+}
+
+void llama_mtp_draft_chain_record(llama_context * ctx, int32_t i) {
+    ctx->mtp_draft_chain_record(i);
+}
+
+const llama_token * llama_mtp_draft_chain_tokens(llama_context * ctx, const float ** probs) {
+    return ctx->mtp_draft_chain_tokens(probs);
 }
 
 llama_memory_t llama_get_memory(const struct llama_context * ctx) {

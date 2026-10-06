@@ -370,6 +370,10 @@ struct llama_context {
     void set_embeddings_nextn(bool value, bool masked);
     void set_embeddings_layer_inp(uint32_t lid, bool enable);
     void set_nextn_layer_offset(int32_t offset);
+    bool set_mtp_draft_chain(bool enable);
+    void mtp_draft_chain_seed(llama_token token, const float * h);
+    void mtp_draft_chain_record(int32_t i);
+    const llama_token * mtp_draft_chain_tokens(const float ** probs);
     void set_causal_attn(bool value);
     void set_warmup(bool value);
 
@@ -829,6 +833,16 @@ public:
 
     // phase-C carry: deferred-inject row storage
     ggml_tensor *              dflash_stage_carry   = nullptr;
+
+    // greedy MTP draft chain stages + pinned token history
+    ggml_context_ptr           mtp_chain_ctx;
+    ggml_backend_buffer_ptr    mtp_chain_buf;
+    ggml_backend_buffer_ptr    mtp_chain_hist_buf;
+    ggml_backend_t             mtp_chain_backend = nullptr;
+    ggml_tensor *              mtp_chain_tok     = nullptr; // owned stages, bound to cparams while enabled
+    ggml_tensor *              mtp_chain_h       = nullptr;
+    ggml_tensor *              mtp_chain_p       = nullptr;
+    static constexpr int32_t   mtp_chain_hist_max = 64; // history: tokens, then as many probs
 
     std::vector<std::vector<dflash_layer_hidden_buf>> layer_hiddens;
     std::unique_ptr<dflash_capture_data> dflash_capture;

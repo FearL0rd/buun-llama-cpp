@@ -238,6 +238,20 @@ LLAMA_API void llama_set_embeddings_nextn(struct llama_context * ctx, bool value
 // chain multiple trained NextN heads. Default 0 (first head).
 LLAMA_API void llama_set_nextn_layer_offset(struct llama_context * ctx, int32_t offset);
 
+// Greedy MTP draft chain (single-head MTP context). When enabled, every 1-token
+// 1-output draft decode reads its token and hidden row from device stages and
+// writes the argmax token and next hidden row back, so consecutive draft decodes
+// run without a host round trip. Those decodes produce no logits or nextn rows.
+// Returns false when unsupported (tensor split, allocation failure).
+LLAMA_API bool llama_set_mtp_draft_chain(struct llama_context * ctx, bool enable);
+// Seed the stages for the first draft decode (synchronous upload).
+LLAMA_API void llama_mtp_draft_chain_seed(struct llama_context * ctx, llama_token token, const float * h);
+// After a draft decode: queue the drafted token and its confidence (top-1 share
+// of the top-10 softmax) into history slot i (async).
+LLAMA_API void llama_mtp_draft_chain_record(struct llama_context * ctx, int32_t i);
+// Synchronize and return the recorded tokens; *probs receives the confidences.
+LLAMA_API const llama_token * llama_mtp_draft_chain_tokens(struct llama_context * ctx, const float ** probs);
+
 // mirrors:
 // LLAMA_API float * llama_get_embeddings(struct llama_context * ctx);
 LLAMA_API float * llama_get_embeddings_nextn(struct llama_context * ctx);
