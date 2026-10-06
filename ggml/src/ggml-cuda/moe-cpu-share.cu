@@ -306,6 +306,7 @@ struct share_host {
     float * d_x = nullptr;
     float * d_y = nullptr;
     share_state * st = nullptr;
+    int device = -1; // st and stage live here; routed layers on other devices skip the share
     char * stage = nullptr;
     size_t stage_stride = 0;
     int n_embd = 0;
@@ -548,6 +549,7 @@ static bool share_init(share_host & h, int n_embd) {
         GGML_LOG_WARN("%s: moe cpu share disabled: mailbox allocation failed\n", __func__);
         return false;
     }
+    CUDA_CHECK(cudaGetDevice(&h.device));
     memset(host, 0, bytes);
     h.mb = (share_mailbox *) host;
     h.d_mb = (share_mailbox *) device;
@@ -620,7 +622,7 @@ ggml_moe_cpu_share_args ggml_moe_cpu_share_begin(
         const ggml_tensor * up, const ggml_tensor * gate, const ggml_tensor * ids,
         const ggml_tensor * x, const ggml_cuda_mm_fusion_args_host * fusion, cudaStream_t stream) {
     share_host & h = g_share;
-    if (share_gpu_fraction() < 0.0f || !h.mb) {
+    if (share_gpu_fraction() < 0.0f || !h.mb || ggml_cuda_get_device() != h.device) {
         return {};
     }
     // the next doorbell relies on the previous shared layer's merge having waited for the host

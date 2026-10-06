@@ -1020,6 +1020,18 @@ static bool ggml_backend_sched_moe_routed(ggml_backend_sched_t sched, const stru
         ggml_moe_cache.route_supported(sched->moe_cache_session, sched->backends[backend_id], node);
 }
 
+// backend already assigned to the op producing t, looking through views and reshapes
+static int ggml_backend_sched_input_backend_id(ggml_backend_sched_t sched, const struct ggml_tensor * t) {
+    for (int depth = 0; t && depth < 8; ++depth) {
+        const int id = tensor_backend_id(const_cast<struct ggml_tensor *>(t));
+        if (id != -1) {
+            return id;
+        }
+        t = t->view_src ? t->view_src : t->src[0];
+    }
+    return -1;
+}
+
 // returns the backend that should be used for the node based on the current locations
 static int ggml_backend_sched_backend_id_from_cur(ggml_backend_sched_t sched, struct ggml_tensor * tensor) {
     // assign pre-allocated nodes to their backend
@@ -1070,8 +1082,12 @@ static int ggml_backend_sched_backend_id_from_cur(ggml_backend_sched_t sched, st
             if (src->buffer != NULL && src->buffer->usage == GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
                 int src_backend_id = ggml_backend_sched_backend_from_buffer(sched, src, tensor);
                 // a moe-cache backend can read host experts in place for small batches
+                // with several devices, only the one already running the layer's activations
+                // may route it: asking registers the route, which pins the tensor to that device
                 if (src_backend_id == sched->n_backends - 1) {
-                    for (int b = 0; b < src_backend_id; b++) {
+                    const int input_id = ggml_backend_sched_input_backend_id(sched, tensor->src[1]);
+                    const bool pinned = input_id >= 0 && input_id < src_backend_id;
+                    for (int b = pinned ? input_id : 0; b < (pinned ? input_id + 1 : src_backend_id); b++) {
                         if (ggml_backend_sched_moe_routed(sched, tensor, src, b)) {
                             SET_CAUSE(tensor, "1.moe");
                             return b;

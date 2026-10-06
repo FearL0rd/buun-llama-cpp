@@ -3040,7 +3040,7 @@ static int moe_cache_output_copy(void * session, void * backend_opaque,
 }
 
 static void moe_cache_route_snapshot_locked(moe_cache_device & device);
-static void moe_cache_route_drain_locked(moe_cache_session & session);
+static void moe_cache_route_drain_locked(moe_cache_session & session, moe_cache_device & device);
 
 static void moe_cache_session_enter(void * opaque) {
     moe_cache_retire_pending();
@@ -3091,10 +3091,14 @@ static void moe_cache_session_enter(void * opaque) {
         return;
     }
     session->active_scopes++;
-    if (g_session_stack.size() == 1 && session->devices.size() == 1 && !session->devices[0]->dead.load()) {
-        moe_cache_route_snapshot_locked(*session->devices[0]);
-        // Fills finished since the last drain reach this evaluation.
-        moe_cache_route_flush_locked(*session->devices[0]);
+    if (g_session_stack.size() == 1) {
+        for (auto & device : session->devices) {
+            if (!device->dead.load()) {
+                moe_cache_route_snapshot_locked(*device);
+                // Fills finished since the last drain reach this evaluation.
+                moe_cache_route_flush_locked(*device);
+            }
+        }
     }
 }
 
@@ -3119,8 +3123,12 @@ static void moe_cache_session_leave(void * opaque) {
         std::lock_guard<std::mutex> lock(active->mu);
         // The outermost scope snapshotted the routes at enter; its evaluation
         // is in flight, so this bookkeeping overlaps GPU work.
-        if (g_session_stack.empty() && active->devices.size() == 1) {
-            moe_cache_route_drain_locked(*active);
+        if (g_session_stack.empty()) {
+            for (auto & device : active->devices) {
+                if (!device->dead.load()) {
+                    moe_cache_route_drain_locked(*active, *device);
+                }
+            }
         }
         if (active->active_scopes > 0) {
             active->active_scopes--;
@@ -3796,8 +3804,7 @@ static cudaEvent_t moe_cache_cool_locked(const moe_cache_session & session, moe_
 // Called under session.mu after an evaluation is launched. Feed the snapshotted
 // experts into the same admission, LRU, and heat bookkeeping the CPU path uses,
 // then publish finished fills to the tables (applied after the launched work).
-static void moe_cache_route_drain_locked(moe_cache_session & session) {
-    moe_cache_device & device = *session.devices[0];
+static void moe_cache_route_drain_locked(moe_cache_session & session, moe_cache_device & device) {
     if (device.routes.empty() || device.dead.load() ||
         !moe_cache_prepare_budget(session, device)) {
         return;
@@ -3960,16 +3967,23 @@ static int moe_cache_route_supported(void * opaque, void * backend_opaque, const
     }();
     auto session = (moe_cache_session *) opaque;
     auto backend = (ggml_backend_t) backend_opaque;
+    // expert-parallel sessions place experts across devices through the fused CPU-side path
     if (!enabled || !session || session->dormant.load() || session->stopping ||
-        session->devices.size() != 1 || !backend || !ggml_backend_is_cuda(backend) ||
+        (session->config.expert_parallel && session->devices.size() >= 2) ||
+        !backend || !ggml_backend_is_cuda(backend) ||
         !op || op->op != GGML_OP_MUL_MAT_ID) {
         return 0;
     }
     auto * ctx = (ggml_backend_cuda_context *) backend->context;
-    moe_cache_device & device = *session->devices[0];
+    auto owner = std::find_if(session->devices.begin(), session->devices.end(),
+            [&](const auto & device) { return device->logical == ctx->device; });
+    if (owner == session->devices.end()) {
+        return 0;
+    }
+    moe_cache_device & device = **owner;
     const ggml_tensor * weights = op->src[0];
     const ggml_tensor * ids = op->src[2];
-    if (ctx->external_capture || device.logical != ctx->device || device.dead.load() ||
+    if (ctx->external_capture || device.dead.load() ||
         !weights || weights->view_src || !weights->data || !weights->buffer ||
         weights->buffer->buft != ggml_backend_cuda_host_buffer_type() ||
         ggml_backend_buffer_get_usage(weights->buffer) != GGML_BACKEND_BUFFER_USAGE_WEIGHTS ||
