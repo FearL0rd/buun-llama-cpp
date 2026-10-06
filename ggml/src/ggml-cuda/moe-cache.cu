@@ -2293,7 +2293,8 @@ static void moe_cache_build_pending(
         const long double value = (long double)available * weight / total;
         return value >= (long double)available ? available : (size_t)value;
     };
-    const bool complete_pools = minimum_remaining <= remaining;
+    // the lent bytes are not owned: every pool's minimum must fit without them
+    const bool complete_pools = minimum_remaining <= remaining - lend;
     for (moe_cache_shape * shape : pending) {
         const long double weight =
             (long double)shape->expert_size * (long double)shape->n_tensors;
@@ -2307,7 +2308,7 @@ static void moe_cache_build_pending(
             share = minimum;
         }
         if (lend) {
-            share = share > lend + minimum ? share - lend : minimum;
+            share = share > lend + minimum ? share - lend : std::min(minimum, remaining - lend);
         }
         const size_t before = device.allocated_bytes;
         moe_cache_allocate_pool(session, device, *shape, share);
