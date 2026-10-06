@@ -842,6 +842,9 @@ public:
     ggml_tensor *              mtp_chain_tok     = nullptr; // owned stages, bound to cparams while enabled
     ggml_tensor *              mtp_chain_h       = nullptr;
     ggml_tensor *              mtp_chain_p       = nullptr;
+    ggml_tensor *              mtp_chain_e       = nullptr;
+    ggml_tensor *              mtp_chain_embd    = nullptr;
+    const ggml_tensor *        mtp_chain_embd_src = nullptr; // host token embedding the rows come from
     static constexpr int32_t   mtp_chain_hist_max = 64; // history: tokens, then as many probs
 
     std::vector<std::vector<dflash_layer_hidden_buf>> layer_hiddens;

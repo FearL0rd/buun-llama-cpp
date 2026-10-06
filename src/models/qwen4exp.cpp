@@ -448,7 +448,9 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
     }
 
     ggml_tensor * tok_embd_w = layer.nextn.embed_tokens ? layer.nextn.embed_tokens : model.tok_embd;
-    ggml_tensor * tok_embd = ggml_get_rows(ctx0, tok_embd_w, tokens);
+    ggml_tensor * tok_embd = chain && cparams.mtp_chain_e
+            ? ggml_reshape_2d(ctx0, cparams.mtp_chain_e, n_embd, 1)
+            : ggml_get_rows(ctx0, tok_embd_w, tokens);
     cb(tok_embd, "mtp_tok_embd", il);
 
     ggml_tensor * inp_pos = build_inp_pos();
@@ -552,11 +554,16 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
     if (chain) {
         // the draft's own inputs are ancestors of both copies, so overwriting the stages is safe
         const int64_t n_vocab_head = cur->ne[0];
-        ggml_tensor * tok = ggml_argmax(ctx0, cur);
+        ggml_tensor * head_tok = ggml_argmax(ctx0, cur);
+        ggml_tensor * tok = head_tok;
         if (model.d2t && head_w == model.output) {
             tok = ggml_get_rows(ctx0, ggml_reshape_2d(ctx0, model.d2t, 1, n_vocab_head), tok);
         }
         ggml_build_forward_expand(gf, ggml_cpy(ctx0, tok, cparams.mtp_chain_tok));
+        if (cparams.mtp_chain_e) {
+            // the embedding rows are in head order
+            ggml_build_forward_expand(gf, ggml_cpy(ctx0, ggml_get_rows(ctx0, cparams.mtp_chain_embd, head_tok), cparams.mtp_chain_e));
+        }
 
         // confidence as the step-by-step drafter's top-10 sampler reports it
         const int64_t n_cand = std::min<int64_t>(10, n_vocab_head);

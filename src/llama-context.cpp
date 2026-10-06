@@ -4097,7 +4097,7 @@ bool llama_context::set_mtp_draft_chain(bool enable) {
             return false;
         }
 
-        ggml_init_params ip = { 3 * ggml_tensor_overhead(), nullptr, true };
+        ggml_init_params ip = { 5 * ggml_tensor_overhead(), nullptr, true };
         ggml_context_ptr chain_ctx { ggml_init(ip) };
         ggml_tensor * tok = ggml_new_tensor_1d(chain_ctx.get(), GGML_TYPE_I32, 1);
         ggml_tensor * h   = ggml_new_tensor_1d(chain_ctx.get(), GGML_TYPE_F32, hparams.n_embd_out());
@@ -4105,11 +4105,41 @@ bool llama_context::set_mtp_draft_chain(bool enable) {
         ggml_set_name(tok, "mtp_chain_tok");
         ggml_set_name(h,   "mtp_chain_h");
         ggml_set_name(p,   "mtp_chain_p");
+
+        // a host token embedding would put each draft's gather on the CPU behind a readback of
+        // the previous draft's token; a trimmed head only ever proposes its own vocabulary, so
+        // keep just those rows on the device
+        const auto & layer = model.layers[hparams.n_layer()];
+        ggml_tensor * embd_w = layer.nextn.embed_tokens ? layer.nextn.embed_tokens : model.tok_embd;
+        ggml_tensor * head_w = layer.nextn.shared_head_head ? layer.nextn.shared_head_head : model.output;
+        ggml_tensor * e    = nullptr;
+        ggml_tensor * embd = nullptr;
+        if (embd_w && embd_w->buffer && ggml_backend_buffer_is_host(embd_w->buffer) && ggml_is_contiguous(embd_w) &&
+                ggml_get_type_traits(embd_w->type)->to_float &&
+                model.d2t && model.d2t->type == GGML_TYPE_I32 && head_w == model.output) {
+            e    = ggml_new_tensor_1d(chain_ctx.get(), GGML_TYPE_F32, embd_w->ne[0]);
+            embd = ggml_new_tensor_2d(chain_ctx.get(), embd_w->type, embd_w->ne[0], model.d2t->ne[0]);
+            ggml_set_name(e,    "mtp_chain_e");
+            ggml_set_name(embd, "mtp_chain_embd");
+        }
+
         ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(chain_ctx.get(), ggml_backend_dev_buffer_type(dev));
         if (!buf) {
             return false;
         }
         mtp_chain_buf.reset(buf);
+
+        if (embd) {
+            std::vector<int32_t> ids(embd->ne[1]);
+            ggml_backend_tensor_get(model.d2t, ids.data(), 0, ggml_nbytes(model.d2t));
+            const size_t row = embd_w->nb[1];
+            std::vector<uint8_t> rows(ggml_nbytes(embd));
+            for (size_t i = 0; i < ids.size(); ++i) {
+                ggml_backend_tensor_get(embd_w, rows.data() + i * row, (size_t) ids[i] * row, row);
+            }
+            ggml_backend_tensor_set(embd, rows.data(), 0, rows.size());
+            mtp_chain_embd_src = embd_w;
+        }
 
         // pinned so the per-draft readback stays asynchronous
         ggml_backend_buffer_type_t hist_buft = ggml_backend_dev_host_buffer_type(dev);
@@ -4124,10 +4154,14 @@ bool llama_context::set_mtp_draft_chain(bool enable) {
         mtp_chain_tok = tok;
         mtp_chain_h   = h;
         mtp_chain_p   = p;
+        mtp_chain_e    = e;
+        mtp_chain_embd = embd;
     }
-    cparams.mtp_chain_tok = enable ? mtp_chain_tok : nullptr;
-    cparams.mtp_chain_h   = enable ? mtp_chain_h   : nullptr;
-    cparams.mtp_chain_p   = enable ? mtp_chain_p   : nullptr;
+    cparams.mtp_chain_tok  = enable ? mtp_chain_tok  : nullptr;
+    cparams.mtp_chain_h    = enable ? mtp_chain_h    : nullptr;
+    cparams.mtp_chain_p    = enable ? mtp_chain_p    : nullptr;
+    cparams.mtp_chain_e    = enable ? mtp_chain_e    : nullptr;
+    cparams.mtp_chain_embd = enable ? mtp_chain_embd : nullptr;
     // the chained draft graph has a different topology and the reuse check does not compare cparams
     invalidate_graph_results();
     return true;
@@ -4137,6 +4171,15 @@ void llama_context::mtp_draft_chain_seed(llama_token token, const float * h) {
     GGML_ASSERT(cparams.mtp_chain_tok);
     ggml_backend_tensor_set(mtp_chain_tok, &token, 0, sizeof(token));
     ggml_backend_tensor_set(mtp_chain_h, h, 0, ggml_nbytes(mtp_chain_h));
+    if (mtp_chain_e) {
+        // the seed is a target token, possibly outside the head vocabulary: dequantize its row here
+        const ggml_tensor * src = mtp_chain_embd_src;
+        std::vector<uint8_t> row(src->nb[1]);
+        std::vector<float> e(src->ne[0]);
+        ggml_backend_tensor_get(src, row.data(), (size_t) token * src->nb[1], src->nb[1]);
+        ggml_get_type_traits(src->type)->to_float(row.data(), e.data(), src->ne[0]);
+        ggml_backend_tensor_set(mtp_chain_e, e.data(), 0, ggml_nbytes(mtp_chain_e));
+    }
 }
 
 void llama_context::mtp_draft_chain_record(int32_t i) {

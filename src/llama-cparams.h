@@ -127,6 +127,10 @@ struct llama_cparams {
     ggml_tensor * mtp_chain_tok = nullptr;
     ggml_tensor * mtp_chain_h   = nullptr;
     ggml_tensor * mtp_chain_p   = nullptr;
+    // with a host token embedding: the next token's embedding row [n_embd] and the head
+    // vocabulary's embedding rows on the device, so the chain never gathers on the CPU
+    ggml_tensor * mtp_chain_e    = nullptr;
+    ggml_tensor * mtp_chain_embd = nullptr;
 
     // Upstream drafter staged injection (DRAFTER context): the fused inject graph
     // gathers its feature rows from this tensor (the target's stage) via a per-decode
