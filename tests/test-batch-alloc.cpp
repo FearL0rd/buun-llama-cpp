@@ -1236,6 +1236,67 @@ static void test_sync_bridge(testing & t) {
     });
 }
 
+static void test_destination_frontier(testing & t) {
+    // Exercise the allocator entry used by llama_context's encode/decode owner.
+    // The batch's creator may have a different frontier and sequence capacity.
+    llama_vocab vocab;
+    mock_memory creator;
+    creator.ranges[0] = {0, 9};
+    mock_memory destination;
+    batch_builder bb(2, &creator, 4, 1, 0, /*encoder width*/ 6);
+    for (llama_pos pos = 0; pos < 2; ++pos) {
+        const int idx = bb.add_embd(&pos, {0}, true, 6);
+        t.assert_true(bb.b.set_decision_order(idx, 1));
+    }
+    llama_batch_allocr alloc(1);
+    auto init_at_destination = [&](const llama_memory_i * memory) {
+        llama_batch view = {};
+        t.assert_true(bb.b.get_batch(view, true));
+        return alloc.init(view, vocab, memory, 6, 2, true, true, &bb.b);
+    };
+    auto check_rows = [&](llama_pos first) {
+        const auto ub = alloc.split_simple(2);
+        t.assert_equal(2u, ub.n_tokens);
+        t.assert_equal(first, ub.pos[0]);
+        t.assert_equal(first + 1, ub.pos[1]);
+        t.assert_true(ub.decision_order != nullptr);
+        t.assert_equal(1, ub.decision_order[0]);
+        t.assert_equal(1, ub.decision_order[1]);
+        t.assert_equal(100.0f, ub.embd[6]); // preserve encoder input stride
+        t.assert_equal(105.0f, ub.embd[11]);
+    };
+
+    // Encode is position-zero even when the creator already has decoder KV.
+    t.assert_true("creator frontier would reject encode", !alloc.init(bb.b, vocab, true));
+    t.assert_true("encode ignores decoder memory", init_at_destination(nullptr));
+    check_rows(0);
+
+    destination.ranges[0] = {0, 1};
+    for (int i = 0; i < 2; ++i) {
+        const llama_pos pos = i + 2;
+        t.assert_true(bb.b.set_token_pos(i, &pos));
+    }
+    t.assert_true("decode rejects creator frontier", !alloc.init(bb.b, vocab, true));
+    t.assert_true("decode follows destination frontier", init_at_destination(&destination));
+    check_rows(2);
+
+    destination.ranges[0] = {0, 3};
+    for (int i = 0; i < 2; ++i) {
+        const llama_pos pos = i;
+        t.assert_true(bb.b.set_token_pos(i, &pos));
+    }
+    t.assert_true("decoder rejects repeated position-zero input", !init_at_destination(&destination));
+    t.assert_true("second encode is independent of previous decode", init_at_destination(nullptr));
+    check_rows(0);
+
+    batch_builder foreign_seq(2, &creator, 4);
+    foreign_seq.add(0, {3}, true);
+    llama_batch view = {};
+    t.assert_true(foreign_seq.b.get_batch(view, true));
+    t.assert_true("destination sequence capacity wins", !alloc.init(
+            view, vocab, nullptr, 2, 2, true, true, &foreign_seq.b));
+}
+
 int main(int argc, char ** argv) {
     testing t;
 
@@ -1260,6 +1321,7 @@ int main(int argc, char ** argv) {
     t.test("mrope",          test_mrope);
     t.test("mtp_embd_width", test_mtp_embd_width);
     t.test("sync_bridge",    test_sync_bridge);
+    t.test("destination_frontier", test_destination_frontier);
 
     return t.summary();
 }
