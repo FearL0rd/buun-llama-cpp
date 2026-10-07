@@ -2246,6 +2246,18 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                 layer.wqkv_gate_s = load_weight_scale(tn(LLM_TENSOR_ATTN_GATE, "scale", i), layer.wqkv_gate);
             }
 
+            // MLA low-rank projections (EXL3; DeepSeek-V4 presets wq_a_s/wq_b_s
+            // via its own block-FP8 path, so the guard leaves those untouched)
+            if (!layer.wq_a_s && layer.wq_a) {
+                layer.wq_a_s = load_weight_scale(tn(LLM_TENSOR_ATTN_Q_A, "scale", i), layer.wq_a);
+            }
+            if (!layer.wq_b_s && layer.wq_b) {
+                layer.wq_b_s = load_weight_scale(tn(LLM_TENSOR_ATTN_Q_B, "scale", i), layer.wq_b);
+            }
+            if (!layer.wkv_a_mqa_s && layer.wkv_a_mqa) {
+                layer.wkv_a_mqa_s = load_weight_scale(tn(LLM_TENSOR_ATTN_KV_A_MQA, "scale", i), layer.wkv_a_mqa);
+            }
+
             // dense FFN weight scales (per-tensor, shape {1})
             if (!layer.ffn_gate_s && layer.ffn_gate) {
                 layer.ffn_gate_s = load_weight_scale(tn(LLM_TENSOR_FFN_GATE, "scale", i), layer.ffn_gate);
@@ -2354,6 +2366,15 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             }
             if (!layer.wqkv_gate_in_s && layer.wqkv_gate) {
                 layer.wqkv_gate_in_s = create_input_scale(tn(LLM_TENSOR_ATTN_GATE, "input_scale", i), layer.wqkv_gate);
+            }
+            if (!layer.wq_a_in_s && layer.wq_a) {
+                layer.wq_a_in_s = create_input_scale(tn(LLM_TENSOR_ATTN_Q_A, "input_scale", i), layer.wq_a);
+            }
+            if (!layer.wq_b_in_s && layer.wq_b) {
+                layer.wq_b_in_s = create_input_scale(tn(LLM_TENSOR_ATTN_Q_B, "input_scale", i), layer.wq_b);
+            }
+            if (!layer.wkv_a_mqa_in_s && layer.wkv_a_mqa) {
+                layer.wkv_a_mqa_in_s = create_input_scale(tn(LLM_TENSOR_ATTN_KV_A_MQA, "input_scale", i), layer.wkv_a_mqa);
             }
             if (!layer.ffn_gate_in_s && layer.ffn_gate) {
                 layer.ffn_gate_in_s = create_input_scale(tn(LLM_TENSOR_FFN_GATE, "input_scale", i), layer.ffn_gate);
@@ -5060,6 +5081,40 @@ llama_model_base::llama_model_base(const struct llama_model_params & params) : l
 ggml_tensor * llama_model_base::create_tensor(const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags) {
     GGML_ASSERT(ml != nullptr);
     return create_tensor(*ml, tn, ne, flags);
+}
+
+void llama_model_base::create_expert_bank(llm_tensor tid, int bid, int64_t k, int64_t n, int64_t experts, int flags,
+        ggml_tensor * & weight, ggml_tensor * & scale, ggml_tensor * & input_scale) {
+    const auto sizes = ml->tensor_source ? ml->tensor_source->expert_group_sizes(tn(tid, "weight", bid)) :
+        std::vector<int64_t>{};
+    if (sizes.empty()) {
+        weight = create_tensor(tn(tid, "weight", bid), {k, n, experts}, flags);
+        return;
+    }
+    if (params.split_mode == LLAMA_SPLIT_MODE_TENSOR || params.split_mode == LLAMA_SPLIT_MODE_ROW) {
+        throw std::runtime_error("mixed-precision expert banks require layer split (or a single device)");
+    }
+    int64_t total = 0;
+    for (auto size : sizes) {
+        if (size <= 0 || size > experts - total) throw std::runtime_error("invalid mixed expert partition");
+        total += size;
+    }
+    if (total != experts) throw std::runtime_error("incomplete mixed expert partition");
+    std::vector<llama_expert_group> groups;
+    for (size_t i = 0; i < sizes.size(); ++i) {
+        const auto prefix = "g" + std::to_string(i) + ".";
+        llama_expert_group group;
+        group.weight = create_tensor(tn(tid, (prefix + "weight").c_str(), bid), {k, n, sizes[i]}, flags);
+        group.scale = create_tensor(tn(tid, (prefix + "scale").c_str(), bid), {n, sizes[i]}, flags);
+        group.input_scale = create_tensor(tn(tid, (prefix + "input_scale").c_str(), bid), {k, sizes[i]}, flags);
+        group.ids = create_tensor(tn(tid, (prefix + "expert_map").c_str(), bid), {1, experts}, flags);
+        groups.push_back(group);
+    }
+    if (flags & TENSOR_SKIP) return;
+    weight = groups.front().weight;
+    scale = groups.front().scale;
+    input_scale = groups.front().input_scale;
+    expert_banks.emplace(weight, std::move(groups));
 }
 
 void llama_model_base::create_tensor_gate_up_exps(llama_layer & layer, int bid, int64_t n_embd_, int64_t n_ff_, int64_t n_expert_, int flags) {

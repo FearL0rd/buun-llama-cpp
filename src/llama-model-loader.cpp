@@ -1749,7 +1749,9 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         // tensors with "bias" suffix are always used with GGML_OP_ADD or GGML_OP_ADD_ID;
         // embedded-adapter ".lora_a"/".lora_b" tensors are always used with GGML_OP_MUL_MAT_ID
         ggml_op op;
-        if (tn.suffix != nullptr && strcmp(tn.suffix, "bias") == 0) {
+        if (tn.suffix != nullptr && strstr(tn.suffix, ".expert_map") != nullptr) {
+            op = GGML_OP_GET_ROWS;
+        } else if (tn.suffix != nullptr && strcmp(tn.suffix, "bias") == 0) {
             op = info.op == GGML_OP_MUL_MAT_ID ? GGML_OP_ADD_ID : GGML_OP_ADD;
         } else if (tn.suffix != nullptr && strcmp(tn.suffix, "input_scale") == 0 &&
                 t_meta->type == GGML_TYPE_I32 && ggml_nelements(t_meta) == 1) {

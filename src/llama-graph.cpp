@@ -2109,6 +2109,27 @@ ggml_tensor * llm_graph_context::build_lora_mm_id(
           ggml_tensor * ids,
           ggml_tensor * w_s,
           ggml_tensor * w_in_s) const {
+    if (expert_banks) {
+        const auto bank = expert_banks->find(w);
+        if (bank != expert_banks->end()) {
+            if (loras && !loras->empty()) {
+                throw std::runtime_error("LoRA on mixed-precision expert banks is not supported");
+            }
+            auto * flat_ids = ggml_reshape_1d(ctx0, ggml_is_contiguous(ids) ? ids : ggml_cont(ctx0, ids), ggml_nelements(ids));
+            ggml_tensor * result = nullptr;
+            for (const auto & group : bank->second) {
+                auto * local_ids = ggml_get_rows(ctx0, group.ids, flat_ids);
+                local_ids = ggml_reshape_2d(ctx0, local_ids, ids->ne[0], ids->ne[1]);
+                auto * part = ggml_mul_mat_id(ctx0, group.weight, cur, local_ids);
+                part->src[3] = group.scale;
+                part->src[4] = group.input_scale;
+                ggml_mul_mat_id_set_expert_window(part, 0, group.weight->ne[2]);
+                if (prec_policy) prec_policy->apply(part);
+                result = result ? ggml_add(ctx0, result, part) : part;
+            }
+            return result;
+        }
+    }
     ggml_tensor * cur_mm = build_hadamard_input(w, cur);
 
     ggml_tensor * res = ggml_mul_mat_id(ctx0, w, cur_mm, ids);

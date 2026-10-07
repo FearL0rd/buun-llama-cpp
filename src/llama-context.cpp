@@ -1014,6 +1014,12 @@ static int llama_moe_cache_expert_parallel(const llama_model & model, int reques
     if (requested == 0) {
         return 0;
     }
+    if (!model.expert_banks.empty()) {
+        // Group-local expert IDs cannot form the canonical up/gate/down bundle
+        // required by fanout. Keep ordinary multi-device cache admission alive.
+        LLAMA_LOG_WARN("MoE cache: mixed-precision expert banks use ordinary multi-device cache routing; fused expert fanout disabled\n");
+        return 0;
+    }
     const auto host_weight = [](const ggml_tensor * tensor) {
         if (!tensor) return false;
         const ggml_backend_buffer_t buffer = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;

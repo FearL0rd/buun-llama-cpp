@@ -19,6 +19,14 @@ struct ggml_cgraph;
 struct ggml_context;
 struct ggml_tensor;
 
+struct llama_expert_group {
+    ggml_tensor * weight;
+    ggml_tensor * scale;
+    ggml_tensor * input_scale;
+    ggml_tensor * ids; // I32 [1, logical experts], local ID or -1
+};
+using llama_expert_banks = std::map<ggml_tensor *, std::vector<llama_expert_group>>;
+
 // Maps a folded model weight to the activation-side transform applied
 // immediately before the matmul: optional sign flip, then the normalized
 // blockwise Hadamard rotation.
@@ -1189,6 +1197,7 @@ struct llm_graph_context {
     using hadamard_input_key = std::tuple<ggml_tensor *, ggml_tensor *, ggml_tensor *, int64_t, int64_t, int64_t>;
     mutable std::map<hadamard_input_key, ggml_tensor *> hadamard_inputs;
     mutable std::map<std::pair<ggml_tensor *, ggml_tensor *>, ggml_tensor *> segmented_inputs;
+    const llama_expert_banks * expert_banks = nullptr;
 
     // DDTree: tree-mode SSM buffers
     ggml_tensor * tree_parent_ids = nullptr;

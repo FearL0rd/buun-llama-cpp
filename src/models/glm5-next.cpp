@@ -150,6 +150,12 @@ void llama_model_glm5_next::load_arch_tensors(llama_model_loader & ml) {
             layer.indexer_proj       = create_tensor(tn(LLM_TENSOR_INDEXER_PROJ,       "weight", i), {n_embd, n_indexer_head}, iflags);
             layer.indexer_attn_k     = create_tensor(tn(LLM_TENSOR_INDEXER_ATTN_K,     "weight", i), {n_embd, n_embd_indexer}, iflags);
             layer.indexer_attn_q_b   = create_tensor(tn(LLM_TENSOR_INDEXER_ATTN_Q_B,   "weight", i), {q_lora_rank, n_indexer_head * n_embd_indexer}, iflags);
+            if (layer.indexer_attn_q_b && ggml_type_is_exl3(layer.indexer_attn_q_b->type)) {
+                layer.indexer_attn_q_b_s = create_tensor(tn(LLM_TENSOR_INDEXER_ATTN_Q_B, "scale", i),
+                    {n_indexer_head * n_embd_indexer}, iflags);
+                layer.indexer_attn_q_b_in_s = create_tensor(tn(LLM_TENSOR_INDEXER_ATTN_Q_B, "input_scale", i),
+                    {q_lora_rank}, iflags);
+            }
             layer.indexer_kpool_gate = create_tensor(tn(LLM_TENSOR_INDEXER_KPOOL_GATE, "weight", i), {n_embd, n_embd_indexer}, iflags);
             layer.indexer_kpool_ape  = create_tensor(tn(LLM_TENSOR_INDEXER_KPOOL_APE,  "weight", i), {n_embd_indexer, kpool}, iflags);
         }
@@ -165,9 +171,12 @@ void llama_model_glm5_next::load_arch_tensors(llama_model_loader & ml) {
             layer.ffn_gate_inp    = create_tensor(tn(LLM_TENSOR_FFN_GATE_INP,    "weight", i), {n_embd, n_expert}, flags);
             layer.ffn_exp_probs_b = create_tensor(tn(LLM_TENSOR_FFN_EXP_PROBS_B, "bias",   i), {n_expert}, flags);
 
-            layer.ffn_gate_exps = create_tensor(tn(LLM_TENSOR_FFN_GATE_EXPS, "weight", i), {  n_embd, n_ff_exp, n_expert}, flags);
-            layer.ffn_down_exps = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", i), {n_ff_exp,   n_embd, n_expert}, flags);
-            layer.ffn_up_exps   = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS,   "weight", i), {  n_embd, n_ff_exp, n_expert}, flags);
+            create_expert_bank(LLM_TENSOR_FFN_GATE_EXPS, i, n_embd, n_ff_exp, n_expert, flags,
+                layer.ffn_gate_exps, layer.ffn_gate_exps_s, layer.ffn_gate_exps_in_s);
+            create_expert_bank(LLM_TENSOR_FFN_DOWN_EXPS, i, n_ff_exp, n_embd, n_expert, flags,
+                layer.ffn_down_exps, layer.ffn_down_exps_s, layer.ffn_down_exps_in_s);
+            create_expert_bank(LLM_TENSOR_FFN_UP_EXPS, i, n_embd, n_ff_exp, n_expert, flags,
+                layer.ffn_up_exps, layer.ffn_up_exps_s, layer.ffn_up_exps_in_s);
 
             layer.ffn_gate_shexp = create_tensor(tn(LLM_TENSOR_FFN_GATE_SHEXP, "weight", i), {n_embd, n_ff_exp * n_expert_shared}, flags);
             layer.ffn_down_shexp = create_tensor(tn(LLM_TENSOR_FFN_DOWN_SHEXP, "weight", i), {        n_ff_exp * n_expert_shared, n_embd}, flags);
@@ -195,7 +204,7 @@ std::unique_ptr<llm_graph_context> llama_model_glm5_next::build_arch_graph(const
 // Causal conv1d over one of Q/K/V
 static ggml_tensor * glm5_conv1d(ggml_cgraph * gf, ggml_context * ctx0,
                                  ggml_tensor * conv_states_all, ggml_tensor * conv_state_all,
-                                 int64_t qkv, ggml_tensor * x, ggml_tensor * proj_w, ggml_tensor * conv_w,
+                                 int64_t qkv, ggml_tensor * x, ggml_tensor * conv_w,
                                  int64_t d_conv, int64_t head_dim, int64_t n_head,
                                  int64_t n_seq_tokens, int64_t n_seqs, int64_t n_tokens, int64_t kv_head,
                                  int64_t mem_size, int64_t K_rs) {
@@ -208,8 +217,10 @@ static ggml_tensor * glm5_conv1d(ggml_cgraph * gf, ggml_context * ctx0,
         n_embd_r_total * ggml_element_size(conv_state_all),
         qkv * conv_state_size * ggml_element_size(conv_state_all));
 
-    ggml_tensor * x_proj = ggml_mul_mat(ctx0, proj_w, x);
-    ggml_tensor * x_3d   = ggml_reshape_3d(ctx0, x_proj, d_inner, n_seq_tokens, n_seqs);
+    if (!ggml_is_contiguous(x)) {
+        x = ggml_cont(ctx0, x);
+    }
+    ggml_tensor * x_3d = ggml_reshape_3d(ctx0, x, d_inner, n_seq_tokens, n_seqs);
     ggml_tensor * conv_x = ggml_concat(ctx0, conv_state_x, ggml_transpose(ctx0, x_3d), 0);
 
     // group s holds the conv window s tokens back.
@@ -540,6 +551,8 @@ ggml_tensor * llama_model_glm5_next::graph::build_hc_post(
 llama_model_glm5_next::graph::graph(const llama_model & model, const llm_graph_params & params) :
     llm_build_delta_net_base(params), model(model) {
 
+    expert_banks = &model.expert_banks;
+
     ggml_tensor * cur;
 
     ggml_tensor * inp = build_inp_embd(model.tok_embd);
@@ -606,10 +619,11 @@ llama_model_glm5_next::graph::graph(const llama_model & model, const llm_graph_p
 
         if ((uint32_t) il < hparams.n_layer_dense_lead) {
             cur = build_ffn(cur,
-                    layer.ffn_up,   nullptr, nullptr,
-                    layer.ffn_gate, nullptr, nullptr,
-                    layer.ffn_down, nullptr, nullptr,
-                    nullptr, LLM_FFN_SILU, LLM_FFN_PAR, il);
+                    layer.ffn_up,   nullptr, layer.ffn_up_s,
+                    layer.ffn_gate, nullptr, layer.ffn_gate_s,
+                    layer.ffn_down, nullptr, layer.ffn_down_s,
+                    nullptr, LLM_FFN_SILU, LLM_FFN_PAR, il,
+                    layer.ffn_up_in_s, layer.ffn_gate_in_s, layer.ffn_down_in_s);
             cb(cur, "ffn_out", il);
         } else {
             ggml_tensor * moe_out = build_moe_ffn(cur,
@@ -622,14 +636,19 @@ llama_model_glm5_next::graph::graph(const llama_model & model, const llm_graph_p
                     LLM_FFN_SILU, hparams.expert_weights_norm,
                     hparams.expert_weights_scale,
                     (llama_expert_gating_func_type) hparams.expert_gating_func,
-                    il);
+                    il,
+                    nullptr, nullptr,                                   // probs_in, fused gate_up_exps
+                    layer.ffn_up_exps_s, layer.ffn_gate_exps_s, layer.ffn_down_exps_s,
+                    nullptr,                                            // selected_experts_in
+                    layer.ffn_up_exps_in_s, layer.ffn_gate_exps_in_s, layer.ffn_down_exps_in_s);
             cb(moe_out, "ffn_moe_out", il);
 
             ggml_tensor * ffn_shexp = build_ffn(cur,
-                    layer.ffn_up_shexp,   nullptr, nullptr,
-                    layer.ffn_gate_shexp, nullptr, nullptr,
-                    layer.ffn_down_shexp, nullptr, nullptr,
-                    nullptr, LLM_FFN_SILU, LLM_FFN_PAR, il);
+                    layer.ffn_up_shexp,   nullptr, layer.ffn_up_shexp_s,
+                    layer.ffn_gate_shexp, nullptr, layer.ffn_gate_shexp_s,
+                    layer.ffn_down_shexp, nullptr, layer.ffn_down_shexp_s,
+                    nullptr, LLM_FFN_SILU, LLM_FFN_PAR, il,
+                    layer.ffn_up_shexp_in_s, layer.ffn_gate_shexp_in_s, layer.ffn_down_shexp_in_s);
             cb(ffn_shexp, "ffn_shexp", il);
 
             cur = ggml_add(ctx0, moe_out, ffn_shexp);
@@ -664,7 +683,7 @@ llama_model_glm5_next::graph::graph(const llama_model & model, const llm_graph_p
     cb(cur, "result_norm", -1);
     res->t_embd = cur;
 
-    cur = ggml_mul_mat(ctx0, model.output, cur);
+    cur = build_lora_mm(model.output, cur, model.output_s, model.output_in_s);
     cb(cur, "result_output", -1);
     res->t_logits = cur;
 
@@ -687,9 +706,26 @@ ggml_tensor * llama_model_glm5_next::graph::build_kda_layer(
     const int64_t mem_size = mctx_cur->get_size();
     const int64_t K_rs     = (int64_t) cparams.n_rs_seq + 1;
 
-    ggml_tensor * Qcur = glm5_conv1d(gf, ctx0, conv_states_all, conv_state_all, 0, cur, layer.wq, layer.ssm_q_conv, d_conv, head_dim, n_head_kda, n_seq_tokens, n_seqs, n_tokens, kv_head, mem_size, K_rs);
-    ggml_tensor * Kcur = glm5_conv1d(gf, ctx0, conv_states_all, conv_state_all, 1, cur, layer.wk, layer.ssm_k_conv, d_conv, head_dim, n_head_kda, n_seq_tokens, n_seqs, n_tokens, kv_head, mem_size, K_rs);
-    ggml_tensor * Vcur = glm5_conv1d(gf, ctx0, conv_states_all, conv_state_all, 2, cur, layer.wv, layer.ssm_v_conv, d_conv, head_dim, n_head_kda, n_seq_tokens, n_seqs, n_tokens, kv_head, mem_size, K_rs);
+    // The checkpoint fuses Q/K/V into one EXL3 qkv_proj (layer.wqkv). Project
+    // once through the EXL3-aware matmul, then split the [3*d_inner, n_tokens]
+    // result into the three per-side activations the conv path consumes.
+    ggml_tensor * q_in;
+    ggml_tensor * k_in;
+    ggml_tensor * v_in;
+    if (layer.wqkv) {
+        auto * qkv = build_lora_mm(layer.wqkv, cur, layer.wqkv_s, layer.wqkv_in_s);
+        q_in = ggml_view_2d(ctx0, qkv, d_inner, n_tokens, qkv->nb[1], 0);
+        k_in = ggml_view_2d(ctx0, qkv, d_inner, n_tokens, qkv->nb[1], d_inner * qkv->nb[0]);
+        v_in = ggml_view_2d(ctx0, qkv, d_inner, n_tokens, qkv->nb[1], 2 * d_inner * qkv->nb[0]);
+    } else {
+        q_in = build_lora_mm(layer.wq, cur, layer.wq_s, layer.wq_in_s);
+        k_in = build_lora_mm(layer.wk, cur, layer.wk_s, layer.wk_in_s);
+        v_in = build_lora_mm(layer.wv, cur, layer.wv_s, layer.wv_in_s);
+    }
+
+    ggml_tensor * Qcur = glm5_conv1d(gf, ctx0, conv_states_all, conv_state_all, 0, q_in, layer.ssm_q_conv, d_conv, head_dim, n_head_kda, n_seq_tokens, n_seqs, n_tokens, kv_head, mem_size, K_rs);
+    ggml_tensor * Kcur = glm5_conv1d(gf, ctx0, conv_states_all, conv_state_all, 1, k_in, layer.ssm_k_conv, d_conv, head_dim, n_head_kda, n_seq_tokens, n_seqs, n_tokens, kv_head, mem_size, K_rs);
+    ggml_tensor * Vcur = glm5_conv1d(gf, ctx0, conv_states_all, conv_state_all, 2, v_in, layer.ssm_v_conv, d_conv, head_dim, n_head_kda, n_seq_tokens, n_seqs, n_tokens, kv_head, mem_size, K_rs);
     cb(Qcur, "kda_q_conv", il);
     cb(Kcur, "kda_k_conv", il);
     cb(Vcur, "kda_v_conv", il);
@@ -745,7 +781,7 @@ ggml_tensor * llama_model_glm5_next::graph::build_kda_layer(
     ggml_tensor * gated = ggml_mul(ctx0, normed, ggml_sigmoid(ctx0, g2));
 
     gated = ggml_cont_2d(ctx0, gated, d_inner, n_tokens);
-    cur   = ggml_mul_mat(ctx0, layer.wo, gated);
+    cur   = build_lora_mm(layer.wo, gated, layer.wo_s, layer.wo_in_s);
     cb(cur, "kda_out", il);
 
     return cur;
@@ -765,7 +801,7 @@ ggml_tensor * llama_model_glm5_next::graph::build_kpool_select(
     const int64_t n_pool         = inp_kpool->pool_cells->ne[0];
     const int64_t n_new          = inp_kpool->n_new;
 
-    ggml_tensor * iq = ggml_mul_mat(ctx0, layer.indexer_attn_q_b, qr);
+    ggml_tensor * iq = build_lora_mm(layer.indexer_attn_q_b, qr, layer.indexer_attn_q_b_s, layer.indexer_attn_q_b_in_s);
     iq = ggml_reshape_3d(ctx0, iq, n_embd_indexer, n_indexer_head, n_tokens);
     cb(iq, "indexer_q", il);
 
@@ -907,14 +943,14 @@ ggml_tensor * llama_model_glm5_next::graph::build_dsa_layer(
 
     GGML_ASSERT(hparams.n_rot() == 0 && "GLM5-Next MLA is nope-only");
 
-    ggml_tensor * qr = ggml_mul_mat(ctx0, layer.wq_a, cur);
+    ggml_tensor * qr = build_lora_mm(layer.wq_a, cur, layer.wq_a_s, layer.wq_a_in_s);
     qr = build_norm(qr, layer.attn_q_a_norm, nullptr, LLM_NORM_RMS, il);
     cb(qr, "q_resid", il);
 
-    ggml_tensor * q = ggml_mul_mat(ctx0, layer.wq_b, qr);
+    ggml_tensor * q = build_lora_mm(layer.wq_b, qr, layer.wq_b_s, layer.wq_b_in_s);
     q = ggml_reshape_3d(ctx0, q, n_embd_head_qk_nope, n_head, n_tokens);
 
-    ggml_tensor * kv_cmpr = ggml_mul_mat(ctx0, layer.wkv_a_mqa, cur);
+    ggml_tensor * kv_cmpr = build_lora_mm(layer.wkv_a_mqa, cur, layer.wkv_a_mqa_s, layer.wkv_a_mqa_in_s);
     kv_cmpr = build_norm(kv_cmpr, layer.attn_kv_a_norm, nullptr, LLM_NORM_RMS, il);
     kv_cmpr = ggml_reshape_3d(ctx0, kv_cmpr, kv_lora_rank, 1, n_tokens);
     cb(kv_cmpr, "kv_cmpr", il);
@@ -950,7 +986,7 @@ ggml_tensor * llama_model_glm5_next::graph::build_dsa_layer(
     ggml_tensor * out = build_attn_mha(q_absorbed, k, v, nullptr, mask, nullptr, layer.wv_b, inp_kpool->n_sel, kq_scale, il);
     cb(out, "kqv_out", il);
 
-    out = ggml_mul_mat(ctx0, layer.wo, out);
+    out = build_lora_mm(layer.wo, out, layer.wo_s, layer.wo_in_s);
     cb(out, "attn_out", il);
 
     return out;

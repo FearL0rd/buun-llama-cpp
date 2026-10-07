@@ -551,10 +551,18 @@ struct llama_layer {
     struct ggml_tensor * wkv_s                = nullptr;
     struct ggml_tensor * wo_a_s               = nullptr;
     struct ggml_tensor * wo_b_s               = nullptr;
+    // EXL3 scale/sign companions for the MLA low-rank projections (GLM5-Next).
+    // DeepSeek-V4's block-FP8 path stores only a weight scale (wq_a_s/wq_b_s
+    // above); EXL3 needs the svh weight scale and the suh input-sign vector.
+    struct ggml_tensor * wq_a_in_s            = nullptr;
+    struct ggml_tensor * wq_b_in_s            = nullptr;
+    struct ggml_tensor * wkv_a_mqa_s          = nullptr;
+    struct ggml_tensor * wkv_a_mqa_in_s       = nullptr;
     struct ggml_tensor * attn_comp_wkv_s      = nullptr;
     struct ggml_tensor * attn_comp_wgate_s    = nullptr;
     struct ggml_tensor * indexer_proj_s        = nullptr;
     struct ggml_tensor * indexer_attn_q_b_s    = nullptr;
+    struct ggml_tensor * indexer_attn_q_b_in_s = nullptr;
     struct ggml_tensor * indexer_comp_wkv_s    = nullptr;
     struct ggml_tensor * indexer_comp_wgate_s  = nullptr;
 
@@ -789,6 +797,7 @@ struct llama_model {
     std::map<uint32_t, std::vector<int32_t>> hadamard_sign_data;
     bool hadamard_gdn_v_grouped = false;
     llama_hadamard_rotations hadamard_rotations;
+    llama_expert_banks expert_banks;
     llama_hadamard_rotations hadamard_inverses;
 
     struct segmented_rotation_spec {
@@ -918,6 +927,9 @@ struct llama_model_base : public llama_model {
     void create_tensor_qkv(llama_layer & layer, int bid,
                 int64_t n_embd_, int64_t n_embd_q_, int64_t n_embd_k_, int64_t n_embd_v_,
                 int flags);
+
+    void create_expert_bank(llm_tensor tid, int bid, int64_t k, int64_t n, int64_t experts, int flags,
+                           ggml_tensor * & weight, ggml_tensor * & scale, ggml_tensor * & input_scale);
 
     // helper: read the SWA pattern as one flag per layer, or as a period expanded by set_swa_pattern
     void load_swa_pattern(llama_model_loader & ml, uint32_t n_pattern, bool dense_first = false);
