@@ -4536,8 +4536,8 @@ int llama_context::encode(const llama_batch & batch_inp, const llama_batch_ext *
     const int64_t n_vocab = model.vocab.n_tokens();
 
     // note: during encode, we always pass the full sequence starting from pos = 0
-    if (!(extended ? balloc->init(*extended, model.vocab, true) :
-            balloc->init(batch_inp, model.vocab, nullptr, n_embd, cparams.kv_unified ? LLAMA_MAX_SEQ : cparams.n_seq_max, true))) {
+    if (!balloc->init(batch_inp, model.vocab, nullptr, n_embd,
+            cparams.kv_unified ? LLAMA_MAX_SEQ : cparams.n_seq_max, true, extended != nullptr, extended)) {
         LLAMA_LOG_ERROR("%s: failed to initialize batch\n", __func__);
         return -1;
     }
@@ -4865,8 +4865,8 @@ int llama_context::decode(const llama_batch & batch_inp, const llama_batch_ext *
         }
     }
 
-    if (!(extended ? balloc->init(*extended, vocab, output_all) :
-            balloc->init(batch_inp, vocab, memory.get(), n_embd, n_seq_max, output_all))) {
+    if (!balloc->init(batch_inp, vocab, memory.get(), n_embd, n_seq_max,
+            output_all, extended != nullptr, extended)) {
         LLAMA_LOG_ERROR("%s: failed to initialize batch\n", __func__);
         return -1;
     }
