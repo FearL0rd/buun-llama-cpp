@@ -7356,24 +7356,6 @@ size_t ggml_hash_size(size_t min_sz) {
     return sz;
 }
 
-struct hash_map {
-    struct ggml_hash_set set;
-    struct ggml_tensor ** vals;
-};
-
-static struct hash_map * ggml_new_hash_map(size_t size) {
-    struct hash_map * result = GGML_MALLOC(sizeof(struct hash_map));
-    result->set = ggml_hash_set_new(size);
-    result->vals = GGML_CALLOC(result->set.size, sizeof(struct ggml_tensor *));
-    return result;
-}
-
-static void ggml_hash_map_free(struct hash_map * map) {
-    ggml_hash_set_free(&map->set);
-    GGML_FREE(map->vals);
-    GGML_FREE(map);
-}
-
 // utility functions to change gradients
 // isrc is the index of tensor in cgraph->visited_has_set.keys
 // the corresponding gradient (accumulators) are also at position isrc

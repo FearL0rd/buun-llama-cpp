@@ -119,11 +119,6 @@ struct qsa_cell_key {
     llama_token token = LLAMA_TOKEN_NULL;
 };
 
-bool operator<(const qsa_cell_key & lhs, const qsa_cell_key & rhs) noexcept {
-    return std::tie(lhs.pos, lhs.x, lhs.y, lhs.token) <
-           std::tie(rhs.pos, rhs.x, rhs.y, rhs.token);
-}
-
 struct qsa_cell_location {
     llama_pos pos = -1;
     int32_t x = 0;
