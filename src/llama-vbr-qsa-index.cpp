@@ -17,7 +17,8 @@
 namespace {
 
 constexpr uint32_t QSA_INDEX_STATE_MAGIC = 0x49534151; // "QSAI"
-constexpr uint32_t QSA_INDEX_STATE_VERSION = 1;
+// Native index KV rows now include rotation dimensions and persistent pooled keys.
+constexpr uint32_t QSA_INDEX_STATE_VERSION = 2;
 constexpr char QSA_INDEX_CODEC_DOMAIN[] = "buun.vbr.capture/qsa-index-codec/v1";
 
 class counting_writer final : public llama_io_write_i {

@@ -2858,7 +2858,25 @@ static void test_qwen4_vbr_cuda(const size_t seed) {
         ggml_row_size(first_index_tensor->type, first_index_tensor->ne[0]);
     GGML_ASSERT(first_row_size > 0 && changed_row->second.size() >= first_row_size);
 
-    // Walk the exact v1 prefix and native KV metadata to the first layer's K
+    // Old codec envelopes and native payload versions must fail before mutation.
+    {
+        auto old_descriptor = qsa_descriptor;
+        old_descriptor.format_version = 1;
+        std::unique_ptr<vbr_parsed_companion_image> refused;
+        GGML_ASSERT(!vbr_parse_qsa_index_companion(nullptr, old_descriptor, qsa_chain, qsa_target, refused));
+        GGML_ASSERT(!refused);
+        auto old_bytes = qsa_bytes;
+        const uint32_t old_version = 1;
+        GGML_ASSERT(old_bytes.size() >= 2*sizeof(old_version));
+        std::memcpy(old_bytes.data() + sizeof(old_version), &old_version, sizeof(old_version));
+        artifact_segment_chain old_chain(old_bytes.size());
+        GGML_ASSERT(old_chain.append(old_bytes.data(), old_bytes.size()));
+        GGML_ASSERT(!vbr_parse_qsa_index_companion(nullptr, qsa_descriptor, old_chain, qsa_target, refused));
+        GGML_ASSERT(!refused);
+        assert_qsa_image(qsa_layout);
+    }
+
+    // Walk the codec prefix and native KV metadata to the first layer's K
     // rows. The native rows are serialized in ascending physical-cell order.
     size_t native_offset = 0;
     const auto read_native_scalar = [&](auto & value) {
