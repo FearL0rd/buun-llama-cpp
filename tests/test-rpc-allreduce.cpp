@@ -35,6 +35,46 @@ int main(int argc, char ** argv) {
     GGML_ASSERT(init && reduce && free_comm);
     void * comm = init(backends, 2);
     GGML_ASSERT(comm);
+
+    // A packed transpose occupies contiguous storage but has different logical
+    // strides. Refuse it before dispatch: the server reduction uses contiguous
+    // scratch/output tensors and cannot safely reduce this view in place.
+    {
+        ggml_context_ptr contexts[] = {
+            ggml_context_ptr(ggml_init({2*ggml_tensor_overhead(), nullptr, true})),
+            ggml_context_ptr(ggml_init({2*ggml_tensor_overhead(), nullptr, true})),
+        };
+        ggml_tensor * bases[2];
+        ggml_tensor * transposed[2];
+        ggml_backend_buffer_ptr buffers[2];
+        const std::vector<float> original[] = {{1, 2, 3, 4}, {11, 13, 17, 19}};
+        for (int rank = 0; rank < 2; ++rank) {
+            bases[rank] = ggml_new_tensor_2d(contexts[rank].get(), GGML_TYPE_F32, 2, 2);
+            transposed[rank] = ggml_transpose(contexts[rank].get(), bases[rank]);
+            buffers[rank].reset(ggml_backend_alloc_ctx_tensors(contexts[rank].get(), backends[rank]));
+            GGML_ASSERT(buffers[rank]);
+            bases[rank]->flags |= GGML_TENSOR_FLAG_COMPUTE;
+            transposed[rank]->flags |= GGML_TENSOR_FLAG_COMPUTE;
+            GGML_ASSERT(ggml_is_contiguously_allocated(transposed[rank]));
+            GGML_ASSERT(!ggml_is_contiguous(transposed[rank]));
+            ggml_backend_tensor_set(bases[rank], original[rank].data(), 0, 4*sizeof(float));
+        }
+        for (int mask : {1, 2, 3}) {
+            ggml_tensor * tensors[] = {
+                mask & 1 ? transposed[0] : bases[0],
+                mask & 2 ? transposed[1] : bases[1],
+            };
+            GGML_ASSERT(!reduce(comm, tensors));
+            for (int rank = 0; rank < 2; ++rank) {
+                std::vector<float> output(4);
+                ggml_backend_synchronize(backends[rank]);
+                ggml_backend_tensor_get(bases[rank], output.data(), 0, 4*sizeof(float));
+                GGML_ASSERT(output == original[rank]);
+            }
+        }
+        std::puts("packed transpose refused on either rank without mutation: PASS");
+    }
+
     bool ok = true;
     for (int count : {32767, 32768, 32769, 65536}) {
         ggml_context_ptr contexts[] = {
