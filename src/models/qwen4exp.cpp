@@ -1083,7 +1083,10 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_sel(
     ggml_build_forward_expand(gf, kpool_cache.scatter_pooled(pooled_new, inp_kpool->new_pool_rep));
     // Preserve the fork's all-cell shortcut, but keep both raw and pooled
     // index writes live so a later sparse graph can reuse this history.
-    if (inp_kpool->n_sel >= inp_kpool->n_kv) {
+    // The budget, not the currently padded pool count, decides whether every
+    // cache cell fits. Early singleton-pool chunks can have fewer pools than
+    // the padded KV watermark even though the budget already covers it all.
+    if ((uint64_t) hparams.indexer_top_k + kpool - 1 >= inp_kpool->n_kv) {
         return nullptr;
     }
     ggml_tensor * pooled = kpool_cache.gather_pooled(inp_kpool->pool_cells);
