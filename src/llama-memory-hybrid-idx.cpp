@@ -1,5 +1,9 @@
 #include "llama-memory-hybrid-idx.h"
 
+#include <algorithm>
+#include <cmath>
+#include <type_traits>
+
 #include "llama-impl.h"
 #include "llama-batch.h"
 #include "llama-io.h"
@@ -51,7 +55,9 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
     mem_idx(filter_idx == nullptr ? nullptr : [&] {
         // MQA with a single key head of indexer_head_size, as llama_kv_cache_dsa shapes its own
         std::fill(hparams_idx.n_head_kv_arr.begin(), hparams_idx.n_head_kv_arr.end(), 1);
-        hparams_idx.n_embd_head_k_full = model.hparams.indexer_head_size;
+        // a k-pool indexer caches its per-token rows and the pooled key side by side
+        // (glm5-next: key | gate | pooled, qwen4exp: key | pooled)
+        hparams_idx.n_embd_head_k_full = model.hparams.indexer_head_size * (model.hparams.indexer_kpool > 0 ? model.hparams.indexer_kpool_row : 1);
 
         // the cached indexer keys are raw, rotation happens after pooling at read time, so a
         // K-shift must not rotate them while the stream copies in the same update still apply
@@ -281,8 +287,36 @@ void llama_memory_hybrid_idx::clear(bool data) {
 
     if (mem_idx) {
         mem_idx->clear(data);
+        mem_idx_stale_set(-1, 0);
     }
     qsa_invalidate();
+}
+
+// A pooled key is only valid while the grouping that produced it holds. Grouping is sequence relative,
+// so an edit at p0 leaves every pool that ends before p0 alone.
+void llama_memory_hybrid_idx::mem_idx_stale_set(llama_seq_id seq_id, llama_pos p0) {
+    p0 = std::max<llama_pos>(p0, 0);
+
+    if (seq_id < 0) {
+        for (auto & p : mem_idx_stale) {
+            p = std::min(p, p0);
+        }
+
+        return;
+    }
+
+    GGML_ASSERT(seq_id < (llama_seq_id) LLAMA_MAX_SEQ);
+
+    mem_idx_stale[seq_id] = std::min(mem_idx_stale[seq_id], p0);
+}
+
+// An edit at or below the first position moves pos_min, which regroups the whole sequence.
+llama_pos llama_memory_hybrid_idx::mem_idx_stale_pos(llama_seq_id seq_id, llama_pos p0) const {
+    if (seq_id < 0 || p0 <= mem_idx->seq_pos_min(seq_id)) {
+        return 0;
+    }
+
+    return p0;
 }
 
 bool llama_memory_hybrid_idx::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
@@ -390,6 +424,8 @@ void llama_memory_hybrid_idx::seq_keep(llama_seq_id seq_id) {
 
     if (mem_idx) {
         mem_idx->seq_keep(seq_id);
+        // every other sequence loses its cells, so their layouts must rebuild
+        mem_idx_stale_set(-1, 0);
     }
 }
 
@@ -483,6 +519,8 @@ void llama_memory_hybrid_idx::state_read(llama_io_read_i & io, llama_seq_id seq_
         if ((flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == 0) {
             if (mem_idx) {
                 mem_idx->state_read_sinfo(io, seq_id, flags, nullptr, &sinfos_attn);
+                // the restore rewrites the cells behind the pool layout's back
+                mem_idx_stale_set(seq_id, 0);
             }
         }
 
@@ -510,11 +548,12 @@ void llama_memory_hybrid_idx::state_drop(llama_seq_id seq_id) {
         return;
     }
 
-    get_mem_attn()->seq_rm(seq_id, -1, -1);
+    get_mem_attn()->state_clear(seq_id);
     get_mem_recr()->seq_rm(seq_id, -1, -1);
 
     if (mem_idx) {
-        mem_idx->seq_rm(seq_id, -1, -1);
+        mem_idx->state_clear(seq_id);
+        mem_idx_stale_set(seq_id, 0);
     }
 }
 
@@ -563,7 +602,20 @@ llama_memory_hybrid_idx_context::llama_memory_hybrid_idx_context(llama_memory_hy
     ns_ubatch(mem->get_mem_idx() == nullptr ?
         std::vector<uint32_t>() : std::vector<uint32_t>{ mem->get_mem_idx()->get_n_stream() }),
     ctx_idx(mem->get_mem_idx() == nullptr ? nullptr :
-        new llama_kv_cache_context(mem->get_mem_idx())) {}
+        new llama_kv_cache_context(mem->get_mem_idx())) {
+    if (kpool_track()) {
+        mem->kpool_layout_update();
+        auto st = kpool_build_sizes();
+        const auto * idx = mem->get_mem_idx();
+        const uint64_t n_pool_max = uint64_t(idx->get_size() / mem->get_kpool()) * idx->get_n_seq_max();
+        GGML_ASSERT(n_pool_max <= UINT32_MAX - 64);
+        st.n_pool_real = std::max(st.n_pool_real, uint32_t(n_pool_max));
+        st.n_new   = st.n_pool_real;
+        st.n_new_g = std::max(st.n_new, 1u);
+        kpool_st = std::make_unique<kpool_state>(std::move(st));
+        i_kpool  = 0;
+    }
+}
 
 llama_memory_hybrid_idx_context::llama_memory_hybrid_idx_context(
         llama_memory_hybrid_idx * mem,
@@ -586,10 +638,21 @@ llama_memory_hybrid_idx_context::llama_memory_hybrid_idx_context(
     mem(mem),
     written_ubatch(llama_memory_hybrid_idx_written(sinfos_idx)),
     ns_ubatch(llama_memory_hybrid_idx_ns(sinfos_idx)),
+    sinfos_kpool(mem->get_mem_idx() != nullptr && mem->get_kpool() > 0 && mem->get_kpool_by_order() ? sinfos_idx : slot_info_vec_t()),
     ctx_idx(mem->get_mem_idx() == nullptr ? nullptr :
-        new llama_kv_cache_context(mem->get_mem_idx(), std::move(sinfos_idx), ubatches)) {}
+        new llama_kv_cache_context(mem->get_mem_idx(), std::move(sinfos_idx), ubatches)) {
+    // Sequence edits force the touched positions to re-pool.
+    mem_idx_stale_batch = mem->mem_idx_stale_get();
+}
+
+llama_memory_hybrid_idx_context::~llama_memory_hybrid_idx_context() = default;
 
 bool llama_memory_hybrid_idx_context::next() {
+    // Clear only after a successful ubatch.
+    if (i_cur == 0 && mem != nullptr) {
+        mem->mem_idx_stale_clear();
+    }
+
     if (ctx_idx) {
         ctx_idx->next();
     }
@@ -616,6 +679,11 @@ bool llama_memory_hybrid_idx_context::apply() {
     }
 
     return res;
+}
+
+bool llama_memory_hybrid_idx_context::kpool_track() const {
+    // Derived from mem instead of being cached.
+    return mem != nullptr && mem->get_mem_idx() != nullptr && mem->get_kpool() > 0 && !ns_ubatch.empty();
 }
 
 const llama_kv_cache_context * llama_memory_hybrid_idx_context::get_idx() const {

@@ -13,8 +13,6 @@
 // llama_memory_hybrid plus a third cache with one indexer key per token, for block-sparse attention (qwen4exp QSA)
 // the indexer is a side buffer over the attention cells: same size, padding, streams and slots, so cell j is one token in both
 
-// TODO: this memory module is pending complete reimplementation - do not use for model other than Qwen4
-
 class llama_memory_hybrid_idx : public llama_memory_hybrid {
 public:
     llama_memory_hybrid_idx(
@@ -43,7 +41,8 @@ public:
     const layer_filter_cb & filter_idx,
     const llama_memory_vbr_params & vbr = {});
 
-    ~llama_memory_hybrid_idx() = default;
+    // Defined out of line because kpool_layout is incomplete here.
+    ~llama_memory_hybrid_idx();
 
     //
     // llama_memory_i
@@ -151,6 +150,22 @@ private:
 
 class llama_memory_hybrid_idx_context : public llama_memory_hybrid_context {
 public:
+    class kpool_access {
+    public:
+        ggml_tensor * gather_key_gate(ggml_tensor * idxs) const;
+        ggml_tensor * scatter_pooled(ggml_tensor * values, ggml_tensor * idxs) const;
+        ggml_tensor * gather_pooled(ggml_tensor * idxs) const;
+
+    private:
+        friend class llama_memory_hybrid_idx_context;
+
+        kpool_access(ggml_context * ctx, ggml_tensor * k, int64_t n_embd);
+
+        ggml_context * ctx;
+        ggml_tensor  * key_gate;
+        ggml_tensor  * pooled;
+    };
+
     using slot_info_vec_t = llama_kv_cache::slot_info_vec_t;
 
     // used for errors
@@ -172,7 +187,7 @@ public:
                     slot_info_vec_t   sinfos_idx,
           std::vector<llama_ubatch>   ubatches);
 
-    ~llama_memory_hybrid_idx_context() = default;
+    ~llama_memory_hybrid_idx_context(); // Defined out of line because kpool_state is incomplete here.
 
     //
     // llama_memory_context_i
@@ -245,9 +260,31 @@ private:
     // streams per ubatch, read from the slot infos before ctx_idx takes them
     const std::vector<uint32_t> ns_ubatch;
 
+    // the indexer cells of each ubatch, kept for pools in cache order (qwen4exp): token s*n + i of ubatch u
+    // sits in cell idxs[s][i] of stream strm[s] of sinfos_kpool[u], and several cells can share a position
+    const slot_info_vec_t sinfos_kpool;
+
     // null unless the model has an indexer
     const llama_memory_context_ptr ctx_idx;
 
     // mirrors the base class's ubatch cursor, which is private there
     size_t i_cur = 0;
+
+    // Which pools of the layout this ubatch must re-pool. The layout itself belongs to the memory.
+    struct kpool_state;
+    kpool_state kpool_build_sizes() const;
+    void kpool_build_state(const llama_ubatch & ubatch);
+    const kpool_state & kpool_cur() const;
+
+    // unique_ptr because kpool_state is incomplete here.
+    std::unique_ptr<kpool_state> kpool_st;
+
+    // The ubatch kpool_st was built for, guards against reads before apply.
+    size_t i_kpool = SIZE_MAX;
+
+    // Whether this context tracks k-pool states.
+    bool kpool_track() const;
+
+    // Positions each sequence must re-pool from, cleared only after the first ubatch succeeds
+    llama_memory_hybrid_idx::stale_pos_t mem_idx_stale_batch = llama_memory_hybrid_idx::stale_pos_clean();
 };
