@@ -1330,6 +1330,18 @@ static bool test_state_range(struct llama_model * model, const struct common_par
             return false;
         }
 
+        // A pre-rotation-layout blob must refuse before touching an occupied prefix.
+        auto old_version = src_mid;
+        const uint32_t version = 1;
+        GGML_ASSERT(old_version.size() >= 2*sizeof(version));
+        std::memcpy(old_version.data() + sizeof(version), &version, sizeof(version));
+        std::vector<uint8_t> head_after_refusal;
+        if (append(ctx.get(), old_version, c0, c1, n) || !holds(c0) ||
+                !get_range(ctx.get(), 0, c0, head_after_refusal) || head_after_refusal != src_head) {
+            LOG_ERR("%s: old range version was accepted or changed the occupied prefix\n", __func__);
+            return false;
+        }
+
         // names another range than the one it was written for
         if (append(ctx.get(), src_mid, c0, c1 + 1, n) || !holds(c0)) {
             LOG_ERR("%s: a blob was accepted for another range\n", __func__);

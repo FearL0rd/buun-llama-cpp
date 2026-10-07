@@ -1218,7 +1218,7 @@ extern "C" {
     // restricted to positions [p0, p1). A range blob does not depend on the stream layout, so it
     // moves between split and unified KV caches. All three return 0 on failure.
     // Bump the version on any change to the blob layout: readers refuse other versions.
-#define LLAMA_STATE_SEQ_RANGE_VERSION 1
+#define LLAMA_STATE_SEQ_RANGE_VERSION 2
 
     // The sequence must hold every position of the range, with none masked out.
     // A memory with no base part (pure recurrent) yields a blob that is only its header.
