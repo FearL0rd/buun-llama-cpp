@@ -168,6 +168,14 @@ public:
             const llama_vocab & vocab,
             bool output_all);
 
+    // Processing context owns position validation: encode has no memory,
+    // decode uses its destination memory even if the batch came from another context.
+    bool init(
+            const llama_batch_ext & batch_inp,
+            const llama_vocab & vocab,
+            const llama_memory_i * memory,
+            bool output_all);
+
     // Keep borrowed legacy batches on the established zero-copy input path.
     bool init(
             const llama_batch & batch_inp,
