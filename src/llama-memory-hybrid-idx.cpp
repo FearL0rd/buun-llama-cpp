@@ -619,6 +619,24 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_memory_hybrid_idx::memory_bre
     return mb;
 }
 
+void llama_memory_hybrid_idx::state_write_range(llama_io_write_i & io, llama_seq_id seq_id, llama_pos p0, llama_pos p1) const {
+    // The inherited attention-only range omits index keys, while PARTIAL_ONLY
+    // carries only recurrent state. Do not publish an incomplete base snapshot.
+    if (mem_idx) {
+        throw std::runtime_error("indexed memory does not support position-range state");
+    }
+    llama_memory_hybrid::state_write_range(io, seq_id, p0, p1);
+}
+
+void llama_memory_hybrid_idx::state_append_range(llama_io_read_i & io, llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_pos p_limit) {
+    // Refuse before any child mutates: an attention-only append would leave
+    // index membership and pooled-key history inconsistent with attention.
+    if (mem_idx) {
+        throw std::runtime_error("indexed memory does not support position-range state");
+    }
+    llama_memory_hybrid::state_append_range(io, seq_id, p0, p1, p_limit);
+}
+
 void llama_memory_hybrid_idx::state_write(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) const {
     llama_memory_hybrid::state_write(io, seq_id, flags);
 

@@ -181,6 +181,12 @@ Version 2 includes the key/value rotation dimensions in the native KV data
 header. Version 1 blobs and their resume compatibility keys are incompatible;
 they are refused rather than interpreted using the new layout.
 
+Indexed/QSA memory refuses these range APIs before changing child state: the
+attention-only payload omits index keys, and `PARTIAL_ONLY` supplies recurrent
+state, not those keys. Full sequence snapshots and their companion contracts
+are separate. This matches the existing server resume `unsupported_qsa` gate;
+it does not add indexed range or indexed `--resume` support.
+
 - **No `n_stream` word.** A range belongs to one sequence, so the blob is the
   same under unified and split KV and installs under either. Tested both ways on
   a dense, a hybrid and an SWA model.
