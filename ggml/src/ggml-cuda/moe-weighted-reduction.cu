@@ -43,7 +43,17 @@ static __global__ void moe_weighted_reduction_f32(const float * __restrict__ exp
     const uint64_t first_row = (uint64_t) token * n_expert_used;
     const auto value = [&](int expert) {
         const int entry = skip ? skip[expert] : 0;
-        return entry ? __ldcv(share.y + (entry - 1) * n_embd + col) : experts[(first_row + expert) * n_embd + col];
+        if (!entry) {
+            return experts[(first_row + expert) * n_embd + col];
+        }
+        const float * host_value = share.y + (entry - 1) * n_embd + col;
+#if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
+        // HIP mapped host allocations are coherent. Keep this read after the
+        // completion-ticket wait without relying on NVIDIA's cache intrinsic.
+        return *reinterpret_cast<const volatile float *>(host_value);
+#else
+        return __ldcv(host_value);
+#endif
     };
 
     const float    first_scale = expert_scale != nullptr ? expert_scale[first_row] : 1.0f;
