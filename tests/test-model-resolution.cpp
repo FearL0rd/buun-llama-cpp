@@ -353,7 +353,8 @@ static void test_plan_resolution() {
 // loopback, downloads skipped by flipping offline before apply
 //
 
-static void assemble(std::vector<std::string> argv, common_params & params, bool skip_download = true) {
+static void assemble(std::vector<std::string> argv, common_params & params, bool skip_download = true,
+        llama_example ex = LLAMA_EXAMPLE_SERVER) {
     std::vector<char *> cargv;
     g_context.clear();
     for (auto & a : argv) {
@@ -396,7 +397,7 @@ static void test_task_assembly() {
     {
         // plain -hf wires the model and its mmproj, nothing speculative
         common_params params;
-        assemble({"download", "-hf", "test/main:Q8_0"}, params, LLAMA_EXAMPLE_DOWNLOAD);
+        assemble({"download", "-hf", "test/main:Q8_0"}, params, true, LLAMA_EXAMPLE_DOWNLOAD);
         REQUIRE_EQ(params.model.path,  cached("test/main", "model-Q8_0.gguf"));
         REQUIRE_EQ(params.mmproj.path, cached("test/main", "mmproj-model-Q8_0.gguf"));
         REQUIRE(params.speculative.draft.mparams.path.empty());
@@ -410,7 +411,7 @@ static void test_task_assembly() {
     {
         // --no-mmproj disables the mmproj discovery
         common_params params;
-        assemble({"download", "-hf", "test/main:Q8_0", "--no-mmproj"}, params, LLAMA_EXAMPLE_DOWNLOAD);
+        assemble({"download", "-hf", "test/main:Q8_0", "--no-mmproj"}, params, true, LLAMA_EXAMPLE_DOWNLOAD);
         REQUIRE(params.mmproj.path.empty());
     }
     {

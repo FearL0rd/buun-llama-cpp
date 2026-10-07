@@ -1532,12 +1532,14 @@ static bool test_state_restore_failure(struct llama_model * model, const struct 
 }
 
 
-// Test 10: state rotation
+// Test 13: state rotation
 // a KV state saved with attention rotation enabled must restore only into a context with the same setting;
 // note: rotation is only active for quantized KV caches with a head size that is a multiple of 64,
-//       for other models the restore into the rotation-disabled context is valid and the test passes vacuously
-static bool test_state_rotation(struct llama_model * model, const struct common_params & params) {
-    LOGV(LOG_LEVEL_INFO, "\n=== Test 10: state rotation ===\n");
+//       other models are SKIP, or FAIL when --rotation-required is requested.
+static bool g_rotation_required = false;
+
+static test_status test_state_rotation(struct llama_model * model, const struct common_params & params) {
+    LOGV(LOG_LEVEL_INFO, "\n=== Test 13: state rotation ===\n");
 
     const std::string attn_rot_disable = common_get_env("LLAMA_ATTN_ROT_DISABLE");
     const auto make_context = [&](ggml_type type_k, ggml_type type_v, bool disable_rotation) {
@@ -1560,10 +1562,12 @@ static bool test_state_rotation(struct llama_model * model, const struct common_
     }
     if (type_pairs.empty()) {
         LOG_WRN("%s: no supported quantized KV cache type combination - skipping\n", __func__);
-        return true;
+        common_set_env("LLAMA_ATTN_ROT_DISABLE", attn_rot_disable);
+        return g_rotation_required ? test_status::FAIL : test_status::SKIP;
     }
 
     bool success = true;
+    bool tested_rejection = false;
     for (const auto & types : type_pairs) {
         auto src = make_context(types.first, types.second, false);
         if (!src) {
@@ -1605,17 +1609,19 @@ static bool test_state_rotation(struct llama_model * model, const struct common_
             break;
         }
         if (llama_state_seq_set_data(mismatched.get(), state.data(), state.size(), 0) != 0) {
-            LOG_TRC("%s: state restored into rotation-disabled context, model does not use attention rotation\n", __func__);
+            LOG_WRN("%s: rotation mismatch was not rejected; no negative control on this model\n", __func__);
+            success = !g_rotation_required;
+        } else {
+            tested_rejection = true;
         }
     }
     common_set_env("LLAMA_ATTN_ROT_DISABLE", attn_rot_disable);
 
     if (!success) {
-        return false;
+        return test_status::FAIL;
     }
 
-    LOGV(LOG_LEVEL_INFO, "\nPASS\n");
-    return true;
+    return tested_rejection ? test_status::PASS : test_status::SKIP;
 }
 
 struct test_suite {
@@ -1632,10 +1638,10 @@ static bool g_range_only = false;
 
 static std::vector<const char *> test_names = {
     "baseline", "seq_rm", "state_load", "cp_h", "cp_d", "integrity",
-    "trim", "cp_h_s", "cp_d_s", "rt", "range", "rf",
+    "trim", "cp_h_s", "cp_d_s", "rt", "range", "rf", "rot",
 };
 
-// Run the full save/load test suite (tests 1-12) for a single model.
+// Run the full save/load test suite (tests 1-13) for a single model.
 static test_suite run_save_load_tests_for_model(const std::string & model_path, const struct common_params & base_params) {
     test_suite suite;
     struct common_params params = base_params;
@@ -1724,6 +1730,7 @@ static test_suite run_save_load_tests_for_model(const std::string & model_path, 
     // Test 11: position-range blobs
     suite.results.push_back(test_state_range(model, params, tokens) ? test_status::PASS : test_status::FAIL);
     suite.results.push_back(test_state_restore_failure(model, params, tokens) ? test_status::PASS : test_status::FAIL);
+    suite.results.push_back(test_state_rotation(model, params));
 
     LOG("\n%s\n", suite.all_passed() ? "All tests passed." : "Some tests failed or were skipped.");
 
@@ -1765,6 +1772,8 @@ int main(int argc, char ** argv) {
         } else if (strcmp(argv[i], "--range-only") == 0) {
             g_range_only = true;
             test_names = { "range" };
+        } else if (strcmp(argv[i], "--rotation-required") == 0) {
+            g_rotation_required = true;
         } else {
             filtered_argv.push_back(argv[i]);
         }

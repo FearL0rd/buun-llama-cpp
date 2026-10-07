@@ -616,6 +616,12 @@ if (NOT LLAMA_SANITIZE_ADDRESS AND NOT GGML_SCHED_NO_REALLOC)
   # TODO: repair known memory leaks
   llama_build_and_test(test-opt.cpp)
 endif()
+if (GGML_METAL AND NOT GGML_BACKEND_DL)
+    llama_build_and_test(test-metal-graph-optimize.cpp)
+    target_include_directories(test-metal-graph-optimize PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src ${PROJECT_SOURCE_DIR}/ggml/src/ggml-metal)
+    target_link_libraries(test-metal-graph-optimize PRIVATE ggml-metal)
+endif()
+
 # The full suite runs explicitly in ci/run.sh. Keep focused fork CTest cases below.
 # TODO: decouple the operator tool from libllama [TAG_TESTS_LLAMA_LINK].
 llama_build(test-backend-ops.cpp)
