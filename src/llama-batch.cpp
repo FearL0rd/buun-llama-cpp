@@ -30,20 +30,12 @@ bool llama_batch_allocr::init(
         const llama_batch_ext & batch_inp,
         const llama_vocab & vocab,
         bool output_all) {
-    return init(batch_inp, vocab, batch_inp.mem, output_all);
-}
-
-bool llama_batch_allocr::init(
-        const llama_batch_ext & batch_inp,
-        const llama_vocab & vocab,
-        const llama_memory_i * memory,
-        bool output_all) {
     llama_batch view = {};
     if (!batch_inp.get_batch(view, true)) {
         return false;
     }
     const size_t n_embd = batch_inp.n_embd > 0 ? batch_inp.n_embd : batch_inp.n_embd_inp;
-    return init(view, vocab, memory, n_embd, batch_inp.n_seq_max, output_all, true, &batch_inp);
+    return init(view, vocab, batch_inp.mem, n_embd, batch_inp.n_seq_max, output_all, true, &batch_inp);
 }
 
 bool llama_batch_allocr::init(

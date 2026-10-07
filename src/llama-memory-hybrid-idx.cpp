@@ -370,9 +370,6 @@ bool llama_memory_hybrid_idx::kpool_can_remove(llama_seq_id seq_id, llama_pos p0
         return true;
     }
     p0 = std::max<llama_pos>(p0, 0);
-    if (p1 < 0) {
-        p1 = std::numeric_limits<llama_pos>::max();
-    }
     const auto & cells = mem_idx->get_cells(0);
     const uint32_t kpool = get_kpool();
     std::map<uint32_t, std::vector<uint32_t>> representatives;
