@@ -858,7 +858,9 @@ static void test_bonsai_loader(const size_t seed) {
             rotations += a->op == GGML_OP_MUL_MAT &&
                 reinterpret_cast<const int32_t *>(a->op_params)[1] == GGML_HINT_SRC0_IS_HADAMARD;
         }
-        GGML_ASSERT(rotations == 3);
+        // two input rotations, plus the embedding inverse on both the token
+        // and the mixed-batch lookup branch of the input select
+        GGML_ASSERT(rotations == 4);
     }
 
     // Optional means absent is allowed, not that malformed metadata is ignored.
@@ -4566,8 +4568,10 @@ static int test_backends(const std::string & arch_filter, const size_t seed, con
                             }
                         }
 
-                        // runs after the mixed batch check, as it leaves the context with non-causal attention
-                        if (!encode && !check_causal_attn_toggle(model_and_ctx_dev.first.get(), model_and_ctx_dev.second.get(), tokens)) {
+                        // runs after the mixed batch check, as it leaves the context with non-causal attention;
+                        // the DFlash drafters pin n_ubatch to n_batch, which leaves no room for the extra batches
+                        const bool drafter = arch == LLM_ARCH_DFLASH_DRAFT || arch == LLM_ARCH_GEMMA4_DFLASH_DRAFT;
+                        if (!encode && !drafter && !check_causal_attn_toggle(model_and_ctx_dev.first.get(), model_and_ctx_dev.second.get(), tokens)) {
                             if (test_ok) {
                                 status_nmse = "\033[1;31mFAIL\033[0m (toggle)";
                             }
