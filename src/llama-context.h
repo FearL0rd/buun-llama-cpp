@@ -559,8 +559,6 @@ private:
 
     llm_graph_cb graph_get_cb() const;
 
-    // ggml_backend_sched copy callback, copies only the experts used by MUL_MAT_ID
-
     // disable auto fused ops (Flash Attention, Gated Delta Net) whose op lands on a device
     // that differs from the layer it belongs to (usually due to missing backend support)
     void resolve_fused_ops(const llama_memory_context_i * mctx, uint32_t n_seqs);

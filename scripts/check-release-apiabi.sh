@@ -20,7 +20,8 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-LIBS=(libllama libmtmd)
+# The fork extends ggml/backend contracts as well as llama and mtmd.
+LIBS=(libllama libmtmd libggml libggml-base libggml-cpu)
 
 usage() {
     echo "Usage: $0 [--tag <version>]" >&2

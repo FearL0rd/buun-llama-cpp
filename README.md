@@ -528,9 +528,11 @@ A few options to get `llama.cpp` installed on your machine:
 
 ```bash
 # curl
+# Upstream llama.cpp binaries, not buun's extended build:
 curl -LsSf https://llama.app/install.sh | sh
 
 # powershell
+# Upstream llama.cpp binaries, not buun's extended build:
 irm https://llama.app/install.ps1 | iex
 ```
 
