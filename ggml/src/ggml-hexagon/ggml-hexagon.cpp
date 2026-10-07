@@ -6485,6 +6485,9 @@ static bool ggml_hexagon_precompute_cpy_params(
     if (nelem_src != nelem_dst || nelem_src < 0) {
         return false;
     }
+    if (uint64_t(nelem_src) > UINT32_MAX) {
+        return false; // HTP copy kernel counters and relative element offsets are 32-bit.
+    }
 
     const uint32_t src_type_size = ggml_type_size(src0->type);
     const uint32_t dst_type_size = ggml_type_size(dst->type);
@@ -8820,9 +8823,11 @@ static bool ggml_backend_hexagon_device_supports_op(ggml_backend_dev_t dev, cons
                 case GGML_GLU_OP_SWIGLU_OAI:
                 case GGML_GLU_OP_SWIGLU_CLAMP:
                 case GGML_GLU_OP_GEGLU:
+                    supp = ggml_hexagon_supported_activations(sess, op);
+                    break;
                 case GGML_GLU_OP_GEGLU_QUICK:
                 case GGML_GLU_OP_GEGLU_ERF:
-                    supp = ggml_hexagon_supported_activations(sess, op);
+                    supp = op->src[0]->type == GGML_TYPE_F32 && ggml_hexagon_supported_activations(sess, op);
                     break;
                 default:
                     supp = false;

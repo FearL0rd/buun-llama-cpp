@@ -470,8 +470,8 @@ struct ggml_cuda_unroll<1> {
 
 template<int width = WARP_SIZE>
 static __device__ __forceinline__ int warp_reduce_sum(int x) {
-#if !defined(GGML_USE_HIP) && __CUDA_ARCH__ >= GGML_CUDA_CC_AMPERE
-    return __reduce_add_sync(0xFFFFFFFFULL, x);
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && __CUDA_ARCH__ >= GGML_CUDA_CC_AMPERE
+    return __reduce_add_sync(0xffffffff, x);
 #else
 #pragma unroll
     for (int offset = width/2; offset > 0; offset >>= 1) {

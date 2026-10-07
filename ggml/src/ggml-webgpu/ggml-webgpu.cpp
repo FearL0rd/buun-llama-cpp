@@ -1271,6 +1271,10 @@ static webgpu_encoded_op ggml_webgpu_ssm_scan(webgpu_context & ctx,
         xbc_merged_range = ggml_webgpu_tensor_merged_binding_range(ctx, { src1, src4 });
         offset_x         = ggml_webgpu_tensor_merged_element_offset(src1, xbc_merged_range);
         offset_B         = ggml_webgpu_tensor_merged_element_offset(src4, xbc_merged_range);
+    } else if (xbc_overlap == 0b101) {  // x/C
+        xbc_merged_range = ggml_webgpu_tensor_merged_binding_range(ctx, { src1, src5 });
+        offset_x         = ggml_webgpu_tensor_merged_element_offset(src1, xbc_merged_range);
+        offset_C         = ggml_webgpu_tensor_merged_element_offset(src5, xbc_merged_range);
     } else if (xbc_overlap == 0b011) {  // B/C
         xbc_merged_range = ggml_webgpu_tensor_merged_binding_range(ctx, { src4, src5 });
         offset_B         = ggml_webgpu_tensor_merged_element_offset(src4, xbc_merged_range);
@@ -1282,7 +1286,7 @@ static webgpu_encoded_op ggml_webgpu_ssm_scan(webgpu_context & ctx,
         offset_C         = ggml_webgpu_tensor_merged_element_offset(src5, xbc_merged_range);
     }
 
-    GGML_ASSERT(xbc_overlap == 0 || xbc_overlap == 0b110 || xbc_overlap == 0b011 || xbc_overlap == 0b111);
+    GGML_ASSERT(xbc_overlap == 0 || xbc_overlap == 0b110 || xbc_overlap == 0b101 || xbc_overlap == 0b011 || xbc_overlap == 0b111);
 
     size_t xbc_bind_offset = 0;
     size_t xbc_bind_size   = 0;
@@ -1339,7 +1343,8 @@ static webgpu_encoded_op ggml_webgpu_ssm_scan(webgpu_context & ctx,
     };
     // xbc_merged binding
     if (xbc_overlap > 0) {
-        entries.push_back(ggml_webgpu_make_bind_group_entry(binding_num++, ggml_webgpu_tensor_buf(src1),
+        const ggml_tensor * merged_source = (xbc_overlap & 0b100) ? src1 : src4;
+        entries.push_back(ggml_webgpu_make_bind_group_entry(binding_num++, ggml_webgpu_tensor_buf(merged_source),
                                                             xbc_bind_offset, xbc_bind_size));
     }
     // x

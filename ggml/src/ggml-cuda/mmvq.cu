@@ -1632,7 +1632,13 @@ static __global__ void mul_mat_vec_q(
         __syncthreads();
     }
 
-    const uint32_t channel_dst = blockIdx.y;
+    const bool shared_expert = has_fusion && fusion.shared_up && blockIdx.y == gridDim.y - 1;
+    const uint32_t channel_dst = shared_expert ? 0 : blockIdx.y;
+    if (shared_expert) {
+        vx = fusion.shared_up;
+        dst = fusion.shared_dst;
+        stride_col_dst = fusion.shared_stride_col_dst;
+    }
 
     uint32_t channel_x;
     uint32_t channel_y;
@@ -1657,7 +1663,7 @@ static __global__ void mul_mat_vec_q(
             for (int j = 0; j < 4; ++j) conv_taps[j] = fusion.conv_weight[4 * row0 + j];
         }
     }
-    channel_x  = ncols_dst == 1 && ids ? ids[channel_dst]                     : fastdiv(channel_dst, channel_ratio);
+    channel_x  = shared_expert ? 0 : ncols_dst == 1 && ids ? ids[channel_dst] : fastdiv(channel_dst, channel_ratio);
     channel_y  = ncols_dst == 1 && ids ? fastmodulo(channel_dst, nchannels_y) : channel_dst;
     sample_dst = blockIdx.z;
     if (ncols_dst == 1 && ids && (int32_t) channel_x < 0) {
@@ -1960,6 +1966,12 @@ static __global__ void mul_mat_vec_q_moe(
 
     constexpr vec_dot_q_cuda_t vec_dot_q_cuda = get_vec_dot_q_cuda(type);
 
+    const bool shared_expert = !flat_hits && has_fusion && fusion.shared_up && blockIdx.y == gridDim.y - 1;
+    if (shared_expert) {
+        vx = fusion.shared_up;
+        dst = fusion.shared_dst;
+        stride_col_dst = fusion.shared_stride_col_dst;
+    }
     uint32_t token_idx;
     uint32_t channel_dst;
     uint32_t route_idx;
@@ -1972,7 +1984,7 @@ static __global__ void mul_mat_vec_q_moe(
         }
     } else {
         token_idx = threadIdx.y;
-        channel_dst = blockIdx.y;
+        channel_dst = shared_expert ? 0 : blockIdx.y;
         route_idx = channel_dst + token_idx*ids_stride;
         if (token_idx >= ncols_dst) {
             return;
@@ -1993,7 +2005,7 @@ static __global__ void mul_mat_vec_q_moe(
     if constexpr (has_fusion) {
         if (fusion.gate != nullptr) {
             use_gate = true;
-            vgate    = fusion.gate;
+            vgate    = shared_expert ? fusion.shared_gate : fusion.gate;
         }
         x_bias     = (const float *) fusion.x_bias;
         gate_bias  = (const float *) fusion.gate_bias;
@@ -2009,7 +2021,7 @@ static __global__ void mul_mat_vec_q_moe(
     constexpr int  blocks_per_iter  = vdr * warp_size / qi;
 
     ggml_cuda_pdl_sync();
-    const uint32_t channel_x = ids[route_idx];
+    const uint32_t channel_x = shared_expert ? 0 : ids[route_idx];
     const uint32_t channel_gate = gate_ids ? gate_ids[route_idx] : channel_x;
     // flat launches carry one token, so its routes are numbered like the strided layout's
     if (fusion.x_route_log && blockIdx.x == 0 && threadIdx.x == 0) {
@@ -2233,7 +2245,7 @@ static void mul_mat_vec_q_moe_launch(
 
     // A single token's routes pack 4 warps to a CTA: one-warp CTAs keep too few loads in flight
     // to reach full bandwidth on an expert's rows.
-    if (ncols_dst == 1) {
+    if (ncols_dst == 1 && !fusion.shared_up) {
         constexpr int route_pack = 4;
         const dim3 block_nums(nblocks_rows, (nchannels_dst + route_pack - 1) / route_pack);
         const dim3 block_dims(warp_size, route_pack);
@@ -2245,7 +2257,7 @@ static void mul_mat_vec_q_moe_launch(
         return;
     }
 
-    const dim3 block_nums(nblocks_rows, nchannels_dst);
+    const dim3 block_nums(nblocks_rows, nchannels_dst + (fusion.shared_up != nullptr));
     const dim3 block_dims(warp_size, ncols_dst);
     if (use_fusion) {
         launch(mul_mat_vec_q_moe<type, rows_per_block, true, has_clamp>, block_nums, block_dims, ncols_dst);

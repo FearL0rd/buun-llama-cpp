@@ -313,7 +313,16 @@ static void * ggml_backend_openvino_buffer_get_base(ggml_backend_buffer_t buffer
 }
 
 static bool is_stateful_enabled() {
-    return ggml_openvino_getenv_int("GGML_OPENVINO_STATEFUL_EXECUTION") != 0;
+    // Infer-request-owned state is invisible to fork checkpoint/rewind/restore.
+    // Keep explicit GGML state tensors until that ownership protocol is implemented.
+    static const bool warned = [] {
+        if (ggml_openvino_getenv_int("GGML_OPENVINO_STATEFUL_EXECUTION") != 0) {
+            GGML_LOG_WARN("OpenVINO stateful execution is unavailable with fork checkpoint ownership; using explicit state tensors.\n");
+        }
+        return true;
+    }();
+    GGML_UNUSED(warned);
+    return false;
 }
 
 static enum ggml_status ggml_backend_openvino_buffer_init_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor) {

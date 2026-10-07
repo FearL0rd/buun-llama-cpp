@@ -1186,6 +1186,9 @@ bool ggml_cuda_should_use_mmvf(enum ggml_type type, int cc, int warp_size, const
             if (GGML_CUDA_CC_IS_NVIDIA(cc)) {
                 const bool src0_small = (src0_ne[1] <= 512 || src0_ne[2]*src0_ne[3] == 1);
                 const bool src0_thin  = src0_ne[1] <= 64 && src0_ne[2]*src0_ne[3] == 1;
+                if (src0_small && !ggml_cuda_should_use_mmf(type, cc, warp_size, src0_ne, src0_nb, ne11, false)) {
+                    return ne11 <= MMVF_MAX_BATCH_SIZE;
+                }
                 if (ampere_mma_available(cc)) {
                     return src0_small && (ne11 == 1 || (src0_thin && ne11 <= MMVF_MAX_BATCH_SIZE));
                 }
@@ -1219,6 +1222,9 @@ bool ggml_cuda_should_use_mmvf(enum ggml_type type, int cc, int warp_size, const
                 // tensor-core GEMM: cuBLAS runs it as a 2-block 16x16 wmma kernel (~34 us) while the vector
                 // kernel finishes in a few microseconds for every batch size it supports.
                 const bool src0_thin = src0_ne[1] <= 64 && src0_ne[2]*src0_ne[3] == 1;
+                if (src0_small && !ggml_cuda_should_use_mmf(type, cc, warp_size, src0_ne, src0_nb, ne11, false)) {
+                    return ne11 <= MMVF_MAX_BATCH_SIZE;
+                }
                 if (ampere_mma_available(cc)) {
                     return src0_small && (ne11 == 1 || (src0_thin && ne11 <= MMVF_MAX_BATCH_SIZE));
                 }
