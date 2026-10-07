@@ -1,14 +1,72 @@
 #include "common.h"
 #include "sampling.h"
 #include "speculative.h"
+#include "ggml-cpp.h"
+#include "gguf.h"
 #include "../src/llama-batch.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdio>
+#include <filesystem>
+#include <fstream>
 #include <limits>
 
 // Model-free batch checks; the sampler tests use the repository's vocab-only
 // llama-spm fixture (no inference weights or accelerator needed).
+static void test_offline_decision_probe() {
+    // A native directory/config is a valid model source, not a malformed GGUF
+    // model. The optional offline probe must report unknown without throwing;
+    // source discovery and the loaded-model probe remain authoritative.
+    struct temporary_directory {
+        std::filesystem::path path;
+        temporary_directory() {
+            const auto stamp = std::chrono::steady_clock::now().time_since_epoch().count();
+            for (unsigned i = 0; i < 100; ++i) {
+                const auto candidate = std::filesystem::temp_directory_path() /
+                    ("llama-decision-probe-" + std::to_string(stamp) + "-" + std::to_string(i));
+                if (std::filesystem::create_directory(candidate)) {
+                    path = candidate;
+                    return;
+                }
+            }
+            GGML_ABORT("cannot create decision probe test directory");
+        }
+        ~temporary_directory() {
+            std::error_code ec;
+            std::filesystem::remove_all(path, ec);
+        }
+    } tmp;
+    GGML_ASSERT(common_get_decision_type(fs_path_to_utf8(tmp.path)) == COMMON_DECISION_TYPE_UNKNOWN);
+    const auto config = tmp.path / "config.json";
+    {
+        std::ofstream out(config);
+        out << "{\"model_type\":\"qwen3\",\"architectures\":[\"Qwen3ForCausalLM\"]}";
+        out.close();
+        GGML_ASSERT(out.good());
+    }
+    GGML_ASSERT(common_get_decision_type(fs_path_to_utf8(config)) == COMMON_DECISION_TYPE_UNKNOWN);
+    GGML_ASSERT(common_get_decision_type(fs_path_to_utf8(tmp.path / "missing.gguf")) == COMMON_DECISION_TYPE_UNKNOWN);
+
+    const auto path = fs_path_to_utf8(tmp.path / "metadata.gguf");
+    gguf_context_ptr metadata(gguf_init_empty());
+    const auto check = [&](common_decision_type expected) {
+        GGML_ASSERT(gguf_write_to_file(metadata.get(), path.c_str(), true));
+        GGML_ASSERT(common_get_decision_type(path) == expected);
+    };
+    check(COMMON_DECISION_TYPE_UNKNOWN); // architecture absent
+    gguf_set_val_u32(metadata.get(), "general.architecture", 1);
+    check(COMMON_DECISION_TYPE_UNKNOWN); // wrong scalar type must not assert
+    gguf_set_val_str(metadata.get(), "general.architecture", "llama");
+    check(COMMON_DECISION_TYPE_NONE);
+    gguf_set_val_u32(metadata.get(), "llama.decision.type", 1);
+    check(COMMON_DECISION_TYPE_UNKNOWN);
+    gguf_set_val_str(metadata.get(), "llama.decision.type", "future-decision");
+    check(COMMON_DECISION_TYPE_UNKNOWN);
+    gguf_set_val_str(metadata.get(), "llama.decision.type", "pplx-decider");
+    check(COMMON_DECISION_TYPE_PPLX_DECIDER);
+}
+
 static void test_staged_batch() {
     common_batch batch;
     batch.batch.reset(new llama_batch_ext(2, 4, 8, 16, nullptr, 32, 4));
@@ -139,6 +197,7 @@ int main(int argc, char ** argv) {
         std::fprintf(stderr, "usage: %s models/ggml-vocab-llama-spm.gguf\n", argv[0]);
         return 1;
     }
+    test_offline_decision_probe();
     test_staged_batch();
     test_proposal_prefix();
     test_sampler(argv[1]);
