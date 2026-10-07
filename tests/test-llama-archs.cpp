@@ -1554,6 +1554,25 @@ static void test_qwen4_indexed_cache_admission(const size_t seed) {
         GGML_ASSERT(!sparse_trace.score_q_has_redundant_cont);
     }
 
+    // Ratio-1 native checkpoints use singleton pools with no tail. Exercise both
+    // dense and sparse graphs, including the full cache where every cell is a rep.
+    for (uint32_t budget : { 256u, 4u }) {
+        gguf_context_ptr gguf = get_gguf_ctx(LLM_ARCH_QWEN4EXP, true);
+        const std::array<uint32_t, 2> ratios = { 1, 1 };
+        gguf_set_arr_data(gguf.get(), "qwen4exp.attention.compress_ratios", GGUF_TYPE_UINT32,
+                          ratios.data(), ratios.size());
+        gguf_set_val_u32(gguf.get(), "qwen4exp.attention.indexer.top_k", budget);
+        qsa_trace trace;
+        auto singleton = get_model_and_ctx(
+                gguf.get(), nullptr, seed, {}, LLAMA_SPLIT_MODE_LAYER, false, trace_qsa, &trace);
+        GGML_ASSERT(singleton.first->hparams.indexer_kpool == 1);
+        const auto logits = get_logits(singleton.first.get(), singleton.second.get(),
+                                       std::vector<llama_token>(256, 1));
+        GGML_ASSERT(std::all_of(logits.begin(), logits.end(), [](float x) { return std::isfinite(x); }));
+        GGML_ASSERT(trace.raw_key_nodes > 0);
+        GGML_ASSERT((trace.top_k_nodes > 0) == (budget < 256));
+    }
+
     // A graph built for the dense 256-cell watermark must be rejected and rebuilt
     // when the active cache pads to 512.  Also prove that the dense phase writes
     // real raw index keys into the mirrored cells needed by that later sparse graph.
