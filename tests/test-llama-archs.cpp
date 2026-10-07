@@ -2934,13 +2934,17 @@ static void test_qwen4_vbr_cuda(const size_t seed) {
         GGML_ASSERT(position >= 0 && sequence == 0);
     }
     uint32_t v_trans = 0, native_layers = 0;
+    uint32_t native_rot_k = 0, native_rot_v = 0;
     int32_t native_k_type = -1;
     uint64_t native_row_size = 0;
     read_native_scalar(v_trans);
     read_native_scalar(native_layers);
+    read_native_scalar(native_rot_k);
+    read_native_scalar(native_rot_v);
     read_native_scalar(native_k_type);
     read_native_scalar(native_row_size);
     GGML_ASSERT(v_trans <= 1 && native_layers == index_layers.size() &&
+        native_rot_k == 0 && native_rot_v == 0 &&
         native_k_type == int32_t(first_index_tensor->type) &&
         native_row_size == first_row_size);
     size_t physical_ordinal = 0;
