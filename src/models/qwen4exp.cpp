@@ -162,8 +162,8 @@ void llama_model_qwen4exp::load_arch_hparams(llama_model_loader & ml) {
         }
         hparams.indexer_kpool = r;
     }
-    if (hparams.indexer_kpool == 1 || (hparams.indexer_kpool > 0 && hparams.indexer_top_k % hparams.indexer_kpool != 0)) {
-        throw std::runtime_error(format("QSA needs a compress ratio above 1 that divides the budget, got %u and %u",
+    if (hparams.indexer_kpool > 0 && hparams.indexer_top_k % hparams.indexer_kpool != 0) {
+        throw std::runtime_error(format("QSA needs a compress ratio that divides the budget, got %u and %u",
                                         hparams.indexer_kpool, hparams.indexer_top_k));
     }
     // the reference groups the visible tokens in cache order and always keeps the tail
@@ -792,7 +792,11 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
     // the QSA layers share one set of k-pool inputs
     // the CUDA lightning indexer takes 32 or 64 heads, QSA has a few, so it scores with plain ops
     llm_graph_input_kpool * inp_kpool = nullptr;
-    if (mctx_idx && hparams.indexer_kpool > 0) {
+    bool has_qsa_layer = false;
+    for (uint32_t il = 0; il < hparams.n_layer(); ++il) {
+        has_qsa_layer |= !hparams.is_recr(il) && hparams.dsv4_compress_ratios[il] > 0;
+    }
+    if (mctx_idx && hparams.indexer_kpool > 0 && has_qsa_layer) {
         inp_kpool = build_inp_kpool(mctx_hyb);
     }
 
@@ -953,7 +957,7 @@ public:
         res &= k_idxs->ne[0]     == params.ubatch.n_tokens;
         res &= pool_cells->ne[0] == mctx->get_n_kpool();
         res &= pool_mask->ne[1]  == params.ubatch.n_tokens;
-        res &= tail_idxs->ne[1]  == params.ubatch.n_tokens;
+        res &= !tail_idxs || tail_idxs->ne[1] == params.ubatch.n_tokens;
         // the scatter mask shape follows n_kv
         res &= n_kv              == idx->get_n_kv();
         res &= n_new             == mctx->get_n_kpool_new();
@@ -990,17 +994,21 @@ llama_model_qwen4exp::llm_graph_input_kpool * llama_model_qwen4exp::graph::build
     inp->pool_cells = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_pool);
     inp->pool_idxs  = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, kpool, n_pool);
     inp->pool_mask  = ggml_new_tensor_2d(ctx0, GGML_TYPE_F16, n_pool, n_tokens);
-    inp->tail_idxs  = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, kpool - 1, n_tokens);
+    // Singleton pools preserve the fork's ratio-1 checkpoints: each pooled key
+    // is its normalized/rotated raw key and there is no incomplete tail.
+    if (kpool > 1) {
+        inp->tail_idxs = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, kpool - 1, n_tokens);
+        ggml_set_input(inp->tail_idxs);
+        ggml_build_forward_expand(gf, inp->tail_idxs);
+    }
     ggml_set_input(inp->pool_cells);
     ggml_set_input(inp->pool_idxs);
     ggml_set_input(inp->pool_mask);
-    ggml_set_input(inp->tail_idxs);
 
     // set_input fills them all, so keep them allocated even when no op reads them
     ggml_build_forward_expand(gf, inp->pool_cells);
     ggml_build_forward_expand(gf, inp->pool_idxs);
     ggml_build_forward_expand(gf, inp->pool_mask);
-    ggml_build_forward_expand(gf, inp->tail_idxs);
 
     inp->n_kv  = mctx_idx->get_n_kv();
     inp->n_new = mctx_hyb->get_n_kpool_new();
@@ -1106,7 +1114,9 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_sel(
     ggml_tensor * sel_idx = ggml_get_rows(ctx0, inp_kpool->pool_idxs,
             ggml_reshape_1d(ctx0, top_k, n_top_pool*n_tokens)); // [kpool, n_top_pool*n_tokens]
     sel_idx = ggml_reshape_2d(ctx0, sel_idx, kpool*n_top_pool, n_tokens);
-    sel_idx = ggml_concat(ctx0, sel_idx, inp_kpool->tail_idxs, 0);
+    if (inp_kpool->tail_idxs) {
+        sel_idx = ggml_concat(ctx0, sel_idx, inp_kpool->tail_idxs, 0);
+    }
     const int64_t n_sel = sel_idx->ne[0];
     GGML_ASSERT(n_sel == inp_kpool->n_sel);
 
@@ -1136,9 +1146,12 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_sel(
     ggml_tensor * live_pool = ggml_clamp(ctx0, ggml_scale_bias(ctx0, top_score, 1.0f, 1.0f), 0.0f, 1.0f);
     live_pool = ggml_reshape_2d(ctx0, ggml_repeat_4d(ctx0, live_pool, kpool, n_top_pool, n_tokens, 1), kpool*n_top_pool, n_tokens);
     // a tail cell is live unless it is the n_kv sentinel
-    ggml_tensor * live_tail = ggml_cast(ctx0, inp_kpool->tail_idxs, GGML_TYPE_F32);
-    live_tail = ggml_clamp(ctx0, ggml_scale_bias(ctx0, live_tail, -1.0f, (float) n_kv), 0.0f, 1.0f);
-    ggml_tensor * live = ggml_concat(ctx0, live_pool, live_tail, 0); // [n_sel, n_tokens]
+    ggml_tensor * live = live_pool;
+    if (inp_kpool->tail_idxs) {
+        ggml_tensor * live_tail = ggml_cast(ctx0, inp_kpool->tail_idxs, GGML_TYPE_F32);
+        live_tail = ggml_clamp(ctx0, ggml_scale_bias(ctx0, live_tail, -1.0f, (float) n_kv), 0.0f, 1.0f);
+        live = ggml_concat(ctx0, live_pool, live_tail, 0); // [n_sel, n_tokens]
+    }
 
     // Gather uses legal cache indices even for dead slots; log(live) supplies
     // -infinity separately, so padding cannot accidentally duplicate a live cell.
