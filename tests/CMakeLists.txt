@@ -662,6 +662,13 @@ if ((TARGET ggml-cuda OR TARGET ggml-hip) AND NOT GGML_BACKEND_DL)
     set_tests_properties(test-cuda-fa-combine PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120)
 endif()
 
+if (TARGET ggml-cuda AND NOT GGML_BACKEND_DL)
+    llama_build(test-cuda-convert-chunks.cpp)
+    target_link_libraries(test-cuda-convert-chunks PRIVATE ggml-cuda)
+    llama_test(test-cuda-convert-chunks LABEL "main;backend;large-memory")
+    set_tests_properties(test-cuda-convert-chunks PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120 RUN_SERIAL TRUE)
+endif()
+
 llama_build_and_test(test-cuda-graph-key.cpp)
 llama_build_and_test(test-cuda-rdna2-vmm-policy.cpp)
 if (TARGET ggml-cuda)
