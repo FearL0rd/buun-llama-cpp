@@ -68,6 +68,7 @@ struct share_mailbox {
     int32_t n_tok;
     int32_t n_expert;
     int32_t n_entry;
+    float glu_limit; // zero for plain SwiGLU, positive for SWIGLU_CLAMP
     int32_t expert[share_max_experts];
     int32_t entry_expert[share_max_entries]; // index into expert
     int32_t entry_tok[share_max_entries];
@@ -125,6 +126,7 @@ struct share_doorbell_args {
     size_t stage_stride;
     int layer;
     int gpu_num;
+    float glu_limit;
     share_mailbox * mb;
     float * mb_x;
     share_state * st;
@@ -228,6 +230,7 @@ static __global__ void share_doorbell(const share_doorbell_args a) {
             mb->n_tok = a.n_tok;
             mb->n_expert = n_pick;
             mb->n_entry = n_entry;
+            mb->glu_limit = a.glu_limit;
         }
         s_n_entry = n_entry;
 
@@ -344,6 +347,7 @@ struct share_host {
     int n_tok = 0;
     int n_expert = 0;
     int n_entry = 0;
+    float glu_limit = 0.0f;
     int expert[share_max_experts];
     int entry_tok[share_max_entries];
     std::vector<int> expert_entries[share_max_experts];
@@ -404,9 +408,11 @@ static void share_chunk(share_host & h, int phase, int c) {
             [&](int j) { return (const void *) (h.xq.data() + h.entry_tok[j]*h.xq_row); });
     } else if (phase == 1) {
         float * gu = h.gu.data() + (size_t) c*2*n_ff;
+        // SWIGLU_CLAMP clamps the gate BEFORE SiLU, not its result.
+        const float lim = h.glu_limit > 0.0f ? h.glu_limit : INFINITY;
         for (int64_t i = 0; i < n_ff; ++i) {
-            const float g = gu[n_ff + i];
-            gu[i] *= g/(1.0f + expf(-g));
+            const float g = std::min(gu[n_ff + i], lim);
+            gu[i] = std::clamp(gu[i], -lim, lim) * (g/(1.0f + expf(-g)));
         }
         ggml_moe_cache_cpu_traits(h.t_down->vec_dot_type)->from_float(gu, h.hq.data() + c*h.hq_row, n_ff);
     } else {
@@ -477,6 +483,7 @@ static void share_leader(share_host & h) {
         h.n_tok = h.mb->n_tok;
         h.n_expert = h.mb->n_expert;
         h.n_entry = h.mb->n_entry;
+        h.glu_limit = h.mb->glu_limit;
         for (int i = 0; i < h.n_expert; ++i) {
             h.expert[i] = h.mb->expert[i];
             h.expert_entries[i].clear();
@@ -663,8 +670,10 @@ ggml_moe_cpu_share_args ggml_moe_cpu_share_begin(
     // only the fused weighted reduction merges the host's rows, so the share needs its width
     if (n_k < 2 || n_k > MOE_WEIGHTED_REDUCTION_MAX_EXPERTS ||
         !fusion || fusion->gate != gate || fusion->x_bias || fusion->gate_bias || fusion->x_scale ||
-        fusion->gate_scale || fusion->residual || fusion->glu_op != GGML_GLU_OP_SWIGLU ||
-        fusion->glu_limit != 0.0f || x->type != GGML_TYPE_F32 || x->ne[1] != 1 ||
+        fusion->gate_scale || fusion->residual ||
+        !((fusion->glu_op == GGML_GLU_OP_SWIGLU && fusion->glu_limit == 0.0f) ||
+          (fusion->glu_op == GGML_GLU_OP_SWIGLU_CLAMP && fusion->glu_limit > 0.0f && std::isfinite(fusion->glu_limit))) ||
+        x->type != GGML_TYPE_F32 || x->ne[1] != 1 ||
         x->ne[0] != up->ne[0] || n_tok > share_max_tokens || n_k*n_tok > share_max_entries ||
         (n_tok - 1)*ids_stride + n_k > share_max_routes || ids->nb[0] != sizeof(int32_t)) {
         return {};
@@ -739,6 +748,9 @@ ggml_moe_cpu_share_args ggml_moe_cpu_share_begin(
     a.stage_stride = d.stage_stride;
     a.layer = layer;
     a.gpu_num = (int) lroundf(share_gpu_fraction()*256.0f);
+    // Pass the activation with the GPU job, so captured graphs replay their own
+    // limit rather than observing mutable launch-time state from another layer.
+    a.glu_limit = fusion->glu_limit;
     a.mb = h.d_mb;
     a.mb_x = h.d_x;
     a.st = d.st;
