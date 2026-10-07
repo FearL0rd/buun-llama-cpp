@@ -123,12 +123,7 @@ struct common_speculative_draft_params {
     // the generated draft from the last _draft() call
     llama_tokens * result;
 
-    // candidate distribution per drafted token; set it to make draft-simple and draft-mtp sample
-    std::vector<std::vector<llama_token_data>> * result_q = nullptr;
 
-    // the target's temp and seed, read only when the drafter samples probabilistically
-    float    temp = 1.0f;
-    uint32_t seed = LLAMA_DEFAULT_SEED;
 };
 
 common_speculative_draft_params & common_speculative_get_draft_params(common_speculative * spec, llama_seq_id seq_id);
@@ -151,7 +146,7 @@ void common_speculative_begin(common_speculative * spec, llama_seq_id seq_id, co
 //      (classic lockstep drafter decodes) — their state is managed entirely via
 //      begin()/process()/draft().
 bool common_speculative_process(common_speculative * spec, const llama_batch & batch);
-bool common_speculative_process(common_speculative * spec, const common_batch & batch);
+bool common_speculative_process(common_speculative * spec, common_batch & batch);
 
 // Whether any configured implementation requires target embeddings.
 bool common_speculative_need_embd(common_speculative * spec);

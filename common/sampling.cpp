@@ -111,6 +111,7 @@ struct ring_buffer {
 
 struct common_sampler {
     common_params_sampling params;
+    const llama_vocab * vocab;
 
     // Number of largest raw model logits that provably contain the sampled
     // token: 1 when the chain is exactly the raw argmax, n + 1 when its only
@@ -475,6 +476,7 @@ struct common_sampler * common_sampler_init(
 
     auto * result = new common_sampler {
         /* .params  = */ params,
+        /* .vocab   = */ vocab,
         /* .raw_argmax_k = */ 0,
         /* .grmr    = */ grmr,
         /* .rbudget = */ rbudget,
@@ -642,8 +644,9 @@ void common_sampler_reset(struct common_sampler * gsmpl) {
 }
 
 struct common_sampler * common_sampler_clone(common_sampler * gsmpl) {
-    return new common_sampler {
+    auto * result = new common_sampler {
         /* .params  = */ gsmpl->params,
+        /* .vocab   = */ gsmpl->vocab,
         /* .raw_argmax_k = */ gsmpl->raw_argmax_k,
         /* .grmr    = */ llama_sampler_clone(gsmpl->grmr),
         /* .rbudget = */ llama_sampler_clone(gsmpl->rbudget),
@@ -656,6 +659,8 @@ struct common_sampler * common_sampler_clone(common_sampler * gsmpl) {
         /* .greedy_argmax    = */ gsmpl->greedy_argmax,
         /* .greedy_bias      = */ gsmpl->greedy_bias,
     };
+    result->cur_p.data = gsmpl->cur_p.data ? result->cur.data() : nullptr;
+    return result;
 }
 
 void common_sampler_copy(const common_sampler * src, common_sampler * dst) {
@@ -671,11 +676,16 @@ void common_sampler_copy(const common_sampler * src, common_sampler * dst) {
     llama_sampler_copy(src->chain,   dst->chain);
 
     dst->params     = src->params;
+    dst->vocab      = src->vocab;
+    dst->raw_argmax_k = src->raw_argmax_k;
+    dst->greedy_argmax = src->greedy_argmax;
+    dst->greedy_bias = src->greedy_bias;
     dst->prev       = src->prev;
     dst->cur        = src->cur;
     dst->cur_p      = src->cur_p;
     dst->cur_p.data = src->cur_p.data ? dst->cur.data() : nullptr; // re-point to dst's buffer
-    dst->rng        = src->rng;
+    dst->speculative_seed = src->speculative_seed;
+    dst->speculative_rng = src->speculative_rng;
     dst->t_total_us = src->t_total_us;
 }
 
@@ -890,8 +900,6 @@ static std::vector<llama_token> common_sampler_sample_and_accept_n_impl(
     std::vector<llama_token> result;
     result.reserve(draft.size() + 1);
 
-    const llama_vocab * vocab = llama_model_get_vocab(llama_get_model(ctx));
-
     size_t i = 0;
     for (; i < draft.size(); i++) {
         const llama_token id = sample(i);
@@ -902,7 +910,7 @@ static std::vector<llama_token> common_sampler_sample_and_accept_n_impl(
 
         // do not accept draft tokens after an EOG - they are not output but would stay in the context
         // on replay the last token is from the target and can be EOG, so a trailing EOG is still accepted
-        if (draft[i] != id || (llama_vocab_is_eog(vocab, id) && i + 1 < draft.size())) {
+        if (draft[i] != id || (llama_vocab_is_eog(gsmpl->vocab, id) && i + 1 < draft.size())) {
             break;
         }
     }
@@ -1189,7 +1197,7 @@ bool common_sampler_sample_and_accept_n_q(
             const llama_token id = common_sampler_sample(gsmpl, ctx, idxs[row], true);
             common_sampler_accept(gsmpl, id, true);
             result.push_back(id);
-            if (id != draft[row]) {
+            if (id != draft[row] || (llama_vocab_is_eog(gsmpl->vocab, id) && row + 1 < draft.size())) {
                 return true;
             }
             continue;
@@ -1217,7 +1225,7 @@ bool common_sampler_sample_and_accept_n_q(
 
         common_sampler_accept(gsmpl, id, true);
         result.push_back(id);
-        if (id != proposed) {
+        if (id != proposed || (llama_vocab_is_eog(gsmpl->vocab, id) && row + 1 < draft.size())) {
             return true;
         }
     }
