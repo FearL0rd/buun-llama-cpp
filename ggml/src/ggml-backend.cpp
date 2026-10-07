@@ -2129,26 +2129,37 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
     ggml_tensor * prev_ids_tensor = nullptr;
     int64_t prev_n_expert = 0;
+    int32_t prev_window_lo = 0;
+    int32_t prev_window_size = 0;
     std::vector<int32_t> ids;
     std::vector<ggml_bitset_t> used_ids;
 
     // One route can feed up, gate and down projections. Share its host bitmap
     // between ordinary copies and lookahead rather than downloading it again.
-    const auto collect_experts = [&](ggml_backend_t backend, ggml_tensor * route, int64_t n_expert) {
-        if (route == prev_ids_tensor && n_expert == prev_n_expert) return;
+    const auto collect_experts = [&](ggml_backend_t backend, ggml_tensor * route, int64_t n_expert,
+                                     const ggml_tensor * node) {
+        const int32_t lo = ggml_mmid_window_lo(node);
+        const int32_t n_local = ggml_mmid_window_n_local(node);
+        if (route == prev_ids_tensor && n_expert == prev_n_expert &&
+                lo == prev_window_lo && n_local == prev_window_size) return;
         ids.resize(ggml_nbytes(route) / sizeof(int32_t));
         ggml_backend_tensor_get_async(backend, route, ids.data(), 0, ggml_nbytes(route));
         ggml_backend_synchronize(backend);
         used_ids.assign(ggml_bitset_size(n_expert), 0);
         for (int64_t row = 0; row < route->ne[1]; ++row) {
             for (int64_t col = 0; col < route->ne[0]; ++col) {
-                const int32_t id = ids[row * route->nb[1]/sizeof(int32_t) + col * route->nb[0]/sizeof(int32_t)];
+                const int32_t raw_id = ids[row * route->nb[1]/sizeof(int32_t) + col * route->nb[0]/sizeof(int32_t)];
+                const int32_t id = ggml_mmid_expert_index(raw_id, lo, n_local);
+                // Windowed banks zero absent experts instead of reading weights.
+                if (n_local != 0 && id < 0) continue;
                 GGML_ASSERT(id >= 0 && id < n_expert);
                 ggml_bitset_set(used_ids.data(), id);
             }
         }
         prev_ids_tensor = route;
         prev_n_expert = n_expert;
+        prev_window_lo = lo;
+        prev_window_size = n_local;
     };
 
     int prev_backend_id = -1;
@@ -2249,7 +2260,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         }
                     }
 
-                    collect_experts(ids_backend, ids_tensor, n_expert);
+                    collect_experts(ids_backend, ids_tensor, n_expert, node);
 
                     if (ggml_moe_cache.prefill_copy && ids_tensor->ne[1] > 16 &&
                             ggml_moe_cache.prefill_copy(sched->moe_cache_session, split_backend,
@@ -2359,7 +2370,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                             current->src[2] == route && source->ne[2] <= 512 &&
                             route->type == GGML_TYPE_I32 && route->nb[0] == sizeof(int32_t) &&
                             route->ne[2] == 1 && route->ne[3] == 1) {
-                        collect_experts(split_backend, route, source->ne[2]);
+                        collect_experts(split_backend, route, source->ne[2], next->graph.nodes[0]);
                         ready = used_ids.data();
                     }
                     prefetch.job = ggml_moe_cache.prefetch_begin(sched->moe_cache_session,
