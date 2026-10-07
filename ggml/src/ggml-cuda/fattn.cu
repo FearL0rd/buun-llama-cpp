@@ -13,11 +13,21 @@
 #include <sys/stat.h>
 #include <vector>
 
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+// The indexed loader reads id -1 as a masked zero row.
+static __global__ void k_ordered_live_ids(const int32_t * ids, const float * live_bias, int32_t * dst, const int n) {
+    const int i = blockIdx.x*blockDim.x + threadIdx.x;
+    if (i < n) {
+        dst[i] = live_bias[i] > -INFINITY ? ids[i] : -1;
+    }
+}
+#endif
+
 bool ggml_cuda_flash_attn_ext_ordered(ggml_backend_cuda_context & ctx, ggml_tensor * dst,
         const ggml_tensor * keys, const ggml_tensor * values,
-        const ggml_tensor * ids, const ggml_tensor * mask_cells) {
+        const ggml_tensor * ids, const ggml_tensor * mask_cells, const ggml_tensor * live_bias) {
 #if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
-    GGML_UNUSED_VARS(ctx, dst, keys, values, ids, mask_cells);
+    GGML_UNUSED_VARS(ctx, dst, keys, values, ids, mask_cells, live_bias);
     return false;
 #else
     const ggml_tensor * q = dst->src[0];
@@ -36,7 +46,9 @@ bool ggml_cuda_flash_attn_ext_ordered(ggml_backend_cuda_context & ctx, ggml_tens
             ggml_nelements(ids) != 2051*q->ne[3] ||
             mask_cells->type != GGML_TYPE_F16 || mask_cells->ne[0] != 1 ||
             mask_cells->ne[1] != keys->ne[1] || mask_cells->ne[2] != q->ne[3] ||
-            mask_cells->ne[3] != 1 || mask_cells->nb[1] != sizeof(half)) return false;
+            mask_cells->ne[3] != 1 || mask_cells->nb[1] != sizeof(half) ||
+            (live_bias && (live_bias->type != GGML_TYPE_F32 || !ggml_is_contiguous(live_bias) ||
+                           ggml_nelements(live_bias) != ggml_nelements(ids)))) return false;
 
     // Metadata-only views of the original pools. The selected width is logical;
     // ordered IDs map every load to a physical row, including the mask load.
@@ -57,8 +69,14 @@ bool ggml_cuda_flash_attn_ext_ordered(ggml_backend_cuda_context & ctx, ggml_tens
     out.src[3] = &mask;
     // Each query is its own sequence with its own selection, so tile over heads: one tile reads
     // its K/V cells once for 8 query heads instead of once per head.
-    ggml_cuda_flash_attn_ext_mma_f16_case<256, 256, 1, 8, false, true>(
-        ctx, &out, (const int32_t *) ids->data);
+    const int32_t * ids_d = (const int32_t *) ids->data;
+    ggml_cuda_pool_alloc<int32_t> live_ids(ctx.pool());
+    if (live_bias) {
+        const int n = ggml_nelements(ids);
+        k_ordered_live_ids<<<(n + 255)/256, 256, 0, ctx.stream()>>>(ids_d, (const float *) live_bias->data, live_ids.alloc(n), n);
+        ids_d = live_ids.ptr;
+    }
+    ggml_cuda_flash_attn_ext_mma_f16_case<256, 256, 1, 8, false, true>(ctx, &out, ids_d);
     return true;
 #endif
 }

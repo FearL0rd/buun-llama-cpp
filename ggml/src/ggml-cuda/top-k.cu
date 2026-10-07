@@ -16,74 +16,53 @@ using namespace cub;
 
 #if defined(GGML_CUDA_USE_CUB) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 namespace {
-// Keep score keys in registers across radix passes, then sort only the survivors.
-// The packed tie key preserves CUB's stable descending order, including signed zeros.
+// Keep score keys in registers across radix passes, then write the k survivors unordered.
 constexpr int register_top_k_threads=1024;
-__host__ __device__ uint32_t register_top_k_ordered(uint32_t b) {
+__device__ uint32_t register_top_k_ordered(uint32_t b) {
     // CUB treats signed zeros as equivalent. Otherwise preserve radix bit order.
     if (!(b & 0x7fffffffU)) b=0;
     return b ^ ((b >> 31) ? 0xffffffffU : 0x80000000U);
 }
-struct top_k_dense_reader {
-    const float * values;
-    int columns;
-    __device__ float operator()(int row, int column) const {
-        return values[size_t(row)*columns + column];
-    }
-};
 
-struct top_k_qsa_reader {
-    const float * scores;
-    const int32_t * cell_blocks;
-    const half * mask;
-    int columns, queries, blocks;
-    __device__ float operator()(int row, int column) const {
-        const int stream = row/queries, query = row%queries;
-        const int block = cell_blocks[size_t(stream)*columns + column];
-        return scores[(size_t(stream)*queries + query)*blocks + block] +
-            __half2float(mask[size_t(row)*columns + column]);
-    }
-};
-
-template<int items, typename Reader>
+template<int items>
 __global__ __launch_bounds__(register_top_k_threads, 1)
-void register_top_k_select(Reader read, uint64_t * selected, int n, int k) {
+void register_top_k_select(const float * values, int * dst, int n, int k) {
     using Scan=cub::BlockScan<int,register_top_k_threads>;
     __shared__ union { unsigned hist[32][256]; Scan::TempStorage scan; } scratch;
-    __shared__ uint32_t prefix, mask;
+    __shared__ uint32_t prefix;
     __shared__ int rank;
     const int t=threadIdx.x, row=blockIdx.x;
     uint32_t keys[items];
 #pragma unroll
     for(int j=0;j<items;++j) {
         int i=t*items+j;
-        keys[j]=i<n ? register_top_k_ordered(__float_as_uint(read(row,i))) : 0;
+        keys[j]=i<n ? register_top_k_ordered(__float_as_uint(values[size_t(row)*n+i])) : 0;
     }
-    if(!t) {prefix=mask=0;rank=k;}
+    if(!t) {prefix=0;rank=k;}
+    uint32_t mask=0;
     __syncthreads();
     for(int shift=24;shift>=0;shift-=8) {
         for(int h=t;h<32*256;h+=register_top_k_threads) scratch.hist[h/256][h%256]=0;
         __syncthreads();
+        const uint32_t pre=prefix;
 #pragma unroll
         for(int j=0;j<items;++j) {
-            if(t*items+j<n && (keys[j]&mask)==prefix)
+            if(t*items+j<n && (keys[j]&mask)==pre)
                 atomicAdd(&scratch.hist[t/32][(keys[j]>>shift)&255],1U);
         }
         __syncthreads();
-        if(t<256) {
-            unsigned count=0;
-            for(int w=0;w<32;++w) count+=scratch.hist[w][t];
-            scratch.hist[0][t]=count;
-        }
+        // thread t owns digit 255 - t; a suffix sum from the top digit finds the one holding the rank-th key
+        int count=0;
+        if(t<256) for(int w=0;w<32;++w) count+=scratch.hist[w][255-t];
+        const int need=rank;
         __syncthreads();
-        if(!t) {
-            for(int digit=255;digit>=0;--digit) {
-                const int count=scratch.hist[0][digit];
-                if(rank>count) rank-=count;
-                else {prefix|=uint32_t(digit)<<shift;break;}
-            }
-            mask|=0xffU<<shift;
+        int above;
+        Scan(scratch.scan).ExclusiveSum(count,above);
+        if(t<256 && above<need && above+count>=need) {
+            prefix=pre|uint32_t(255-t)<<shift;
+            rank=need-above;
         }
+        mask|=0xffU<<shift;
         __syncthreads();
     }
     int ng=0,ne=0;
@@ -101,69 +80,31 @@ void register_top_k_select(Reader read, uint64_t * selected, int n, int k) {
         int pos=-1;
         if(keys[j]>prefix) pos=bg++;
         else if(keys[j]==prefix) pos=total+be++;
-        if(pos>=0 && pos<k) selected[size_t(row)*k+pos]=(uint64_t(keys[j])<<32)|uint32_t(~i);
+        if(pos>=0 && pos<k) dst[size_t(row)*k+pos]=i;
     }
 }
-template<typename Reader>
-void register_top_k_launch(Reader read,uint64_t * selected,int n,int rows,int k,cudaStream_t stream=0) {
-    if(n<=8192)register_top_k_select<8><<<rows,register_top_k_threads,0,stream>>>(read,selected,n,k);
-    else if(n<=16384)register_top_k_select<16><<<rows,register_top_k_threads,0,stream>>>(read,selected,n,k);
-    else if(n<=32768)register_top_k_select<32><<<rows,register_top_k_threads,0,stream>>>(read,selected,n,k);
-    else if(n<=40960)register_top_k_select<40><<<rows,register_top_k_threads,0,stream>>>(read,selected,n,k);
+void register_top_k_launch(const float * values,int * dst,int n,int rows,int k,cudaStream_t stream) {
+    if(n<=8192)register_top_k_select<8><<<rows,register_top_k_threads,0,stream>>>(values,dst,n,k);
+    else if(n<=16384)register_top_k_select<16><<<rows,register_top_k_threads,0,stream>>>(values,dst,n,k);
+    else if(n<=32768)register_top_k_select<32><<<rows,register_top_k_threads,0,stream>>>(values,dst,n,k);
+    else if(n<=40960)register_top_k_select<40><<<rows,register_top_k_threads,0,stream>>>(values,dst,n,k);
     else GGML_ABORT("register top-k shape exceeds dispatch bound");
-}
-__global__ void register_top_k_sort(const uint64_t * selected, int * dst, int k) {
-    using Sort=cub::BlockRadixSort<uint64_t,256,16>;
-    __shared__ Sort::TempStorage tmp;
-    uint64_t keys[16];
-#pragma unroll
-    for(int j=0;j<16;++j) {int i=threadIdx.x*16+j;keys[j]=i<k?selected[size_t(blockIdx.x)*k+i]:0;}
-    Sort(tmp).SortDescending(keys);
-#pragma unroll
-    for(int j=0;j<16;++j) {int i=threadIdx.x*16+j;if(i<k)dst[size_t(blockIdx.x)*k+i]=int(~uint32_t(keys[j]));}
 }
 
 // One block per row: from four rows up this beats a DeviceTopK launch chain per row (25x on
 // 4352-row prefill), while a lone decode row leaves the device idle and stays on DeviceTopK.
-// Without DeviceTopK (CCCL < 3.2) the fallback is a full segmented argsort, which loses at any row count.
-bool register_top_k_wins(int cc, int64_t columns, int64_t rows, int64_t k) {
+// Without a race-free DeviceTopK (CCCL < 3.4.3) the fallback is a full segmented argsort, which loses at any row count.
+bool register_top_k_wins(int64_t columns, int64_t rows, int64_t k) {
 #ifdef CUB_TOP_K_AVAILABLE
-    return cc == 860 && k == 2051 && columns >= 4352 && columns <= 40960 && rows >= 4 && rows <= 8192;
+    const int64_t min_rows = 4;
 #else
-    GGML_UNUSED(cc);
-    return columns > 1024 && columns <= 40960 && rows >= 1 && rows <= 8192 && k >= 1 && k <= 4096 && k <= columns;
+    const int64_t min_rows = 1;
 #endif
+    return columns > 1024 && columns <= 40960 && rows >= min_rows && rows <= 8192 && k >= 1 && k <= 4096 && k <= columns;
 }
 
 } // namespace
 #endif
-
-bool ggml_cuda_top_k_qsa(ggml_backend_cuda_context & ctx, ggml_tensor * dst,
-        const ggml_tensor * scores, const ggml_tensor * cell_blocks, const ggml_tensor * mask) {
-#if defined(GGML_CUDA_USE_CUB) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
-    if (ggml_top_k_is_stable(dst) ||
-            scores->type != GGML_TYPE_F32 || cell_blocks->type != GGML_TYPE_I32 ||
-            mask->type != GGML_TYPE_F16 || dst->type != GGML_TYPE_I32 ||
-            !ggml_is_contiguous(scores) || !ggml_is_contiguous(cell_blocks) ||
-            !ggml_is_contiguous(mask) || !ggml_is_contiguous(dst)) return false;
-    const int64_t columns = cell_blocks->ne[0], queries = scores->ne[1], blocks = scores->ne[0];
-    const int64_t streams = scores->ne[2], rows = queries*streams, k = dst->ne[0];
-    if (queries < 1 || blocks < 1 || blocks > INT_MAX || streams < 1 || scores->ne[3] != 1 ||
-            cell_blocks->ne[1] != streams || ggml_nrows(cell_blocks) != streams ||
-            ggml_nelements(mask) != columns*rows || dst->ne[1] != queries ||
-            dst->ne[2] != streams || dst->ne[3] != 1 ||
-            !register_top_k_wins(ggml_cuda_info().devices[ctx.device].cc, columns, rows, k)) return false;
-    ggml_cuda_pool_alloc<uint64_t> selected(ctx.pool(), rows*k);
-    const top_k_qsa_reader read{(const float *) scores->data, (const int32_t *) cell_blocks->data,
-        (const half *) mask->data, int(columns), int(queries), int(blocks)};
-    register_top_k_launch(read, selected.get(), columns, rows, k, ctx.stream());
-    register_top_k_sort<<<rows, 256, 0, ctx.stream()>>>(selected.get(), (int *) dst->data, k);
-    return true;
-#else
-    GGML_UNUSED_VARS(ctx, dst, scores, cell_blocks, mask);
-    return false;
-#endif
-}
 
 static constexpr int stable_top_k_chunk = 4096;
 
@@ -494,10 +435,8 @@ void ggml_cuda_op_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     ggml_cuda_pool & pool  = ctx.pool();
     GGML_ASSERT(!stable || k <= 64);
 #if defined(GGML_CUDA_USE_CUB) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
-    if (!stable && register_top_k_wins(ggml_cuda_info().devices[ctx.device].cc, ncols, nrows, k)) {
-        ggml_cuda_pool_alloc<uint64_t> selected(pool, nrows*k);
-        register_top_k_launch(top_k_dense_reader{src0_d, int(ncols)}, selected.get(), ncols, nrows, k, stream);
-        register_top_k_sort<<<nrows, 256, 0, stream>>>(selected.get(), dst_d, k);
+    if (!stable && register_top_k_wins(ncols, nrows, k)) {
+        register_top_k_launch(src0_d, dst_d, ncols, nrows, k, stream);
         return;
     }
 #endif

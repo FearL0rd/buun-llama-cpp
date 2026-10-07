@@ -1273,6 +1273,11 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_gather(
     ggml_tensor * v_all = mctx_cur->get_v(ctx0, il);
     const int64_t n_kv = k_all->ne[2];
 
+    // 0 for live slots, -inf for dead ones; expanded first so the K/V/mask gathers through attention stay one
+    // closed interval that a backend can fuse
+    ggml_tensor * live_bias = ggml_log(ctx0, qsa_selected_live);
+    ggml_build_forward_expand(gf, live_bias);
+
     // All heads belonging to a cell are adjacent, so each gather row is one complete cell.
     ggml_tensor * k_cells = ggml_view_3d(ctx0, k_all, k_all->ne[0]*k_all->ne[1], n_kv, n_stream,
             k_all->nb[2], k_all->nb[3], 0);
@@ -1308,8 +1313,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_gather(
     GGML_ASSERT(qsa_mask_cells->ne[1] == n_kv && qsa_mask_cells->ne[2] == n_q);
     ggml_tensor * idx_query = ggml_reshape_3d(ctx0, top_k, width, n_q, 1);
     ggml_tensor * mask = ggml_get_rows(ctx0, qsa_mask_cells, idx_query);
-    mask = ggml_reshape_2d(ctx0, ggml_cast(ctx0, mask, GGML_TYPE_F32), width, n_q);
-    mask = ggml_add(ctx0, mask, ggml_log(ctx0, qsa_selected_live));
+    mask = ggml_add(ctx0, ggml_reshape_2d(ctx0, mask, width, n_q), live_bias);
     mask = ggml_cast(ctx0, ggml_reshape_4d(ctx0, mask, width, 1, 1, n_q), GGML_TYPE_F16);
     cb(mask, "qsa_mask_sel", il);
 

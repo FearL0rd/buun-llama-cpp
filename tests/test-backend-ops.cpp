@@ -8886,120 +8886,6 @@ struct test_top_k : public test_case {
     }
 };
 
-// qwen4exp QSA indexer top-k fusion: expand per-block scores to cells, add the f16 mask, top-k.
-struct test_topk_qsa : public test_case {
-    const int64_t n_blocks;
-    const int64_t n_kv;
-    const int64_t n_tps;
-    const int64_t n_stream;
-    const int     width;
-    const bool    observe_gather;
-    ggml_tensor * out {};
-    ggml_tensor * observed {};
-
-    std::string op_desc(ggml_tensor * t) override {
-        GGML_UNUSED(t);
-        return "TOPK_QSA";
-    }
-
-    std::string vars() override {
-        return VARS_TO_STR6(n_blocks, n_kv, n_tps, n_stream, width, observe_gather);
-    }
-
-    test_topk_qsa(int64_t n_blocks = 512, int64_t n_kv = 2048, int64_t n_tps = 2, int64_t n_stream = 1,
-                  int width = 1500, bool observe_gather = false)
-        : n_blocks(n_blocks), n_kv(n_kv), n_tps(n_tps), n_stream(n_stream), width(width),
-          observe_gather(observe_gather) {}
-
-    double max_err() override { return 0.0; }
-    bool run_whole_graph() override { return true; }
-
-    ggml_tensor * build_graph(ggml_context * ctx) override {
-        ggml_tensor * score = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_blocks, n_tps, n_stream);
-        ggml_set_name(score, "score");
-        ggml_tensor * cell_blk = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_kv, n_stream);
-        ggml_set_name(cell_blk, "cell_blk");
-        ggml_tensor * kq_mask = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, n_kv, n_tps, n_stream);
-        ggml_set_name(kq_mask, "kq_mask");
-
-        ggml_tensor * a = ggml_cont(ctx, ggml_permute(ctx, score, 1, 0, 2, 3));
-        ggml_tensor * e = ggml_get_rows(ctx, a, cell_blk);
-        if (observe_gather) {
-            ggml_set_output(e); // The compressed-score reader must not elide this output.
-            observed = e;
-        }
-        e = ggml_cont(ctx, ggml_permute(ctx, e, 1, 0, 2, 3));
-        ggml_tensor * m = ggml_cast(ctx, kq_mask, GGML_TYPE_F32);
-        e = ggml_add(ctx, e, ggml_reshape_3d(ctx, m, n_kv, n_tps, n_stream));
-        out = ggml_top_k(ctx, e, width);
-        ggml_set_name(out, "out");
-        return out;
-    }
-
-    std::vector<ggml_tensor *> fusion_test_nodes() override {
-        return observed ? std::vector<ggml_tensor *>{out, observed} : std::vector<ggml_tensor *>{out};
-    }
-
-    // distinct mask ramp + small scores keep every cell value unique, so no top-k ties
-    void initialize_tensors(ggml_context * ctx) override {
-        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
-            if (t->op != GGML_OP_NONE) {
-                continue;
-            }
-            if (t->type == GGML_TYPE_I32) {
-                std::vector<int32_t> data(ggml_nelements(t));
-                for (size_t i = 0; i < data.size(); ++i) {
-                    data[i] = width == 2051 ? (i % n_kv) % 64 : rand() % n_blocks;
-                }
-                ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(int32_t));
-            } else if (t->type == GGML_TYPE_F16) {
-                std::vector<ggml_fp16_t> data(ggml_nelements(t));
-                for (int64_t r = 0; r < ggml_nrows(t); r++) {
-                    for (int64_t i = 0; i < n_kv; i++) {
-                        const bool masked = width == 2051 && i >= n_kv - (r * 173) % (n_kv - width);
-                        data[r * n_kv + i] = ggml_fp32_to_fp16(masked ? -INFINITY : (float) i);
-                    }
-                }
-                ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(ggml_fp16_t));
-            } else if (width == 2051 && t->type == GGML_TYPE_F32 && strcmp(t->name, "score") == 0) {
-                // Beyond 2048, an F16 integer ramp has plateaus. Distinguish
-                // their cells with exactly representable fractions so CPU/GPU
-                // top-k tie permutations cannot obscure the graph test.
-                GGML_ASSERT(n_blocks >= 64 && n_kv <= 40961);
-                std::vector<float> data(ggml_nelements(t));
-                for (size_t i = 0; i < data.size(); ++i) {
-                    data[i] = float((i % n_blocks) % 64) / 64.0f;
-                }
-                ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(float));
-            } else {
-                init_tensor_uniform(t, 0.0f, 0.5f);
-            }
-        }
-    }
-
-    // top-k output order is unspecified; compare as a set of indices
-    double err(const float * a, const float * b, size_t n) override {
-        if (observed && n == size_t(ggml_nelements(observed))) {
-            GGML_ASSERT(n != size_t(ggml_nelements(out)));
-            return std::memcmp(a, b, n * sizeof(float)) != 0;
-        }
-        std::vector<int32_t> ia(n), ib(n);
-        double diff = 0.0;
-        for (size_t i = 0; i < n; i++) {
-            ia[i] = (int32_t) a[i];
-            ib[i] = (int32_t) b[i];
-            diff += std::fabs(a[i] - ia[i]) + std::fabs(b[i] - ib[i]);
-        }
-        // Compare each query/stream separately: a set over the entire tensor
-        // would also accept outputs accidentally exchanged between rows.
-        GGML_ASSERT(n % width == 0);
-        for (size_t offset = 0; offset < n; offset += width) {
-            diff += jdst(ia.data() + offset, ib.data() + offset, width);
-        }
-        return diff;
-    }
-};
-
 enum MoeGatingFunc {
     GATING_FUNC_SOFTMAX,
     GATING_FUNC_SIGMOID,
@@ -10262,7 +10148,10 @@ struct test_selected_flash_attn : public test_case {
         auto * mc = ggml_view_3d(ctx, mask, 1, physical, queries, mask->nb[0], mask->nb[1], 0);
         auto * mi = ggml_reshape_3d(ctx, ids, width, queries, 1);
         auto * mg = ggml_get_rows(ctx, mc, mi);
-        auto * mf = ggml_cast(ctx, ggml_reshape_4d(ctx, mg, width, 1, 1, queries), GGML_TYPE_F16);
+        auto * live = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, width, queries);
+        ggml_set_name(live, "live_bias");
+        auto * ma = ggml_add(ctx, ggml_reshape_2d(ctx, mg, width, queries), live);
+        auto * mf = ggml_cast(ctx, ggml_reshape_4d(ctx, ma, width, 1, 1, queries), GGML_TYPE_F16);
         auto * kf = ggml_cast(ctx, ggml_permute(ctx, ks, 0, 2, 1, 3), GGML_TYPE_F16);
         auto * vf = ggml_cast(ctx, ggml_permute(ctx, vs, 0, 2, 1, 3), GGML_TYPE_F16);
         observed = variant == 2 ? kg : variant == 3 ? vf : variant == 4 ? mf : nullptr;
@@ -10290,6 +10179,13 @@ struct test_selected_flash_attn : public test_case {
                         const bool hidden = i % 11 == 0 || i > physical*(s+1)/queries;
                         data[s*physical + i] = ggml_fp32_to_fp16(hidden ? -INFINITY : (i%7 - 3)*0.125f);
                     }
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, data.size()*sizeof(data[0]));
+            } else if (strcmp(t->name, "live_bias") == 0) {
+                // dead slots repeat live cells, as padded QSA pools do
+                std::vector<float> data(ggml_nelements(t));
+                for (size_t i = 0; i < data.size(); ++i) {
+                    data[i] = i % 13 == 5 ? -INFINITY : 0.0f;
                 }
                 ggml_backend_tensor_set(t, data.data(), 0, data.size()*sizeof(data[0]));
             } else {
@@ -13483,22 +13379,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
-    // qwen4exp QSA indexer top-k fusion (get_rows + f16 mask + top_k)
-    test_cases.emplace_back(new test_topk_qsa(512,  2048,  1, 1, 1500));
-    test_cases.emplace_back(new test_topk_qsa(512,  2048,  2, 1, 1500));
-    test_cases.emplace_back(new test_topk_qsa(256,  2048,  4, 2, 2000));
-    test_cases.emplace_back(new test_topk_qsa(64,   256,   2, 1, 200));  // small k: unfused fallback
-
-    // Compressed QSA reader: admitted verification/prefill shapes, multiple
-    // streams, and adjacent fallback boundaries. An observed gather must keep
-    // the ordinary graph even when the shape otherwise qualifies.
-    for (const auto & shape : std::vector<std::array<int64_t, 4>>{
-            {1088, 4351, 4, 1}, {1088, 4352, 4, 1}, {1088, 4352, 17, 1},
-            {4096, 16384, 32, 2}, {4097, 16387, 4, 2},
-            {4096, 16384, 63, 1}, {4096, 16384, 64, 1}, {4096, 16384, 65, 1},
-            {10240, 40960, 4, 1}, {10241, 40961, 4, 1}}) {
-        for (bool observed : {false, true}) {
-            test_cases.emplace_back(new test_topk_qsa(shape[0], shape[1], shape[2], shape[3], 2051, observed));
+    // k-pool QSA picks 512 pools: decode, MTP verify and prefill rows
+    for (int64_t cols : {1025, 8192, 10240, 40960}) {
+        for (int64_t rows : {1, 4, 512}) {
+            for (bool ties : {false, true}) {
+                test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {cols, rows, 1, 1}, 512, ties));
+            }
         }
     }
 
