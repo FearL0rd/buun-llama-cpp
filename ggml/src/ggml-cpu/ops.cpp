@@ -10103,8 +10103,6 @@ static void ggml_compute_forward_ssm_conv_tree_f32(
     const int ir1 = MIN(ir0 + dr, nr);
     const int ir  = ir1 - ir0;
 
-    const int ncs = src0->ne[0]; // d_conv - 1 + n_t
-
     for (int i3 = 0; i3 < n_s; ++i3) {
         for (int i2 = 0; i2 < n_t; ++i2) {
             // Walk parent chain to find conv window ancestors
