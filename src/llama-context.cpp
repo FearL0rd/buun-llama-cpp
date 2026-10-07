@@ -219,7 +219,9 @@ llama_context::llama_context(
     cvec(std::make_unique<llama_adapter_cvec>()),
     loras(std::make_unique<llama_adapter_loras>()),
     loras_ordered(std::make_unique<llama_adapter_loras_ordered>()),
-    balloc(std::make_unique<llama_batch_allocr>(model.hparams.n_pos_per_embd())) {
+    // MTP uses its embedding input for target hidden states, not media rows.
+    balloc(std::make_unique<llama_batch_allocr>(model.hparams.n_pos_per_embd(),
+                llm_arch_supports_mixed_batch(model.arch) && params.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT)) {
     // TODO warning when creating llama_context with awkward ctx size that is not a power of 2,
     //     may need to be backend-dependent
     LLAMA_LOG_INFO("%s: constructing llama_context\n", __func__);
@@ -1034,6 +1036,32 @@ static int llama_moe_cache_expert_parallel(const llama_model & model, int reques
         }
     }
     return requested;
+}
+
+static int llama_graph_n_input_tensors(ggml_cgraph * gf) {
+    std::unordered_map<const ggml_tensor *, std::vector<ggml_tensor *>> users;
+    for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
+        ggml_tensor * node = ggml_graph_node(gf, i);
+        if (node->flags & GGML_TENSOR_FLAG_INPUT) {
+            users[node].push_back(node);
+        }
+        for (int j = 0; j < GGML_MAX_SRC; ++j) {
+            ggml_tensor * src = node->src[j];
+            if (src && (src->flags & GGML_TENSOR_FLAG_INPUT)) {
+                users[src].push_back(node);
+            }
+        }
+    }
+    for (const auto & [tensor, nodes] : users) {
+        GGML_ASSERT(tensor->op == GGML_OP_NONE);
+        for (const ggml_tensor * node : nodes) {
+            LLAMA_LOG_DEBUG("%s: input tensor '%32s' [%s, ne = { %5" PRId64 ", %5" PRId64 ", %5" PRId64 ", %5" PRId64 " }] is used by node '%s' (%s)\n",
+                    __func__, tensor->name, ggml_type_name(tensor->type),
+                    tensor->ne[0], tensor->ne[1], tensor->ne[2], tensor->ne[3],
+                    node->name, ggml_op_name(node->op));
+        }
+    }
+    return (int) users.size();
 }
 
 uint32_t llama_context::effective_reserve_n_seqs(const llama_memory_context_i * mctx) const {
@@ -4485,7 +4513,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     return res;
 }
 
-int llama_context::encode(const llama_batch & batch_inp) {
+int llama_context::encode(const llama_batch & batch_inp, const llama_batch_ext * extended) {
     // MTP hook batches carry both token (next-token id) and embd (h_nextn row),
     // so accept either present rather than requiring exactly one.
     GGML_ASSERT(batch_inp.token || batch_inp.embd);
@@ -4508,7 +4536,8 @@ int llama_context::encode(const llama_batch & batch_inp) {
     const int64_t n_vocab = model.vocab.n_tokens();
 
     // note: during encode, we always pass the full sequence starting from pos = 0
-    if (!balloc->init(batch_inp, model.vocab, nullptr, n_embd, cparams.kv_unified ? LLAMA_MAX_SEQ : cparams.n_seq_max, true)) {
+    if (!(extended ? balloc->init(*extended, model.vocab, true) :
+            balloc->init(batch_inp, model.vocab, nullptr, n_embd, cparams.kv_unified ? LLAMA_MAX_SEQ : cparams.n_seq_max, true))) {
         LLAMA_LOG_ERROR("%s: failed to initialize batch\n", __func__);
         return -1;
     }
@@ -4765,7 +4794,7 @@ struct vbr_decode_txn {
 };
 }  // namespace
 
-int llama_context::decode(const llama_batch & batch_inp) {
+int llama_context::decode(const llama_batch & batch_inp, const llama_batch_ext * extended) {
     // MTP hook batches carry both token (next-token id) and embd (h_nextn row),
     // so accept either present rather than requiring exactly one.
     GGML_ASSERT(batch_inp.token || batch_inp.embd);
@@ -4780,7 +4809,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
      if (!memory) {
         LLAMA_LOG_DEBUG("%s: cannot decode batches with this context (calling encode() instead)\n", __func__);
-        return encode(batch_inp);
+        return encode(batch_inp, extended);
     }
 
     if (batch_inp.n_tokens == 0) {
@@ -4836,7 +4865,8 @@ int llama_context::decode(const llama_batch & batch_inp) {
         }
     }
 
-    if (!balloc->init(batch_inp, vocab, memory.get(), n_embd, n_seq_max, output_all)) {
+    if (!(extended ? balloc->init(*extended, vocab, output_all) :
+            balloc->init(batch_inp, vocab, memory.get(), n_embd, n_seq_max, output_all))) {
         LLAMA_LOG_ERROR("%s: failed to initialize batch\n", __func__);
         return -1;
     }
@@ -5251,7 +5281,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
             // skip the host D2H for those layers and mark the stage rows valid
             dflash_stage_valid_n = (int32_t) n_tokens_all;
         }
-        extract_layer_inputs(res, n_tokens_prev, ubatch.n_tokens);
+        bool extract_all_idxs = extract_layer_inputs(res, n_tokens_prev, ubatch.n_tokens);
 
         // extract nextn embeddings before
         // only meaningful in LLAMA_POOLING_TYPE_NONE (per-token); other pooling modes are ignored.
@@ -5604,16 +5634,6 @@ void llama_context::output_reorder() {
             }
         }
 
-        if (embd_layer_inp.size() > 0) {
-            for (int lid = 0; lid < (int) embd_layer_inp.size(); ++lid) {
-                if (embd_layer_inp[lid].size > 0) {
-                    for (uint64_t k = 0; k < n_embd; ++k) {
-                        std::swap(embd_layer_inp[lid].data[i0*n_embd + k], embd_layer_inp[lid].data[i1*n_embd + k]);
-                    }
-                }
-            }
-        }
-
         if (!logits_argmax_buf.empty()) {
             GGML_ASSERT(logits_argmax_k > 0);
             GGML_ASSERT(i0 < (uint64_t) logits_argmax_count);
@@ -5703,7 +5723,7 @@ uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
     if (has_dflash2_selector) {
         // The DFlash2 selector builds a conditional K-way lattice for every block.
         res = std::max<uint32_t>(1024u + 64u * n_tokens, 8u * model.n_tensors());
-    } else if (model.arch == LLM_ARCH_KIMI_K3) {
+    } else if (model.arch == LLM_ARCH_KIMI_K3 || model.arch == LLM_ARCH_GLM5_NEXT) {
         // the n_tokens*40 budget below is exhausted at ubatch 3840
         res = std::max<uint32_t>(n_tokens * 160, 64u * model.n_tensors());
     } else if (model.arch == LLM_ARCH_HRM_TEXT) {
@@ -5918,6 +5938,8 @@ ggml_cgraph * llama_context::graph_reserve(
 
     auto * gf = model.build_graph(gparams);
 
+    this->n_input_tensors = llama_graph_n_input_tensors(gf);
+
     // verify transform coverage on the pristine graph: after scheduling,
     // cross-backend copies break the producer chain the check follows
     if (!hadamard_verified && gf && (!model.hadamard_rotations.empty() || !model.hadamard_inverses.empty())) {
@@ -6045,7 +6067,6 @@ ggml_status llama_context::graph_compute(
         set_n_threads_fn.second(set_n_threads_fn.first, n_threads);
     }
 
-    copy_experts.reset();
 
     auto status = ggml_backend_sched_graph_compute_async(sched.get(), gf);
     if (status != GGML_STATUS_SUCCESS) {
@@ -6055,65 +6076,6 @@ ggml_status llama_context::graph_compute(
     // fprintf(stderr, "splits: %d\n", ggml_backend_sched_get_n_splits(sched));
 
     return status;
-}
-
-bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph, void * user_data) {
-    auto & st = static_cast<llama_context *>(user_data)->copy_experts;
-
-    // the ids must be computed before the split starts, so only the first node of the split is considered
-    if (ggml_graph_n_nodes(graph) == 0) {
-        return false;
-    }
-    const ggml_tensor * node = ggml_graph_node(graph, 0);
-    if (node->op != GGML_OP_MUL_MAT_ID || node->src[0] != dst) {
-        return false;
-    }
-
-    const ggml_tensor * ids = node->src[2];
-    if (ggml_nelements(ids) == 0) {
-        return true;
-    }
-
-    const int64_t n_expert    = src->ne[2];
-    const size_t  expert_size = src->nb[2];
-
-    if (ids != st.ids || (int64_t) st.used.size() != n_expert) {
-        st.ids_data.resize(ggml_nbytes(ids)/sizeof(int32_t));
-        ggml_backend_tensor_get_async(backend, ids, st.ids_data.data(), 0, ggml_nbytes(ids));
-        ggml_backend_synchronize(backend);
-
-        st.used.assign(n_expert, false);
-        for (int64_t i1 = 0; i1 < ids->ne[1]; i1++) {
-            for (int64_t i0 = 0; i0 < ids->ne[0]; i0++) {
-                const int32_t id = st.ids_data[i1*ids->nb[1]/sizeof(int32_t) + i0*ids->nb[0]/sizeof(int32_t)];
-                GGML_ASSERT(id >= 0 && id < n_expert);
-                st.used[id] = true;
-            }
-        }
-
-        st.ids = ids;
-    }
-
-    // group consecutive experts and copy them together
-    for (int64_t first = 0; first < n_expert; ) {
-        if (!st.used[first]) {
-            first++;
-            continue;
-        }
-        int64_t last = first;
-        while (last + 1 < n_expert && st.used[last + 1]) {
-            last++;
-        }
-
-        // copy a bit extra to ensure there are no NaNs in the padding of the last expert, this is necessary for MMQ in the CUDA backend
-        const size_t offset  = first*expert_size;
-        const size_t padding = last < n_expert - 1 ? std::min<size_t>(expert_size, 512) : 0;
-        ggml_backend_tensor_set_async(backend, dst, (const uint8_t *) src->data + offset, offset, (last - first + 1)*expert_size + padding);
-
-        first = last + 1;
-    }
-
-    return true;
 }
 
 llm_graph_cb llama_context::graph_get_cb() const {
@@ -7629,7 +7591,6 @@ void llama_context::opt_epoch_iter(
                     ggml_backend_tensor_set(labels, &onef, (pos_ubatch*labels->ne[0] + labels_sparse[ilabel])*sizeof(float), sizeof(float));
                 }
             }
-            copy_experts.reset();
             ggml_opt_eval(opt_ctx, result);
             if (callback) {
                 callback(train, opt_ctx, dataset, result, idata_in_loop + (pos_ctx + pos_batch)/n_ubatch + 1, ndata_in_loop, t_loop_start);
@@ -9247,7 +9208,7 @@ int llama_context::encode(const llama_batch_ext & batch_inp) {
         return -1;
     }
     llama_batch batch = {};
-    return batch_inp.get_batch(batch) ? encode(batch) : -1;
+    return batch_inp.get_batch(batch, true) ? encode(batch, &batch_inp) : -1;
 }
 
 int llama_context::decode(const llama_batch_ext & batch_inp) {
@@ -9264,7 +9225,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         return -1;
     }
     llama_batch batch = {};
-    return batch_inp.get_batch(batch) ? decode(batch) : -1;
+    return batch_inp.get_batch(batch, true) ? decode(batch, &batch_inp) : -1;
 }
 
 ///

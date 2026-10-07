@@ -402,8 +402,8 @@ struct llama_context {
     int decode(const llama_batch_ext & batch_inp);
 
     // compat version
-    int encode(const llama_batch & batch_inp);
-    int decode(const llama_batch & batch_inp);
+    int encode(const llama_batch & batch_inp, const llama_batch_ext * extended = nullptr);
+    int decode(const llama_batch & batch_inp, const llama_batch_ext * extended = nullptr);
 
     //
     // state save/load
@@ -560,7 +560,6 @@ private:
     llm_graph_cb graph_get_cb() const;
 
     // ggml_backend_sched copy callback, copies only the experts used by MUL_MAT_ID
-    static bool sched_copy_experts(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph, void * user_data);
 
     // disable auto fused ops (Flash Attention, Gated Delta Net) whose op lands on a device
     // that differs from the layer it belongs to (usually due to missing backend support)
@@ -653,21 +652,6 @@ private:
     // allocation. Smaller graph shapes can reuse that allocation without
     // rebuilding the scheduler and replacing its host staging buffer.
     int64_t dflash_cross_reserved_bucket = 0;
-
-    // state of sched_copy_experts, reset before each graph compute
-    struct copy_experts_info {
-        const ggml_tensor *  ids = nullptr;
-        std::vector<int32_t> ids_data;
-        std::vector<bool>    used;
-
-        void reset() {
-            ids = nullptr;
-            ids_data.clear();
-            used.clear();
-        }
-    };
-
-    copy_experts_info copy_experts;
 
     ggml_backend_t backend_cpu = nullptr;
     std::vector<ggml_backend_ptr> backends;

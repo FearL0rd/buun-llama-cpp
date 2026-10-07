@@ -532,6 +532,15 @@ static bool ggml_backend_meta_split_state_has_sources(const ggml_tensor * tensor
         (ggml_backend_buffer_get_usage(tensor->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE || tensor->view_src != nullptr);
 }
 
+static const ggml_tensor * ggml_backend_meta_split_state_source(const ggml_tensor * tensor, size_t i) {
+    // ggml_view_tensor is an OP_NONE full view, not an operation with src[0].
+    // Resolve it through the iterative dependency stack too.
+    if (tensor->op == GGML_OP_NONE && tensor->view_src != nullptr) {
+        return i == 0 ? tensor->view_src : nullptr;
+    }
+    return tensor->src[i];
+}
+
 static struct ggml_backend_meta_split_state ggml_backend_meta_calculate_split_state(
         const struct ggml_tensor * tensor, bool assume_sync, const std::vector<ggml_backend_meta_split_state> & src_ss) {
     // FIXME Currently this function preserves/erases the information in n_segments and nr in an inconsistent way.
@@ -983,6 +992,9 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_calculate_split_st
         ggml_backend_meta_split_state split_state;
         switch (tensor->op) {
             case GGML_OP_NONE: {
+                if (tensor->view_src != nullptr) {
+                    return src_ss[0];
+                }
                 split_state = {GGML_BACKEND_SPLIT_AXIS_MIRRORED, {0}, {1}, 1};
                 // A scheduler copy of a host-resident expert weight ("<backend>#<weight>#<n>") keeps the
                 // weight's expert split, so each device uploads and runs only its own experts.
@@ -1302,7 +1314,7 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(co
     std::vector<frame> parents;
     for (;;) {
         if (current.next_src < current.src_ss.size()) {
-            const auto * src = current.tensor->src[current.next_src];
+            const auto * src = ggml_backend_meta_split_state_source(current.tensor, current.next_src);
             if (src == nullptr || src == current.tensor) {
                 ++current.next_src;
             } else if (const auto * cached = ggml_backend_meta_find_split_state(src, true)) {
@@ -1325,7 +1337,8 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(co
             const size_t n_bufs = buf_ctx->bufs.size();
             std::string srcs_info;
             for (size_t i = 0; i < current.src_ss.size(); i++) {
-                if (tensor->src[i] == nullptr || tensor->src[i] == tensor) {
+                const auto * src = ggml_backend_meta_split_state_source(tensor, i);
+                if (src == nullptr || src == tensor) {
                     continue;
                 }
                 if (!srcs_info.empty()) {
@@ -1340,7 +1353,7 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(co
                     }
                     ne_info += std::to_string(split_state.ne[j]) + "x" + std::to_string(split_state.nr[0]);
                 }
-                srcs_info += std::string(tensor->src[i]->name) + "[" + ggml_op_name(tensor->src[i]->op) + ", " + axis_name + ", {" + ne_info + "}]";
+                srcs_info += std::string(src->name) + "[" + ggml_op_name(src->op) + ", " + axis_name + ", {" + ne_info + "}]";
             }
             std::string ne_info;
             for (size_t j = 0; j < n_bufs; j++) {
@@ -1805,8 +1818,9 @@ static ggml_backend_buffer_t ggml_backend_meta_buffer_type_alloc_buffer(ggml_bac
     return ggml_backend_buffer_init(buft, ggml_backend_meta_buffer_iface, buf_ctx, max_size);
 }
 
-ggml_backend_buffer_t ggml_backend_meta_alloc_ctx_tensors_from_buft_ext(
-        struct ggml_context * ctx, ggml_backend_buffer_type_t buft, ggml_backend_meta_alloc_simple_t alloc, void * userdata) {
+static ggml_backend_buffer_t ggml_backend_meta_alloc_tensors_ext(
+        ggml_backend_buffer_type_t buft, ggml_tensor ** tensors, int n_tensors,
+        ggml_backend_meta_alloc_simple_t alloc, void * userdata) {
     const size_t n_simple_bufts = ggml_backend_meta_buft_n_bufts(buft);
 
     constexpr size_t compute_headroom = 16; // Maximum number of views per statically allocated tensor that can be created between evals.
@@ -1881,8 +1895,18 @@ ggml_backend_buffer_t ggml_backend_meta_alloc_ctx_tensors_from_buft_ext(
     return meta_buf;
 }
 
-struct ggml_backend_buffer * ggml_backend_meta_alloc_ctx_tensors_from_buft(struct ggml_context * ctx, ggml_backend_buffer_type_t buft) {
-    return ggml_backend_meta_alloc_ctx_tensors_from_buft_ext(ctx, buft, /*alloc =*/ nullptr, /*userdata =*/ nullptr);
+static ggml_backend_buffer_t ggml_backend_meta_buffer_type_alloc_buffer_n(
+        ggml_backend_buffer_type_t buft, ggml_tensor ** tensors, int n_tensors) {
+    return ggml_backend_meta_alloc_tensors_ext(buft, tensors, n_tensors, nullptr, nullptr);
+}
+
+ggml_backend_buffer_t ggml_backend_meta_alloc_ctx_tensors_from_buft_ext(
+        ggml_context * ctx, ggml_backend_buffer_type_t buft, ggml_backend_meta_alloc_simple_t alloc, void * userdata) {
+    std::vector<ggml_tensor *> tensors;
+    for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+        tensors.push_back(t);
+    }
+    return ggml_backend_meta_alloc_tensors_ext(buft, tensors.data(), int(tensors.size()), alloc, userdata);
 }
 
 //

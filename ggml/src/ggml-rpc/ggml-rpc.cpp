@@ -2204,18 +2204,19 @@ bool rpc_server::comm_allreduce(const rpc_msg_comm_allreduce_req & request) {
         return false;
     }
     const size_t  nbytes = ggml_nbytes(t_dst);
-    const int64_t ne     = ggml_nelements(t_dst);
     if (nbytes == 0) {
         return true;
     }
-    // reduce large partials in bf16 to halve the wire bytes; small (decode-sized) ones
-    // stay f32 since the extra casts and sync cost more than the bytes saved
-    const bool   wire_bf16  = t_dst->type == GGML_TYPE_F32 && ne >= 32768;
-    const size_t wire_bytes = wire_bf16 ? (size_t) ne*2 : nbytes;
-    const size_t need       = wire_bf16 ? 2*nbytes : nbytes;
-    if (state.scratch_size < need) {
-        state.scratch.reset(ggml_backend_alloc_buffer(backend, need));
-        state.scratch_size = need;
+    // Preserve the partial's precision on both ranks. Rounding only the peer
+    // to BF16 makes local + peer differ between ranks, not just from F32.
+    const size_t wire_bytes = nbytes;
+    if (state.scratch_size < nbytes) {
+        state.scratch.reset(ggml_backend_alloc_buffer(backend, nbytes));
+        if (!state.scratch) {
+            state.scratch_size = 0;
+            return false;
+        }
+        state.scratch_size = nbytes;
     }
     char * scratch_base = (char *) ggml_backend_buffer_get_base(state.scratch.get());
     state.send_buf.resize(wire_bytes);
@@ -2225,16 +2226,6 @@ bool rpc_server::comm_allreduce(const rpc_msg_comm_allreduce_req & request) {
         ggml_tensor * t = ggml_new_tensor_4d(ctx, type, t_dst->ne[0], t_dst->ne[1], t_dst->ne[2], t_dst->ne[3]);
         t->buffer = state.scratch.get();
         t->data   = scratch_base + offset;
-        return t;
-    };
-    auto new_cpy_node = [&](ggml_tensor * src, ggml_tensor * dst) {
-        ggml_tensor * t = ggml_new_tensor_4d(ctx, dst->type, dst->ne[0], dst->ne[1], dst->ne[2], dst->ne[3]);
-        t->op     = GGML_OP_CPY;
-        t->src[0] = src;
-        t->src[1] = dst;
-        t->buffer = dst->buffer;
-        t->data   = dst->data;
-        t->flags |= GGML_TENSOR_FLAG_COMPUTE;
         return t;
     };
     auto compute_nodes = [&](ggml_tensor * n0, ggml_tensor * n1) {
@@ -2249,17 +2240,7 @@ bool rpc_server::comm_allreduce(const rpc_msg_comm_allreduce_req & request) {
     // wait for the pending subgraph that produced this partial
     ggml_backend_synchronize(backend);
 
-    ggml_tensor * t_wire_send = nullptr;
-    ggml_tensor * t_wire_recv = nullptr;
-    if (wire_bf16) {
-        t_wire_send = new_scratch_tensor(GGML_TYPE_BF16, 0);
-        t_wire_recv = new_scratch_tensor(GGML_TYPE_BF16, ne*2);
-        compute_nodes(new_cpy_node(t_dst, t_wire_send), nullptr);
-        ggml_backend_synchronize(backend);
-        ggml_backend_tensor_get(t_wire_send, state.send_buf.data(), 0, wire_bytes);
-    } else {
-        ggml_backend_tensor_get(t_dst, state.send_buf.data(), 0, wire_bytes);
-    }
+    ggml_backend_tensor_get(t_dst, state.send_buf.data(), 0, wire_bytes);
 
     // rank 0 sends first, rank 1 receives first, so large payloads cannot deadlock
     if (state.rank == 0) {
@@ -2274,14 +2255,8 @@ bool rpc_server::comm_allreduce(const rpc_msg_comm_allreduce_req & request) {
         }
     }
 
-    ggml_tensor * t_peer = new_scratch_tensor(t_dst->type, wire_bf16 ? (size_t) ne*4 : 0);
-    ggml_tensor * t_cast = nullptr;
-    if (wire_bf16) {
-        ggml_backend_tensor_set(t_wire_recv, state.recv_buf.data(), 0, wire_bytes);
-        t_cast = new_cpy_node(t_wire_recv, t_peer);
-    } else {
-        ggml_backend_tensor_set(t_peer, state.recv_buf.data(), 0, wire_bytes);
-    }
+    ggml_tensor * t_peer = new_scratch_tensor(t_dst->type, 0);
+    ggml_backend_tensor_set(t_peer, state.recv_buf.data(), 0, wire_bytes);
 
     ggml_tensor * t_red = ggml_new_tensor_4d(ctx, t_dst->type, t_dst->ne[0], t_dst->ne[1], t_dst->ne[2], t_dst->ne[3]);
     t_red->op     = GGML_OP_ADD;
@@ -2291,11 +2266,7 @@ bool rpc_server::comm_allreduce(const rpc_msg_comm_allreduce_req & request) {
     t_red->data   = t_dst->data;
     t_red->flags |= GGML_TENSOR_FLAG_COMPUTE;
 
-    if (t_cast != nullptr) {
-        compute_nodes(t_cast, t_red);
-    } else {
-        compute_nodes(t_red, nullptr);
-    }
+    compute_nodes(t_red, nullptr);
     return true;
 }
 
