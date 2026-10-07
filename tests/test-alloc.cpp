@@ -642,6 +642,34 @@ static void test_reallocation() {
     }
 }
 
+// An unconsumed registered input may grow while every node and count stays
+// unchanged. Multi-buffer allocators must refuse before installing stale offsets.
+static void test_unused_leaf_reallocation(int n_buffers) {
+    dummy_backend backend_a = dummy_backend_init(SIZE_MAX);
+    dummy_backend backend_b = dummy_backend_init(SIZE_MAX);
+    ggml_backend_buffer_type_t bufts[] = { &backend_a.buffer_type, &backend_b.buffer_type };
+    ggml_gallocr_ptr galloc(ggml_gallocr_new_n(bufts, n_buffers));
+    const int leaf_ids[] = { 0 };
+    size_t reserved = 0;
+    for (size_t size : { 16u, 4096u, 32u, 8192u }) {
+        auto [ctx, graph, ctx_ptr] = make_context();
+        ggml_tensor * input = make_input_with_size(ctx, size);
+        ggml_build_forward_expand(graph, input);
+        GGML_ASSERT(graph->n_leafs == 1 && graph->n_nodes == 0);
+        if (reserved == 0) {
+            GGML_ASSERT(ggml_gallocr_reserve_n(galloc.get(), graph, nullptr, leaf_ids));
+        } else if (n_buffers > 1 && size > reserved) {
+            GGML_ASSERT(!ggml_gallocr_alloc_graph(galloc.get(), graph));
+            GGML_ASSERT(input->data == nullptr && input->buffer == nullptr);
+            GGML_ASSERT(ggml_gallocr_reserve_n(galloc.get(), graph, nullptr, leaf_ids));
+        }
+        GGML_ASSERT(ggml_gallocr_alloc_graph(galloc.get(), graph));
+        check_all_allocated(graph);
+        GGML_ASSERT(ggml_gallocr_get_buffer_size(galloc.get(), 0) >= size);
+        reserved = std::max(reserved, size);
+    }
+}
+
 static void test_backend_graph_optimize(ggml_backend_t /*backend*/, ggml_cgraph * graph, ggml_backend_graph_optimize_params * params) {
     GGML_ASSERT(graph->n_nodes == 3);
     params->add_alloc_dep(params->user_data, graph->nodes[0], graph->nodes[2]);
@@ -1120,6 +1148,8 @@ int main() {
     run("test_multiple_buffer_types", test_multiple_buffer_types);
     run("test_buffer_size_zero", test_buffer_size_zero);
     run("test_reallocation", test_reallocation);
+    run("test_unused_leaf_reallocation(1)", []() { test_unused_leaf_reallocation(1); });
+    run("test_unused_leaf_reallocation(2)", []() { test_unused_leaf_reallocation(2); });
     run("test_graph_optimize_alloc_dep", test_graph_optimize_alloc_dep);
     run("test_buft_alloc_buffer_n_single_buffer", test_buft_alloc_buffer_n_single_buffer);
     run("test_buft_alloc_buffer_n_multi_buffer", test_buft_alloc_buffer_n_multi_buffer);
