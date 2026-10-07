@@ -332,7 +332,8 @@ static void get_rows_cuda_float(
         const int64_t ne00v = ne00 / VEC;
         const int64_t vec_block_num_y = (ne00v + CUDA_GET_ROWS_BLOCK_SIZE - 1) / CUDA_GET_ROWS_BLOCK_SIZE;
         const bool enough_blocks = vec_block_num_y * ne10 * ne11 * ne12 >= 128;
-        const bool can_vec = VEC > 1 && enough_blocks &&
+        // a block per row idles nearly all its threads on rows narrower than a warp
+        const bool can_vec = VEC > 1 && enough_blocks && ne00 >= 32 &&
             (ne00 % VEC == 0) &&
             (nb01 % 16 == 0) && (nb02 % 16 == 0) && (nb03 % 16 == 0) &&
             (nb1  % 16 == 0) && (nb2  % 16 == 0) && (nb3  % 16 == 0) &&
