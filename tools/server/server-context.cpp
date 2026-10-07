@@ -25,6 +25,7 @@
 #include "fit.h"
 #include "gguf.h"
 #include "llama.h"
+#include "../../src/llama-batch.h"
 #include "../../src/llama-ext.h" // llama_vram_mark_serviced (fork ext API; fit.cpp precedent)
 #include "../../src/llama-context.h"
 #include "../../src/llama-io.h"
@@ -1111,29 +1112,7 @@ static common_speculative_output_limits server_output_limits(const common_params
 }
 
 // a checkpoint restore dropped tokens the target had accepted - re-accept them rather than verify again
-static std::vector<llama_token> server_accept_replay(
-        common_sampler * smpl,
-        llama_context * ctx,
-        const std::vector<int32_t> & idxs,
-        const llama_tokens & draft) {
-    GGML_ASSERT(idxs.size() == draft.size() + 1);
 
-    std::vector<llama_token> result;
-    result.reserve(idxs.size());
-
-    for (size_t i = 0; i < draft.size(); ++i) {
-        // the token is discarded - the call is what advances the sampler over this position
-        common_sampler_sample(smpl, ctx, idxs[i]);
-        common_sampler_accept(smpl, draft[i], true);
-        result.push_back(draft[i]);
-    }
-
-    const llama_token id = common_sampler_sample(smpl, ctx, idxs[draft.size()]);
-    common_sampler_accept(smpl, id, true);
-    result.push_back(id);
-
-    return result;
-}
 
 // synthetic draft verification for benchmarking - accept draft tokens at random instead of by match with the target
 // on replay the draft was already accepted before a context checkpoint restore, so repeat the same decisions
@@ -1477,14 +1456,17 @@ static bool server_task_can_split(const server_task & task, llama_context * ctx)
     if (!llama_get_memory(ctx)) {
         return false;
     }
+    if (task.type == SERVER_TASK_TYPE_DECISION) {
+        return true;
+    }
     const auto pooling = llama_pooling_type(ctx);
     return pooling == LLAMA_POOLING_TYPE_LAST ||
         (pooling == LLAMA_POOLING_TYPE_RANK && llama_get_causal_attn(ctx));
 }
 
 struct server_batch {
-    llama_batch batch;
-    bool batch_rendered = false;
+    llama_batch_ext * rendered = nullptr;
+    common_batch view; // the rendered sub-batch [off, off + n_tokens), see render()
 
     struct token {
         int32_t id_slot;
@@ -1502,36 +1484,20 @@ struct server_batch {
     // track if given slot can be batched with slots already in the batch
     server_slot * slot_batched = nullptr;
 
-    // in embd mode, we temporarily swap out the tokens arr and restore it on clear()
-    bool has_embd = false;
-    llama_token * tokens_ptr = nullptr;
-    std::vector<float> embd;
+    // embedding entries, they can be mixed with tokens if the context supports it
+    std::vector<float> embd; // n_embd per row
 
     float  alora_scale       = -1.0f;
     size_t alora_disabled_id = 0;
 
-    server_batch() {
-        batch.pos = nullptr; // sentinel: uninitialized batch
-    }
-
-    ~server_batch() {
-        if (batch.pos != nullptr) {
-            clear();
-            llama_batch_free(batch);
-        }
-    }
-
-    void init(int32_t n_tokens_alloc, int32_t n_embd) {
+    void init(llama_context * ctx, int32_t n_tokens_alloc, int32_t n_embd) {
         this->n_tokens_alloc = n_tokens_alloc;
         this->n_embd = n_embd;
-        batch = llama_batch_init(n_tokens_alloc, 0, 1);
-        tokens_ptr = batch.token;
+        view = common_batch(ctx);
         tokens.reserve(n_tokens_alloc);
     }
 
     bool add(int32_t id_slot, llama_token token, llama_pos pos, bool output, bool is_prompt) {
-        GGML_ASSERT(!has_embd); // cannot mix tokens + embd in same batch
-        GGML_ASSERT(batch.pos != nullptr);
         if ((int32_t)tokens.size() >= n_tokens_alloc) {
             return false;
         }
@@ -1539,8 +1505,8 @@ struct server_batch {
         return true;
     }
 
-    bool add(int32_t id_slot, const std::vector<float> & embd_in, llama_pos pos, bool output, bool is_prompt) {
-        GGML_ASSERT(batch.pos != nullptr);
+    // embd_in has n_embd values, pos has GGML_MROPE_SECTIONS values
+    bool add_embd(int32_t id_slot, const float * embd_in, const llama_pos * pos, bool output, bool is_prompt) {
         if ((int32_t)tokens.size() >= n_tokens_alloc) {
             return false;
         }
@@ -1557,16 +1523,10 @@ struct server_batch {
     void clear() {
         tokens.clear();
         embd.clear();
-        common_batch_clear(batch);
+        view.clear();
         slot_batched      = nullptr;
         alora_scale       = -1.0f;
         alora_disabled_id = 0;
-        batch_rendered    = false;
-        has_embd          = false;
-        if (batch.token == nullptr) {
-            batch.token = tokens_ptr;
-            batch.embd  = nullptr;
-        }
     }
 
     int32_t size() const {
@@ -1590,41 +1550,33 @@ struct server_batch {
         tokens[idx].output = output;
     }
 
-    void render() {
-        GGML_ASSERT(!batch_rendered);
-        GGML_ASSERT(batch.pos != nullptr);
-        common_batch_clear(batch);
-        for (int32_t i = 0; i < size(); i++) {
-            const auto & t = tokens[i];
-            common_batch_add(batch, t.token, t.pos, { t.id_slot }, t.output);
-        }
-        if (has_embd) {
-            batch.token = nullptr; // will be restored on clear()
-            batch.embd  = embd.data();
-        }
-        batch_rendered = true;
+    void set_decision_order(int32_t idx, int32_t order) {
+        GGML_ASSERT(idx >= 0 && idx < (int32_t)tokens.size());
+        tokens[idx].decision_order = order;
     }
 
-    llama_batch get_view(int32_t off, int32_t n_tokens) const {
-        GGML_ASSERT(batch.pos != nullptr);
-        GGML_ASSERT(batch_rendered);
+    // render the sub-batch [off, off + n_tokens) into view, index i in view is index off + i here
+    void render(int32_t off, int32_t n_tokens) {
         GGML_ASSERT(off >= 0 && off < size());
         GGML_ASSERT(n_tokens > 0 && off + n_tokens <= size());
 
-        auto * token = batch.token ? batch.token + off          : nullptr;
-        auto * embd  = batch.embd  ? batch.embd  + off * n_embd : nullptr;
-
-        llama_batch view = {
-            n_tokens,
-            token,
-            embd,
-            batch.pos      + off,
-            batch.n_seq_id + off,
-            batch.seq_id   + off,
-            batch.logits   + off,
-        };
-
-        return view;
+        view.clear();
+        for (int32_t i = off; i < off + n_tokens; i++) {
+            const auto & t = tokens[i];
+            if (t.i_embd >= 0) {
+                view.add_embd({ embd.data() + (size_t) t.i_embd * n_embd, 1, (size_t) n_embd }, t.pos.data(), t.id_slot, t.output);
+            } else {
+                view.add(t.token, t.pos[0], t.id_slot, t.output);
+            }
+            view.tokens.back().decision_order = t.decision_order;
+        }
+    }
+    llama_batch get_view(int32_t off, int32_t n_tokens) {
+        render(off, n_tokens);
+        rendered = view.get();
+        llama_batch raw = {};
+        rendered->get_batch(raw, true);
+        return raw;
     }
 };
 
@@ -1842,8 +1794,7 @@ struct server_slot {
 
     llama_tokens spec_draft;
 
-    // draft candidates per token in spec_draft; only draft-simple and draft-mtp fill it
-    std::vector<std::vector<llama_token_data>> spec_draft_q;
+
     llama_tokens spec_prompt;
     std::vector<int32_t> spec_i_batch;
     common_prompt_checkpoint spec_ckpt;
@@ -3337,9 +3288,7 @@ struct server_slot {
 
     // Returns false if the state copy could not be performed (for example, the recurrent pool has no
     // free cell for the child) -- the caller must not run the child on empty state
-    bool copy_state_to(server_slot & other) const {
-        GGML_ASSERT(state == SLOT_STATE_DONE_PROMPT);
-
+    bool copy_prompt_to(server_slot & other) const {
         other.observe_live_range_drop(
             server_cache_destruction_reason::child_release, true);
         ::server_cache_live_range_drop_impl(ctx_tgt, other.id, -1, -1);
@@ -3360,12 +3309,18 @@ struct server_slot {
                 ? common_speculative_sequence_event::draft_image_restored
                 : common_speculative_sequence_event::target_restored_without_draft);
 
-        other.i_batch = i_batch;
-
-        other.stats = stats;
-
         other.prompt = prompt.clone();
         other.cache_family = cache_family;
+        return true;
+    }
+
+    bool copy_state_to(server_slot & other) const {
+        GGML_ASSERT(state == SLOT_STATE_DONE_PROMPT);
+        if (!copy_prompt_to(other)) {
+            return false;
+        }
+        other.i_batch = i_batch;
+        other.stats = stats;
         other.init_sampler();
         return true;
     }
@@ -3386,6 +3341,42 @@ static void server_reset_processing_slots_after_committed_failure(
 // note: this is not a member of server_slot because we want to run it inside yield_to_queue
 //       slot is passed as const to avoid accidental modification of the slot state
 //       some pointers are allowed to be used, they are not used by to_json()
+static int encode_mtmd_chunk(const server_slot & slot, mtmd::batch_ptr & mbatch, size_t idx) {
+    const auto & mctx = slot.mctx;
+    const auto & input_tokens = slot.task->tokens;
+    const auto & chunk = input_tokens.find_chunk(idx);
+
+    mbatch.reset(mtmd_batch_init(mctx));
+    int32_t res = mtmd_batch_add_chunk(mbatch.get(), chunk.get());
+    GGML_ASSERT(res == 0); // we should never have an empty batch
+
+    // try batching as much as possible
+    int n_added = 1;
+    size_t idx_cur = idx;
+    while (res == 0) {
+        auto [next_chunk, next_idx] = input_tokens.find_next_media_chunk(idx_cur);
+        if (next_chunk == nullptr) {
+            break;
+        }
+        res = mtmd_batch_add_chunk(mbatch.get(), next_chunk->get());
+        n_added += (res == 0 ? 1 : 0);
+        idx_cur = next_idx;
+        SLT_DBG(slot, "try adding media chunk idx = %zu to batch, res = %d\n", next_idx, res);
+        // if res != 0, batch is full or chunk is not compatible -> this loop breaks
+    }
+
+    // TODO @ngxson : move this log line to debug when it become more stable
+    SLT_TRC(slot, "encoding mtmd batch from idx = %zu, n_chunks = %d\n", idx, n_added);
+
+    res = mtmd_batch_encode(mbatch.get());
+    if (res != 0) {
+        SLT_ERR(slot, "failed to encode mtmd batch for chunk idx = %zu, res = %d\n", idx, res);
+        return -1;
+    }
+
+    return 0;
+}
+
 static int process_mtmd_chunk(const server_slot & slot, mtmd::batch_ptr & mbatch, size_t idx, size_t & n_tokens_out) {
     GGML_ASSERT(slot.mctx);
     const auto & mctx = slot.mctx;
@@ -3454,34 +3445,37 @@ static int process_mtmd_chunk(const server_slot & slot, mtmd::batch_ptr & mbatch
         return res;
     }
 
-    // otherwise, the batch is either uninitialized or is used up
-    mbatch.reset(mtmd_batch_init(mctx));
-    res = mtmd_batch_add_chunk(mbatch.get(), chunk.get());
-    GGML_ASSERT(res == 0); // we should never have an empty batch
-
-    // try batching as much as possible
-    int n_added = 1;
-    size_t idx_cur = idx;
-    while (res == 0) {
-        auto [next_chunk, next_idx] = input_tokens.find_next_media_chunk(idx_cur);
-        if (next_chunk == nullptr) {
-            break;
-        }
-        res = mtmd_batch_add_chunk(mbatch.get(), next_chunk->get());
-        n_added += (res == 0 ? 1 : 0);
-        idx_cur = next_idx;
-        SLT_DBG(slot, "try adding media chunk idx = %zu to batch, res = %d\n", next_idx, res);
-    }
-
-    SLT_TRC(slot, "encoding mtmd batch from idx = %zu, n_chunks = %d\n", idx, n_added);
-
-    res = mtmd_batch_encode(mbatch.get());
+    res = encode_mtmd_chunk(slot, mbatch, idx);
     if (res != 0) {
-        SLT_ERR(slot, "failed to encode mtmd batch for chunk idx = %zu, res = %d\n", idx, res);
-        return -1;
+        return res;
     }
 
     return try_decode();
+}
+
+static bool add_mtmd_chunk(const server_slot & slot, const mtmd_input_chunk * chunk, const float * embd, server_batch & batch) {
+    // positions are the ones of mtmd_helper_decode_image_chunk()
+    const auto * image    = mtmd_input_chunk_get_tokens_image(chunk);
+    const bool   is_mrope = mtmd_decode_use_mrope(slot.mctx);
+    const size_t n_tokens = mtmd_input_chunk_get_n_tokens(chunk);
+    const size_t n_embd   = batch.n_embd;
+    const llama_pos pos_0 = slot.prompt.tokens.pos_next();
+
+    for (size_t i = 0; i < n_tokens; i++) {
+        const llama_pos p = pos_0 + (llama_pos) i;
+        llama_pos pos[GGML_MROPE_SECTIONS] = { p, p, p, p };
+        if (is_mrope && image) {
+            const mtmd_decoder_pos rel = mtmd_image_tokens_get_decoder_pos(image, pos_0, i);
+            pos[0] = rel.t;
+            pos[1] = rel.y;
+            pos[2] = rel.x;
+            pos[3] = rel.z;
+        }
+        if (!batch.add_embd(slot.id, embd + i * n_embd, pos, slot.need_embd(), /* is_prompt */ true)) {
+            return false;
+        }
+    }
+    return true;
 }
 
 static bool server_vbr_apply_occupied_restore_failure_to_slot(
@@ -5209,7 +5203,7 @@ private:
         };
         if (params_base.resume) {
             open(resume_store,
-                 params_base.resume_path.empty() ? fs_get_cache_directory() : params_base.resume_path, "resume", true);
+                 params_base.resume_path.empty() ? fs_path_to_utf8(fs_get_cache_directory()) : params_base.resume_path, "resume", true);
         }
         if (!params_base.slot_save_path.empty()) {
             // its entries live for one request; the file of a slot is synced on its own
@@ -9709,14 +9703,22 @@ private:
                     params_base.fit_params_target.begin(), params_base.fit_params_target.end());
         }
 
+        // Probe metadata even when fitting is disabled: non-causal images must fit one ubatch.
+        mtmd_memory_usage mmproj_usage = {{}, -1, false};
+        int64_t mmproj_usage_t_us = 0;
+        if (has_mmproj) {
+            const auto mparams_measure = make_mmproj_params(params_base.mmproj_use_gpu);
+            const int64_t t_start = ggml_time_us();
+            mmproj_usage = mtmd_get_memory_usage(mmproj_path.c_str(), mparams_measure);
+            mmproj_usage_t_us = ggml_time_us() - t_start;
+        }
+
         // measure mmproj memory for auto-fit (upstream #21489)
         // Only reserve mmproj space when auto-fit is actively selecting context size.
         // When -c is explicit, the fitter doesn't run so there's no need to reserve.
         if (has_mmproj && params_base.fit_params && params_base.n_ctx == 0 && !params_base.mmproj_gpu_swap) {
-            auto mparams_measure = make_mmproj_params(params_base.mmproj_use_gpu);
-            int64_t t_start = ggml_time_us();
-            auto mmproj_mem = mtmd_get_memory_usage(mmproj_path.c_str(), mparams_measure);
-            int64_t t_elapsed = ggml_time_us() - t_start;
+            const auto & mmproj_mem = mmproj_usage.backend_mem_usage;
+            const int64_t t_elapsed = mmproj_usage_t_us;
             if (!mmproj_mem.empty()) {
                 size_t total = 0;
                 for (auto & [dev, size] : mmproj_mem) {
@@ -9755,7 +9757,7 @@ private:
             params_base.speculative.has_type(COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH)) {
             const auto target_devices = server_target_fit_devices(params_base);
             auto mparams_gpu = make_mmproj_params(true);
-            const auto mmproj_mem = mtmd_get_memory_usage(mmproj_path.c_str(), mparams_gpu);
+            const auto mmproj_mem = mtmd_get_memory_usage(mmproj_path.c_str(), mparams_gpu).backend_mem_usage;
             bool reserved = false;
             for (const auto & [device, bytes] : mmproj_mem) {
                 for (size_t i = 0; i < target_devices.size() &&
@@ -9881,7 +9883,7 @@ private:
 
             std::vector<size_t> mmproj_by_device(margins_base.size(), 0);
             auto mparams_gpu = make_mmproj_params(true);
-            auto mmproj_mem = mtmd_get_memory_usage(mmproj_path.c_str(), mparams_gpu);
+            auto mmproj_mem = mtmd_get_memory_usage(mmproj_path.c_str(), mparams_gpu).backend_mem_usage;
             for (auto & [dev, size] : mmproj_mem) {
                 bool mapped = false;
                 for (size_t i = 0; i < tgt_devices.size() && i < mmproj_by_device.size(); ++i) {
@@ -10124,6 +10126,7 @@ private:
         vocab = llama_model_get_vocab(model_tgt);
 
         needs_reeval = llama_model_is_recurrent(model_tgt) || llama_model_is_hybrid(model_tgt);
+        decision.init(model_tgt);
         is_diffusion = llama_model_is_diffusion(model_tgt);
 
         dflash_tape_ok = llama_dflash_tape_replay_available(ctx_tgt);
@@ -10528,6 +10531,24 @@ private:
             auto mparams = make_mmproj_params(use_gpu, load_progress_callback, &load_progress_mmproj);
             if (!mmproj_gpu_swap) {
                 mparams.warmup = params_base.warmup;
+            }
+
+            const int n_ubatch = llama_n_ubatch(ctx_tgt);
+            const bool is_mixed = use_mixed_batch();
+            if (is_mixed || mmproj_usage.use_non_causal) {
+                const int n_max = is_mixed ? n_ubatch / 2 : n_ubatch;
+                if (mmproj_usage.image_max_tokens > n_max) {
+                    if (n_max < 1) {
+                        SRV_ERR("%s\n", "n_ubatch is too small for multimodal input");
+                        return false;
+                    }
+                    SRV_WRN("cap image_max_tokens from %d to %d for n_ubatch = %d\n",
+                            mmproj_usage.image_max_tokens, n_max, n_ubatch);
+                    // Persist the effective budget through fork CPU/GPU projector reloads.
+                    params_base.image_max_tokens = mparams.image_max_tokens = n_max;
+                    params_base.image_min_tokens = mparams.image_min_tokens =
+                        std::min(mparams.image_min_tokens, n_max);
+                }
             }
 
             mctx = mtmd_init_from_file(mmproj_path.c_str(), model_tgt, mparams);
@@ -10941,7 +10962,7 @@ private:
         {
             const int32_t n_batch = llama_n_batch(ctx_tgt);
             const int32_t n_embd  = llama_model_n_embd_inp(model_tgt);
-            batch.init(std::max(n_batch, params_base.n_parallel), n_embd);
+            batch.init(ctx_tgt, std::max(n_batch, params_base.n_parallel), n_embd);
         }
 
         // may adopt the stored execution identity, which the block below derives from
@@ -14771,6 +14792,77 @@ private:
         }
 
         SLT_DBG(slot, "%s", "sending embeddings\n");
+
+        queue_results.send(std::move(res));
+    }
+
+    void send_decision(const server_slot & slot, const common_batch & batch, int32_t i_batch) {
+        auto res = std::make_unique<server_task_result_decision>();
+        res->id       = slot.task->id;
+        res->index    = slot.task->index;
+        res->n_tokens = slot.task->n_tokens();
+
+        const auto & decision = slot.task->decision;
+
+        if (!decision.labels.empty()) {
+            const float * logits = llama_get_logits_ith(slot.ctx_tgt, i_batch);
+            if (logits == nullptr) {
+                send_error(slot, "failed to get logits", ERROR_TYPE_SERVER);
+                return;
+            }
+            const int32_t n_vocab = llama_vocab_n_tokens(vocab);
+            for (const llama_token label : decision.labels) {
+                GGML_ASSERT(label >= 0 && label < n_vocab);
+                res->scores.push_back(logits[label]);
+            }
+        } else {
+            // the outputs of this slot in this batch are the last tokens of the prompt
+            std::vector<int32_t> idx;
+            for (int i = 0; i < batch.size(); ++i) {
+                if (batch.tokens[i].output && batch.tokens[i].seq_id == slot.id) {
+                    idx.push_back(i);
+                }
+            }
+            const int32_t pos_first = slot.prompt.n_tokens() - (int32_t) idx.size();
+            auto get_embd = [&](int32_t pos) -> const float * {
+                const int32_t i = pos - pos_first;
+                return i >= 0 && i < (int32_t) idx.size() ? llama_get_embeddings_ith(slot.ctx_tgt, idx[i]) : nullptr;
+            };
+
+            // joint head (decision model): the scores are the first rows
+            for (int32_t i = 0; i < decision.n_scores; i++) {
+                const float * embd = i < (int32_t) idx.size() ? llama_get_embeddings_ith(slot.ctx_tgt, idx[i]) : nullptr;
+                if (embd == nullptr) {
+                    send_error(slot, "failed to get embeddings", ERROR_TYPE_SERVER);
+                    return;
+                }
+                res->scores.push_back(embd[0]);
+            }
+
+            const int32_t n_embd_out = llama_model_n_embd_out(model_tgt);
+            const int32_t n_pointer  = n_embd_out / 2;
+            const float * embd_q = decision.pointer >= 0 ? get_embd(decision.pointer) : nullptr;
+            GGML_ASSERT(decision.column >= 0 && decision.column < n_embd_out);
+
+            for (const int32_t marker : decision.markers) {
+                const float * embd = get_embd(marker);
+                if (embd == nullptr || (decision.pointer >= 0 && embd_q == nullptr)) {
+                    send_error(slot, "failed to get embeddings, the question and its options must fit in one batch", ERROR_TYPE_SERVER);
+                    return;
+                }
+                if (decision.pointer < 0) {
+                    res->scores.push_back(embd[decision.column]);
+                    continue;
+                }
+                float dot = 0.0f;
+                for (int32_t i = 0; i < n_pointer; i++) {
+                    dot += embd_q[i] * embd[n_pointer + i];
+                }
+                res->scores.push_back(dot / sqrtf((float) n_pointer));
+            }
+        }
+
+        SLT_DBG(slot, "%s", "sending decision result\n");
 
         queue_results.send(std::move(res));
     }
@@ -19661,7 +19753,7 @@ private:
         try {
             scoped_timer t(t_pre_decode, n_pre_decode);
             pre_decode();
-            batch.render();
+
         } catch (const std::exception & e) {
             cycle_failed = true;
             SRV_ERR("pre_decode() failed: %s\n", e.what());
@@ -21369,7 +21461,13 @@ private:
                             }
                             if (is_shared_done) {
                                 SLT_TRC(slot, " - copying shared prompt (%d tokens) to child %d\n", slot.prompt.n_tokens(), other.id);
-                                slot.copy_prompt_to(other);
+                                if (!slot.copy_prompt_to(other)) {
+                                    send_error(other, "Failed to clone shared prompt to child slot");
+                                    other.release();
+                                    other.mandatory_recovery_reset(
+                                        server_cache_destruction_reason::restore_failure);
+                                    continue;
+                                }
                                 other.state = SLOT_STATE_STARTED;
                             } else {
                                 wait_shared = true;
@@ -22534,9 +22632,16 @@ private:
             n_empty_consecutive = 0;
         }
 
+        // Stateless mixed-media tasks do not update a speculative sequence. Raw fork
+        // drivers cannot consume mixed rows: their token-zero placeholders are not text.
+        const bool stateless = batch.slot_batched && batch.slot_batched->task->need_embd();
+        if (spec && !stateless && !batch.rendered->flat_type.empty()) {
+            throw std::runtime_error("mixed token/embedding speculative batches are not supported");
+        }
+
         // TODO @ngxson : dft model may have different n_embd than the tgt model, so we check & reject if that's the case
         // this case is not currently used by any models, but may need to be supported in the future
-        if (spec && batch.has_embd) {
+        if (spec && !stateless && model_dft && batch.has_embd()) {
             if (llama_model_n_embd_inp(model_dft.get()) != llama_model_n_embd_inp(model_tgt)) {
                 SRV_ERR("%s", "unsupported batch.has_embd + spec case\n");
                 throw std::runtime_error("unsupported batch.has_embd + spec case");
@@ -22545,7 +22650,6 @@ private:
 
         // Diffusion drafting toggles this for generation. Stateless embedding
         // and rerank tasks must retain the context's configured attention mode.
-        const bool stateless = batch.slot_batched && batch.slot_batched->task->need_embd();
         if (!stateless) {
             llama_set_causal_attn(ctx_tgt, true);
         }
@@ -22566,10 +22670,13 @@ private:
         int64_t t_verify_elapsed = 0;
         const std::exception_ptr yield_exception =
             queue_tasks.yield_to_queue_capture_exception([&]() {
-            ret = llama_decode(ctx_tgt, batch_view);
+            ret = llama_process(ctx_tgt, LLAMA_PROCESS_TYPE_DECODE, batch.rendered);
             if (ret == 0 && has_output) {
                 llama_synchronize(ctx_tgt);
             }
+            // llama_process rebuilds the ext batch's flat storage. Reborrow it
+            // for fork speculative processing and post-decode metrics/outputs.
+            batch.rendered->get_batch(batch_view, true);
 
             t_verify_elapsed = ggml_time_us() - t_verify_start;
 
@@ -22598,7 +22705,9 @@ private:
 
         auto * memory = llama_get_memory(ctx_tgt);
         std::vector<vbr_hard_seal_subject> hard_seal_evidence;
-        memory->vbr_hard_seal_evidence_take(hard_seal_evidence);
+        if (memory) {
+            memory->vbr_hard_seal_evidence_take(hard_seal_evidence);
+        }
         if (params_base.cache_debug) {
             for (const auto & step : hard_seal_evidence) {
                 const json payload = {
@@ -22611,7 +22720,7 @@ private:
             }
         }
         const bool hard_seal_terminal =
-            memory->vbr_hard_seal_blocked_take(ret != 0);
+            memory && memory->vbr_hard_seal_blocked_take(ret != 0);
         const auto decode_terminal = server_speculative_decode_terminal_resolve(
             ret, hard_seal_terminal, n_batch == 1,
             yield_exception != nullptr, speculative_ok);
@@ -25620,6 +25729,7 @@ server_context_meta server_context::get_meta() const {
         /* model_aliases          */ impl->model_aliases,
         /* model_tags             */ impl->model_tags,
         /* model_path             */ impl->params_base.model.path,
+        /* model_output_modalities */ server_model_output_modalities(common_get_decision_type(impl->model_tgt)),
         /* has_mtmd               */ impl->mctx != nullptr,
         /* has_inp_image          */ impl->chat_params.allow_image,
         /* has_inp_audio          */ impl->chat_params.allow_audio,
