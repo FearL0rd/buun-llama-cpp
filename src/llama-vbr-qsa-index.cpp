@@ -308,10 +308,15 @@ public:
             if (!terminal_ok || terminal != parsed.terminal || !bytes_ok) {
                 return false;
             }
+            // Physical placement can change pool representatives even when
+            // the restored token count is unchanged. Rebuild derived pools
+            // through the indexed-memory owner before the next decode.
+            target.index_state_restored();
             return true;
         } catch (...) {
             if (auto * cache = target.get_mem_idx()) {
                 cache->seq_rm(destination, -1, -1);
+                target.index_state_restored();
             }
             return false;
         }
@@ -424,6 +429,7 @@ public:
             return false;
         }
         image.target->get_mem_idx()->seq_rm(image.destination, -1, -1);
+        image.target->index_state_restored();
         if (image.destination_was_empty) {
             return true;
         }
