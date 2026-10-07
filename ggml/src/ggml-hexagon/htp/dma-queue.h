@@ -222,7 +222,9 @@ static inline bool dma_ring_push_single_1d(dma_ring * r, dma_data ddata, size_t 
 
 static inline bool dma_ring_push_single_2d(dma_ring * r, dma_data ddata, size_t dst_stride, size_t src_stride, size_t row_size, size_t nrows) {
 #if __HVX_ARCH__ > 79
-    assert(!((ddata.src | ddata.dst) >> 40) || nrows == 0);
+    if (((ddata.src | ddata.dst) >> 40) && nrows != 0) {
+        return false; // retain the fork's unsupported-address fallback contract
+    }
     const uint32_t src_hi = (uint32_t) (ddata.src >> 32);
     const uint32_t dst_hi = (uint32_t) (ddata.dst >> 32);
     const bool is_ext     = (src_hi | dst_hi) != 0;
@@ -412,13 +414,12 @@ static inline bool dma_queue_push(dma_queue * q, dma_data ddata, size_t dst_stri
     if (row_size <= DMA_MAX_SIZE_16B && (src_stride | dst_stride) <= DMA_MAX_STRIDE_16B) {
         return dma_queue_push_fallback_2d(q, ddata, dst_stride, src_stride, row_size, nrows);
     }
-
+    return dma_queue_push_fallback_1d(q, ddata, dst_stride, src_stride, row_size, nrows);
+#else
     if (row_size <= DMA_MAX_SIZE_24B && src_stride <= DMA_MAX_STRIDE_24B && dst_stride <= DMA_MAX_STRIDE_24B) {
         return dma_queue_push_fallback_2d(q, ddata, dst_stride, src_stride, row_size, nrows);
     }
     return dma_queue_push_fallback_1d(q, ddata, dst_stride, src_stride, row_size, nrows);
-}
-
 #endif
 }
 

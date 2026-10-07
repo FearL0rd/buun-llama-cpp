@@ -1858,6 +1858,9 @@ class ggml_webgpu_shader_lib {
         if (key.xbc_overlap == 0b110) {  // x/B
             defines.push_back("XB_OVERLAP");
             variant += "_xb_overlap";
+        } else if (key.xbc_overlap == 0b101) {  // x/C
+            defines.push_back("XC_OVERLAP");
+            variant += "_xc_overlap";
         } else if (key.xbc_overlap == 0b011) {  // B/C
             defines.push_back("BC_OVERLAP");
             variant += "_bc_overlap";

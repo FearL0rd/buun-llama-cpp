@@ -15,24 +15,11 @@ static __global__ void scale_f32(const T * x, T * dst, const float scale, const 
     }
 }
 
-static __global__ void scale_bf16(const nv_bfloat16 * x, nv_bfloat16 * dst, const float scale, const float bias, const int64_t nelements) {
-    int64_t tid = (int64_t)blockIdx.x * (int64_t)blockDim.x + (int64_t)threadIdx.x;
-    int64_t stride = (int64_t)blockDim.x * (int64_t)gridDim.x;
-
-    for (int64_t i = tid; i < nelements; i += stride) {
-        dst[i] = __float2bfloat16(scale * __bfloat162float(x[i]) + bias);
-    }
-}
-
-static void scale_f32_cuda(const float * x, float * dst, const float scale, const float bias, const int64_t nelements, cudaStream_t stream) {
+template <typename T>
+static void scale_f32_cuda(const T * x, T * dst, const float scale, const float bias, const int64_t nelements, cudaStream_t stream) {
     const int64_t num_blocks = (nelements + CUDA_SCALE_BLOCK_SIZE - 1) / CUDA_SCALE_BLOCK_SIZE;
     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(MIN(MAX_GRIDDIM_X, num_blocks), CUDA_SCALE_BLOCK_SIZE, 0, stream);
     ggml_cuda_kernel_launch(scale_f32<T>, launch_params, x, dst, scale, bias, nelements);
-}
-
-static void scale_bf16_cuda(const nv_bfloat16 * x, nv_bfloat16 * dst, const float scale, const float bias, const int64_t nelements, cudaStream_t stream) {
-    const int64_t num_blocks = (nelements + CUDA_SCALE_BLOCK_SIZE - 1) / CUDA_SCALE_BLOCK_SIZE;
-    scale_bf16<<<MIN(MAX_GRIDDIM_X, num_blocks), CUDA_SCALE_BLOCK_SIZE, 0, stream>>>(x, dst, scale, bias, nelements);
 }
 
 void ggml_cuda_op_scale(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
@@ -48,7 +35,7 @@ void ggml_cuda_op_scale(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     memcpy(&bias,  (float *) dst->op_params + 1, sizeof(float));
 
     if (src0->type == GGML_TYPE_BF16) {
-        scale_bf16_cuda(
+        scale_f32_cuda(
             (const nv_bfloat16 *)src0->data, (nv_bfloat16 *)dst->data,
             scale, bias, ggml_nelements(src0), stream);
     } else {

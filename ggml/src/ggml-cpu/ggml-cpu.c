@@ -2133,7 +2133,9 @@ UseGgmlGemm1:;
         const size_t nbw3 = nbw2*ne12;
 
         assert(params->wsize >= ne13*nbw3);
-        GGML_ASSERT(src1->type == GGML_TYPE_F32 || src1->type == GGML_TYPE_F16);
+        const bool widen = src1->type != GGML_TYPE_F32;
+        GGML_ASSERT(!widen || vec_dot_type == GGML_TYPE_F32);
+        GGML_ASSERT(!widen || src1->type == GGML_TYPE_F16 || src1->type == GGML_TYPE_BF16);
 
     #if 0
         for (int64_t i13 = 0; i13 < ne13; ++i13) {
@@ -2163,12 +2165,7 @@ UseGgmlGemm1:;
                     } else if (src1->type == GGML_TYPE_BF16) {
                         ggml_cpu_bf16_to_fp32((const ggml_bf16_t *) src1_row, (float *) wdata_row, ne10_block_size);
                     } else {
-                        GGML_ASSERT(vec_dot_type == GGML_TYPE_F32);
-                        const ggml_fp16_t * src_f16 = (const ggml_fp16_t *) src1_block;
-                        float * dst_f32 = (float *) dst_block;
-                        for (int64_t i = 0; i < n_block; ++i) {
-                            dst_f32[i] = GGML_CPU_FP16_TO_FP32(src_f16[i]);
-                        }
+                        from_float((const float *) src1_row, wdata_row, ne10_block_size);
                     }
                 }
             }

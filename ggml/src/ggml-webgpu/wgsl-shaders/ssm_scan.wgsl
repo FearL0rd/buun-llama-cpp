@@ -58,6 +58,10 @@ struct Params {
 @group(0) @binding(1) var<storage, read_write> merged: array<f32>;
 @group(0) @binding(2) var<storage, read_write> C: array<f32>;
 #define BIND_DT 3
+#elif defined(XC_OVERLAP)
+@group(0) @binding(1) var<storage, read_write> merged: array<f32>;
+@group(0) @binding(2) var<storage, read_write> B: array<f32>;
+#define BIND_DT 3
 #else
 @group(0) @binding(1) var<storage, read_write> x: array<f32>;
 @group(0) @binding(2) var<storage, read_write> B: array<f32>;
@@ -79,7 +83,7 @@ fn reduce_base(token_in_tile: u32) -> u32 {
     return token_in_tile * WG_SIZE;
 }
 
-#if defined(XBC_OVERLAP) || defined(XB_OVERLAP) || defined(BC_OVERLAP)
+#if defined(XBC_OVERLAP) || defined(XB_OVERLAP) || defined(BC_OVERLAP) || defined(XC_OVERLAP)
 fn read_merged_f32(idx: u32) -> f32 {
     return merged[idx];
 }
@@ -127,7 +131,7 @@ fn main(
                 let dt0 = dt[dt_idx];
                 let dtsp = select(log(1.0 + exp(dt0)), dt0, dt0 > 20.0);
                 shared_dtsp[tid] = dtsp;
-#if defined(XBC_OVERLAP) || defined(XB_OVERLAP)
+#if defined(XBC_OVERLAP) || defined(XB_OVERLAP) || defined(XC_OVERLAP)
                 shared_x_dt[tid] = read_merged_f32(x_idx) * dtsp;
 #else
                 shared_x_dt[tid] = x[x_idx] * dtsp;
@@ -166,7 +170,7 @@ fn main(
             }
 
 #ifdef USE_SUBGROUP_REDUCTION
-#if defined(XBC_OVERLAP) || defined(BC_OVERLAP)
+#if defined(XBC_OVERLAP) || defined(BC_OVERLAP) || defined(XC_OVERLAP)
             let subgroup_partial = subgroupAdd(s * read_merged_f32(c_idx));
 #else
             let subgroup_partial = subgroupAdd(s * C[c_idx]);
@@ -175,7 +179,7 @@ fn main(
                 shared_reduce[reduce_idx - tid + subgroup_id] = subgroup_partial;
             }
 #else
-#if defined(XBC_OVERLAP) || defined(BC_OVERLAP)
+#if defined(XBC_OVERLAP) || defined(BC_OVERLAP) || defined(XC_OVERLAP)
             shared_reduce[reduce_idx] = s * read_merged_f32(c_idx);
 #else
             shared_reduce[reduce_idx] = s * C[c_idx];

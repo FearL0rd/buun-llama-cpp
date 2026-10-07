@@ -730,7 +730,7 @@ static __global__ void unary_strided_op_kernel(
     row /= ne1;
     const int64_t i2 = row % ne2;
     const int64_t i3 = row / ne2;
-    dst[i] = (T)op((float)x[i0 + i1*sx1 + i2*sx2 + i3*sx3]);
+    dst[i] = ggml_cuda_cast<T>(op(ggml_cuda_cast<float>(x[i0 + i1*sx1 + i2*sx2 + i3*sx3])));
 }
 
 template <float (*op)(float), typename T>
@@ -787,6 +787,14 @@ void ggml_cuda_op_unary(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
         } else {
             unary_strided_op_kernel<op, half><<<blocks, CUDA_NEG_BLOCK_SIZE, 0, stream>>>(
                 static_cast<const half *>(src0_d), static_cast<half *>(dst_d), k,
+                src0->ne[0], src0->ne[1], src0->ne[2], GGML_CUDA_UNARY_STRIDED_ARGS(src0));
+        }
+    } else if (src0->type == GGML_TYPE_BF16) {
+        if (ggml_is_contiguous(src0)) {
+            unary_cuda<op>((const nv_bfloat16 *)src0_d, (nv_bfloat16 *)dst_d, k, stream);
+        } else {
+            unary_strided_op_kernel<op, nv_bfloat16><<<blocks, CUDA_NEG_BLOCK_SIZE, 0, stream>>>(
+                static_cast<const nv_bfloat16 *>(src0_d), static_cast<nv_bfloat16 *>(dst_d), k,
                 src0->ne[0], src0->ne[1], src0->ne[2], GGML_CUDA_UNARY_STRIDED_ARGS(src0));
         }
     } else {
@@ -979,7 +987,7 @@ static __global__ void unary_gated_strided_op_kernel(
     const int64_t i3 = row / ne2;
     const int64_t jx = i0 + i1*sx1 + i2*sx2 + i3*sx3;
     const int64_t jg = i0 + i1*sg1 + i2*sg2 + i3*sg3;
-    dst[i] = (T)(op((float)x[jx]) * (float)g[jg]);
+    dst[i] = ggml_cuda_cast<T>(op(ggml_cuda_cast<float>(x[jx])) * ggml_cuda_cast<float>(g[jg]));
 }
 
 template <float (*op)(float)>
@@ -1574,6 +1582,19 @@ static void ggml_cuda_op_unary_mul_impl(ggml_backend_cuda_context & ctx, ggml_te
             unary_gated_strided_op_kernel<op, half><<<blocks, CUDA_GLU_BLOCK_SIZE, 0, stream>>>(
                 static_cast<const half *>(unary_src->data), static_cast<const half *>(other_src->data),
                 static_cast<half *>(mul_node->data), k,
+                unary_src->ne[0], unary_src->ne[1], unary_src->ne[2],
+                GGML_CUDA_UNARY_MUL_STRIDED_ARGS(unary_src),
+                GGML_CUDA_UNARY_MUL_STRIDED_ARGS(other_src));
+        }
+    } else if (unary_src->type == GGML_TYPE_BF16) {
+        if (simple_rows) {
+            unary_gated_cuda<op>((const nv_bfloat16 *) unary_src->data, (const nv_bfloat16 *) other_src->data,
+                                 (nv_bfloat16 *) mul_node->data, k, nc,
+                                 unary_stride / sizeof(nv_bfloat16), other_stride / sizeof(nv_bfloat16), stream);
+        } else {
+            unary_gated_strided_op_kernel<op, nv_bfloat16><<<blocks, CUDA_GLU_BLOCK_SIZE, 0, stream>>>(
+                static_cast<const nv_bfloat16 *>(unary_src->data), static_cast<const nv_bfloat16 *>(other_src->data),
+                static_cast<nv_bfloat16 *>(mul_node->data), k,
                 unary_src->ne[0], unary_src->ne[1], unary_src->ne[2],
                 GGML_CUDA_UNARY_MUL_STRIDED_ARGS(unary_src),
                 GGML_CUDA_UNARY_MUL_STRIDED_ARGS(other_src));
