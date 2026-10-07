@@ -1104,7 +1104,67 @@ static void test_dflash_selector_family_contract() {
     GGML_ASSERT(!llm_dflash_selector_tensor_schema_for_family(family::unidentified).valid);
 }
 
+// Shared k-pool representatives must never name different member groups.
+static void test_qwen4_kpool_remove_alias_cpu(llama_model * model) {
+    auto params = llama_context_default_params();
+    params.n_ctx = 128;
+    params.n_batch = params.n_ubatch = 64;
+    params.n_seq_max = 2;
+    params.n_threads = params.n_threads_batch = 2;
+    params.kv_unified = true;
+    params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
+    llama_context_ptr ctx(llama_init_from_model(model, params));
+    GGML_ASSERT(ctx);
+    auto * memory = dynamic_cast<llama_memory_hybrid_idx *>(llama_get_memory(ctx.get()));
+    GGML_ASSERT(memory && memory->get_kpool() == 4 && memory->get_kpool_by_order());
+    llama_batch batch = llama_batch_init(8, 0, 1);
+    for (int p = 0; p < 8; ++p) {
+        common_batch_add(batch, p + 1, p, {0}, true);
+    }
+    GGML_ASSERT(llama_decode(ctx.get(), batch) == 0);
+    GGML_ASSERT(memory->try_seq_cp(0, 1, -1, -1));
+    const auto snapshot = [&]() {
+        std::vector<uint8_t> bytes(llama_state_get_size(ctx.get()));
+        GGML_ASSERT(llama_state_get_data(ctx.get(), bytes.data(), bytes.size()) == bytes.size());
+        return bytes;
+    };
+    const auto before = snapshot();
+    using remove_fn = bool (llama_memory_hybrid_idx::*)(llama_seq_id, llama_pos, llama_pos);
+    const remove_fn removals[] = {
+        &llama_memory_hybrid_idx::seq_rm, &llama_memory_hybrid_idx::seq_rm_attn,
+        &llama_memory_hybrid_idx::seq_rm_transient, &llama_memory_hybrid_idx::seq_rm_attn_transient,
+    };
+    for (const auto remove : removals) {
+        // A's [4,5,6,7] and B's proposed [0,5,6,7] would share rep7.
+        // Refuse before changing any of the three children, including bytes.
+        GGML_ASSERT(!(memory->*remove)(1, 1, 5));
+        GGML_ASSERT(snapshot() == before);
+        for (llama_pos prefix : {2, 4}) {
+            // Both unaligned and pool-aligned prefix trims are still valid.
+            GGML_ASSERT((memory->*remove)(1, 0, prefix));
+            GGML_ASSERT(memory->get_mem_idx()->seq_pos_min(1) == prefix);
+            GGML_ASSERT(memory->get_mem_attn()->seq_pos_min(1) == prefix);
+            GGML_ASSERT(memory->get_mem_idx()->get_cells(0).seq_pos_get(0).size() == 8);
+            common_batch_clear(batch);
+            common_batch_add(batch, 9, 8, {1}, true);
+            GGML_ASSERT(llama_decode(ctx.get(), batch) == 0);
+            GGML_ASSERT(llama_state_set_data(ctx.get(), before.data(), before.size()) == before.size());
+        }
+    }
+    GGML_ASSERT(memory->seq_rm_attn_transient(1, 7, -1)); // valid shared suffix rollback
+    GGML_ASSERT(memory->get_mem_idx()->get_cells(0).seq_pos_get(0).size() == 8);
+    GGML_ASSERT(llama_state_set_data(ctx.get(), before.data(), before.size()) == before.size());
+    // The same middle edit is supported once representatives are not shared.
+    GGML_ASSERT(memory->seq_rm(1, -1, -1));
+    GGML_ASSERT(memory->seq_rm(0, 1, 5));
+    GGML_ASSERT(memory->get_mem_idx()->get_cells(0).seq_pos_get(0).size() == 4);
+    GGML_ASSERT(memory->seq_rm(-1, -1, -1));
+    llama_batch_free(batch);
+    std::puts("Qwen4 kpool shared representative refusal / valid prefix trims: PASS");
+}
+
 static void test_qwen4_qsa_layout_cpu(llama_model * model, size_t seed) {
+    test_qwen4_kpool_remove_alias_cpu(model);
     const auto load_with_ratios = [&](const std::array<uint32_t, 2> & ratios) {
         gguf_context_ptr gguf = get_gguf_ctx(LLM_ARCH_QWEN4EXP, true);
         gguf_set_arr_data(gguf.get(), "qwen4exp.attention.compress_ratios", GGUF_TYPE_UINT32,
