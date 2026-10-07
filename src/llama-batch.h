@@ -117,7 +117,9 @@ struct llama_batch_ext {
 
     // Reusable metadata view for the shared legacy decode/allocator path. The
     // extended API owns its embeddings; already ordered rows need no second copy.
-    bool get_batch(llama_batch & batch) const;
+    // Legacy views cannot carry mixed-row/decision metadata. Only the allocator
+    // opts into the extended layout and consumes the flat metadata alongside it.
+    bool get_batch(llama_batch & batch, bool extended_layout = false) const;
 
     mutable std::vector<llama_token> flat_token;
     mutable std::vector<float> flat_embd;
@@ -126,6 +128,8 @@ struct llama_batch_ext {
     mutable std::vector<llama_seq_id> flat_seq_id_data;
     mutable std::vector<llama_seq_id *> flat_seq_id;
     mutable std::vector<int8_t> flat_output;
+    mutable std::vector<int8_t> flat_type;
+    mutable std::vector<int32_t> flat_decision_order;
 
     llama_batch_ext(llama_context * ctx);
 
@@ -172,7 +176,8 @@ public:
             uint32_t n_embd,
             uint32_t n_seq_max,
             bool output_all,
-            bool token_ids_validated = false);
+            bool token_ids_validated = false,
+            const llama_batch_ext * extended = nullptr);
 
     const llama_batch & get_batch() const;
 
@@ -231,6 +236,8 @@ private:
     uint32_t n_outputs;
 
     std::vector<llama_seq_id>   seq_id_0 = { 0 };
+    std::vector<int8_t>        is_embd_vec;
+    bool positions_expanded = false;
 
     std::vector<llama_pos>      pos;
     std::vector<int32_t>        n_seq_id;

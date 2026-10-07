@@ -2998,7 +2998,7 @@ ggml_tensor * llm_graph_context::build_get_rows_embd(ggml_tensor * tok_embd, ggm
 }
 
 // input embeddings with optional lora
-ggml_tensor * llm_graph_context::build_inp_embd(ggml_tensor * tok_embd, float tok_scale) const {
+ggml_tensor * llm_graph_context::build_inp_embd(ggml_tensor * tok_embd, float tok_scale, bool tok_bf16) const {
     const int64_t n_embd_inp = hparams.n_embd_inp();
     const int64_t n_embd     = hparams.n_embd;
 
@@ -3015,15 +3015,10 @@ ggml_tensor * llm_graph_context::build_inp_embd(ggml_tensor * tok_embd, float to
     cb(inp->embd, "inp_embd", -1);
     ggml_set_input(inp->embd);
 
-    // select one of the 2 inputs, based on the batch contents
-    // ref: https://github.com/ggml-org/llama.cpp/pull/18550
-    std::array<ggml_tensor *, 2> inps;
-
-    // token embeddings path (ubatch.token != nullptr)
-    {
-        auto & cur = inps[0];
-
-        cur = build_get_rows_embd(tok_embd, inp->tokens);
+    // Share the fork's native latent-basis restoration in both text and mixed
+    // branches; each select branch still owns independent graph inputs.
+    auto build_tok = [&](ggml_tensor * ids) {
+        ggml_tensor * cur = build_get_rows_embd(tok_embd, ids);
 
         // apply lora for embedding tokens if needed
         for (const auto & lora : *loras) {
@@ -3043,6 +3038,13 @@ ggml_tensor * llm_graph_context::build_inp_embd(ggml_tensor * tok_embd, float to
             cur = ggml_add(ctx0, cur, inpL_delta);
         }
 
+        if (tok_bf16) {
+            // Gemma token embeddings preserve training-time BF16 rounding.
+            // Keep this in the token branch so raw media rows are untouched.
+            cur = ggml_cast(ctx0, cur, GGML_TYPE_BF16);
+            cur = ggml_scale(ctx0, cur, tok_scale);
+            cur = ggml_cast(ctx0, cur, GGML_TYPE_F32);
+        }
         if (n_embd_inp != n_embd) {
             cur = ggml_pad(ctx0, cur, hparams.n_embd_inp() - n_embd, 0, 0, 0);
         }
@@ -3108,7 +3110,7 @@ ggml_tensor * llm_graph_context::build_inp_embd(ggml_tensor * tok_embd, float to
     }
 
     // scale the token rows only, applied after the select so that the graph is the same for any batch contents
-    inp->scale_tok = tok_scale*(scale_tok_only ? hparams.f_embedding_scale : 1.0f);
+    inp->scale_tok = (tok_bf16 ? 1.0f : tok_scale)*(scale_tok_only ? hparams.f_embedding_scale : 1.0f);
     if (inp->scale_tok != 1.0f) {
         inp->scale_rows = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, 1, ubatch.n_tokens);
         cb(inp->scale_rows, "inp_scale_rows", -1);
@@ -3655,10 +3657,6 @@ ggml_tensor * llm_graph_context::build_attn(
 
     ggml_tensor * kq_mask = inp->get_kq_mask();
 
-    ggml_tensor * q = q_cur;
-    ggml_tensor * k = mctx_cur->get_k(ctx0, il);
-    ggml_tensor * v = mctx_cur->get_v(ctx0, il);
-
     // TurboQuant Q pre-rotation is handled inline in CUDA FA kernels:
     // - Vec kernel: shared memory FWHT (fattn-vec.cuh)
     // - Prefill MMA: separate Q rotation kernel (fattn.cu)
@@ -3673,7 +3671,7 @@ ggml_tensor * llm_graph_context::build_attn(
     ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, 0, kq_scale, il);
     cb(cur, "kqv_out", il);
 
-    cur = build_attn_v_unrotate(cur, v, inp->self_v_rot, inp->self_vmean, il);
+    cur = build_attn_v_unrotate(cur, v, inp->self_v_rot, cparams.training ? nullptr : inp->self_vmean, il);
 
     // Crop output back to original head_dim after turbo head padding
     // cur is 2D [padded_head * n_head_q, n_tokens] — unflatten, crop per-head, reflatten
@@ -3948,7 +3946,7 @@ ggml_tensor * llm_graph_context::build_attn(
     ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, 0, kq_scale, il);
     cb(cur, "kqv_out", il);
 
-    cur = build_attn_v_unrotate(cur, v, v_rot, inp->self_vmean, il);
+    cur = build_attn_v_unrotate(cur, v, v_rot, use_kv_cur ? nullptr : inp->self_vmean, il);
 
     if (wo) {
         cur = build_lora_mm(wo, cur, wo_s);

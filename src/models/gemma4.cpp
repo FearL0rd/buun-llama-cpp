@@ -1,5 +1,6 @@
 #include "models.h"
 #include "ggml.h"
+#include "llama-impl.h"
 
 void llama_model_gemma4::load_arch_hparams(llama_model_loader & ml) {
     hparams.swa_type = LLAMA_SWA_TYPE_STANDARD;
@@ -161,9 +162,8 @@ llama_model_gemma4::graph::graph(const llama_model & model, const llm_graph_para
 
     // important: do not normalize weights for raw embeddings input (i.e. encoded image emdeddings)
     // BF16 precision: match training-time BF16 rounding for embedding scale
-    inpL = ggml_cast(ctx0, inpL, GGML_TYPE_BF16);
-    inpL = ggml_scale(ctx0, inpL, ubatch.token ? ggml_bf16_to_fp32(ggml_fp32_to_bf16(sqrtf(n_embd))) : 1.0f);
-    inpL = ggml_cast(ctx0, inpL, GGML_TYPE_F32);
+    inpL = build_inp_embd(model.tok_embd,
+            ggml_bf16_to_fp32(ggml_fp32_to_bf16(sqrtf(n_embd))), true);
     cb(inpL, "inp_scaled", -1);
 
     // inp_pos - contains the positions

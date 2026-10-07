@@ -1365,6 +1365,7 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
         const auto & layer = model.layers[il];
         ggml_tensor * selected_experts = nullptr;
         ggml_tensor * exp_probs_b = layer.ffn_exp_probs_b;
+        ASSERT_EMBD_OR_TOKEN(ubatch);
         if (ubatch.embd != nullptr) {
             if (layer.ffn_exp_probs_b_vl) {
                 exp_probs_b = layer.ffn_exp_probs_b_vl;

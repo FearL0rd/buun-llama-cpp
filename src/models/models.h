@@ -2593,32 +2593,18 @@ struct llama_model_qwen4exp : public llama_model_base {
                           float   kq_scale,
                             int   il);
 
-        // Attention over the complete cache window, masked down to the selected cells.
-        ggml_tensor * build_qsa_scan(
-        llm_graph_input_attn_kv * inp,
-                    ggml_tensor * q_cur,
-                    ggml_tensor * top_k,
-                          float   kq_scale,
-                            int   il);
+        llm_graph_input_kpool * build_inp_kpool(const llama_memory_hybrid_idx_context * mctx_hyb);
 
-        // Attention over only the selected cells, gathered into a window per query.
-        ggml_tensor * build_qsa_gather(
-        llm_graph_input_attn_kv * inp,
-                    ggml_tensor * q_cur,
-                    ggml_tensor * top_k,
-                          float   kq_scale,
-                            int   il);
-
-        // the QSA cache layout inputs do not depend on the layer, only on its compress ratio,
-        // so the layers sharing a ratio share one input set
-        std::map<uint32_t, llm_graph_input_qsa *> qsa_inps;
-
-        // one [1, n_kv, n_q] view of the KQ mask for every gather layer: the scheduler copies
-        // each distinct view of a host input to the device, so a view per layer copies the mask per layer
+        ggml_tensor * build_qsa_gather(llm_graph_input_attn_kv * inp, ggml_tensor * q_cur,
+                                      float kq_scale, int il);
+        // Per-layer selection from final kpool scoring, consumed immediately
+        // by build_attn_qsa; dead slots are clamped and masked independently.
+        ggml_tensor * qsa_selected_idxs = nullptr;
+        ggml_tensor * qsa_selected_live = nullptr;
         ggml_tensor * qsa_mask_cells = nullptr;
 
-        // QSA: token indices this layer's queries may attend to, or nullptr for dense
-        ggml_tensor * build_qsa_top_k(
+        // Final QSA additive mask includes the causal mask and distinct dead slots.
+        ggml_tensor * build_qsa_sel(
   const llama_memory_hybrid_idx_context * mctx_hyb,
           llm_graph_input_kpool * inp_kpool,
                     ggml_tensor * cur,

@@ -619,7 +619,8 @@ static bool devices_support_vbr_vmm(const std::vector<ggml_backend_dev_t> & devi
 static std::pair<llama_model_ptr, llama_context_ptr> get_model_and_ctx(
         struct gguf_context * gguf_ctx, FILE * file, const size_t seed, const std::vector<ggml_backend_dev_t> & devs,
         const llama_split_mode split_mode = LLAMA_SPLIT_MODE_LAYER, bool encode = false,
-        ggml_backend_sched_eval_callback cb_eval = nullptr, void * cb_eval_user_data = nullptr, float stdev = 0.01f) {
+        ggml_backend_sched_eval_callback cb_eval = nullptr, void * cb_eval_user_data = nullptr, float stdev = 0.01f,
+        const llama_model_tensor_buft_override * tensor_buft_overrides = nullptr) {
     GGML_ASSERT((gguf_ctx == nullptr) != (file == nullptr));
     llama_model_params model_params = llama_model_default_params();
     model_params.progress_callback = silent_model_load_progress;
@@ -1504,10 +1505,10 @@ static void test_qwen4_indexed_cache_admission(const size_t seed) {
 
     // The index cache must still be populated when every cache cell fits within
     // the QSA budget, but selection-only graph work must disappear.  Pin the exact
-    // ratio-4 boundary: top_k 253 selects at most 256 cells, while 252 selects 255.
+    // ratio-4 boundary: top_k 256 covers all 256 cells, while 252 selects 255.
     {
         gguf_context_ptr dense_gguf = get_gguf_ctx(LLM_ARCH_QWEN4EXP, true);
-        gguf_set_val_u32(dense_gguf.get(), "qwen4exp.attention.indexer.top_k", 253);
+        gguf_set_val_u32(dense_gguf.get(), "qwen4exp.attention.indexer.top_k", 256);
         qsa_trace dense_trace;
         auto dense = get_model_and_ctx(
                 dense_gguf.get(), nullptr, seed, {}, LLAMA_SPLIT_MODE_LAYER, false,
@@ -1549,7 +1550,7 @@ static void test_qwen4_indexed_cache_admission(const size_t seed) {
         GGML_ASSERT(sparse_trace.raw_key_nodes > 0);
         GGML_ASSERT(sparse_trace.score_nodes > 0);
         GGML_ASSERT(sparse_trace.top_k_nodes > 0);
-        GGML_ASSERT(sparse_trace.score_q_reshape_seen);
+        // Final upstream uses the fused lightning indexer, not the old explicit score matmul.
         GGML_ASSERT(!sparse_trace.score_q_has_redundant_cont);
     }
 
@@ -1559,7 +1560,7 @@ static void test_qwen4_indexed_cache_admission(const size_t seed) {
     {
         gguf_context_ptr transition_gguf = get_gguf_ctx(LLM_ARCH_QWEN4EXP, true);
         gguf_set_val_u32(transition_gguf.get(), "qwen4exp.context_length", 512);
-        gguf_set_val_u32(transition_gguf.get(), "qwen4exp.attention.indexer.top_k", 253);
+        gguf_set_val_u32(transition_gguf.get(), "qwen4exp.attention.indexer.top_k", 256);
         qsa_trace transition_trace;
         auto transition = get_model_and_ctx(
                 transition_gguf.get(), nullptr, seed, {}, LLAMA_SPLIT_MODE_LAYER, false,
@@ -1837,6 +1838,24 @@ static void test_qwen4_indexed_cache_admission(const size_t seed) {
         assert_mirrored(0);
         assert_mirrored(1);
 
+        // Shared pooled representatives cannot express partial aliasing. Both
+        // copy entry points must refuse before touching any child or metadata.
+        const auto snapshot = [&]() {
+            std::vector<uint8_t> data(llama_state_get_size(mutation_ctx.get()));
+            const size_t written = llama_state_get_data(mutation_ctx.get(), data.data(), data.size());
+            GGML_ASSERT(written == data.size());
+            return data;
+        };
+        const auto before_partial_copy = snapshot();
+        for (const auto & range : { std::pair<llama_pos, llama_pos>{ 1, -1 }, { 0, 3 } }) {
+            GGML_ASSERT(!mutation_memory->try_seq_cp(0, 1, range.first, range.second));
+            GGML_ASSERT(snapshot() == before_partial_copy);
+            GGML_ASSERT(!mutation_memory->try_seq_cp_transient(0, 1, range.first, range.second));
+            GGML_ASSERT(snapshot() == before_partial_copy);
+            assert_mirrored(0);
+            assert_mirrored(1);
+        }
+
         GGML_ASSERT(!mutation_memory->try_seq_cp(0, 1, 0, -1));
         assert_mirrored(1);
         GGML_ASSERT(mutation_attn->seq_pos_max(1) == -1);
@@ -2078,7 +2097,7 @@ static void test_qwen4_vbr_cuda(const size_t seed) {
 
     // The 256-cell padded dense frontier becomes sparse when the continuation
     // grows to 512. This is the same boundary used by the CPU QSA mutation test.
-    model->hparams.indexer_top_k = 253;
+    model->hparams.indexer_top_k = 256;
 
     const auto assert_finite = [&](llama_context * ctx, int32_t i) {
         const float * logits = llama_get_logits_ith(ctx, i);
@@ -2356,8 +2375,8 @@ static void test_qwen4_vbr_cuda(const size_t seed) {
     GGML_ASSERT(std::isfinite(stream0_nmse) && stream0_nmse <= 1.0e-10);
     GGML_ASSERT(std::isfinite(stream1_nmse) && stream1_nmse <= 1.0e-10);
 
-    // Unified KV has one physical QSA layout. A shared prefix followed by private continuations
-    // therefore falls back to dense attention; compare each query with its isolated history.
+    // Final kpool tracks per-sequence groups in unified KV, including a shared
+    // prefix followed by private continuations. Compare sparse isolated histories.
     const auto isolated_fork = [&](llama_token private_base, llama_token query_token) {
         llama_context_ptr isolated(llama_init_from_model(model.get(), sequential_params));
         GGML_ASSERT(isolated != nullptr);
@@ -2376,12 +2395,8 @@ static void test_qwen4_vbr_cuda(const size_t seed) {
         llama_batch_free(query);
         return last_logits(isolated.get());
     };
-    const auto saved_ratios = model->hparams.dsv4_compress_ratios;
-    std::fill(model->hparams.dsv4_compress_ratios.begin(),
-              model->hparams.dsv4_compress_ratios.end(), 0);
     const auto fork_ref0 = isolated_fork(1, 17);
     const auto fork_ref1 = isolated_fork(9, 23);
-    model->hparams.dsv4_compress_ratios = saved_ratios;
 
     qsa_gather_trace fork_trace;
     llama_context_params fork_params = streams_params;
@@ -2427,7 +2442,7 @@ static void test_qwen4_vbr_cuda(const size_t seed) {
     common_batch_add(fork_queries, 23, 64, { 1 }, true);
     GGML_ASSERT(llama_decode(fork_ctx.get(), fork_queries) == 0);
     llama_batch_free(fork_queries);
-    GGML_ASSERT(fork_trace.top_k == 0 && fork_trace.selected_k == 0 && fork_trace.selected_v == 0);
+    GGML_ASSERT(fork_trace.top_k > 0 && fork_trace.selected_k > 0 && fork_trace.selected_v > 0);
     const double fork0_nmse = nmse(fork_ref0, logits_ith(fork_ctx.get(), 0));
     const double fork1_nmse = nmse(fork_ref1, logits_ith(fork_ctx.get(), 1));
     GGML_ASSERT(std::isfinite(fork0_nmse) && fork0_nmse <= 1.0e-10);
@@ -2743,7 +2758,8 @@ static void test_qwen4_vbr_cuda(const size_t seed) {
     // relocated restore must reproduce it, proving the restored index bytes
     // are not merely plausible metadata.
     GGML_ASSERT(memory->seq_rm(1, -1, -1));
-    GGML_ASSERT(memory->try_seq_cp(0, 1, 0, 321));
+    // Source ends at 320: final pooled indexers share only whole sequences.
+    GGML_ASSERT(memory->try_seq_cp(0, 1, 0, -1));
     llama_batch qsa_reference_batch = llama_batch_init(1, 0, 1);
     common_batch_add(qsa_reference_batch, 1, 321, { 1 }, true);
     GGML_ASSERT(llama_decode(ctx.get(), qsa_reference_batch) == 0);
@@ -2869,9 +2885,23 @@ static void test_qwen4_vbr_cuda(const size_t seed) {
         uint32_t layer = 0;
         uint64_t width = 0;
         read_native_scalar(layer);
+        const size_t width_offset = native_offset;
         read_native_scalar(width);
         GGML_ASSERT(layer == index_layers[i] && width ==
             uint64_t(idx->get_k_storage(layer)->ne[0]));
+        if (i == 0) {
+            // A raw-only pre-kpool image cannot restore into raw|pooled rows.
+            auto raw_only = qsa_bytes;
+            const uint64_t old_width = model->hparams.indexer_head_size;
+            GGML_ASSERT(old_width < width);
+            std::memcpy(raw_only.data() + width_offset, &old_width, sizeof(old_width));
+            artifact_segment_chain old_chain(raw_only.size());
+            GGML_ASSERT(old_chain.append(raw_only.data(), raw_only.size()));
+            std::unique_ptr<vbr_parsed_companion_image> refused;
+            GGML_ASSERT(!vbr_parse_qsa_index_companion(nullptr, qsa_descriptor, old_chain, qsa_target, refused));
+            GGML_ASSERT(!refused);
+            assert_qsa_image(qsa_layout);
+        }
     }
     llama_pos encoded_terminal = -1;
     uint32_t encoded_stream = 0, encoded_cells = 0;
@@ -4510,6 +4540,7 @@ static int test_backends(const std::string & arch_filter, const size_t seed, con
                 std::string status_roundtrip = "\033[1;33mSKIP\033[0m";
                 std::string status_mixed     = "\033[1;33mSKIP\033[0m";
                 char nmse_str[12] = {0};
+                char mixed_str[12] = {0};
                 bool test_executed = false;
                 bool test_ok = true;
                 bool skip = !arch_supported(arch) || (dc.split_mode == LLAMA_SPLIT_MODE_TENSOR &&
@@ -4532,7 +4563,7 @@ static int test_backends(const std::string & arch_filter, const size_t seed, con
                         logits_cpu = get_logits(model_and_ctx_cpu.first.get(), model_and_ctx_cpu.second.get(), tokens, encode);
                     }
                     if (dc.split_mode != LLAMA_SPLIT_MODE_TENSOR || llm_arch_supports_sm_tensor(arch)) {
-                        model_and_ctx_dev = get_model_and_ctx(gguf_ctx.get(), nullptr, seed, dc.devs, dc.split_mode, encode, nullptr, nullptr, stdev);
+                        model_and_ctx_dev = get_model_and_ctx(gguf_ctx.get(), nullptr, seed, dc.devs, dc.split_mode, encode, nullptr, nullptr, stdev, overrides);
                         if (dc.split_mode == LLAMA_SPLIT_MODE_TENSOR &&
                             (arch == LLM_ARCH_QWEN3NEXT || arch == LLM_ARCH_QWEN35 ||
                              arch == LLM_ARCH_QWEN35MOE || arch == LLM_ARCH_QWEN4EXP)) {
@@ -4697,7 +4728,7 @@ static int test_backends(const std::string & arch_filter, const size_t seed, con
                                 const double nmse_mixed = nmse(logits_chunks, logits_mixed);
                                 snprintf(mixed_str, sizeof(mixed_str), "(%.2e)", nmse_mixed);
                                 status_mixed = "\033[1;32mOK\033[0m";
-                                if (nmse_mixed > 1e-4) {
+                                if (!(nmse_mixed <= 1e-4)) {
                                     test_ok = false;
                                     status_mixed = "\033[1;31mFAIL\033[0m";
                                 }
@@ -4741,7 +4772,7 @@ static int test_backends(const std::string & arch_filter, const size_t seed, con
                         ms.save(file.get());
                         rewind(file.get());
 
-                        auto model_and_ctx_roundtrip = get_model_and_ctx(nullptr, file.get(), seed, dc.devs, dc.split_mode, encode, nullptr, nullptr, stdev);
+                        auto model_and_ctx_roundtrip = get_model_and_ctx(nullptr, file.get(), seed, dc.devs, dc.split_mode, encode, nullptr, nullptr, stdev, overrides);
                         const std::vector<float> logits_roundtrip = get_logits(
                             model_and_ctx_roundtrip.first.get(), model_and_ctx_roundtrip.second.get(), tokens, encode);
                         status_roundtrip = "\033[1;32mOK\033[0m";
@@ -4782,11 +4813,50 @@ static int test_backends(const std::string & arch_filter, const size_t seed, con
     return all_ok && n_tests > 0 ? 0 : 1;
 }
 
+static void test_extended_batch_view() {
+    llama_batch_ext ext(4, 2, 4, 8, nullptr, 32, 4);
+    const float media[] = { 0.25f, -0.5f };
+    const llama_pos text_pos[] = { 7, 99, 99, 99 };
+    const llama_pos media_pos[] = { 8, 2, 3, 0 };
+    const int text = ext.add_token(6);
+    const int embd = ext.add_token(6);
+    GGML_ASSERT(ext.add_seq(text, 7));
+    GGML_ASSERT(ext.set_token_id(text, 3));
+    GGML_ASSERT(ext.set_token_pos(text, text_pos));
+    GGML_ASSERT(ext.set_token_embd(embd, { media, 1, 2 }));
+    GGML_ASSERT(ext.set_token_pos(embd, media_pos));
+    GGML_ASSERT(ext.set_decision_order(text, 2));
+    llama_batch view = {};
+    GGML_ASSERT(!ext.get_batch(view)); // raw ABI cannot carry mixed/order metadata
+    GGML_ASSERT(ext.get_batch(view, true));
+    GGML_ASSERT(view.n_tokens == 2 && view.token[0] == 3 && view.token[1] == 0);
+    GGML_ASSERT(view.embd[0] == 0 && view.embd[1] == 0 && view.embd[2] == media[0] && view.embd[3] == media[1]);
+    GGML_ASSERT((ext.flat_type == std::vector<int8_t>{ 0, 1 }));
+    GGML_ASSERT((ext.flat_decision_order == std::vector<int32_t>{ 2, 0 }));
+    GGML_ASSERT((ext.flat_pos == std::vector<llama_pos>{ 7, 8, 7, 2, 7, 3, 0, 0 }));
+    GGML_ASSERT(view.n_seq_id[0] == 2 && view.n_seq_id[1] == 1);
+    ext.tokens[1].seq_ids.insert(8);
+    GGML_ASSERT(!ext.get_batch(view, true));
+    ext.tokens[1].seq_ids.erase(8);
+    GGML_ASSERT(ext.get_batch(view, true));
+
+    // All-embedding and all-both-bearing MTP batches retain borrowed storage.
+    ext.clear();
+    const int row = ext.add_token(0);
+    GGML_ASSERT(ext.set_token_embd(row, { media, 1, 2 }));
+    GGML_ASSERT(ext.set_token_pos(row, media_pos));
+    GGML_ASSERT(ext.get_batch(view, true) && view.embd == ext.embd.data());
+    GGML_ASSERT(ext.set_token_id(row, 4));
+    GGML_ASSERT(ext.get_batch(view, true) && view.embd == ext.embd.data() && view.token[0] == 4);
+    GGML_ASSERT(ext.flat_type.empty());
+}
+
 int main(int argc, char ** argv) {
     // init the logger at max verbosity. filter with a custom callback respecting the user-configure verbosity
     common_log_set_verbosity_thold(LOG_LEVEL_DEBUG);
     common_init();
     llama_backend_init();
+    test_extended_batch_view();
 
     std::random_device rd;
 

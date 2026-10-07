@@ -3,6 +3,7 @@
 
 #include "arg.h"
 #include "common.h"
+#include "log.h"
 #include "ggml-backend.h"
 #include "llama-batch.h"
 #include "llama-io.h"
@@ -71,6 +72,85 @@ static llama_context_ptr init_ctx(llama_model * model, llama_context_params cpar
     return ctx;
 }
 
+static bool test_shared_seq_reserve(const common_params & params, llama_model * model) {
+    const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model));
+
+    // these archs reserve the final pp graph with n_seqs = 1, so every multi-seq
+    // graph has a different layout and re-reserves by design
+    // see [TAG_RESERVE_DIAG_DECAY] in llama-context.cpp
+    char arch_str[64] = {};
+    llama_model_meta_val_str(model, "general.architecture", arch_str, sizeof(arch_str));
+    if (strcmp(arch_str, "kimi-linear") == 0 || strcmp(arch_str, "minimax-01") == 0) {
+        LOG_INF("%s: skipping %s, its reserve uses n_seqs = 1\n", __func__, arch_str);
+        return true;
+    }
+
+    constexpr uint32_t n_seqs     = 2;
+    constexpr uint32_t n_prompt   = 128;
+    constexpr uint32_t n_continue = 32;
+
+    auto cparams = common_context_params_to_llama(params);
+    cparams.n_seq_max  = n_seqs;
+    cparams.n_ctx      = 512;
+    cparams.n_batch    = 256;
+    cparams.n_ubatch   = 64;
+    cparams.kv_unified = true; // only a unified cache shares cells on seq_cp
+
+    llama_context_ptr ctx = init_ctx(model, cparams);
+    if (!ctx) {
+        LOG_ERR("%s: failed to init context\n", __func__);
+        return false;
+    }
+
+    const auto tok = [&](uint32_t seq, llama_pos pos) {
+        return (llama_token) ((7*(uint32_t) pos + 31*seq + 1) % (uint32_t) n_vocab);
+    };
+
+    {
+        common_batch batch(ctx.get());
+        for (llama_pos pos = 0; pos < (llama_pos) n_prompt; ++pos) {
+            batch.add(tok(0, pos), pos, 0, false);
+        }
+        if (llama_process(ctx.get(), LLAMA_PROCESS_TYPE_DECODE, batch.get()) != 0) {
+            LOG_ERR("%s: prompt decode failed\n", __func__);
+            return false;
+        }
+    }
+
+    // this is what llama-batched-bench does for -pps
+    llama_memory_seq_cp(llama_get_memory(ctx.get()), 0, 1, -1, -1);
+
+    for (uint32_t i = 0; i < n_continue; ++i) {
+        const llama_pos pos = (llama_pos) (n_prompt + i);
+
+        common_batch batch(ctx.get());
+        for (uint32_t s = 0; s < n_seqs; ++s) {
+            batch.add(tok(s, pos), pos, (llama_seq_id) s, true);
+        }
+        if (llama_process(ctx.get(), LLAMA_PROCESS_TYPE_DECODE, batch.get()) != 0) {
+            LOG_ERR("%s: shared-seq decode failed at step %u\n", __func__, i);
+            return false;
+        }
+
+        for (uint32_t s = 0; s < n_seqs; ++s) {
+            const float * logits = llama_get_logits_ith(ctx.get(), (int) s);
+            if (logits == nullptr) {
+                LOG_ERR("%s: missing shared-seq logits at index %u\n", __func__, s);
+                return false;
+            }
+            for (int t = 0; t < n_vocab; ++t) {
+                if (!std::isfinite(logits[t])) {
+                    LOG_ERR("%s: non-finite shared-seq logit at step %u, seq %u, index %d\n", __func__, i, s, t);
+                    return false;
+                }
+            }
+        }
+    }
+
+    LOG_INF("%s: shared-seq decode succeeded (%u tokens after seq_cp)\n", __func__, n_continue*n_seqs);
+    return true;
+}
+
 static float logit_diff(float a, float b) {
     return std::isfinite(a) && std::isfinite(b) ? std::fabs(a - b) : std::numeric_limits<float>::infinity();
 }
@@ -122,6 +202,14 @@ static bool check_depth(llama_context * ctx, llama_seq_id seq_id, uint32_t expec
         return false;
     }
     return true;
+}
+
+static bool decode_one(llama_context * ctx, llama_token token, llama_pos pos, llama_seq_id seq_id) {
+    llama_batch batch = llama_batch_init(1, 0, 1);
+    common_batch_add(batch, token, pos, { seq_id }, true);
+    const bool ok = llama_decode(ctx, batch) == 0;
+    llama_batch_free(batch);
+    return ok;
 }
 
 static bool decode_range(
@@ -1885,7 +1973,8 @@ static int run_model(int argc, char ** argv) {
         return 1;
     }
 
-    if (!test_multi_seq_split_replay(params, model, n_vocab)) {
+    if (!test_multi_seq_split_replay(params, model, n_vocab) ||
+        !test_shared_seq_reserve(params, model)) {
         return 1;
     }
 
