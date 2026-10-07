@@ -560,7 +560,6 @@ class MODEL_ARCH(IntEnum):
     GEMMA4           = auto()
     GEMMA4_ASSISTANT = auto()
     GEMMA_EMBEDDING  = auto()
-    GEMMA_EMBEDDING2 = auto()
     STARCODER2       = auto()
     RWKV6            = auto()
     RWKV6QWEN2       = auto()
@@ -590,7 +589,6 @@ class MODEL_ARCH(IntEnum):
     GLM4             = auto()
     GLM4_MOE         = auto()
     GLM_DSA          = auto()
-    GLM5_NEXT        = auto()
     BITNET           = auto()
     T5               = auto()
     T5ENCODER        = auto()
@@ -661,6 +659,11 @@ class MODEL_ARCH(IntEnum):
     NANBEIGE         = auto()
     QWEN3TTS         = auto()
     POCKETTTS        = 150
+    # Append upstream additions without renumbering existing fork symbols.
+    GEMMA_EMBEDDING2 = 248
+    GLM5_NEXT = 249
+    CLEF = 250
+    K2HORIZON = 251
 
 
 class VISION_PROJECTOR_TYPE(IntEnum):
@@ -869,7 +872,6 @@ class MODEL_TENSOR(IntEnum):
     DEC_ATTN_OUT         = auto()
     DEC_ATTN_REL_B       = auto()
     DEC_CROSS_ATTN_NORM  = auto()
-    DEC_CROSS_ATTN_NORM_KV = auto()
     DEC_CROSS_ATTN_Q     = auto()
     DEC_CROSS_ATTN_K     = auto()
     DEC_CROSS_ATTN_V     = auto()
@@ -894,19 +896,6 @@ class MODEL_TENSOR(IntEnum):
     CLS                  = auto() # classifier
     CLS_OUT              = auto() # classifier output projection
     CLS_NORM             = auto()
-    DECISION_HIDDEN_NORM          = auto()
-    DECISION_PROJ_MEMORY          = auto()
-    DECISION_PROJ_QUESTION        = auto()
-    DECISION_PROJ_OPTION_QUESTION = auto()
-    DECISION_PROJ_GLOBAL          = auto()
-    DECISION_PROJ_OPTION_CONTEXT  = auto()
-    DECISION_PROJ_OPTION_LEXICAL  = auto()
-    DECISION_OPTION_SUMMARY_NORM  = auto()
-    DECISION_FIELD_NORM           = auto()
-    DECISION_OPTION_NORM          = auto()
-    DECISION_SCALES               = auto()
-    DECISION_SCORER               = auto()
-    DECISION_SCORER_OUT           = auto()
     CONV1D               = auto()
     CONVNEXT_DW          = auto()
     CONVNEXT_NORM        = auto()
@@ -942,10 +931,6 @@ class MODEL_TENSOR(IntEnum):
     INDEXER_COMPRESSOR_WGATE = auto()
     INDEXER_COMPRESSOR_APE = auto()
     INDEXER_COMPRESSOR_NORM = auto()
-    INDEXER_KPOOL_GATE   = auto()
-    INDEXER_KPOOL_APE    = auto()
-    ATTN_V_GATE          = auto() # k2-horizon MoVA router
-    ATTN_V_EXP           = auto() # k2-horizon MoVA value experts
     # vision
     V_MMPROJ             = auto()
     V_MMPROJ_FC          = auto()
@@ -1299,6 +1284,25 @@ class MODEL_TENSOR(IntEnum):
     A_QF_FFN_UP            = auto()
     A_QF_FFN_DOWN          = auto()
     A_QF_FFN_NORM          = auto()
+    # Append upstream additions without renumbering existing fork symbols.
+    DEC_CROSS_ATTN_NORM_KV = 587
+    DECISION_HIDDEN_NORM = 588
+    DECISION_PROJ_MEMORY = 589
+    DECISION_PROJ_QUESTION = 590
+    DECISION_PROJ_OPTION_QUESTION = 591
+    DECISION_PROJ_GLOBAL = 592
+    DECISION_PROJ_OPTION_CONTEXT = 593
+    DECISION_PROJ_OPTION_LEXICAL = 594
+    DECISION_OPTION_SUMMARY_NORM = 595
+    DECISION_FIELD_NORM = 596
+    DECISION_OPTION_NORM = 597
+    DECISION_SCALES = 598
+    DECISION_SCORER = 599
+    DECISION_SCORER_OUT = 600
+    INDEXER_KPOOL_GATE = 601
+    INDEXER_KPOOL_APE = 602
+    ATTN_V_GATE = 603
+    ATTN_V_EXP = 604
 
 
 MODEL_ARCH_NAMES: dict[MODEL_ARCH, str] = {

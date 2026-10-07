@@ -1360,7 +1360,8 @@ struct llm_graph_context {
     // inputs
     //
 
-    ggml_tensor * build_inp_embd(ggml_tensor * tok_embd) const;
+    // tok_scale applies only to token rows, never caller-provided media embeddings.
+    ggml_tensor * build_inp_embd(ggml_tensor * tok_embd, float tok_scale = 1.0f, bool tok_bf16 = false) const;
     ggml_tensor * build_get_rows_embd(ggml_tensor * tok_embd, ggml_tensor * tokens) const;
     ggml_tensor * build_inp_pos() const;
     ggml_tensor * build_inp_attn_scale() const;

@@ -3,6 +3,7 @@
 #include "llama-ext.h"
 
 #include <cmath>
+#include <algorithm>
 
 void llama_model_clef::load_arch_hparams(llama_model_loader & ml) {
     llama_model_qwen35::load_arch_hparams(ml);
@@ -27,13 +28,14 @@ void llama_model_clef::load_arch_tensors(llama_model_loader & ml) {
 
     LLAMA_LOAD_LOCALS;
 
-    const auto * w_memory = ml.get_weight(tn(LLM_TENSOR_DECISION_PROJ_MEMORY, "weight").str().c_str());
-    const auto * w_ffn    = ml.get_weight(tn(LLM_TENSOR_DEC_FFN_UP, "weight", 0).str().c_str());
-    if (w_memory == nullptr || w_ffn == nullptr) {
+    ggml_type memory_type, ffn_type;
+    std::array<int64_t, GGML_MAX_DIMS> memory_shape, ffn_shape;
+    if (!ml.get_tensor_info(tn(LLM_TENSOR_DECISION_PROJ_MEMORY, "weight").str().c_str(), memory_type, memory_shape) ||
+        !ml.get_tensor_info(tn(LLM_TENSOR_DEC_FFN_UP, "weight", 0).str().c_str(), ffn_type, ffn_shape)) {
         throw std::runtime_error("the decision head is missing");
     }
-    const int64_t n_embd_h = w_memory->tensor->ne[1];
-    const int64_t n_ff_h   = w_ffn->tensor->ne[1];
+    const int64_t n_embd_h = memory_shape[1];
+    const int64_t n_ff_h   = ffn_shape[1];
 
     if (n_embd_h % n_head_decision != 0) {
         throw std::runtime_error("invalid width of the decision head");

@@ -85,6 +85,7 @@ class Qwen4ExpTextModel(_Qwen35MRopeMixin, _LinearAttentionVReorderBase):
         # the MTP block is a full-attention QSA layer too
         self.gguf_writer.add_attention_compress_ratios(
             [ratio if layer_types[i] in ("full_attention", "qwen_sparse_attention") else 0 for i in range(n_layer)]
+            + [ratio] * (self.block_count - n_layer)
         )
 
         # ple_layer_ids is 1-based in the HF config; empty means no n-gram table,

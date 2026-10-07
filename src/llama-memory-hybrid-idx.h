@@ -3,6 +3,8 @@
 #include "llama-memory-hybrid.h"
 
 #include <map>
+#include <array>
+#include <limits>
 #include <memory>
 #include <vector>
 
@@ -92,11 +94,30 @@ public:
 
     llama_kv_cache * get_mem_idx() const;   // nullptr when the model carries no indexer
 
+    // Companion restore writes the child directly; invalidate derived pool
+    // layouts after installing bytes or rolling a failed install back.
+    void index_state_restored();
+
     // qwen4exp QSA keeps each block's pooled indexer key, already normed and rotated, across
     // ubatches, so a step re-pools only the blocks whose members changed (unified cache only).
     // F32 [idx_dim, max_blocks + 1]: row b holds block b, the last row absorbs padded updates.
     // nullptr when layer il has no indexer or the cache is not unified.
     ggml_tensor * get_qsa_pooled(int32_t il) const;
+
+    uint32_t get_kpool() const { return hparams_idx.indexer_kpool; }
+    bool get_kpool_by_order() const { return hparams_idx.indexer_kpool_by_order; }
+    struct kpool_layout;
+    const kpool_layout & kpool_layout_update();
+    const kpool_layout & kpool_layout_get() const;
+    using stale_pos_t = std::array<llama_pos, LLAMA_MAX_SEQ>;
+    static constexpr llama_pos POS_CLEAN = std::numeric_limits<llama_pos>::max();
+    static stale_pos_t stale_pos_clean() {
+        stale_pos_t res;
+        res.fill(POS_CLEAN);
+        return res;
+    }
+    const stale_pos_t & mem_idx_stale_get() const { return mem_idx_stale; }
+    void mem_idx_stale_clear() { mem_idx_stale.fill(POS_CLEAN); }
 
 private:
     friend class llama_memory_hybrid_idx_context;
@@ -113,6 +134,10 @@ private:
     llama_hparams hparams_idx;
 
     const std::unique_ptr<llama_kv_cache> mem_idx;
+    std::unique_ptr<kpool_layout> kpool_lay;
+    void mem_idx_stale_set(llama_seq_id seq_id, llama_pos p0);
+    llama_pos mem_idx_stale_pos(llama_seq_id seq_id, llama_pos p0) const;
+    stale_pos_t mem_idx_stale = stale_pos_clean();
 
     std::vector<std::pair<ggml_context_ptr, ggml_backend_buffer_ptr>> qsa_ctxs_bufs;
     std::map<int32_t, ggml_tensor *> qsa_pooled;
@@ -205,6 +230,13 @@ public:
 
     // streams in the current slot info, the `ns` of get_k/get_v; 1 if unified
     uint32_t get_n_stream() const;
+
+    uint32_t get_n_kpool() const;
+    uint32_t get_n_kpool_new() const;
+    kpool_access get_kpool_access(ggml_context * ctx, int32_t il, int64_t n_embd) const;
+    void set_input_kpool(ggml_tensor * pool_cells, ggml_tensor * pool_idxs, ggml_tensor * pool_mask, ggml_tensor * tail_idxs,
+                        ggml_tensor * sel_mask, ggml_tensor * new_pool_idxs, ggml_tensor * new_pool_rep,
+                        const llama_ubatch * ubatch, ggml_tensor * new_pool_pos = nullptr) const;
 
     // A unified physical stream can expose one block layout only. Sparse selection is safe when
     // the current ubatch has one logical sequence; separate physical streams are independent.

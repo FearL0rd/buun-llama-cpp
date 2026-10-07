@@ -358,6 +358,8 @@ static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params
             return new llama_model_spark2_5(params);
         case LLM_ARCH_DFLASH_DRAFT:
             return new llama_model_dflash_draft(params);
+        case LLM_ARCH_K2_HORIZON:
+            return new llama_model_k2_horizon(params);
         case LLM_ARCH_GEMMA4_DFLASH_DRAFT:
             return new llama_model_gemma4_dflash_draft(params);
         default:
@@ -418,7 +420,7 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
         (ud->model->arch == LLM_ARCH_DFLASH && hparams.dsv4_hc_mult > 0);
     const bool is_qwen_hybrid = ud->model->arch == LLM_ARCH_QWEN3NEXT ||
         ud->model->arch == LLM_ARCH_QWEN35 || ud->model->arch == LLM_ARCH_QWEN35MOE ||
-        ud->model->arch == LLM_ARCH_QWEN4EXP;
+        ud->model->arch == LLM_ARCH_QWEN4EXP || ud->model->arch == LLM_ARCH_CLEF;
 
     static const std::regex pattern_q_weight        ("blk\\.\\d*\\.attn_q.weight");
     static const std::regex pattern_kv_weight       ("blk\\.\\d*\\.attn_(k|v).weight");
@@ -779,7 +781,7 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             return {{q_rows, 1}, {k_rows, 1}, {v_rows, 1}};
         }
         if (ud->model->arch == LLM_ARCH_QWEN3NEXT || ud->model->arch == LLM_ARCH_QWEN35 || ud->model->arch == LLM_ARCH_QWEN35MOE ||
-                ud->model->arch == LLM_ARCH_QWEN4EXP) {
+                ud->model->arch == LLM_ARCH_QWEN4EXP || ud->model->arch == LLM_ARCH_CLEF) {
 
             const int64_t head_k_dim = hparams.ssm_d_state;
             const int64_t head_v_dim = hparams.ssm_d_state;
@@ -985,6 +987,7 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             const int64_t granularity_v  = (granularity_kv / hparams.n_embd_head_k(il)) * hparams.n_embd_head_v(il);
             if (std::regex_match(tensor_name, pattern_kv_weight) ||
                 std::regex_match(tensor_name, pattern_kv_scale) ||
+                std::regex_match(tensor_name, pattern_v_exps_weight) ||
                 std::regex_match(tensor_name, pattern_kv_bias) ||
                 std::regex_match(tensor_name, pattern_kv_cache)) {
                 GGML_ASSERT(segments.size() == 1);
@@ -3289,6 +3292,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
         case LLM_ARCH_RND1:
         case LLM_ARCH_DFLASH_DRAFT:
         case LLM_ARCH_GEMMA4_DFLASH_DRAFT:
+        case LLM_ARCH_CLEF:
             {
                 res = nullptr;
             } break;
@@ -3381,14 +3385,9 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                     return il < hparams.n_layer() && hparams.is_recr(il);
                 };
 
-                // the draft head is a single DSA layer
+                // Tensor export alone is not an implemented draft graph.
                 if (params.ctx_type == LLAMA_CONTEXT_TYPE_MTP) {
-                    if (hparams.n_layer_nextn == 0) {
-                        throw std::runtime_error("GLM5-Next MTP requires the NextN block, convert without --no-mtp");
-                    }
-                    filter_attn = [&](uint32_t il) { return il >= hparams.n_layer(); };
-                    filter_idx  = [&](uint32_t il) { return il >= hparams.n_layer(); };
-                    filter_recr = [&](uint32_t)    { return false; };
+                    throw std::runtime_error("GLM5-Next NextN graph is not implemented");
                 }
 
                 res = new llama_memory_hybrid_idx(
@@ -3409,7 +3408,8 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                     /* unified           */ cparams.kv_unified,
                     /* filter_attn       */ std::move(filter_attn),
                     /* filter_recr       */ std::move(filter_recr),
-                    /* filter_idx        */ std::move(filter_idx));
+                    /* filter_idx        */ std::move(filter_idx),
+                    /* vbr               */ vbr);
             } break;
         case LLM_ARCH_HY_V4:
             {
@@ -3578,11 +3578,14 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
         // checks
         default:
             {
-                // Dense MTP heads use a plain attention KV cache instead of the hybrid wrapper.
+                const bool qwen4_mtp_indexed = arch == LLM_ARCH_QWEN4EXP && hparams.n_layer_nextn > 0 &&
+                    layers[hparams.n_layer()].index_k_proj && hparams.dsv4_compress_ratios[hparams.n_layer()] > 0;
+                // Legacy dense MTP heads keep their plain attention cache; QSA
+                // draft heads need the indexed wrapper with an empty recurrent child.
                 const bool mtp_on_hybrid_qwen =
                     params.ctx_type == LLAMA_CONTEXT_TYPE_MTP &&
                     (arch == LLM_ARCH_QWEN3NEXT || arch == LLM_ARCH_QWEN35 || arch == LLM_ARCH_QWEN35MOE ||
-                     arch == LLM_ARCH_QWEN4EXP || arch == LLM_ARCH_BAILINGMOE3);
+                     (arch == LLM_ARCH_QWEN4EXP && !qwen4_mtp_indexed) || arch == LLM_ARCH_BAILINGMOE3);
 
                 const bool mtp_on_hybrid_nemotron =
                     params.ctx_type == LLAMA_CONTEXT_TYPE_MTP && arch == LLM_ARCH_NEMOTRON_H_MOE;

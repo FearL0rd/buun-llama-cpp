@@ -252,6 +252,16 @@ LLAMA_API void llama_mtp_draft_chain_record(struct llama_context * ctx, int32_t 
 // Synchronize and return the recorded tokens; *probs receives the confidences.
 LLAMA_API const llama_token * llama_mtp_draft_chain_tokens(struct llama_context * ctx, const float ** probs);
 
+// Joint decision-head span labels. Adjacent equal labels form a span; zero separates spans.
+enum llama_decision_order {
+    LLAMA_DECISION_ORDER_NONE = 0,
+    LLAMA_DECISION_ORDER_QUESTION_NOUL = 1,
+    LLAMA_DECISION_ORDER_QUESTION_CHOICE = 2,
+    LLAMA_DECISION_ORDER_QUESTION_SCORE = 3,
+    LLAMA_DECISION_ORDER_OPTION = 4,
+};
+LLAMA_API bool llama_batch_ext_set_decision_order(struct llama_batch_ext * batch, int32_t idx, enum llama_decision_order order);
+
 // mirrors:
 // LLAMA_API float * llama_get_embeddings(struct llama_context * ctx);
 LLAMA_API float * llama_get_embeddings_nextn(struct llama_context * ctx);
