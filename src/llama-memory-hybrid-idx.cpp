@@ -21,6 +21,40 @@
 // llama_memory_hybrid_idx
 //
 
+namespace {
+
+// One grouping rule for the live incremental layout and pre-edit validation.
+// Return the first cell that could begin a pool after a later append.
+template<typename F>
+size_t kpool_visit(const std::vector<std::pair<llama_pos, uint32_t>> & cells,
+        size_t j, uint32_t kpool, bool by_order, F visit) {
+    if (cells.empty()) {
+        return j;
+    }
+    const llama_pos first = cells.front().first;
+    while (j + kpool <= cells.size()) {
+        bool complete = by_order;
+        if (!by_order && (cells[j].first - first) % (llama_pos) kpool == 0) {
+            complete = true;
+            for (uint32_t k = 1; k < kpool; ++k) {
+                if (cells[j + k].first != cells[j].first + (llama_pos) k) {
+                    complete = false;
+                    break;
+                }
+            }
+        }
+        if (complete) {
+            visit(j);
+            j += kpool;
+        } else {
+            ++j;
+        }
+    }
+    return j;
+}
+
+}
+
 llama_memory_hybrid_idx::llama_memory_hybrid_idx(
         const llama_model & model,
                             /* attn */
@@ -326,7 +360,58 @@ llama_pos llama_memory_hybrid_idx::mem_idx_stale_pos(llama_seq_id seq_id, llama_
     return p0;
 }
 
+bool llama_memory_hybrid_idx::kpool_can_remove(llama_seq_id seq_id, llama_pos p0, llama_pos p1) const {
+    // Separate streams never share a representative. Suffix/full removal
+    // cannot regroup surviving pools; keep speculative rollback constant-time.
+    if (!mem_idx || get_kpool() <= 1 || mem_idx->get_n_stream() != 1 ||
+            seq_id >= (llama_seq_id) LLAMA_MAX_SEQ ||
+            p1 < 0 || p0 >= p1 ||
+            (seq_id >= 0 && p1 > mem_idx->seq_pos_max(seq_id))) {
+        return true;
+    }
+    p0 = std::max<llama_pos>(p0, 0);
+    if (p1 < 0) {
+        p1 = std::numeric_limits<llama_pos>::max();
+    }
+    const auto & cells = mem_idx->get_cells(0);
+    const uint32_t kpool = get_kpool();
+    std::map<uint32_t, std::vector<uint32_t>> representatives;
+    bool compatible = true;
+    for (llama_seq_id s = 0; s < LLAMA_MAX_SEQ; ++s) {
+        const auto & positions = cells.seq_pos_get(s);
+        std::vector<std::pair<llama_pos, uint32_t>> remaining;
+        remaining.reserve(positions.size());
+        for (const auto & pc : positions) {
+            if ((seq_id < 0 || seq_id == s) && p0 <= pc.first && pc.first < p1) {
+                continue;
+            }
+            remaining.push_back(pc);
+        }
+        kpool_visit(remaining, 0, kpool, get_kpool_by_order(), [&](size_t j) {
+            const uint32_t rep = remaining[j + kpool - 1].second;
+            if (cells.seq_count(rep) <= 1) {
+                return;
+            }
+            std::vector<uint32_t> members;
+            members.reserve(kpool);
+            for (uint32_t k = 0; k < kpool; ++k) {
+                members.push_back(remaining[j + k].second);
+            }
+            const auto inserted = representatives.emplace(rep, members);
+            compatible &= inserted.second || inserted.first->second == members;
+        });
+        if (!compatible) {
+            LLAMA_LOG_WARN("%s: refusing edit that aliases different pools at a shared representative\n", __func__);
+            return false;
+        }
+    }
+    return true;
+}
+
 bool llama_memory_hybrid_idx::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
+    if (!kpool_can_remove(seq_id, p0, p1)) {
+        return false;
+    }
     // same order as llama_memory_hybrid::seq_rm: the recurrent cache can refuse, so try it first
     if (!get_mem_recr()->seq_rm(seq_id, p0, p1)) {
         return false;
@@ -344,6 +429,9 @@ bool llama_memory_hybrid_idx::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_po
 }
 
 bool llama_memory_hybrid_idx::seq_rm_attn(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
+    if (!kpool_can_remove(seq_id, p0, p1)) {
+        return false;
+    }
     // The indexer is auxiliary attention state. Every attention-only edit must retain the same
     // cell membership in both children, while deliberately leaving recurrent state untouched.
     if (mem_idx) {
@@ -357,6 +445,9 @@ bool llama_memory_hybrid_idx::seq_rm_attn(llama_seq_id seq_id, llama_pos p0, lla
 }
 
 bool llama_memory_hybrid_idx::seq_rm_transient(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
+    if (!kpool_can_remove(seq_id, p0, p1)) {
+        return false;
+    }
     if (!get_mem_recr()->seq_rm(seq_id, p0, p1)) {
         return false;
     }
@@ -371,6 +462,9 @@ bool llama_memory_hybrid_idx::seq_rm_transient(llama_seq_id seq_id, llama_pos p0
 }
 
 bool llama_memory_hybrid_idx::seq_rm_attn_transient(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
+    if (!kpool_can_remove(seq_id, p0, p1)) {
+        return false;
+    }
     if (mem_idx) {
         const llama_pos stale = mem_idx_stale_pos(seq_id, p0);
         const bool removed_idx = mem_idx->seq_rm_attn_transient(seq_id, p0, p1);
@@ -735,35 +829,8 @@ const llama_memory_hybrid_idx::kpool_layout & llama_memory_hybrid_idx::kpool_lay
         }
 
         // Pools start at the first valid token
-        size_t j = sq.j_next;
-        if (hparams_idx.indexer_kpool_by_order) {
-            // consecutive cells in sequence order, whatever their positions
-            for (; j + kpool <= sq.cells.size(); j += kpool) {
-                sq.pools.push_back((uint32_t) j);
-            }
-        } else {
-            while (j + kpool <= sq.cells.size()) {
-                const llama_pos p0 = sq.cells[j].first;
-                if ((p0 - sq.pos_min) % (llama_pos) kpool != 0) {
-                    ++j;
-                    continue;
-                }
-                bool ok = true;
-                for (uint32_t k = 1; k < kpool; ++k) {
-                    if (sq.cells[j + k].first != p0 + (llama_pos) k) {
-                        ok = false;
-                        break;
-                    }
-                }
-                if (ok) {
-                    sq.pools.push_back((uint32_t) j);
-                    j += kpool;
-                } else {
-                    ++j;
-                }
-            }
-        }
-        sq.j_next = j;
+        sq.j_next = kpool_visit(sq.cells, sq.j_next, kpool, hparams_idx.indexer_kpool_by_order,
+                [&](size_t j) { sq.pools.push_back((uint32_t) j); });
 
         lay.n_pool_real += (uint32_t) sq.pools.size();
     }
@@ -1026,7 +1093,10 @@ void llama_memory_hybrid_idx_context::kpool_build_state(const llama_ubatch & uba
     // as the count moves; reserve sizes the list for every pool the cache can hold, so never pad past n_pool_max
     const uint32_t n_pool_max = kv_size / kpool * idx->get_n_seq_max();
     const uint32_t bound = ubatch.n_tokens/kpool + ubatch.n_seqs_unq;
-    st.n_new_g = std::max({st.n_new, 1u, std::min({bound, kpool_pad(st.n_pool_real) - 1, n_pool_max})});
+    // Singleton pools can occupy every cell: there is no non-representative
+    // scratch row for scatter padding. Every nonempty ubatch marks a pool.
+    st.n_new_g = kpool == 1 ? std::max(st.n_new, 1u) :
+        std::max({st.n_new, 1u, std::min({bound, kpool_pad(st.n_pool_real) - 1, n_pool_max})});
 }
 
 const llama_memory_hybrid_idx_context::kpool_state & llama_memory_hybrid_idx_context::kpool_cur() const {
@@ -1050,7 +1120,7 @@ void llama_memory_hybrid_idx_context::set_input_kpool(ggml_tensor * pool_cells, 
     GGML_ASSERT(ggml_backend_buffer_is_host(pool_cells->buffer));
     GGML_ASSERT(ggml_backend_buffer_is_host(pool_idxs->buffer));
     GGML_ASSERT(ggml_backend_buffer_is_host(pool_mask->buffer));
-    GGML_ASSERT(ggml_backend_buffer_is_host(tail_idxs->buffer));
+    GGML_ASSERT(tail_idxs == nullptr || ggml_backend_buffer_is_host(tail_idxs->buffer));
 
     const uint32_t kpool = mem->get_kpool();
     const uint32_t n_kv  = get_idx()->get_n_kv();
@@ -1069,7 +1139,7 @@ void llama_memory_hybrid_idx_context::set_input_kpool(ggml_tensor * pool_cells, 
     GGML_ASSERT(n_pool == kpool_pad(st.n_pool_real));
     GGML_ASSERT(st.is_new.size() == st.n_pool_real);
     GGML_ASSERT(pool_mask->ne[0] == (int64_t) n_pool && pool_mask->ne[1] == (int64_t) n_tokens);
-    GGML_ASSERT(tail_idxs->ne[0] == (int64_t) kpool - 1 && tail_idxs->ne[1] == (int64_t) n_tokens);
+    GGML_ASSERT(tail_idxs ? (tail_idxs->ne[0] == (int64_t) kpool - 1 && tail_idxs->ne[1] == (int64_t) n_tokens) : kpool == 1);
     GGML_ASSERT(pool_idxs->ne[0] == (int64_t) kpool && pool_idxs->ne[1] == (int64_t) n_pool);
     GGML_ASSERT(ggml_backend_buffer_is_host(new_pool_idxs->buffer));
     GGML_ASSERT(new_pool_idxs->ne[0] == (int64_t) kpool && new_pool_idxs->ne[1] == (int64_t) n_new_g);
@@ -1255,7 +1325,7 @@ void llama_memory_hybrid_idx_context::set_input_kpool(ggml_tensor * pool_cells, 
         fill_mask((float *) pool_mask->data);
     }
 
-    int32_t * tidx = (int32_t *) tail_idxs->data;
+    int32_t * tidx = tail_idxs ? (int32_t *) tail_idxs->data : nullptr;
     for (uint32_t i = 0; i < n_tokens; ++i) {
         const llama_seq_id s = ubatch->seq_id[i][0];
         const llama_pos    p = ubatch->pos[i];
