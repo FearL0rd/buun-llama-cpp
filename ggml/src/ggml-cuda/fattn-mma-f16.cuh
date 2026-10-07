@@ -384,6 +384,21 @@ static constexpr __device__ bool ggml_cuda_fattn_mma_get_swizzled(const int DKQ,
 #endif // TURING_MMA_AVAILABLE
 }
 
+// Offsets and strides are in half2 elements. Combination reuses tile_Q while
+// multi-stage iteration may still have readers in tile_V in another warp.
+static constexpr __host__ __device__ bool ggml_cuda_fattn_mma_combine_needs_sync(
+        const int nstages, const int combine_rows, const int combine_stride, const int v_offset) {
+    return nstages > 1 && combine_rows*combine_stride > v_offset;
+}
+
+// DKQ=DV=256: equal row counts are unsafe after swizzling removes K padding.
+static_assert( ggml_cuda_fattn_mma_combine_needs_sync(2, 64, 132, 64*128), "swizzled ncols16 overlap");
+static_assert( ggml_cuda_fattn_mma_combine_needs_sync(2, 64, 132, 32*128), "wider combine retains existing barrier");
+static_assert(!ggml_cuda_fattn_mma_combine_needs_sync(2, 64, 132, 64*132), "padded tiles do not overlap");
+static_assert(!ggml_cuda_fattn_mma_combine_needs_sync(2, 64, 132, 16*132 + 64*128), "persistent Q offsets V");
+static_assert(!ggml_cuda_fattn_mma_combine_needs_sync(2, 64, 68, 64*96), "unequal K/V widths use actual stride");
+static_assert(!ggml_cuda_fattn_mma_combine_needs_sync(1, 64, 132, 0), "single-stage iteration already synchronizes");
+
 // ------------------------------------------------------------------------------------------------------------------
 
 static __host__ int ggml_cuda_fattn_mma_get_nstages(const int DKQ, const int DV, const int ncols1, const int ncols2, const int cc) {
@@ -1846,9 +1861,12 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
         }
     }
 
-    // With multi-stage loading there is no __syncthreads at the end of the iter,
-    //     there can be a race condition on shared memory access for combining/writing back results.
-    if constexpr (nstages > 1 && nwarps*cols_per_warp > nbatch_fa) {
+    // With multi-stage loading there is no final iteration barrier. Compare
+    // storage footprints: swizzled K rows are narrower than padded combine rows,
+    // so equal row counts can still overwrite V before another warp finishes.
+    constexpr int v_offset = (Q_in_reg ? 0 : ncols*stride_tile_Q) + nbatch_fa*stride_tile_K;
+    if constexpr (ggml_cuda_fattn_mma_combine_needs_sync(
+            nstages, nwarps*cols_per_warp, nbatch_combine + 4, v_offset)) {
         __syncthreads();
     }
 
