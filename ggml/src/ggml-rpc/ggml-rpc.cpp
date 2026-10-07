@@ -2948,7 +2948,9 @@ static bool ggml_backend_rpc_comm_allreduce_tensor(void * comm_ctx_v, ggml_tenso
     }
     for (size_t i = 0; i < n_ranks; i++) {
         if (tensors[i] == nullptr || tensors[i]->type != GGML_TYPE_F32 || ggml_nelements(tensors[i]) != ne ||
-                !ggml_is_contiguously_allocated(tensors[i]) ||
+                // The wire bytes and the server's scratch/reduction tensors
+                // use the ordinary contiguous layout, not just packed storage.
+                !ggml_is_contiguous(tensors[i]) ||
                 tensors[i]->buffer == nullptr || !ggml_backend_buffer_is_rpc(tensors[i]->buffer)) {
             return false;
         }
