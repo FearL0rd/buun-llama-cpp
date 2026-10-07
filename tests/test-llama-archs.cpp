@@ -1513,6 +1513,51 @@ static void test_qwen4_indexed_cache_admission(const size_t seed) {
         auto dense = get_model_and_ctx(
                 dense_gguf.get(), nullptr, seed, {}, LLAMA_SPLIT_MODE_LAYER, false,
                 trace_qsa, &dense_trace);
+        // Persistence identity binds each active pooling semantic, including
+        // GLM's configurable tail policy; inert defaults must not invalidate
+        // ordinary non-pooled families.
+        auto & hp = dense.first->hparams;
+        const auto digest = [&]() {
+            std::array<uint8_t, 32> value = {};
+            GGML_ASSERT(llama_model_semantic_family_digest(dense.first.get(), value.data()));
+            return value;
+        };
+        const auto pooled_identity = digest();
+        const auto changes_identity = [&](auto & field, auto value) {
+            const auto before = digest();
+            const auto original = field;
+            field = value;
+            GGML_ASSERT(digest() != before);
+            field = original;
+            GGML_ASSERT(digest() == before);
+        };
+        changes_identity(hp.indexer_kpool, hp.indexer_kpool + 1);
+        changes_identity(hp.indexer_kpool_row, hp.indexer_kpool_row + 1);
+        changes_identity(hp.indexer_kpool_by_order, !hp.indexer_kpool_by_order);
+        changes_identity(hp.indexer_kpool_select_tail, !hp.indexer_kpool_select_tail);
+        changes_identity(hp.n_value_expert, 2u);
+        hp.n_value_expert = 2;
+        changes_identity(hp.n_value_expert_used, 1u);
+        hp.n_value_expert = 0;
+        changes_identity(hp.n_layer_decision, 1u);
+        changes_identity(hp.pooling_type_cls, LLAMA_POOLING_TYPE_MEAN);
+        hp.pooling_type_cls = LLAMA_POOLING_TYPE_CLS;
+        GGML_ASSERT(digest() == pooled_identity); // explicit legacy default
+        hp.pooling_type_cls = LLAMA_POOLING_TYPE_UNSPECIFIED;
+        const auto saved_pool = hp.indexer_kpool;
+        hp.indexer_kpool = 0;
+        const auto ordinary_identity = digest();
+        GGML_ASSERT(ordinary_identity != pooled_identity);
+        const auto saved_row = hp.indexer_kpool_row;
+        hp.indexer_kpool_row++;
+        hp.indexer_kpool_by_order = !hp.indexer_kpool_by_order;
+        hp.indexer_kpool_select_tail = !hp.indexer_kpool_select_tail;
+        GGML_ASSERT(digest() == ordinary_identity);
+        hp.indexer_kpool_row = saved_row;
+        hp.indexer_kpool_by_order = !hp.indexer_kpool_by_order;
+        hp.indexer_kpool_select_tail = !hp.indexer_kpool_select_tail;
+        hp.indexer_kpool = saved_pool;
+        GGML_ASSERT(digest() == pooled_identity);
         const auto dense_logits = get_logits(dense.first.get(), dense.second.get(), { 1, 2, 3, 4 });
         GGML_ASSERT(dense_trace.raw_key_nodes > 0);
         GGML_ASSERT(dense_trace.score_nodes == 0);

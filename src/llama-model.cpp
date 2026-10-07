@@ -4724,6 +4724,38 @@ bool llama_model_semantic_family_digest(
     writer.u32(hp.indexer_top_k);
     writer.u32(hp.indexer_block_size);
     writer.u32(hp.indexer_local_blocks);
+    // Pooling changes both cached rows and the attention history that produced
+    // them. Extend only active pooled families; ordinary v4 identities retain
+    // their exact byte stream (including inert/default pool settings).
+    if (hp.indexer_kpool > 0) {
+        static constexpr char pool_domain[] = "indexer-pool-semantics/v1";
+        writer.string(pool_domain, sizeof(pool_domain) - 1);
+        writer.u32(hp.indexer_kpool);
+        writer.u32(hp.indexer_kpool_row);
+        writer.u32(hp.indexer_kpool_by_order ? 1u : 0u);
+        writer.u32(hp.indexer_kpool_select_tail ? 1u : 0u);
+    }
+    if (hp.n_value_expert > 0) {
+        static constexpr char value_domain[] = "attention-value-experts/v1";
+        writer.string(value_domain, sizeof(value_domain) - 1);
+        writer.u32(hp.n_value_expert);
+        writer.u32(hp.n_value_expert_used);
+    }
+    if (hp.n_layer_decision > 0) {
+        static constexpr char decision_domain[] = "decision-head-layers/v1";
+        writer.string(decision_domain, sizeof(decision_domain) - 1);
+        writer.u32(hp.n_layer_decision);
+    }
+    // Before configurable classifier pooling, ModernBERT used MEAN and the
+    // other classifier graphs used CLS. Preserve those existing identities.
+    const auto legacy_classifier_pooling = model->arch == LLM_ARCH_MODERN_BERT ?
+            LLAMA_POOLING_TYPE_MEAN : LLAMA_POOLING_TYPE_CLS;
+    if (hp.pooling_type_cls != LLAMA_POOLING_TYPE_UNSPECIFIED &&
+            hp.pooling_type_cls != legacy_classifier_pooling) {
+        static constexpr char classifier_domain[] = "classifier-pooling/v1";
+        writer.string(classifier_domain, sizeof(classifier_domain) - 1);
+        writer.u32(uint32_t(hp.pooling_type_cls));
+    }
     writer.u32(hp.dsv4_o_group_count);
     writer.u32(hp.dsv4_o_lora_rank);
     writer.u32(hp.dsv4_hc_mult);
