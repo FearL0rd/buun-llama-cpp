@@ -69,11 +69,6 @@ struct llama_mmap {
     // Best-effort hint over a live mapped range; false restores NORMAL.
     void advise_random(size_t first, size_t last, bool enabled) const;
 
-    // Start reading every [first, last) span of base in the background, so random
-    // gathers from a mapped file wait for one round of reads instead of one per page.
-    // Best effort; spans is sorted and merged in place.
-    static void prefetch(const void * base, ranges & spans);
-
     static const bool SUPPORTED;
 
 private:
