@@ -324,7 +324,9 @@ bool llama_batch_allocr::init(
             const llama_pos p0 = memory ? memory->seq_pos_max(s) : -1;
 
             if (!seq_first_embd[s]) {
-                if (p0 >= 0 && p0 > seq_pos_min(s)) {
+                // New mixed batches must not reinterpret an overlapping text
+                // row as media. Keep the established homogeneous/raw tolerance.
+                if (p0 >= 0 && (mixed ? p0 >= seq_pos_min(s) : p0 > seq_pos_min(s))) {
                     LLAMA_LOG_ERROR(
                             "%s: the tokens of sequence %d in the input batch have inconsistent sequence positions:\n"
                             " - the last position stored in the memory module of the context (i.e. the KV cache) for sequence %d is X = %d\n"
