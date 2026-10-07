@@ -1300,6 +1300,15 @@ struct model_file_shape {
 static model_file_shape model_read_file_shape(const std::string & model_path) {
     model_file_shape shape;
 
+    // This optional NextN schema probe is GGUF-only. Native directories and
+    // safetensors files still go through the model-source loader below; do not
+    // mistake a failed GGUF probe for an unsupported ordinary target model.
+    std::ifstream header(std::filesystem::u8path(model_path), std::ios::binary);
+    char magic[4] = {};
+    if (!header.read(magic, sizeof(magic)) || std::memcmp(magic, "GGUF", sizeof(magic)) != 0) {
+        return shape;
+    }
+
     struct gguf_init_params gguf_params = { /*.no_alloc =*/ true, /*.ctx =*/ nullptr };
     struct gguf_context * ctx_gguf = gguf_init_from_file(model_path.c_str(), gguf_params);
     if (!ctx_gguf) { return shape; }
@@ -1902,6 +1911,10 @@ int main(int argc, char ** argv) {
 
     {
         const model_file_shape shape = model_read_file_shape(params.model.path);
+        if (params.load_mtp && !use_draft && !shape.valid) {
+            LOG_ERR("%s: --nextn metadata discovery currently requires a GGUF source; ordinary native imatrix collection remains supported\n", __func__);
+            return 1;
+        }
         if (use_draft && shape.n_nextn_layers > 0) {
             LOG_ERR("%s: model already includes NextN layers\n", __func__);
             return 1;
