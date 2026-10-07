@@ -84,15 +84,6 @@ static std::string read_file(const std::string & fname) {
     return content;
 }
 
-static const std::vector<common_arg> & get_common_arg_defs() {
-    static const std::vector<common_arg> options = [] {
-        common_params params;
-        auto ctx = common_params_parser_init(params, LLAMA_EXAMPLE_SERVER, nullptr);
-        return ctx.options;
-    }();
-    return options;
-}
-
 common_arg & common_arg::set_examples(std::initializer_list<enum llama_example> examples) {
     this->examples = examples;
     return *this;
@@ -299,13 +290,6 @@ static void parse_tensor_buffer_overrides(const std::string & value, std::vector
         buft_overrides.push_back(tensor_name);
         overrides.push_back({buft_overrides.back().c_str(), buft_list.at(buffer_type)});
     }
-}
-
-static std::string clean_file_name(const std::string & fname) {
-    std::string clean_fname = fname;
-    string_replace_all(clean_fname, "\\", "_");
-    string_replace_all(clean_fname, "/", "_");
-    return clean_fname;
 }
 
 struct handle_model_result {

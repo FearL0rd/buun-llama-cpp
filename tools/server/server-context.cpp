@@ -1624,14 +1624,6 @@ static void server_cache_live_range_drop_impl(
     common_context_seq_rm(ctx, seq_id, p0, p1);
 }
 
-static bool server_cache_mandatory_recovery_reset_impl(
-        llama_memory_t mem,
-        llama_seq_id seq_id,
-        llama_pos p0,
-        llama_pos p1) {
-    return llama_memory_seq_rm(mem, seq_id, p0, p1);
-}
-
 static void server_cache_mandatory_recovery_reset_impl(
         llama_context * ctx,
         llama_seq_id seq_id,
