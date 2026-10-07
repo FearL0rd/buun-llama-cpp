@@ -24,6 +24,7 @@
 #include <memory>
 #include <stdexcept>
 #include <utility>
+#include <cstdio>
 
 #if defined(_WIN32) && !defined(_WIN32_WINNT)
 #define _WIN32_WINNT 0x0A00
@@ -351,7 +352,6 @@ struct common_params_speculative_draft {
     bool backend_sampling = true; // offload draft sampling to the backend (default: on)
     bool dspark_gpu_assist = true; // keep lightweight DSpark layers/tail on a GPU when its backbone is CPU-resident
 
-    bool probabilistic = false; // sample the draft and verify by rejection, instead of argmax and match
 
     common_params_model mparams;
 
@@ -1263,12 +1263,17 @@ std::filesystem::path common_get_path_from_env(const std::string & name);
 bool fs_validate_filename(const std::string & filename, bool allow_subdirs = false);
 bool fs_is_directory(const std::string & path);
 
-std::string fs_get_cache_directory();
-std::string fs_get_cache_file(const std::string & filename);
-
 // Stable, versioned cache location for a model family's learned expert heatmap.
 std::string common_moe_cache_profile_file(const uint8_t semantic_digest[32]);
-std::string fs_get_config_directory();
+
+// Follow directory symlinks on older libstdc++ versions too (GCC PR 101510).
+inline bool common_create_directories(const std::filesystem::path & path, std::error_code & ec) {
+#if defined(__linux__)
+    return std::filesystem::create_directories(path / "", ec);
+#else
+    return std::filesystem::create_directories(path, ec);
+#endif
+}
 
 std::filesystem::path fs_get_cache_directory();
 std::filesystem::path fs_get_cache_file(const std::string & filename);
@@ -1410,6 +1415,11 @@ struct common_memory {
 // Batch utils
 //
 
+// Compatibility for the fork's borrowed raw-batch speculative execution paths.
+void common_batch_clear(struct llama_batch & batch);
+void common_batch_add(struct llama_batch & batch, llama_token id, llama_pos pos,
+        const std::vector<llama_seq_id> & seq_ids, bool logits);
+
 // wrapper around llama_batch_ext that provide getter functions for downstream code
 // entries can exceed n_batch, use get_sub_batch() to decode them in chunks
 struct common_batch {
@@ -1420,12 +1430,14 @@ struct common_batch {
         bool         output;
         llama_embd   embd; // non-owning view of the data passed to add_embd()/set_embd(), data == NULL if none
         std::vector<llama_seq_id> seq_ids; // full membership; seq_id above remains the primary ID
+        int32_t decision_order = 0;
     };
 
     std::vector<token> tokens; // mirror of the entries, tokens[i] describes batch index i
     llama_batch_ext_ptr batch;
 
     int32_t n_pos = 1; // positions per embedding entry, GGML_MROPE_SECTIONS for MROPE/IMROPE
+    uint32_t seq_id_limit = 0; // actual ID domain, including unified-KV IDs
 
     common_batch() = default;
     common_batch(struct llama_context * ctx);
@@ -1451,7 +1463,6 @@ struct common_batch {
     bool add_seq(int32_t idx, llama_seq_id seq_id);
 
     bool set_output(int32_t idx, bool value);
-    bool add_seq(int32_t idx, llama_seq_id seq_id);
 
     // attach a token embedding to the entry at idx, can only be set once per entry
     bool set_embd(int32_t idx, llama_embd embd);
@@ -1467,6 +1478,9 @@ struct common_batch {
 // positions continue from the memory, last token always have output_logits set to true
 common_batch common_batch_get_one(struct llama_context * ctx, const llama_token * tokens, int32_t n_tokens);
 common_batch common_batch_get_one(struct llama_context * ctx, const llama_tokens & tokens);
+
+// Borrow legacy embedding rows and preserve every sequence ID and position axis.
+common_batch common_batch_from_llama_batch(struct llama_context * ctx, const llama_batch & batch);
 
 // decodes a single batch of tokens for a prompt and manages session tokens
 //

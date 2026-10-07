@@ -5,7 +5,7 @@
 #include "build-info.h"
 #include "common.h"
 
-#include "../src/llama-ext.h"
+#include "../src/llama-batch.h"
 
 #include "fit.h"
 #include "log.h"
@@ -57,6 +57,8 @@
 
 #if defined(__linux__)
 #include <sched.h>
+#endif
+#if !defined(_WIN32)
 #include <sys/types.h>
 #include <pwd.h>
 #endif
@@ -1263,6 +1265,72 @@ struct common_init_result::impl {
     std::vector<llama_sampler_seq_config> samplers_seq_config;
 };
 
+static const std::map<common_decision_type, std::string> COMMON_DECISION_TYPE_NAMES = {
+    { COMMON_DECISION_TYPE_OPENJEV,        "openjev"       },
+    { COMMON_DECISION_TYPE_LEV,            "lev"           },
+    { COMMON_DECISION_TYPE_KEV,            "kev"           },
+    { COMMON_DECISION_TYPE_NIMBLE,         "nimble"        },
+    { COMMON_DECISION_TYPE_LAYA,           "laya"          },
+    { COMMON_DECISION_TYPE_CLEF,           "clef"          },
+    { COMMON_DECISION_TYPE_PPLX_DECIDER,   "pplx-decider"  },
+};
+
+static common_decision_type common_decision_type_from_string(const std::string & str) {
+    for (const auto & pair : COMMON_DECISION_TYPE_NAMES) {
+        if (pair.second == str) {
+            return pair.first;
+        }
+    }
+    return COMMON_DECISION_TYPE_UNKNOWN;
+}
+
+common_decision_type common_get_decision_type(const struct llama_model * model) {
+    char buf[64];
+    if (llama_model_meta_val_str(model, "general.architecture", buf, sizeof(buf)) < 0) {
+        return COMMON_DECISION_TYPE_NONE;
+    }
+    const std::string key = std::string(buf) + ".decision.type";
+    if (llama_model_meta_val_str(model, key.c_str(), buf, sizeof(buf)) < 0) {
+        return COMMON_DECISION_TYPE_NONE;
+    }
+    return common_decision_type_from_string(buf);
+}
+
+common_decision_type common_get_decision_type(const std::string & fname) {
+    struct gguf_init_params gguf_params = {
+        /* .no_alloc = */ true,
+        /* .ctx      = */ nullptr,
+    };
+
+    gguf_context_ptr gguf_ctx(gguf_init_from_file(fname.c_str(), gguf_params));
+    if (!gguf_ctx) {
+        return COMMON_DECISION_TYPE_UNKNOWN; // missing or unreadable file
+    }
+
+    std::string arch;
+    const int64_t arch_id = gguf_find_key(gguf_ctx.get(), "general.architecture");
+    if (arch_id < 0) {
+        return COMMON_DECISION_TYPE_UNKNOWN; // no architecture in the metadata
+    }
+    if (gguf_get_kv_type(gguf_ctx.get(), arch_id) != GGUF_TYPE_STRING) {
+        return COMMON_DECISION_TYPE_UNKNOWN; // malformed metadata
+    }
+    arch = gguf_get_val_str(gguf_ctx.get(), arch_id);
+    if (arch.empty()) {
+        return COMMON_DECISION_TYPE_UNKNOWN;
+    }
+
+    const std::string key = arch + ".decision.type";
+    const int64_t type_id = gguf_find_key(gguf_ctx.get(), key.c_str());
+    if (type_id < 0) {
+        return COMMON_DECISION_TYPE_NONE;
+    }
+    if (gguf_get_kv_type(gguf_ctx.get(), type_id) != GGUF_TYPE_STRING) {
+        return COMMON_DECISION_TYPE_UNKNOWN; // malformed metadata
+    }
+    return common_decision_type_from_string(gguf_get_val_str(gguf_ctx.get(), type_id));
+}
+
 std::string common_moe_cache_profile_file(const uint8_t semantic_digest[32]) {
     if (!semantic_digest) {
         throw std::invalid_argument("missing model semantic digest");
@@ -1272,7 +1340,7 @@ std::string common_moe_cache_profile_file(const uint8_t semantic_digest[32]) {
         snprintf(hex + 2*i, 3, "%02x", semantic_digest[i]);
     }
     hex[64] = '\0';
-    return fs_get_cache_file(string_format("moe-experts-%s.v1", hex));
+    return fs_path_to_utf8(fs_get_cache_file(string_format("moe-experts-%s.v1", hex)));
 }
 
 static void common_params_resolve_vbr_codec_auto_from_model(
@@ -2462,57 +2530,60 @@ bool common_replay_last_token(struct llama_context * ctx, llama_token last_token
     return true;
 }
 
+void common_batch_clear(struct llama_batch & batch) {
+    batch.n_tokens = 0;
+}
+
+void common_batch_add(
+                 struct llama_batch & batch,
+                        llama_token   id,
+                          llama_pos   pos,
+    const std::vector<llama_seq_id> & seq_ids,
+                               bool   logits) {
+    GGML_ASSERT(batch.seq_id[batch.n_tokens] && "llama_batch size exceeded");
+
+    batch.token   [batch.n_tokens] = id;
+    batch.pos     [batch.n_tokens] = pos;
+    batch.n_seq_id[batch.n_tokens] = seq_ids.size();
+    for (size_t i = 0; i < seq_ids.size(); ++i) {
+        batch.seq_id[batch.n_tokens][i] = seq_ids[i];
+    }
+    batch.logits  [batch.n_tokens] = logits;
+
+    batch.n_tokens++;
+}
+
 common_batch::common_batch(llama_context * ctx) : batch(llama_batch_ext_init(ctx)) {
     const auto rope_type = llama_model_rope_type(llama_get_model(ctx));
     n_pos = rope_type == LLAMA_ROPE_TYPE_MROPE || rope_type == LLAMA_ROPE_TYPE_IMROPE ? GGML_MROPE_SECTIONS : 1;
+    seq_id_limit = batch->n_seq_max;
 }
 
 void common_batch::clear() {
     tokens.clear();
+    if (batch) {
+        llama_batch_ext_clear(batch.get());
+    }
 }
 
 int32_t common_batch::add(llama_token id, llama_pos pos, llama_seq_id seq_id, bool output) {
-    tokens.push_back({ id, { pos, 0, 0, 0 }, seq_id, output, { nullptr, 0, 0 }, {} });
+    GGML_ASSERT(batch && seq_id >= 0 && (uint32_t) seq_id < seq_id_limit);
+    GGML_ASSERT(id >= 0 && id < batch->n_vocab);
+    tokens.push_back({ id, { pos, 0, 0, 0 }, seq_id, output, { nullptr, 0, 0 }, { seq_id } });
     return size() - 1;
 }
 
 int32_t common_batch::add(llama_token id, llama_pos pos, const std::vector<llama_seq_id> & seq_ids, bool output) {
     GGML_ASSERT(!seq_ids.empty());
-
     const int32_t idx = add(id, pos, seq_ids[0], output);
     for (size_t s = 1; s < seq_ids.size(); ++s) {
-        add_seq(idx, seq_ids[s]);
+        GGML_ASSERT(add_seq(idx, seq_ids[s]));
     }
-    llama_batch_ext_set_pos(batch.get(), idx, &pos);
-    if (output) {
-        llama_batch_ext_set_output_logits(batch.get(), idx, true);
-    }
-    tokens.push_back({ id, { pos, 0, 0, 0 }, seq_id, output, { nullptr, 0, 0 }, { seq_id } });
     return idx;
 }
 
 bool common_batch::add_seq(int32_t idx, llama_seq_id seq_id) {
-    if (idx < 0 || idx >= size()) {
-        return false;
-    }
-    tokens[idx].seq_ids_extra.push_back(seq_id);
-    return true;
-}
-
-bool common_batch::set_output(int32_t idx, bool value) {
-    if (idx < 0 || idx >= size()) {
-        return false;
-    }
-    if (!llama_batch_ext_set_output_logits(batch.get(), idx, value)) {
-        return false;
-    }
-    tokens[idx].output = value;
-    return true;
-}
-
-bool common_batch::add_seq(int32_t idx, llama_seq_id seq_id) {
-    if (idx < 0 || idx >= (int32_t) tokens.size() ||
-            !llama_batch_ext_add_seq(batch.get(), idx, seq_id)) {
+    if (idx < 0 || idx >= size() || seq_id < 0 || (uint32_t) seq_id >= seq_id_limit) {
         return false;
     }
     auto & ids = tokens[idx].seq_ids;
@@ -2522,8 +2593,21 @@ bool common_batch::add_seq(int32_t idx, llama_seq_id seq_id) {
     return true;
 }
 
+bool common_batch::set_output(int32_t idx, bool value) {
+    if (idx < 0 || idx >= size()) {
+        return false;
+    }
+    tokens[idx].output = value;
+    return true;
+}
+
 bool common_batch::set_embd(int32_t idx, llama_embd embd) {
-    if (idx < 0 || idx >= size() || tokens[idx].embd.data != nullptr) {
+    if (idx < 0 || idx >= size() || tokens[idx].embd.data || !embd.data ||
+            embd.n_rows == 0 || embd.n_embd == 0 || embd.n_rows > SIZE_MAX / embd.n_embd) {
+        return false;
+    }
+    const size_t width = embd.n_rows * embd.n_embd;
+    if (width != batch->n_embd_inp && width != batch->n_embd_inp_enc) {
         return false;
     }
     tokens[idx].embd = embd;
@@ -2531,28 +2615,53 @@ bool common_batch::set_embd(int32_t idx, llama_embd embd) {
 }
 
 int32_t common_batch::add_embd(llama_embd embd, const llama_pos * pos, llama_seq_id seq_id, bool output) {
-    const int32_t idx = llama_batch_ext_add_embd(batch.get(), seq_id, embd);
-    if (idx < 0) {
-        GGML_ABORT("%s: failed to add embedding to the batch (error %d, n_tokens = %d)\n", __func__, idx, size());
-    }
-    llama_batch_ext_set_pos(batch.get(), idx, pos);
-    if (output) {
-        llama_batch_ext_set_output_logits(batch.get(), idx, true);
-    }
-    token t = { LLAMA_TOKEN_NULL, { 0, 0, 0, 0 }, seq_id, output, embd, { seq_id } };
+    GGML_ASSERT(batch && pos && seq_id >= 0 && (uint32_t) seq_id < seq_id_limit);
+    token t = { LLAMA_TOKEN_NULL, { 0, 0, 0, 0 }, seq_id, output, { nullptr, 0, 0 }, { seq_id } };
     for (int32_t j = 0; j < n_pos; ++j) {
         t.pos[j] = pos[j];
     }
     tokens.push_back(t);
-    return size() - 1;
+    const int32_t idx = size() - 1;
+    GGML_ASSERT(set_embd(idx, embd));
+    return idx;
 }
 
 llama_batch_ext * common_batch::get_sub_batch(int32_t off, int32_t n) {
     GGML_ASSERT(batch && "common_batch was not initialized with a context");
-    GGML_ASSERT(off >= 0 && n >= 0 && off + n <= size());
-
+    GGML_ASSERT(off >= 0 && n >= 0 && off <= size() && n <= size() - off);
     llama_batch_ext * res = batch.get();
     llama_batch_ext_clear(res);
+    for (int32_t i = off; i < off + n; ++i) {
+        const token & t = tokens[i];
+        const int32_t idx = t.id != LLAMA_TOKEN_NULL
+            ? llama_batch_ext_add_token(res, t.seq_id, t.id)
+            : llama_batch_ext_add_embd(res, t.seq_id, t.embd);
+        if (idx < 0) {
+            GGML_ABORT("%s: invalid staged entry %d (error %d)\n", __func__, i, idx);
+        }
+        GGML_ASSERT(idx == i - off);
+        if (t.id != LLAMA_TOKEN_NULL && t.embd.data) {
+            GGML_ASSERT(llama_batch_ext_set_embd_token(res, idx, t.embd));
+        }
+        GGML_ASSERT(llama_batch_ext_set_pos(res, idx, t.pos.data()));
+        for (llama_seq_id seq_id : t.seq_ids) {
+            if (seq_id != t.seq_id) {
+                GGML_ASSERT(llama_batch_ext_add_seq(res, idx, seq_id));
+            }
+        }
+        GGML_ASSERT(llama_batch_ext_set_output_logits(res, idx, t.output));
+        if (t.decision_order != 0) {
+            GGML_ASSERT(llama_batch_ext_set_decision_order(res, idx, (llama_decision_order) t.decision_order));
+        }
+    }
+    return res;
+}
+
+common_batch common_batch_from_llama_batch(llama_context * ctx, const llama_batch & batch) {
+    common_batch res(ctx);
+
+    const bool has_token = batch.token != nullptr;
+    const bool has_embd  = batch.embd  != nullptr;
 
     const size_t n_embd = llama_model_n_embd_inp(llama_get_model(ctx));
 
@@ -2590,13 +2699,8 @@ llama_batch_ext * common_batch::get_sub_batch(int32_t off, int32_t n) {
                 }
             }
         } else {
-            idx = llama_batch_ext_add_embd(res, t.seq_id, t.embd);
-            if (idx < 0) {
-                GGML_ABORT("%s: failed to add embedding at index %d (error %d, n = %d)\n", __func__, i, idx, n);
-            }
-            llama_batch_ext_set_pos(res, idx, t.pos.data());
+            idx = res.add_embd(embd, pos, seq_id, output);
         }
-        GGML_ASSERT(idx == i - off);
 
         for (int32_t s = 1; s < n_sid; ++s) {
             if (!res.add_seq(idx, batch.seq_id[i][s])) {
@@ -2612,7 +2716,7 @@ llama_batch_ext * common_batch::get_sub_batch(int32_t off, int32_t n) {
                 pos_next[id] = pos[0] + 1;
             }
             res.tokens[idx].pos[0] = pos[0];
-            GGML_ASSERT(llama_batch_ext_set_pos(res.get(), idx, pos));
+            // get_sub_batch() renders the staged position on demand.
         }
     }
 

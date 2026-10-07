@@ -287,6 +287,7 @@ void llama_model_dflash::load_arch_hparams(llama_model_loader & ml) {
     // Missing tensors alone must not change old drafts' target-sharing contract.
     ml.get_key("dflash.attention.k_eq_v", hparams.dflash_shared_kv, false);
     ml.get_key("dflash.tie_word_embeddings", hparams.dflash_tied_output, false);
+    ml.get_key(LLM_KV_ATTENTION_VALUE_SCALE, hparams.f_attn_value_scale, false);
 
     hparams.llm_ffn_op = LLM_FFN_SILU;
     std::string hidden_act;
@@ -1131,6 +1132,11 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
         }
         if (project_separately) {
             cur = build_lora_mm(layer.wo, cur, layer.wo_s, layer.wo_in_s);
+        }
+
+        if (hparams.f_attn_value_scale != 0.0f) {
+            cur = ggml_scale(ctx0, cur, hparams.f_attn_value_scale);
+            cb(cur, "attn_out_scaled", il);
         }
 
         if (attn_coeff) {
