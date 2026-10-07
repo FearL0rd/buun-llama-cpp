@@ -627,11 +627,11 @@ static bool test_seq_file_integrity(
         return false;
     }
 
-    llama_batch_ptr batch((int32_t) n_tokens, 0, 1);
+    common_batch batch(ctx_src.get());
     for (size_t i = 0; i < n_tokens; ++i) {
-        common_batch_add(batch.get(), tokens[i], (llama_pos) i, { 0 }, false);
+        batch.add(tokens[i], (llama_pos) i, 0, false);
     }
-    if (llama_decode(ctx_src.get(), batch.get())) {
+    if (llama_process(ctx_src.get(), LLAMA_PROCESS_TYPE_DECODE, batch.get())) {
         LOG_ERR("%s: failed to decode source sequence\n", __func__);
         return false;
     }
@@ -953,11 +953,11 @@ static bool test_attn_trim_nonhybrid(
         return false;
     }
 
-    llama_batch_ptr batch((int32_t) n_tokens, 0, 1);
+    common_batch batch(ctx_attn.get());
     for (size_t i = 0; i < n_tokens; ++i) {
-        common_batch_add(batch.get(), tokens[i], (llama_pos) i, { 0 }, false);
+        batch.add(tokens[i], (llama_pos) i, 0, false);
     }
-    if (llama_decode(ctx_attn.get(), batch.get())) {
+    if (llama_process(ctx_attn.get(), LLAMA_PROCESS_TYPE_DECODE, batch.get())) {
         LOG_ERR("%s: failed to decode source sequence\n", __func__);
         return false;
     }
@@ -1235,9 +1235,9 @@ static bool test_state_range(struct llama_model * model, const struct common_par
 
         for (llama_pos i = 0; i < n; ++i) {
             for (llama_seq_id seq = 0; seq < 2; ++seq) {
-                llama_batch_ptr batch(1, 0, 1);
-                common_batch_add(batch.get(), tokens[i], i, { seq }, true);
-                if (llama_decode(ctx.get(), batch.get()) != 0) {
+                common_batch batch(ctx.get());
+                batch.add(tokens[i], i, seq, true);
+                if (llama_process(ctx.get(), LLAMA_PROCESS_TYPE_DECODE, batch.get()) != 0) {
                     LOG_ERR("%s: failed to decode position %d of seq %d\n", __func__, i, seq);
                     return false;
                 }
