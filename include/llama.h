@@ -1217,6 +1217,7 @@ extern "C" {
     // Position-range form of a sequence's base state: the part that PARTIAL_ONLY leaves out,
     // restricted to positions [p0, p1). A range blob does not depend on the stream layout, so it
     // moves between split and unified KV caches. All three return 0 on failure.
+    // Indexed/QSA memories currently refuse ranges: attention-only ranges cannot restore their index state.
     // Bump the version on any change to the blob layout: readers refuse other versions.
 #define LLAMA_STATE_SEQ_RANGE_VERSION 2
 

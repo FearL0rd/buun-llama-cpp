@@ -7,6 +7,8 @@
 #include "llama-cpp.h"
 #include "../src/llama-context.h"
 #include "../src/llama-model.h"
+#include "../src/llama-memory-hybrid-idx.h"
+#include "../src/llama-io.h"
 
 #include <algorithm>
 #include <clocale>
@@ -1242,6 +1244,62 @@ static bool test_state_range(struct llama_model * model, const struct common_par
                     return false;
                 }
             }
+        }
+
+        if (auto * indexed = dynamic_cast<llama_memory_hybrid_idx *>(llama_get_memory(ctx.get()));
+                indexed && indexed->get_mem_idx()) {
+            // Exercise the unsupported contract, not an apparent round-trip
+            // success that silently omits the indexer. The legacy attention-only
+            // blob is otherwise valid and would append to occupied seq 1.
+            common_batch extra(ctx.get());
+            extra.add(tokens[0], n, 0, true);
+            if (llama_process(ctx.get(), LLAMA_PROCESS_TYPE_DECODE, extra.get()) != 0) {
+                return false;
+            }
+            llama_synchronize(ctx.get());
+            struct range_writer : llama_io_write_i {
+                std::vector<uint8_t> bytes;
+                void write(const void * src, size_t size) override {
+                    const auto * p = static_cast<const uint8_t *>(src);
+                    bytes.insert(bytes.end(), p, p + size);
+                }
+                void write_tensor(ggml_tensor * tensor, size_t offset, size_t size) override {
+                    const size_t begin = bytes.size();
+                    bytes.resize(begin + size);
+                    ggml_backend_tensor_get(tensor, bytes.data() + begin, offset, size);
+                }
+                size_t n_bytes() override { return bytes.size(); }
+            } legacy;
+            const uint32_t magic = 0x72737167; // production range-envelope magic
+            const uint32_t version = LLAMA_STATE_SEQ_RANGE_VERSION;
+            const llama_pos end = n + 1;
+            legacy.write(&magic, sizeof(magic));
+            legacy.write(&version, sizeof(version));
+            legacy.write(&n, sizeof(n));
+            legacy.write(&end, sizeof(end));
+            indexed->get_mem_attn()->state_write_range(legacy, 0, n, end);
+
+            std::vector<uint8_t> before(llama_state_get_size(ctx.get()));
+            if (llama_state_get_data(ctx.get(), before.data(), before.size()) != before.size()) {
+                return false;
+            }
+            std::vector<uint8_t> output(before.size());
+            const size_t sized = llama_state_seq_get_size_range(ctx.get(), 1, 0, n);
+            const size_t written = llama_state_seq_get_data_range(ctx.get(), output.data(), output.size(), 1, 0, n);
+            const size_t appended = llama_state_seq_append_data(
+                    ctx.get(), legacy.bytes.data(), legacy.bytes.size(), 1, n, end, end);
+            if (sized != 0 || written != 0 || appended != 0) {
+                LOG_ERR("%s: indexed memory accepted incomplete range state (size=%zu, write=%zu, append=%zu)\n",
+                        __func__, sized, written, appended);
+                return false;
+            }
+            std::vector<uint8_t> after(llama_state_get_size(ctx.get()));
+            if (llama_state_get_data(ctx.get(), after.data(), after.size()) != after.size() || after != before) {
+                LOG_ERR("%s: indexed range refusal changed occupied state\n", __func__);
+                return false;
+            }
+            LOG("indexed position ranges explicitly refused; occupied state unchanged\n");
+            return true;
         }
 
         if (!get_state(ctx.get(), LLAMA_STATE_SEQ_FLAGS_NONE, src_full) ||
