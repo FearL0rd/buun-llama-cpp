@@ -2036,7 +2036,7 @@ llama_kv_cache::llama_kv_cache(
         const bool classic_dynamic = vbr_params_.dynamic &&
             vbr_params_.codec == LLAMA_VBR_CODEC_CLASSIC;
 
-        attn_rot_k =
+        bool attn_rot_k =
             !attn_rot_disable &&
             n_embd_head_k_all > 0 &&
             (ggml_is_quantized(type_k) || classic_dynamic) && !is_turbo_k &&
