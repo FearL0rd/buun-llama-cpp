@@ -1216,9 +1216,11 @@ static char causes[GGML_DEFAULT_GRAPH_SIZE*16 + GGML_SCHED_MAX_SPLITS_DEBUG*GGML
 #endif
 
 // the moe-cache provider lets backend_id read node's host expert weights in place
+// (routes also hold VRAM copies of the expert scales riding as src[3]/src[4])
 static bool ggml_backend_sched_moe_routed(ggml_backend_sched_t sched, const struct ggml_tensor * node,
         const struct ggml_tensor * src, int backend_id) {
-    return node->op == GGML_OP_MUL_MAT_ID && src == node->src[0] && sched->moe_cache_session &&
+    const bool routed_src = src == node->src[0] || src == node->src[3] || src == node->src[4];
+    return node->op == GGML_OP_MUL_MAT_ID && routed_src && sched->moe_cache_session &&
         ggml_moe_cache.route_supported &&
         ggml_moe_cache.route_supported(sched->moe_cache_session, sched->backends[backend_id], node);
 }

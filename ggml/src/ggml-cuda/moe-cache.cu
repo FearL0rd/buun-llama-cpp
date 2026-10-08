@@ -200,6 +200,7 @@ struct moe_cache_route {
     const void ** table = nullptr;
     int32_t * log = nullptr;      // mapped host view
     int32_t * d_log = nullptr;    // device view of log
+    char * d_scales = nullptr;    // VRAM copy of host src[3] then src[4] (EXL3 expert scales)
     int64_t n_expert = 0;
     size_t expert_size = 0;
     int wtype = -1;
@@ -1739,6 +1740,10 @@ static void moe_cache_route_free(moe_cache_route & route) {
     if (route.log) {
         cudaFreeHost(route.log);
         route.log = nullptr;
+    }
+    if (route.d_scales) {
+        cudaFree(route.d_scales);
+        route.d_scales = nullptr;
     }
 }
 
@@ -3905,7 +3910,8 @@ static void moe_cache_route_drain_locked(moe_cache_session & session, moe_cache_
 
 static bool moe_cache_route_register(
         moe_cache_session & session, moe_cache_device & device,
-        cudaStream_t stream, const ggml_tensor * weights) {
+        cudaStream_t stream, const ggml_tensor * op) {
+    const ggml_tensor * weights = op->src[0];
     ggml_cuda_set_device(device.logical);
     cudaPointerAttributes attributes = {};
     if (cudaPointerGetAttributes(&attributes, weights->data) != cudaSuccess ||
@@ -3946,6 +3952,19 @@ static bool moe_cache_route_register(
         route->log[0] = 0;
         error = cudaHostGetDevicePointer((void **)&route->d_log, route->log, 0);
     }
+    // expert scales (src[3]/src[4]) are read once per block: host-resident ones would cross PCIe every launch
+    const ggml_tensor * svh = op->src[3], * suh = op->src[4];
+    if (error == cudaSuccess && svh && suh &&
+        ggml_backend_buffer_is_host(svh->buffer) && ggml_backend_buffer_is_host(suh->buffer)) {
+        const size_t svh_bytes = ggml_nbytes(svh);
+        error = cudaMalloc((void **)&route->d_scales, svh_bytes + ggml_nbytes(suh));
+        if (error == cudaSuccess) {
+            error = cudaMemcpy(route->d_scales, svh->data, svh_bytes, cudaMemcpyHostToDevice);
+        }
+        if (error == cudaSuccess) {
+            error = cudaMemcpy(route->d_scales + svh_bytes, suh->data, ggml_nbytes(suh), cudaMemcpyHostToDevice);
+        }
+    }
     if (!moe_cache_cuda_ok(device, error, "route setup", false)) {
         moe_cache_route_free(*route);
         return false;
@@ -3954,7 +3973,14 @@ static bool moe_cache_route_register(
     {
         // g_routes is keyed by host address alone: weights another session routes stay its own
         std::lock_guard<std::mutex> lock(g_route_mu);
-        claimed = g_routes.emplace(route->host_base, ggml_moe_cache_route_table{route->table, route->d_log}).second;
+        ggml_moe_cache_route_table entry;
+        entry.table = route->table;
+        entry.log = route->d_log;
+        if (route->d_scales) {
+            entry.scales[0] = route->d_scales;
+            entry.scales[1] = route->d_scales + ggml_nbytes(op->src[3]);
+        }
+        claimed = g_routes.emplace(route->host_base, entry).second;
     }
     if (!claimed) {
         // freed outside g_route_mu: cudaFree may wait on a replay whose reduction needs the share's lock
@@ -3996,7 +4022,7 @@ static int moe_cache_route_supported(void * opaque, void * backend_opaque, const
         ggml_backend_buffer_get_usage(weights->buffer) != GGML_BACKEND_BUFFER_USAGE_WEIGHTS ||
         !ggml_is_contiguous(weights) || weights->ne[3] != 1 ||
         !moe_cache_tensor_name_supported(weights->name) ||
-        !moe_cache_type_supported(weights->type) || ggml_type_is_exl3(weights->type) ||
+        !moe_cache_type_supported(weights->type) ||
         weights->nb[2] != ggml_row_size(weights->type, weights->ne[0]) * weights->ne[1] ||
         weights->nb[2] < ggml_moe_cache_effective_min_expert_bytes(weights->type,
             session->config.min_expert_explicit, session->config.min_expert_bytes) ||
@@ -4004,12 +4030,13 @@ static int moe_cache_route_supported(void * opaque, void * backend_opaque, const
         ids->ne[0] * ids->ne[1] > moe_cache_route_log_max) {
         return 0;
     }
-    // Mirror ggml_cuda_mul_mat_id's MMVQ selection: only that kernel reads the table. Host
-    // weights take MMVQ up to the mmid cap, past the dense MMVQ/MMQ crossover.
+    // Mirror ggml_cuda_mul_mat_id's selection: only MMVQ and the grouped EXL3 kernel read the
+    // table. Host weights take MMVQ up to the mmid cap, past the dense MMVQ/MMQ crossover.
     const int cc = ggml_cuda_info().devices[ctx->device].cc;
     const int64_t n_tokens = op->ne[2];
-    if (n_tokens > MMVQ_MAX_BATCH_SIZE || n_tokens > get_mmvq_mmid_max_batch(weights->type, cc) ||
-        !ggml_backend_supports_op(backend, op)) {
+    const bool table_kernel = ggml_type_is_exl3(weights->type) ? ggml_cuda_exl3_mul_mat_id_fast(op) :
+        n_tokens <= get_mmvq_mmid_max_batch(weights->type, cc);
+    if (n_tokens > MMVQ_MAX_BATCH_SIZE || !table_kernel || !ggml_backend_supports_op(backend, op)) {
         return 0;
     }
     std::lock_guard<std::mutex> lock(session->mu);
@@ -4020,7 +4047,7 @@ static int moe_cache_route_supported(void * opaque, void * backend_opaque, const
         return 1;
     }
     try {
-        return moe_cache_route_register(*session, device, ctx->stream(), weights) ? 1 : 0;
+        return moe_cache_route_register(*session, device, ctx->stream(), op) ? 1 : 0;
     } catch (...) {
         return 0;
     }
