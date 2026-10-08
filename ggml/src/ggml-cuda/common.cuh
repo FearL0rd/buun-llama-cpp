@@ -1700,6 +1700,8 @@ struct ggml_backend_cuda_context {
     // packer, which applies the same reduction while writing BF16 directly.
     // Entries are produced and consumed within one graph evaluation.
     std::unordered_set<const void *> gdn_deferred_l2;
+    // Key gathers whose only reader is a lightning indexer, which reads the rows in place instead.
+    std::unordered_set<const void *> lightning_deferred_k;
     std::unordered_map<const ggml_tensor *, ggml_cuda_humming_prepared_activation> humming_prepared_activations;
     std::unordered_set<const ggml_tensor *> humming_prepared_active;
 

@@ -5113,6 +5113,45 @@ static int ggml_cuda_try_ordered_attention(ggml_backend_cuda_context & ctx,
     return last - first;
 }
 
+// A key gather (+ reshape) read only by a lightning indexer, as the k-pool indexers gather every
+// pooled key each step: skip the copy and let the indexer read the rows through the index list.
+static int ggml_cuda_defer_lightning_k_gather(ggml_backend_cuda_context & ctx, const ggml_cgraph * graph, int first) {
+    const ggml_tensor * gather = graph->nodes[first];
+    if (gather->op != GGML_OP_GET_ROWS || first + 1 >= graph->n_nodes) return 0;
+    const ggml_tensor * shape = graph->nodes[first + 1];
+    if (shape->op != GGML_OP_RESHAPE || shape->src[0] != gather) return 0;
+
+    const ggml_tensor * src = gather->src[0];
+    const ggml_tensor * idx = gather->src[1];
+    // one index per key, each key a single row of the source
+    if (gather->type != GGML_TYPE_F32 || idx->type != GGML_TYPE_I32 || !ggml_is_contiguous(idx) || !ggml_is_vector(idx) ||
+            src->ne[2] != 1 || src->ne[3] != 1 ||
+            shape->ne[0] != gather->ne[0] || shape->ne[1] != 1 || shape->ne[3] != 1) return 0;
+    // the indexer reads 16-byte aligned rows of contiguous elements
+    if (!ggml_cuda_lightning_indexer_k_type_supported(src->type) || src->nb[0] != ggml_type_size(src->type) ||
+            (!ggml_is_quantized(src->type) && (src->nb[1] % 16 != 0 || (uintptr_t) src->data % 16 != 0))) return 0;
+
+    int indexer = -1;
+    for (int i = first + 2; i < graph->n_nodes && i < first + 64; ++i) {
+        if (graph->nodes[i]->op == GGML_OP_LIGHTNING_INDEXER && graph->nodes[i]->src[1] == shape) {
+            indexer = i;
+            break;
+        }
+    }
+    const int nodes[] = { first, first + 1, indexer };
+    const ggml_op ops[] = { GGML_OP_GET_ROWS, GGML_OP_RESHAPE, GGML_OP_LIGHTNING_INDEXER };
+    if (indexer < 0 || !ggml_can_fuse_subgraph_ext(graph, nodes, 3, ops, &indexer, 1)) return 0;
+    // nothing up to the indexer's own output may rewrite the rows or the indices, as the allocator
+    // considers both dead once the skipped gather ran
+    for (int i = first + 2; i <= indexer; ++i) {
+        const ggml_tensor * node = graph->nodes[i];
+        if (!ggml_cuda_is_view_or_noop(node) &&
+                (ggml_cuda_tensors_overlap(node, src) || ggml_cuda_tensors_overlap(node, idx))) return 0;
+    }
+    ctx.lightning_deferred_k.insert(gather->data);
+    return 1;
+}
+
 static int32_t ggml_cuda_tensor_use_count(
         const ggml_cgraph * cgraph, const ggml_tensor * tensor) {
     const size_t hash_pos = ggml_hash_find(&cgraph->visited_hash_set, tensor);
@@ -7034,6 +7073,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     }
 
     if (const int skipped = ggml_cuda_try_ordered_attention(*cuda_ctx, cgraph, i)) return skipped;
+    if (const int skipped = ggml_cuda_defer_lightning_k_gather(*cuda_ctx, cgraph, i)) return skipped;
 
     // Gather F16 cache cells straight into the final head-major F16 window.
     // Preserve the selection order and attention geometry; only remove the
