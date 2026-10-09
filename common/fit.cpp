@@ -690,10 +690,8 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
         }
     }
 
-    hp_ngl         = llama_model_n_layer(model.get());
-    if (mparams->load_mtp) {
-        hp_ngl    += llama_model_n_layer_nextn(model.get());
-    }
+    // the loader indexes nextn blocks even when MTP is not loaded, so count them or GPU layers shift up
+    hp_ngl         = llama_model_n_layer(model.get()) + llama_model_n_layer_nextn(model.get());
     hp_n_ctx_train = llama_model_n_ctx_train(model.get());
     hp_n_expert    = llama_model_n_expert(model.get());
 
