@@ -181,7 +181,7 @@ struct ggml_moe_tier {
     std::unordered_map<uint32_t, int> staged; // key -> stage
     int stage_hand = 0;
     std::mutex ring_mu;
-    std::condition_variable ring_cv;
+    std::condition_variable ring_cv; // a ring stage or an arena load landed
 
     std::mutex mu;
     std::atomic<bool> stopping{false};
@@ -198,6 +198,7 @@ struct ggml_moe_tier {
     std::atomic<long long> hint_loads{0};
     std::atomic<long long> hint_used{0}; // hinted slots a demand then found
     std::atomic<long long> prefill_ram{0};   // prefill experts copied from the arena
+    std::atomic<long long> prefill_admits{0}; // prefill reads into free arena slots
     std::atomic<long long> prefill_reads{0}; // prefill experts read into the ring
     std::atomic<long long> prefill_ahead{0}; // of them, read before their launch asked
     std::atomic<long long> prefill_us{0};
@@ -774,20 +775,24 @@ static void moe_tier_loaded(void * user, bool ok) {
     ggml_moe_tier * tier = slot.tier;
     const int index = (int) (&slot - tier->slots.data());
     const auto now = std::chrono::steady_clock::now();
-    std::lock_guard<std::mutex> lock(tier->mu);
-    ggml_moe_tier_route & route = *tier->routes[slot.route];
-    slot.loading = false;
-    if (ok) {
-        moe_tier_publish(route, slot.expert, moe_tier_slot_data(tier, index));
-        tier->loads++;
-        tier->load_us += std::chrono::duration_cast<std::chrono::microseconds>(now - slot.queued).count();
-        return;
+    {
+        std::lock_guard<std::mutex> lock(tier->mu);
+        ggml_moe_tier_route & route = *tier->routes[slot.route];
+        slot.loading = false;
+        if (ok) {
+            moe_tier_publish(route, slot.expert, moe_tier_slot_data(tier, index));
+            tier->loads++;
+            tier->load_us += std::chrono::duration_cast<std::chrono::microseconds>(now - slot.queued).count();
+        } else {
+            route.slot[slot.expert] = -1;
+            slot.route = -1;
+            tier->free_slots.push_back(index);
+            tier->load_failures++;
+            tier->retry = true;
+        }
     }
-    route.slot[slot.expert] = -1;
-    slot.route = -1;
-    tier->free_slots.push_back(index);
-    tier->load_failures++;
-    tier->retry = true;
+    // a prefill may wait on it
+    tier->ring_cv.notify_all();
 }
 
 struct moe_tier_victim {
@@ -804,15 +809,50 @@ struct moe_tier_read {
     int priority;
 };
 
+// Starts reads into their slots; outside tier->mu, since a rejected read completes inside the call.
+static void moe_tier_issue(ggml_moe_tier * tier, const std::vector<moe_tier_read> & reads) {
+    const auto now = std::chrono::steady_clock::now();
+    for (const moe_tier_read & read : reads) {
+        tier->slots[read.slot].queued = now;
+        ggml_moe_store_read(tier->store, read.file, read.offset, read.size,
+                tier->arena + (size_t) read.slot * tier->slot_bytes,
+                read.priority, moe_tier_loaded, &tier->slots[read.slot]);
+    }
+}
+
+// Called under tier->mu.
+static int moe_tier_free_slot(ggml_moe_tier * tier) {
+    if (tier->free_slots.empty()) {
+        return -1;
+    }
+    const int index = tier->free_slots.back();
+    tier->free_slots.pop_back();
+    return index;
+}
+
+// Called under tier->mu. A prefill read takes a free slot, so prompts fill the arena,
+// but never evicts: it lands unreferenced, and CLOCK takes it before the decode set.
+static bool moe_tier_admit(ggml_moe_tier * tier, ggml_moe_tier_route & route, int32_t expert,
+        std::vector<moe_tier_read> & reads) {
+    const int index = moe_tier_free_slot(tier);
+    if (index < 0) {
+        return false;
+    }
+    moe_tier_slot_assign(tier, index, route.id, expert, true);
+    tier->slots[index].ref = false;
+    tier->slots[index].hinted = false;
+    reads.push_back({route.file, moe_tier_expert_offset(route, expert), route.expert_size, index, GGML_MOE_STORE_PREFILL});
+    return true;
+}
+
 // Called under tier->mu. A free slot, or one taken by CLOCK from an expert outside
 // set: VRAM-resident experts first, then any not referenced since the hand passed.
 // A hint takes only what CLOCK would, without spending other slots' second chance.
 static int moe_tier_take_slot(ggml_moe_tier * tier, const std::vector<uint32_t> & set, bool hint,
         std::vector<moe_tier_victim> & victims) {
-    if (!tier->free_slots.empty()) {
-        const int index = tier->free_slots.back();
-        tier->free_slots.pop_back();
-        return index;
+    const int free_index = moe_tier_free_slot(tier);
+    if (free_index >= 0) {
+        return free_index;
     }
     for (int step = 0; step < 2*tier->n_ready; step++) {
         const int index = tier->hand;
@@ -931,13 +971,7 @@ static void moe_tier_serve(ggml_moe_tier * tier, uint32_t seq, std::vector<uint3
     tier->sets++;
     tier->miss_sets += (long long) reads.size() > hint_reads;
     tier->hint_loads += hint_reads;
-    const auto now = std::chrono::steady_clock::now();
-    for (const moe_tier_read & read : reads) {
-        tier->slots[read.slot].queued = now;
-        ggml_moe_store_read(tier->store, read.file, read.offset, read.size,
-                tier->arena + (size_t) read.slot * tier->slot_bytes,
-                read.priority, moe_tier_loaded, &tier->slots[read.slot]);
-    }
+    moe_tier_issue(tier, reads);
 }
 
 // Polls the box: spins while sets arrive, then backs off to sleeps.
@@ -1136,8 +1170,9 @@ void ggml_moe_tier_log_stats(const ggml_moe_tier * tier, int device) {
             (double) loads * tier->slot_bytes / (1ull << 30), loads ? tier->load_us.load() / 1000.0 / loads : 0.0,
             tier->evictions.load(), tier->load_failures.load());
     if (tier->prefill_us.load()) {
-        GGML_LOG_INFO("moe tier: device %d: prefill %lld from RAM, %lld read (%lld ahead), %.1f s\n", device,
-                tier->prefill_ram.load(), tier->prefill_reads.load(), tier->prefill_ahead.load(), tier->prefill_us.load() / 1e6);
+        GGML_LOG_INFO("moe tier: device %d: prefill %lld from RAM (%lld read into it), %lld read through the ring (%lld ahead), %.1f s\n",
+                device, tier->prefill_ram.load(), tier->prefill_admits.load(), tier->prefill_reads.load(), tier->prefill_ahead.load(),
+                tier->prefill_us.load() / 1e6);
     }
 }
 
@@ -1194,9 +1229,9 @@ void ggml_moe_tier_route_link(ggml_moe_tier_route * route, int group) {
     tier->groups[group].push_back(route);
 }
 
-const void * ggml_moe_tier_pin(ggml_moe_tier_route * route, int32_t expert) {
+// Called under tier->mu.
+static const void * moe_tier_pin_locked(ggml_moe_tier_route * route, int32_t expert) {
     ggml_moe_tier * tier = route->tier;
-    std::lock_guard<std::mutex> lock(tier->mu);
     const int index = route->slot[expert];
     if (index < 0 || tier->slots[index].loading) {
         return nullptr;
@@ -1211,6 +1246,11 @@ const void * ggml_moe_tier_pin(ggml_moe_tier_route * route, int32_t expert) {
     }
     slot.pins++;
     return moe_tier_slot_data(tier, index);
+}
+
+const void * ggml_moe_tier_pin(ggml_moe_tier_route * route, int32_t expert) {
+    std::lock_guard<std::mutex> lock(route->tier->mu);
+    return moe_tier_pin_locked(route, expert);
 }
 
 void ggml_moe_tier_unpin(ggml_moe_tier_route * route, int32_t expert) {
@@ -1289,11 +1329,31 @@ void ggml_moe_tier_prefill(ggml_moe_tier_route * route, uint32_t * want, bool ah
         want[e / 32] &= ~(1u << (e % 32));
     };
 
+    std::vector<int32_t> pinned;
+    std::vector<std::pair<int32_t, const void *>> ready; // pinned, copied once tier->mu is released
+    // under tier->mu
+    const auto take_ram = [&](int32_t e) {
+        const void * ram = moe_tier_pin_locked(route, e);
+        if (ram) {
+            ready.push_back({e, ram});
+        }
+        return ram != nullptr;
+    };
+    const auto copy_ready = [&]() {
+        for (const auto & [e, ram] : ready) {
+            copy(e, ram);
+            pinned.push_back(e);
+        }
+        ready.clear();
+    };
+    std::vector<int32_t> filling; // loading into the arena
+    std::vector<uint32_t> misses; // for the ring, ascending
+    std::vector<moe_tier_read> fills;
     // Read ahead: the experts outside VRAM and RAM of the layer's later routes, which
     // take the same ids, then any of the next layer's, in launch order.
-    std::vector<std::pair<const ggml_moe_tier_route *, uint32_t>> next;
+    std::vector<std::pair<ggml_moe_tier_route *, uint32_t>> next;
+    std::unique_lock<std::mutex> tier_lock(tier->mu);
     if (ahead && route->group >= 0) {
-        std::lock_guard<std::mutex> lock(tier->mu);
         for (int group = route->group; group <= route->group + 1; group++) {
             auto found = tier->groups.find(group);
             if (found == tier->groups.end()) {
@@ -1306,29 +1366,38 @@ void ggml_moe_tier_prefill(ggml_moe_tier_route * route, uint32_t * want, bool ah
                 it += it != routes.end();
             }
             for (; it != routes.end(); ++it) {
-                const ggml_moe_tier_route & r = **it;
-                for (int32_t e = 0; e < r.n_expert; e++) {
-                    if ((group != route->group || wanted(e)) && r.slot[e] < 0 && !r.vram[e].load(std::memory_order_relaxed)) {
-                        next.push_back({&r, moe_tier_key(r.id, e)});
+                ggml_moe_tier_route * r = *it;
+                for (int32_t e = 0; e < r->n_expert; e++) {
+                    if ((group != route->group || wanted(e)) && r->slot[e] < 0 && !r->vram[e].load(std::memory_order_relaxed)) {
+                        next.push_back({r, moe_tier_key(r->id, e)});
                     }
                 }
             }
         }
     }
-
-    std::vector<int32_t> pinned;
-    std::vector<uint32_t> misses; // keys still to copy, ascending
+    // Experts in RAM copy from the arena; the rest load into its free slots while it has
+    // them, then read through the ring. Reads ahead take free slots after them.
     for (int32_t e = 0; e < route->n_expert; e++) {
         if (!wanted(e)) {
             continue;
         }
-        if (const void * ram = ggml_moe_tier_pin(route, e)) {
-            copy(e, ram);
-            pinned.push_back(e);
-        } else {
-            misses.push_back(moe_tier_key(route->id, e));
+        const int index = route->slot[e];
+        if (index >= 0 && tier->slots[index].loading) {
+            filling.push_back(e);
+        } else if (!take_ram(e)) {
+            if (index < 0 && moe_tier_admit(tier, *route, e, fills)) {
+                filling.push_back(e);
+            } else {
+                misses.push_back(moe_tier_key(route->id, e));
+            }
         }
     }
+    next.erase(std::remove_if(next.begin(), next.end(), [&](const auto & n) {
+        return moe_tier_admit(tier, *n.first, (int32_t) (n.second & 0xffff), fills);
+    }), next.end());
+    tier_lock.unlock();
+    moe_tier_issue(tier, fills);
+    copy_ready();
 
     size_t ahead_next = 0;
     long long reads = 0;
@@ -1337,7 +1406,27 @@ void ggml_moe_tier_prefill(ggml_moe_tier_route * route, uint32_t * want, bool ah
     for (const uint32_t k : misses) {
         ahead_reads += tier->staged.count(k);
     }
-    while (!misses.empty()) {
+    while (!misses.empty() || !filling.empty()) {
+        if (!filling.empty()) {
+            {
+                // ring_mu then tier->mu: no path takes them the other way round
+                std::lock_guard<std::mutex> lock_tier(tier->mu);
+                filling.erase(std::remove_if(filling.begin(), filling.end(), [&](int32_t e) {
+                    const int index = route->slot[e];
+                    if (index >= 0 && tier->slots[index].loading) {
+                        return false;
+                    }
+                    // a failed or evicted load stays wanted: the caller copies it from the mapping;
+                    // one past the pin cap reads through the ring
+                    if (!take_ram(e) && index >= 0) {
+                        const uint32_t k = moe_tier_key(route->id, e);
+                        misses.insert(std::lower_bound(misses.begin(), misses.end(), k), k);
+                    }
+                    return true;
+                }), filling.end());
+            }
+            copy_ready();
+        }
         std::vector<std::pair<moe_tier_stage *, const ggml_moe_tier_route *>> issue;
         // false once the ring is full this pass
         const auto stage_read = [&](uint32_t k, const ggml_moe_tier_route * r, const std::vector<uint32_t> * keep) {
@@ -1391,7 +1480,7 @@ void ggml_moe_tier_prefill(ggml_moe_tier_route * route, uint32_t * want, bool ah
                         r->expert_size, stage->buffer, GGML_MOE_STORE_PREFILL, moe_tier_staged_done, stage);
             }
             lock.lock();
-        } else if (!misses.empty()) {
+        } else if (!misses.empty() || !filling.empty()) {
             // landed reads notify; finished copies free stages without notice
             tier->ring_cv.wait_for(lock, std::chrono::microseconds(200));
         }
@@ -1402,6 +1491,7 @@ void ggml_moe_tier_prefill(ggml_moe_tier_route * route, uint32_t * want, bool ah
         ggml_moe_tier_unpin(route, e);
     }
     tier->prefill_ram += (long long) pinned.size();
+    tier->prefill_admits += (long long) fills.size();
     tier->prefill_reads += reads + ahead_reads;
     tier->prefill_ahead += ahead_reads;
     tier->prefill_us += std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - start).count();

@@ -653,9 +653,12 @@ struct ggml_cuda_pool_vmm : public ggml_cuda_pool {
 #else
                 create_result == CUDA_ERROR_OUT_OF_MEMORY;
 #endif
-            if (out_of_memory &&
-                ggml_moe_cache_trim(device) > 0) {
-                create_result = cuMemCreate(&handle, reserve_size, &prop, 0);
+            if (out_of_memory) {
+                GGML_LOG_WARN(GGML_CUDA_NAME " pool[%d]: growing %.2f MiB to %.2f MiB failed\n",
+                              device, reserve_size/1024.0/1024.0, (pool_size + reserve_size)/1024.0/1024.0);
+                if (ggml_moe_cache_trim(device) > 0) {
+                    create_result = cuMemCreate(&handle, reserve_size, &prop, 0);
+                }
             }
             if (create_result != CUDA_SUCCESS) {
                 return nullptr;

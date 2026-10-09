@@ -684,7 +684,7 @@ static void moe_cache_budget_unregister(moe_cache_device & device) {
 
 static size_t moe_cache_budget_claim(
         moe_cache_session & session, moe_cache_device & device,
-        size_t free_memory, size_t & reserve_bytes) {
+        size_t free_memory, size_t min_reserve, size_t & reserve_bytes) {
     std::lock_guard<std::mutex> lock(g_budget_mu);
     reserve_bytes = 0;
     auto found = g_physical_budgets.find(device.physical);
@@ -692,8 +692,16 @@ static size_t moe_cache_budget_claim(
         return 0;
     }
     moe_cache_physical_budget & state = found->second;
-    reserve_bytes = state.reserves.empty()
-        ? 0 : *state.reserves.rbegin();
+    // registered, so later claims on the device keep it too
+    if (min_reserve > device.budget_reserve_bytes) {
+        auto reserve = state.reserves.find(device.budget_reserve_bytes);
+        if (reserve != state.reserves.end()) {
+            state.reserves.erase(reserve);
+        }
+        state.reserves.insert(min_reserve);
+        device.budget_reserve_bytes = min_reserve;
+    }
+    reserve_bytes = *state.reserves.rbegin();
     const size_t available_after_reserve = free_memory > reserve_bytes
         ? free_memory - reserve_bytes : 0;
     const size_t unclaimed = available_after_reserve > state.outstanding_bytes
@@ -2073,6 +2081,10 @@ static int moe_cache_find_pool(
     return -1;
 }
 
+#if defined(GGML_USE_VMM) && !defined(GGML_USE_HIP)
+static size_t moe_cache_lend_size(const moe_cache_device & device);
+#endif
+
 static bool moe_cache_prepare_budget(
         moe_cache_session & session, moe_cache_device & device) {
     if (device.budget_ready) {
@@ -2091,9 +2103,20 @@ static bool moe_cache_prepare_budget(
         return false;
     }
 
+    size_t min_reserve = 0;
+#if defined(GGML_USE_VMM) && !defined(GGML_USE_HIP)
+    // Pool scratch grows with the ubatch, as does the compute buffer lent to the cache,
+    // and comes on top of the fixed automatic reserve: without a quarter of that buffer
+    // more, the first large prompt fails a pool allocation and the trim that follows
+    // takes the whole cache. A stopgap until trim reclaims only what the failed
+    // allocation needs.
+    if (!session.config.reserve_explicit) {
+        min_reserve = device.automatic_reserve_bytes + moe_cache_lend_size(device) / 4;
+    }
+#endif
     size_t reserve_bytes = 0;
     const size_t available = moe_cache_budget_claim(
-            session, device, free_memory, reserve_bytes);
+            session, device, free_memory, min_reserve, reserve_bytes);
     device.budget_limit = available;
 
     if (session.config.budget_mb > 0) {
