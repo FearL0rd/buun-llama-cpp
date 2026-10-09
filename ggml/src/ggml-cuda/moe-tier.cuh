@@ -44,3 +44,10 @@ const void * ggml_moe_tier_pin(ggml_moe_tier_route * route, int32_t expert);
 void ggml_moe_tier_unpin(ggml_moe_tier_route * route, int32_t expert);
 // VRAM-resident experts are the tier's first eviction choice.
 void ggml_moe_tier_set_vram(ggml_moe_tier_route * route, int32_t expert, bool vram);
+
+// Copies experts want marks into dst, the route's tensor, on stream after its earlier
+// work, and returns once they landed: RAM copies directly, the rest read from the store
+// through a pinned ring. Clears the bits of the experts it copied; the rest (all of
+// them without a ring, or after a failed read) stay the caller's. ahead also reads the
+// next routes' experts.
+void ggml_moe_tier_prefill(ggml_moe_tier_route * route, uint32_t * want, bool ahead, char * dst, cudaStream_t stream);

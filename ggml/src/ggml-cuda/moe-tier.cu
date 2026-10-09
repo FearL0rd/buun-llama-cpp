@@ -43,6 +43,9 @@ void ggml_moe_tier_unpin(ggml_moe_tier_route *, int32_t) {
 void ggml_moe_tier_set_vram(ggml_moe_tier_route *, int32_t, bool) {
 }
 
+void ggml_moe_tier_prefill(ggml_moe_tier_route *, uint32_t *, bool, char *, cudaStream_t) {
+}
+
 #else
 
 #include "ggml-moe-store.h"
@@ -51,6 +54,7 @@ void ggml_moe_tier_set_vram(ggml_moe_tier_route *, int32_t, bool) {
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -115,6 +119,28 @@ struct ggml_moe_tier_route {
     }
 };
 
+static uint32_t moe_tier_key(int route, int32_t expert) {
+    return (uint32_t) route << 16 | (uint32_t) expert;
+}
+
+enum moe_tier_stage_state {
+    MOE_TIER_STAGE_FREE,
+    MOE_TIER_STAGE_READING,
+    MOE_TIER_STAGE_READY,
+    MOE_TIER_STAGE_FAILED,
+    MOE_TIER_STAGE_COPYING, // its bytes stay valid until copied fires
+};
+
+// A prefill ring entry: an expert read from the store on its way to a launch.
+struct moe_tier_stage {
+    ggml_moe_tier * tier = nullptr;
+    uint32_t key = 0; // route << 16 | expert
+    moe_tier_stage_state state = MOE_TIER_STAGE_FREE;
+    char * buffer = nullptr;
+    const char * data = nullptr;
+    cudaEvent_t copied = nullptr;
+};
+
 struct ggml_moe_tier {
     int device = -1;
     cudaStream_t stream = nullptr;
@@ -148,6 +174,15 @@ struct ggml_moe_tier {
     float * d_scores = nullptr;   // [moe_tier_hint_experts]
     int32_t * d_hint = nullptr;   // [moe_tier_hint_max]
 
+    // Prefill ring, taken in order: large launches read experts outside RAM from the
+    // store through it rather than through the arena, which keeps the decode set.
+    char * ring = nullptr;
+    std::vector<moe_tier_stage> stages;
+    std::unordered_map<uint32_t, int> staged; // key -> stage
+    int stage_hand = 0;
+    std::mutex ring_mu;
+    std::condition_variable ring_cv;
+
     std::mutex mu;
     std::atomic<bool> stopping{false};
     std::atomic<bool> retry{false};
@@ -162,6 +197,10 @@ struct ggml_moe_tier {
     std::atomic<long long> load_us{0};
     std::atomic<long long> hint_loads{0};
     std::atomic<long long> hint_used{0}; // hinted slots a demand then found
+    std::atomic<long long> prefill_ram{0};   // prefill experts copied from the arena
+    std::atomic<long long> prefill_reads{0}; // prefill experts read into the ring
+    std::atomic<long long> prefill_ahead{0}; // of them, read before their launch asked
+    std::atomic<long long> prefill_us{0};
 };
 
 struct moe_tier_resolve_route {
@@ -281,6 +320,11 @@ static bool moe_tier_env_on(const char * name) {
 
 static bool moe_tier_siblings_enabled() {
     static const bool enabled = moe_tier_env_on("GGML_CUDA_MOE_TIER_SIBLINGS");
+    return enabled;
+}
+
+static bool moe_tier_prefill_enabled() {
+    static const bool enabled = moe_tier_env_on("GGML_CUDA_MOE_TIER_PREFILL");
     return enabled;
 }
 
@@ -775,7 +819,7 @@ static int moe_tier_take_slot(ggml_moe_tier * tier, const std::vector<uint32_t> 
         tier->hand = (tier->hand + 1) % tier->n_ready;
         moe_tier_slot & slot = tier->slots[index];
         if (slot.route < 0 || slot.loading || slot.pins > 0 ||
-            std::binary_search(set.begin(), set.end(), (uint32_t) slot.route << 16 | (uint32_t) slot.expert)) {
+            std::binary_search(set.begin(), set.end(), moe_tier_key(slot.route, slot.expert))) {
             continue;
         }
         ggml_moe_tier_route & route = *tier->routes[slot.route];
@@ -862,7 +906,7 @@ static void moe_tier_serve(ggml_moe_tier * tier, uint32_t seq, std::vector<uint3
             seq = now;
             for (const moe_tier_victim & victim : victims) {
                 if (!std::binary_search(set.begin(), set.end(),
-                        (uint32_t) victim.route << 16 | (uint32_t) victim.expert)) {
+                        moe_tier_key(victim.route, victim.expert))) {
                     continue;
                 }
                 const moe_tier_slot & slot = tier->slots[victim.slot];
@@ -941,8 +985,14 @@ void ggml_moe_tier_free(ggml_moe_tier * tier) {
     if (tier->grower.joinable()) {
         tier->grower.join();
     }
-    // reads still in flight land in the arena
+    // reads still in flight land in the arena and the ring
     ggml_moe_store_free(tier->store);
+    for (const moe_tier_stage & stage : tier->stages) {
+        cudaEventDestroy(stage.copied);
+    }
+    if (tier->ring) {
+        cudaFreeHost(tier->ring);
+    }
     for (const auto & chunk : tier->chunks) {
         cudaHostUnregister(tier->arena + (size_t) chunk.first * tier->slot_bytes);
     }
@@ -1014,12 +1064,44 @@ ggml_moe_tier * ggml_moe_tier_create(int device, cudaStream_t stream) {
     return tier;
 }
 
+// Pins the prefill ring out of the budget; without one, prefill copies stay the caller's.
+static void moe_tier_ring_init(ggml_moe_tier * tier) {
+    if (!moe_tier_prefill_enabled()) {
+        return;
+    }
+    int64_t ring_mb = 1024;
+    moe_cache_env_i64("GGML_CUDA_MOE_TIER_RING_MB", 0, 1 << 20, ring_mb);
+    // the arena keeps at least three quarters of the budget, and its minimum slots
+    const size_t arena_min = (size_t) moe_tier_slots_min * tier->slot_bytes;
+    const size_t spare = tier->budget > arena_min ? tier->budget - arena_min : 0;
+    const size_t n_stages = std::min({(size_t) ring_mb << 20, tier->budget / 4, spare}) / tier->slot_bytes;
+    if (n_stages < 8) {
+        return;
+    }
+    const size_t bytes = n_stages * tier->slot_bytes;
+    if (cudaHostAlloc((void **) &tier->ring, bytes, cudaHostAllocPortable) != cudaSuccess) {
+        (void) cudaGetLastError();
+        tier->ring = nullptr;
+        GGML_LOG_WARN("moe tier: device %d: cannot pin the prefill ring\n", tier->device);
+        return;
+    }
+    tier->budget -= bytes;
+    tier->stages.resize(n_stages);
+    for (size_t i = 0; i < n_stages; i++) {
+        moe_tier_stage & stage = tier->stages[i];
+        stage.tier = tier;
+        stage.buffer = tier->ring + i * tier->slot_bytes;
+        CUDA_CHECK(cudaEventCreateWithFlags(&stage.copied, cudaEventDisableTiming));
+    }
+}
+
 // Reserves the arena for the routes added so far and pins its first chunk.
 static void moe_tier_start(ggml_moe_tier * tier) {
     {
         std::lock_guard<std::mutex> lock(tier->mu);
         tier->slot_bytes = moe_tier_slot_bytes(tier->expert_max);
     }
+    moe_tier_ring_init(tier);
     const size_t n_slots = tier->budget / tier->slot_bytes;
     void * arena = mmap(nullptr, n_slots * tier->slot_bytes, PROT_READ | PROT_WRITE,
             MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
@@ -1053,6 +1135,10 @@ void ggml_moe_tier_log_stats(const ggml_moe_tier * tier, int device) {
             device, tier->n_ready, tier->sets.load(), tier->miss_sets.load(), loads, tier->hint_loads.load(), tier->hint_used.load(),
             (double) loads * tier->slot_bytes / (1ull << 30), loads ? tier->load_us.load() / 1000.0 / loads : 0.0,
             tier->evictions.load(), tier->load_failures.load());
+    if (tier->prefill_us.load()) {
+        GGML_LOG_INFO("moe tier: device %d: prefill %lld from RAM, %lld read (%lld ahead), %.1f s\n", device,
+                tier->prefill_ram.load(), tier->prefill_reads.load(), tier->prefill_ahead.load(), tier->prefill_us.load() / 1e6);
+    }
 }
 
 ggml_moe_tier_route * ggml_moe_tier_route_add(ggml_moe_tier * tier, const void * host_base,
@@ -1139,6 +1225,186 @@ void ggml_moe_tier_unpin(ggml_moe_tier_route * route, int32_t expert) {
 
 void ggml_moe_tier_set_vram(ggml_moe_tier_route * route, int32_t expert, bool vram) {
     route->vram[expert].store(vram, std::memory_order_relaxed);
+}
+
+static void moe_tier_staged_done(void * user, bool ok) {
+    moe_tier_stage & stage = *(moe_tier_stage *) user;
+    {
+        std::lock_guard<std::mutex> lock(stage.tier->ring_mu);
+        stage.state = ok ? MOE_TIER_STAGE_READY : MOE_TIER_STAGE_FAILED;
+    }
+    stage.tier->ring_cv.notify_all();
+}
+
+// Called under ring_mu: the stage at the hand once it can take a new read, else -1.
+// Copied and failed stages free; with keep, so do read stages outside it (reads ahead
+// of a launch that turned out not to need them). keep: the sorted keys still wanted.
+static int moe_tier_ring_take(ggml_moe_tier * tier, const std::vector<uint32_t> * keep) {
+    moe_tier_stage & stage = tier->stages[tier->stage_hand];
+    switch (stage.state) {
+        case MOE_TIER_STAGE_READING:
+            return -1;
+        case MOE_TIER_STAGE_READY:
+            if (!keep || std::binary_search(keep->begin(), keep->end(), stage.key)) {
+                return -1;
+            }
+            break;
+        case MOE_TIER_STAGE_COPYING: {
+            const cudaError_t status = cudaEventQuery(stage.copied);
+            if (status == cudaErrorNotReady) {
+                return -1;
+            }
+            CUDA_CHECK(status);
+            break;
+        }
+        default:
+            break;
+    }
+    if (stage.state != MOE_TIER_STAGE_FREE) {
+        tier->staged.erase(stage.key);
+        stage.state = MOE_TIER_STAGE_FREE;
+    }
+    const int index = tier->stage_hand;
+    tier->stage_hand = (tier->stage_hand + 1) % (int) tier->stages.size();
+    return index;
+}
+
+void ggml_moe_tier_prefill(ggml_moe_tier_route * route, uint32_t * want, bool ahead, char * dst, cudaStream_t stream) {
+    ggml_moe_tier * tier = route->tier;
+    if (!moe_tier_prefill_enabled()) {
+        return;
+    }
+    // a prompt may come before any resolve
+    if (!tier->arena) {
+        moe_tier_start(tier);
+    }
+    if (!tier->ring) {
+        return;
+    }
+    const auto start = std::chrono::steady_clock::now();
+    const size_t size = route->expert_size;
+    const auto wanted = [&](int32_t e) { return (want[e / 32] >> (e % 32)) & 1u; };
+    const auto copy = [&](int32_t e, const void * src) {
+        CUDA_CHECK(cudaMemcpyAsync(dst + (size_t) e * size, src, size, cudaMemcpyHostToDevice, stream));
+        want[e / 32] &= ~(1u << (e % 32));
+    };
+
+    // Read ahead: the experts outside VRAM and RAM of the layer's later routes, which
+    // take the same ids, then any of the next layer's, in launch order.
+    std::vector<std::pair<const ggml_moe_tier_route *, uint32_t>> next;
+    if (ahead && route->group >= 0) {
+        std::lock_guard<std::mutex> lock(tier->mu);
+        for (int group = route->group; group <= route->group + 1; group++) {
+            auto found = tier->groups.find(group);
+            if (found == tier->groups.end()) {
+                continue;
+            }
+            const auto & routes = found->second;
+            auto it = routes.begin();
+            if (group == route->group) {
+                it = std::find(routes.begin(), routes.end(), route);
+                it += it != routes.end();
+            }
+            for (; it != routes.end(); ++it) {
+                const ggml_moe_tier_route & r = **it;
+                for (int32_t e = 0; e < r.n_expert; e++) {
+                    if ((group != route->group || wanted(e)) && r.slot[e] < 0 && !r.vram[e].load(std::memory_order_relaxed)) {
+                        next.push_back({&r, moe_tier_key(r.id, e)});
+                    }
+                }
+            }
+        }
+    }
+
+    std::vector<int32_t> pinned;
+    std::vector<uint32_t> misses; // keys still to copy, ascending
+    for (int32_t e = 0; e < route->n_expert; e++) {
+        if (!wanted(e)) {
+            continue;
+        }
+        if (const void * ram = ggml_moe_tier_pin(route, e)) {
+            copy(e, ram);
+            pinned.push_back(e);
+        } else {
+            misses.push_back(moe_tier_key(route->id, e));
+        }
+    }
+
+    size_t ahead_next = 0;
+    long long reads = 0;
+    long long ahead_reads = 0;
+    std::unique_lock<std::mutex> lock(tier->ring_mu);
+    for (const uint32_t k : misses) {
+        ahead_reads += tier->staged.count(k);
+    }
+    while (!misses.empty()) {
+        std::vector<std::pair<moe_tier_stage *, const ggml_moe_tier_route *>> issue;
+        // false once the ring is full this pass
+        const auto stage_read = [&](uint32_t k, const ggml_moe_tier_route * r, const std::vector<uint32_t> * keep) {
+            const int index = moe_tier_ring_take(tier, keep);
+            if (index < 0) {
+                return false;
+            }
+            moe_tier_stage & stage = tier->stages[index];
+            stage.key = k;
+            stage.state = MOE_TIER_STAGE_READING;
+            tier->staged[k] = index;
+            issue.push_back({&stage, r});
+            return true;
+        };
+        bool issuing = true; // misses get stages in order
+        for (size_t i = 0; i < misses.size();) {
+            auto found = tier->staged.find(misses[i]);
+            if (found == tier->staged.end()) {
+                issuing = issuing && stage_read(misses[i], route, &misses);
+                reads += issuing;
+                i++;
+                continue;
+            }
+            moe_tier_stage & stage = tier->stages[found->second];
+            if (stage.state == MOE_TIER_STAGE_READY || stage.state == MOE_TIER_STAGE_COPYING) {
+                copy(misses[i] & 0xffff, stage.data);
+                CUDA_CHECK(cudaEventRecord(stage.copied, stream));
+                stage.state = MOE_TIER_STAGE_COPYING;
+            } else if (stage.state == MOE_TIER_STAGE_FAILED) {
+                // left wanted: the caller copies it from the mapping
+                tier->staged.erase(found);
+                stage.state = MOE_TIER_STAGE_FREE;
+            } else {
+                i++;
+                continue;
+            }
+            misses.erase(misses.begin() + i);
+        }
+        // reads ahead take only what the ring has spare
+        for (; issuing && ahead_next < next.size(); ahead_next++) {
+            const auto & [r, k] = next[ahead_next];
+            if (!tier->staged.count(k) && !stage_read(k, r, nullptr)) {
+                break;
+            }
+        }
+        if (!issue.empty()) {
+            // a rejected read completes inside the call, under ring_mu
+            lock.unlock();
+            for (const auto & [stage, r] : issue) {
+                stage->data = (const char *) ggml_moe_store_read(tier->store, r->file, moe_tier_expert_offset(*r, stage->key & 0xffff),
+                        r->expert_size, stage->buffer, GGML_MOE_STORE_PREFILL, moe_tier_staged_done, stage);
+            }
+            lock.lock();
+        } else if (!misses.empty()) {
+            // landed reads notify; finished copies free stages without notice
+            tier->ring_cv.wait_for(lock, std::chrono::microseconds(200));
+        }
+    }
+    lock.unlock();
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    for (const int32_t e : pinned) {
+        ggml_moe_tier_unpin(route, e);
+    }
+    tier->prefill_ram += (long long) pinned.size();
+    tier->prefill_reads += reads + ahead_reads;
+    tier->prefill_ahead += ahead_reads;
+    tier->prefill_us += std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - start).count();
 }
 
 #endif

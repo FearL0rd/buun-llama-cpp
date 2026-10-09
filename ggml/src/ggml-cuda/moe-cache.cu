@@ -2881,33 +2881,54 @@ static int moe_cache_prefill_copy(void * opaque, void * backend_opaque,
     moe_cache_device * local = moe_cache_device_for(session, ctx->device);
     if (!local || local->dead) return false;
     auto & device = *local;
+    // a tiered route's misses come from the RAM tier and the store, not the mapping
+    const moe_cache_route * route = device.tier ? moe_cache_route_get(device, source->data) : nullptr;
+    ggml_moe_tier_route * tier_route = route ? route->tier : nullptr;
     const int pool_index = moe_cache_find_pool(device, expert_size, source->type);
-    if (pool_index < 0) return false;
-    const auto & pool = *device.pools[pool_index];
-    if (!pool.slab) return false;
+    const moe_cache_pool * pool = pool_index >= 0 && device.pools[pool_index]->slab ? device.pools[pool_index].get() : nullptr;
+    if (!pool && !tier_route) return false;
 
     const int n_expert = source->ne[2];
     const auto used = [&](int e) { return (selected[e / 32] >> (e % 32)) & 1u; };
     bool resident[512] = {};
     moe_cache_pp_copy_refs refs = {};
     int hits = 0;
-    for (int e = 0; e < n_expert; ++e) {
+    for (int e = 0; pool && e < n_expert; ++e) {
         if (!used(e)) continue;
-        const auto found = pool.map.find({source->data, e});
-        if (found != pool.map.end() && pool.slots[found->second].state == moe_cache_slot_state::valid) {
+        const auto found = pool->map.find({source->data, e});
+        if (found != pool->map.end() && pool->slots[found->second].state == moe_cache_slot_state::valid) {
             if (found->second > 65535) return false;
             resident[e] = true;
             refs.packed[hits++] = (uint32_t(e) << 16) | uint32_t(found->second);
         }
     }
-    if (!hits) return false;
+    if (!hits && !tier_route) return false;
 
     ggml_cuda_set_device(ctx->device);
-    const size_t vectors = expert_size / sizeof(uint4);
-    const unsigned blocks = std::min<size_t>(32, (vectors + 255) / 256);
-    moe_cache_pp_gather<<<dim3(blocks, hits), 256, 0, ctx->stream()>>>(
-        (const uint4 *) pool.slab, (uint4 *) destination->data, vectors, refs);
-    CUDA_CHECK(cudaGetLastError());
+    if (hits) {
+        const size_t vectors = expert_size / sizeof(uint4);
+        const unsigned blocks = std::min<size_t>(32, (vectors + 255) / 256);
+        moe_cache_pp_gather<<<dim3(blocks, hits), 256, 0, ctx->stream()>>>(
+            (const uint4 *) pool->slab, (uint4 *) destination->data, vectors, refs);
+        CUDA_CHECK(cudaGetLastError());
+    }
+    if (tier_route) {
+        // the gather reads the pool; the tier's reads take long, so drop it first
+        if (hits) CUDA_CHECK(cudaStreamSynchronize(ctx->stream()));
+        lock.unlock();
+        uint32_t want[512 / 32] = {};
+        int n_used = 0;
+        for (int e = 0; e < n_expert; ++e) {
+            n_used += used(e);
+            if (used(e) && !resident[e]) want[e / 32] |= 1u << (e % 32);
+        }
+        // reading ahead pays off once a launch takes most of the experts
+        ggml_moe_tier_prefill(tier_route, want, 4*n_used >= 3*n_expert, (char *) destination->data, ctx->stream());
+        // what the tier copied is in place; the copy below takes the rest from the mapping
+        for (int e = 0; e < n_expert; ++e) {
+            if (used(e) && !resident[e]) resident[e] = !((want[e / 32] >> (e % 32)) & 1u);
+        }
+    }
     for (int e = 0; e < n_expert;) {
         if (!used(e)) { ++e; continue; }
         int end = e + 1;
