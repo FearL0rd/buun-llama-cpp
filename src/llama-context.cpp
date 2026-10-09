@@ -874,7 +874,10 @@ void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint3
             // but is still wrong for cases like --no-kv-offload.
             ggml_backend_dev_t device_layer = model.dev_layer(node.il);
 
-            if (device_fused != device_layer) {
+            // the scheduler only places a node where it is supported, so missing support shows as a
+            // fall back to the CPU; a CPU layer's node offloaded to a GPU (large batches) is supported
+            if (device_fused != device_layer &&
+                    (!device_fused || ggml_backend_dev_type(device_fused) == GGML_BACKEND_DEVICE_TYPE_CPU)) {
                 LLAMA_LOG_WARN("%s: layer %d is assigned to device %s but %s "
                         "is assigned to device %s (usually due to missing support)\n",
                         func, node.il,
