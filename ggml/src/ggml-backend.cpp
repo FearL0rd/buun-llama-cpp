@@ -2580,6 +2580,12 @@ void ggml_backend_sched_set_moe_cache(
             cache_backends, sched->n_backends, &config);
 }
 
+void ggml_backend_sched_set_moe_cache_warmup(ggml_backend_sched_t sched, bool warmup) {
+    if (sched->moe_cache_session && ggml_moe_cache.session_warmup) {
+        ggml_moe_cache.session_warmup(sched->moe_cache_session, warmup);
+    }
+}
+
 bool ggml_backend_sched_has_moe_cache(ggml_backend_sched_t sched) {
     return sched->moe_cache_session != nullptr;
 }

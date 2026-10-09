@@ -44,6 +44,7 @@ bool ggml_moe_cache_route_find(const void * host_base, ggml_moe_cache_route_tabl
 #include <cstring>
 #include <deque>
 #include <fstream>
+#include <functional>
 #include <iterator>
 #include <limits>
 #include <memory>
@@ -175,7 +176,8 @@ struct moe_cache_seen_tensor {
     size_t expert_size = 0;
     int wtype = -1;
     int64_t n_expert = 0;
-    int stream_stage_registered = -1;
+    uint64_t profile_key = 0;
+    int registered = -1;
 };
 
 struct moe_cache_job {
@@ -188,6 +190,13 @@ struct moe_cache_job {
     // The slot was evicted from a device-routed table: wait until the routed
     // stream has passed the table repoint before overwriting it.
     cudaEvent_t wait_event = nullptr;
+    // A warm-start fill: it lands at the LRU head, so real demand evicts it first.
+    bool seed = false;
+};
+
+struct moe_cache_seed {
+    int pool = -1;
+    moe_cache_key key;
 };
 
 static constexpr int moe_cache_route_log_max = 512;
@@ -249,6 +258,8 @@ struct moe_cache_config {
     int cool = 0;
     // Most fills the worker copies per stream synchronization.
     int fill_batch = 16;
+    // Fill every free slot after the pools are built (warm start), not only on demand.
+    bool seed = true;
     int queue_max = 128;
     size_t queue_mb = 512;
     int stats_every = 0;
@@ -320,6 +331,9 @@ struct moe_cache_device {
 
     std::deque<moe_cache_job> queue;
     size_t queued_bytes = 0;
+    // Warm-start fills, hottest first, queued only while no demand fill waits.
+    std::deque<moe_cache_seed> seeds;
+    bool seed_planned = false;
     bool worker_started = false;
     std::vector<moe_cache_job> inflight; // the worker's current batch
     std::thread worker;
@@ -417,6 +431,7 @@ struct moe_cache_session {
     std::atomic<bool> enabled_announced{false};
     std::atomic<bool> batch_bypass_announced{false};
     std::atomic<bool> row_bypass_announced{false};
+    bool warmup = false;
     int active_scopes = 0;
     int active_nodes = 0;
     struct active_source {
@@ -806,6 +821,9 @@ static moe_cache_config moe_cache_read_config() {
     if (moe_cache_env_i64("GGML_CUDA_MOE_CACHE_FILL_BATCH", 1, 256, value)) {
         config.fill_batch = (int)value;
     }
+    if (moe_cache_env_i64("GGML_CUDA_MOE_CACHE_SEED", 0, 1, value)) {
+        config.seed = value != 0;
+    }
     if (moe_cache_env_i64("GGML_CUDA_MOE_CACHE_LFU", 0, 1, value)) {
         config.lfu = value != 0;
     }
@@ -920,6 +938,12 @@ static uint64_t moe_cache_profile_tensor_hash(
     return hash;
 }
 
+static uint64_t moe_cache_tensor_profile_key(
+        const moe_cache_session & session, const char * name, size_t expert_size, int wtype, int64_t n_expert) {
+    return session.config.profile_path.empty() ? 0 :
+        moe_cache_profile_tensor_hash(name, expert_size, wtype, n_expert);
+}
+
 static uint32_t moe_cache_profile_u32(const unsigned char * data) {
     return uint32_t(data[0]) | uint32_t(data[1]) << 8 |
         uint32_t(data[2]) << 16 | uint32_t(data[3]) << 24;
@@ -1018,9 +1042,6 @@ static void moe_cache_profile_load(moe_cache_session & session, bool announce = 
             std::sort(tensor.second.begin(), tensor.second.end(), [](const auto & a, const auto & b) {
                 return a.first > b.first || (a.first == b.first && a.second < b.second);
             });
-            if (tensor.second.size() > 32) {
-                tensor.second.resize(32);
-            }
             std::vector<int32_t> & hot = session.profile_hot[tensor.first];
             hot.reserve(tensor.second.size());
             for (const auto & item : tensor.second) {
@@ -1226,7 +1247,9 @@ static void moe_cache_profile_advise(
         return;
     }
     const uintptr_t page = (uintptr_t)page_long;
-    for (int32_t expert : experts) {
+    // readahead for the head of the ranking only; the bulk seed reads the rest in order
+    for (size_t i = 0; i < std::min<size_t>(experts.size(), 32); i++) {
+        const int32_t expert = experts[i];
         if (expert < 0 || expert >= n_expert) {
             continue;
         }
@@ -1336,6 +1359,18 @@ static void moe_cache_lru_push_back(moe_cache_pool & pool, int index) {
         pool.lru_head = index;
     }
     pool.lru_tail = index;
+}
+
+static void moe_cache_lru_push_front(moe_cache_pool & pool, int index) {
+    moe_cache_slot & slot = pool.slots[index];
+    slot.prev = -1;
+    slot.next = pool.lru_head;
+    if (pool.lru_head >= 0) {
+        pool.slots[pool.lru_head].prev = index;
+    } else {
+        pool.lru_tail = index;
+    }
+    pool.lru_head = index;
 }
 
 static void moe_cache_map_erase(moe_cache_pool & pool, int index) {
@@ -1783,6 +1818,8 @@ static void moe_cache_route_destroy(moe_cache_device & device) {
     device.route_stream = nullptr;
 }
 
+static void moe_cache_seed_topup_locked(moe_cache_session & session, moe_cache_device & device);
+
 static void moe_cache_worker(moe_cache_session * session, moe_cache_device * device) {
 #if defined(GGML_USE_HIP)
     // Keep ROCm's pageable sources on a bounded pinned buffer: direct transfers
@@ -1799,6 +1836,9 @@ static void moe_cache_worker(moe_cache_session * session, moe_cache_device * dev
         destinations.clear();
         {
             std::unique_lock<std::mutex> lock(session->mu);
+            if (device->queue.empty()) {
+                moe_cache_seed_topup_locked(*session, *device);
+            }
             session->cv.wait(lock, [&] {
                 return session->stopping || device->dead.load() ||
                     !device->queue.empty();
@@ -1935,7 +1975,12 @@ static void moe_cache_worker(moe_cache_session * session, moe_cache_device * dev
                     slot.generation == job.generation && slot.key == job.key) {
                     if (error == cudaSuccess) {
                         slot.state = moe_cache_slot_state::valid;
-                        moe_cache_lru_push_back(pool, job.slot);
+                        // seeds complete hottest first, so the coldest guess ends at the head
+                        if (job.seed) {
+                            moe_cache_lru_push_front(pool, job.slot);
+                        } else {
+                            moe_cache_lru_push_back(pool, job.slot);
+                        }
                         device->demand_count.erase(job.key);
                         device->fills++;
                         moe_cache_route_push_locked(*device, job.key, destinations[i]);
@@ -2330,7 +2375,7 @@ static void moe_cache_build_pending(
 // Adds a tensor to the device's shape census; returns false when it was already counted.
 static bool moe_cache_census_tensor(
         moe_cache_device & device, int pool, const void * host_base, size_t tensor_size,
-        size_t expert_size, int wtype, int64_t n_expert) {
+        size_t expert_size, int wtype, int64_t n_expert, uint64_t profile_key) {
     if (device.seen_tensors.find(host_base) != device.seen_tensors.end()) {
         return false;
     }
@@ -2346,7 +2391,7 @@ static bool moe_cache_census_tensor(
         shape = &device.shapes.back();
     }
     device.seen_tensors.emplace(
-            host_base, moe_cache_seen_tensor{tensor_size, expert_size, wtype, n_expert});
+            host_base, moe_cache_seen_tensor{tensor_size, expert_size, wtype, n_expert, profile_key});
     if (shape->n_tensors == 0 && shape->pool < 0) {
         shape->finished = false;
     }
@@ -2367,7 +2412,7 @@ static bool moe_cache_census_tensor(
 static int moe_cache_discover_pool(
         moe_cache_session & session, moe_cache_device & device,
         const void * host_base, size_t tensor_size, size_t expert_size,
-        int wtype, int64_t n_expert) {
+        int wtype, int64_t n_expert, uint64_t profile_key) {
     const int pool = moe_cache_find_pool(device, expert_size, wtype);
     if (pool >= 0 && !device.pools[pool]->covers_all_entries) {
         return pool;
@@ -2376,7 +2421,7 @@ static int moe_cache_discover_pool(
         return pool;
     }
 
-    if (!moe_cache_census_tensor(device, pool, host_base, tensor_size, expert_size, wtype, n_expert) &&
+    if (!moe_cache_census_tensor(device, pool, host_base, tensor_size, expert_size, wtype, n_expert, profile_key) &&
         device.visits_since_new_tensor < SIZE_MAX) {
         device.visits_since_new_tensor++;
     }
@@ -2384,7 +2429,8 @@ static int moe_cache_discover_pool(
         return pool;
     }
 
-    if (device.visits_since_new_tensor < device.seen_tensors.size()) {
+    // Warmup only takes the census; pools are built at the first real evaluation.
+    if (session.warmup || device.visits_since_new_tensor < device.seen_tensors.size()) {
         return -1;
     }
 
@@ -2649,6 +2695,15 @@ static void moe_cache_cancel_queue_locked(
             ++it;
         }
     }
+    device.seeds.erase(std::remove_if(device.seeds.begin(), device.seeds.end(),
+            [&](const moe_cache_seed & seed) {
+                if (all || seed.pool >= (int)device.pools.size()) {
+                    return true;
+                }
+                const size_t expert_size = device.pools[seed.pool]->expert_size;
+                return moe_cache_ranges_overlap((const char *)seed.key.tensor +
+                        (size_t)seed.key.expert * expert_size, expert_size, base, size);
+            }), device.seeds.end());
 }
 
 static void moe_cache_free_device(moe_cache_device & device) {
@@ -3062,6 +3117,25 @@ static int moe_cache_output_copy(void * session, void * backend_opaque,
 
 static void moe_cache_route_snapshot_locked(moe_cache_device & device);
 static void moe_cache_route_drain_locked(moe_cache_session & session, moe_cache_device & device);
+static void moe_cache_seed_plan_locked(const moe_cache_session & session, moe_cache_device & device);
+
+// Called under session.mu before an outermost evaluation outside warmup. An earlier
+// graph put every expert tensor in the census, so the pools need not wait for
+// another round of visits, and a warm start fills them behind demand.
+static void moe_cache_build_eager_locked(moe_cache_session & session, moe_cache_device & device) {
+    if (std::any_of(device.shapes.begin(), device.shapes.end(), [](const moe_cache_shape & shape) {
+            return !shape.finished && shape.n_tensors > 0; })) {
+        moe_cache_build_pending(session, device);
+    }
+    moe_cache_seed_plan_locked(session, device);
+    // A worker already asleep waits on the queue, not the seeds, so top up here.
+    if (!device.seeds.empty() && device.queue.empty()) {
+        moe_cache_seed_topup_locked(session, device);
+    }
+    if (!device.queue.empty() && moe_cache_start_worker(session, device)) {
+        session.cv.notify_all();
+    }
+}
 
 static void moe_cache_session_enter(void * opaque) {
     moe_cache_retire_pending();
@@ -3118,9 +3192,18 @@ static void moe_cache_session_enter(void * opaque) {
                 moe_cache_route_snapshot_locked(*device);
                 // Fills finished since the last drain reach this evaluation.
                 moe_cache_route_flush_locked(*device);
+                if (!session->warmup) {
+                    moe_cache_build_eager_locked(*session, *device);
+                }
             }
         }
     }
+}
+
+static void moe_cache_session_warmup(void * opaque, int warmup) {
+    moe_cache_session * session = (moe_cache_session *)opaque;
+    std::lock_guard<std::mutex> lock(session->mu);
+    session->warmup = warmup != 0;
 }
 
 static void moe_cache_session_leave(void * opaque) {
@@ -3221,8 +3304,7 @@ static void * moe_cache_begin(
     }
     int layer = -1;
     const bool has_layer = moe_cache_layer_number(name, layer);
-    const uint64_t profile_key = session->config.profile_path.empty() ? 0 :
-        moe_cache_profile_tensor_hash(name, expert_size, wtype, n_expert);
+    const uint64_t profile_key = moe_cache_tensor_profile_key(*session, name, expert_size, wtype, n_expert);
 
     moe_cache_device * selected = nullptr;
     int pool_index = -1;
@@ -3425,7 +3507,8 @@ static void * moe_cache_begin(
 
         try {
             pool_index = moe_cache_discover_pool(
-                    *session, *selected, host_base, tensor_size, expert_size, wtype, n_expert);
+                    *session, *selected, host_base, tensor_size, expert_size, wtype, n_expert,
+                    profile_key);
         } catch (...) {
             MOE_CACHE_LOG("[moe-cache] disabled one node after host allocation failure\n");
             return nullptr;
@@ -3594,7 +3677,7 @@ static bool moe_cache_enqueue_locked(
         moe_cache_session & session, moe_cache_device & device,
         moe_cache_pool & pool, int pool_index, const void * host_base,
         int32_t expert, size_t expert_size, int & inserts_left,
-        bool & wake_worker, bool allow_eviction, uint16_t freq, bool contest) {
+        bool & wake_worker, bool allow_eviction, uint16_t freq, bool contest, bool seed = false) {
     const moe_cache_key key{host_base, expert};
     const size_t queue_limit = session.config.queue_mb << 20;
     if (inserts_left <= 0 || (int)device.queue.size() >= session.config.queue_max ||
@@ -3643,7 +3726,7 @@ static bool moe_cache_enqueue_locked(
             (const char *)host_base + (size_t)expert * expert_size;
         device.queue.push_back({
                 pool_index, slot_index, slot.generation,
-                key, source, expert_size, wait_event});
+                key, source, expert_size, wait_event, seed});
         device.queued_bytes += expert_size;
     } catch (...) {
         moe_cache_slot_reset(pool, slot_index, true);
@@ -3732,6 +3815,20 @@ static void moe_cache_freq_age_locked(const moe_cache_session & session, moe_cac
     }
 }
 
+static bool moe_cache_source_registered(moe_cache_device & device, const void * base) {
+    auto found = device.seen_tensors.find(base);
+    if (found != device.seen_tensors.end() && found->second.registered >= 0)
+        return found->second.registered != 0;
+    // Partial pools stop extending the census; absence there does not imply a
+    // pageable source (including a source rediscovered after invalidation).
+    cudaPointerAttributes attributes = {};
+    const cudaError_t error = cudaPointerGetAttributes(&attributes, base);
+    const bool registered = error == cudaSuccess && attributes.type == cudaMemoryTypeHost;
+    if (error != cudaSuccess) (void)cudaGetLastError();
+    if (found != device.seen_tensors.end()) found->second.registered = registered;
+    return registered;
+}
+
 static void moe_cache_profile_seed_locked(
         moe_cache_session & session, moe_cache_device & device,
         moe_cache_pool & pool, int pool_index, const void * host_base,
@@ -3750,6 +3847,9 @@ static void moe_cache_profile_seed_locked(
     const std::vector<int32_t> & hot = moe_cache_profile_hot_experts(
             session, tensor_profile);
     moe_cache_profile_advise(host_base, expert_size, hot, n_expert);
+    if (session.config.seed && moe_cache_source_registered(device, host_base)) {
+        return; // the warm start fills every free slot from the whole ranking
+    }
     int inserts_left = std::min(session.config.inserts_per_plan, 8);
     for (int32_t expert : hot) {
         if (expert < 0 || expert >= n_expert) {
@@ -3763,6 +3863,84 @@ static void moe_cache_profile_seed_locked(
                     session, device, pool, pool_index, host_base, expert,
                     expert_size, inserts_left, wake_worker, false, 0, false);
         }
+    }
+}
+
+// Called under session.mu once the device has pools: plans a warm start for every
+// free slot from registered sources. Profiled experts go first by heat; the rest
+// spread evenly across tensors. Mapped sources keep the small
+// profile seed: bulk reads would fault the cold tail through the page cache.
+static void moe_cache_seed_plan_locked(const moe_cache_session & session, moe_cache_device & device) {
+    if (device.seed_planned || device.pools.empty() || !session.config.seed) {
+        return;
+    }
+    device.seed_planned = true;
+    struct candidate {
+        uint32_t heat;
+        int pool;
+        moe_cache_key key;
+    };
+    std::vector<candidate> candidates;
+    const bool profiled = !session.profile_heat.empty();
+    ggml_cuda_set_device(device.logical);
+    for (const auto & seen : device.seen_tensors) {
+        const int pool = moe_cache_find_pool(device, seen.second.expert_size, seen.second.wtype);
+        if (pool < 0 || !device.pools[pool]->slab || !moe_cache_source_registered(device, seen.first)) {
+            continue;
+        }
+        for (int64_t expert = 0; expert < seen.second.n_expert; expert++) {
+            uint32_t heat = 0;
+            if (profiled) {
+                const auto it = session.profile_heat.find({seen.second.profile_key, (int32_t)expert});
+                heat = it != session.profile_heat.end() ? it->second : 0;
+            }
+            candidates.push_back({heat, pool, {seen.first, (int32_t)expert}});
+        }
+    }
+    // Equal heat keeps one expert's up, gate and down together: it hits only with all three.
+    std::sort(candidates.begin(), candidates.end(), [](const candidate & a, const candidate & b) {
+        if (a.heat != b.heat) {
+            return a.heat > b.heat;
+        }
+        if (a.key.expert != b.key.expert) {
+            return a.key.expert < b.key.expert;
+        }
+        return std::less<const void *>()(a.key.tensor, b.key.tensor);
+    });
+    std::vector<size_t> room(device.pools.size());
+    for (size_t pool = 0; pool < device.pools.size(); pool++) {
+        room[pool] = device.pools[pool]->free_slots.size();
+    }
+    for (const candidate & c : candidates) {
+        if (room[c.pool] > 0) {
+            room[c.pool]--;
+            device.seeds.push_back({c.pool, c.key});
+        }
+    }
+    if (!device.seeds.empty()) {
+        MOE_CACHE_LOG("[moe-cache] CUDA%d warm start: seeding %zu slots from %s\n",
+                device.physical, device.seeds.size(), profiled ? "the heat profile" : "an even spread");
+    }
+}
+
+// Called under session.mu by the fill worker when no demand fill waits: queues the
+// next seeds. Seeds take free slots only and never evict.
+static void moe_cache_seed_topup_locked(moe_cache_session & session, moe_cache_device & device) {
+    int inserts_left = session.config.fill_batch;
+    bool wake_worker = false;
+    while (inserts_left > 0 && !device.seeds.empty()) {
+        const moe_cache_seed seed = device.seeds.front();
+        if (seed.pool < (int)device.pools.size()) {
+            moe_cache_pool & pool = *device.pools[seed.pool];
+            // A full queue keeps the seed for the next top-up.
+            if (pool.slab && !pool.free_slots.empty() && !pool.map.count(seed.key) &&
+                !moe_cache_enqueue_locked(
+                    session, device, pool, seed.pool, seed.key.tensor, seed.key.expert,
+                    pool.expert_size, inserts_left, wake_worker, false, 0, false, true)) {
+                break;
+            }
+        }
+        device.seeds.pop_front();
     }
 }
 
@@ -3848,7 +4026,7 @@ static void moe_cache_route_drain_locked(moe_cache_session & session, moe_cache_
             try {
                 pool_index = moe_cache_discover_pool(session, device, route.host_base,
                         (size_t)route.n_expert * route.expert_size, route.expert_size,
-                        route.wtype, route.n_expert);
+                        route.wtype, route.n_expert, route.profile_key);
             } catch (...) {
                 pool_index = -1;
             }
@@ -3945,8 +4123,7 @@ static bool moe_cache_route_register(
     route->n_expert = weights->ne[2];
     route->expert_size = weights->nb[2];
     route->wtype = weights->type;
-    route->profile_key = session.config.profile_path.empty() ? 0 :
-        moe_cache_profile_tensor_hash(weights->name, route->expert_size, route->wtype, route->n_expert);
+    route->profile_key = moe_cache_tensor_profile_key(session, weights->name, route->expert_size, route->wtype, route->n_expert);
 
     cudaError_t error = cudaMalloc((void **)&route->table, route->n_expert * sizeof(void *));
     if (error == cudaSuccess) {
@@ -4057,7 +4234,8 @@ static int moe_cache_route_supported(void * opaque, void * backend_opaque, const
         // Census before the batch-shape gate: warmup and prompt graphs route only their last
         // layer, so a census taken from routed ids alone would size the pool for one layer.
         moe_cache_census_tensor(device, moe_cache_find_pool(device, weights->nb[2], weights->type),
-                weights->data, ggml_nbytes(weights), weights->nb[2], weights->type, weights->ne[2]);
+                weights->data, ggml_nbytes(weights), weights->nb[2], weights->type, weights->ne[2],
+                moe_cache_tensor_profile_key(*session, weights->name, weights->nb[2], weights->type, weights->ne[2]));
         if (!routable) {
             return 0;
         }
@@ -4778,17 +4956,7 @@ static bool moe_cache_stream_stage_reserve(moe_cache_device & device, moe_cache_
 
 static bool moe_cache_stream_stage_source(moe_cache_device & device, const void * base) {
 #if !defined(GGML_USE_HIP)
-    auto found = device.seen_tensors.find(base);
-    if (found != device.seen_tensors.end() && found->second.stream_stage_registered >= 0)
-        return found->second.stream_stage_registered != 0;
-    // Partial pools stop extending the census; absence there does not imply a
-    // pageable source (including a source rediscovered after invalidation).
-    cudaPointerAttributes attributes = {};
-    const cudaError_t error = cudaPointerGetAttributes(&attributes, base);
-    const bool registered = error == cudaSuccess && attributes.type == cudaMemoryTypeHost;
-    if (error != cudaSuccess) (void)cudaGetLastError();
-    if (found != device.seen_tensors.end()) found->second.stream_stage_registered = registered;
-    return registered;
+    return moe_cache_source_registered(device, base);
 #else
     (void)device; (void)base;
     return false;
@@ -4903,13 +5071,13 @@ static void * moe_cache_fused_plan_expert_parallel(
             try {
                 up_pool = moe_cache_discover_pool(
                         session, device, up->data, up_tensor_size,
-                        up->expert_size, up->type, up->n_expert);
+                        up->expert_size, up->type, up->n_expert, profile_keys[0]);
                 (void)moe_cache_discover_pool(
                         session, device, gate->data, up_tensor_size,
-                        gate->expert_size, gate->type, gate->n_expert);
+                        gate->expert_size, gate->type, gate->n_expert, profile_keys[1]);
                 down_pool = moe_cache_discover_pool(
                         session, device, down->data, down_tensor_size,
-                        down->expert_size, down->type, down->n_expert);
+                        down->expert_size, down->type, down->n_expert, profile_keys[2]);
             } catch (...) {
                 device.insert_skips++;
                 continue;
@@ -6117,6 +6285,7 @@ void ggml_moe_cache_register(const void * owner) {
     ggml_moe_cache.session_destroy = moe_cache_session_destroy;
     ggml_moe_cache.session_enter = moe_cache_session_enter;
     ggml_moe_cache.session_leave = moe_cache_session_leave;
+    ggml_moe_cache.session_warmup = moe_cache_session_warmup;
     ggml_moe_cache.prefill_copy = moe_cache_prefill_copy;
     ggml_moe_cache.output_supported = moe_cache_output_supported;
     ggml_moe_cache.output_bind = moe_cache_output_bind;

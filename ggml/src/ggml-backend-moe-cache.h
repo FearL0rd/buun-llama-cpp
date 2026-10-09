@@ -111,6 +111,9 @@ struct ggml_moe_cache_api {
     // NULL and dormant sessions still create a suppressing thread-local scope.
     void   (*session_enter)(void * session);
     void   (*session_leave)(void * session);
+    // Init-time evaluations (warmup, compatibility probes) do not build the cache:
+    // contexts created after them, such as drafters, allocate first.
+    void   (*session_warmup)(void * session, int warmup);
 
     // Copy selected host experts to their ordinary device layout, reusing cached
     // bytes where available. selected is an expert-indexed 32-bit bitset.
@@ -206,6 +209,7 @@ GGML_API void ggml_moe_cache_unregister(const void * owner);
 GGML_API void ggml_backend_sched_set_moe_cache(
         ggml_backend_sched_t sched, enum ggml_moe_cache_mode mode,
         size_t budget_mib, int expert_parallel, int cpu_overlap, const char * profile_path);
+GGML_API void ggml_backend_sched_set_moe_cache_warmup(ggml_backend_sched_t sched, bool warmup);
 // Resolved provider admission, including no_alloc graph reservation. A session
 // does not imply that any particular expert is currently resident.
 GGML_API bool ggml_backend_sched_has_moe_cache(ggml_backend_sched_t sched);

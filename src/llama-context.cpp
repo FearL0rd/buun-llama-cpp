@@ -1136,7 +1136,7 @@ void llama_context::sched_reserve() {
     switch (cparams.moe_cache_mode) {
         case LLAMA_MOE_CACHE_MODE_OFF:  moe_cache_requested = "off";  break;
         case LLAMA_MOE_CACHE_MODE_AUTO: moe_cache_requested = "auto"; break;
-        case LLAMA_MOE_CACHE_MODE_ON:   moe_cache_requested = "on";   break;
+        case LLAMA_MOE_CACHE_MODE_ON:   moe_cache_requested = "budget"; break;
         case LLAMA_MOE_CACHE_MODE_UNSPECIFIED: break;
     }
     LLAMA_LOG_INFO("%s: MoE cache requested=%s resolved=%s\n",
@@ -1173,6 +1173,7 @@ void llama_context::sched_reserve() {
             cparams.moe_cache_cpu_overlap,
             cparams.moe_cache_profile_path.empty() ? nullptr :
                 cparams.moe_cache_profile_path.c_str());
+    ggml_backend_sched_set_moe_cache_warmup(sched.get(), cparams.warmup);
 
     // avoid reserving graphs with zero outputs - assume one output per sequence
     const int n_outputs = n_seqs;
@@ -1244,6 +1245,7 @@ void llama_context::sched_reserve() {
                         cparams.moe_cache_cpu_overlap,
                         cparams.moe_cache_profile_path.empty() ? nullptr :
                             cparams.moe_cache_profile_path.c_str());
+                ggml_backend_sched_set_moe_cache_warmup(sched.get(), cparams.warmup);
                 gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get());
             }
             if (!gf) {
@@ -4266,6 +4268,9 @@ void llama_context::set_warmup(bool value) {
     }
 
     cparams.warmup = value;
+    if (sched) {
+        ggml_backend_sched_set_moe_cache_warmup(sched.get(), value);
+    }
 
     // warmups are usually with small batches, so no need to reserve
     //sched_need_reserve = true;
