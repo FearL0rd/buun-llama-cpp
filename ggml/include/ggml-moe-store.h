@@ -53,6 +53,17 @@ GGML_API void * ggml_moe_store_read(
         struct ggml_moe_store * store, int file, uint64_t offset, size_t size,
         void * dst, int priority, ggml_moe_store_done_t done, void * user);
 
+// Registry of read-only file mappings, so a tier can read a mapped tensor's
+// bytes from its file instead of faulting them in. map duplicates fd; unmap
+// drops any registered bytes in [addr, addr + size).
+GGML_API void ggml_moe_store_map(const void * addr, size_t size, int fd);
+GGML_API void ggml_moe_store_unmap(const void * addr, size_t size);
+// True when [ptr, ptr + size) lies in one registered range: path (re)opens its
+// file, file identifies that file for this process's lifetime, and offset is
+// ptr's position in it; each may be NULL.
+GGML_API bool ggml_moe_store_find(const void * ptr, size_t size, char * path, size_t path_size,
+        uint64_t * file, uint64_t * offset);
+
 #ifdef __cplusplus
 }
 #endif

@@ -4,7 +4,9 @@
 #include <algorithm>
 #include <atomic>
 #include <condition_variable>
+#include <cstdio>
 #include <cstring>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <queue>
@@ -306,4 +308,109 @@ void * ggml_moe_store_read(
         store->cv.notify_one();
     }
     return (char *)dst + (offset - start);
+}
+
+namespace {
+
+// one open file shared by every live range of its mapping
+struct store_mapped_file {
+    int fd = -1;
+    uint64_t id = 0;
+    ~store_mapped_file() {
+#if defined(__linux__)
+        close(fd);
+#endif
+    }
+};
+
+struct store_mapping {
+    size_t size = 0;
+    uint64_t offset = 0;
+    std::shared_ptr<store_mapped_file> file;
+};
+
+std::mutex g_mappings_mu;
+std::map<uintptr_t, store_mapping> g_mappings;
+uint64_t g_mapped_files = 0;
+
+}  // namespace
+
+void ggml_moe_store_map(const void * addr, size_t size, int fd) {
+#if defined(__linux__)
+    const int copy = fcntl(fd, F_DUPFD_CLOEXEC, 0);
+    if (copy < 0) {
+        return;
+    }
+    auto file = std::make_shared<store_mapped_file>();
+    file->fd = copy;
+    std::lock_guard<std::mutex> lock(g_mappings_mu);
+    file->id = ++g_mapped_files;
+    g_mappings[(uintptr_t)addr] = {size, 0, std::move(file)};
+#else
+    GGML_UNUSED(addr);
+    GGML_UNUSED(size);
+    GGML_UNUSED(fd);
+#endif
+}
+
+void ggml_moe_store_unmap(const void * addr, size_t size) {
+    const uintptr_t first = (uintptr_t)addr;
+    const uintptr_t last = first + size;
+    std::lock_guard<std::mutex> lock(g_mappings_mu);
+    auto it = g_mappings.upper_bound(first);
+    if (it != g_mappings.begin()) {
+        --it;
+    }
+    while (it != g_mappings.end() && it->first < last) {
+        const uintptr_t begin = it->first;
+        const uintptr_t end = begin + it->second.size;
+        if (end <= first) {
+            ++it;
+            continue;
+        }
+        const store_mapping mapping = it->second;
+        it = g_mappings.erase(it);
+        // keep the parts outside [first, last)
+        if (begin < first) {
+            g_mappings[begin] = {first - begin, mapping.offset, mapping.file};
+        }
+        if (end > last) {
+            it = g_mappings.emplace(last, store_mapping{end - last, mapping.offset + (last - begin), mapping.file}).first;
+            ++it;
+        }
+    }
+}
+
+bool ggml_moe_store_find(const void * ptr, size_t size, char * path, size_t path_size, uint64_t * file, uint64_t * offset) {
+#if defined(__linux__)
+    std::lock_guard<std::mutex> lock(g_mappings_mu);
+    auto found = g_mappings.upper_bound((uintptr_t)ptr);
+    if (found == g_mappings.begin()) {
+        return false;
+    }
+    --found;
+    const uint64_t position = (uintptr_t)ptr - found->first;
+    if (position + size > found->second.size) {
+        return false;
+    }
+    if (path) {
+        // reopens unlinked files too, with flags of the store's choosing
+        snprintf(path, path_size, "/proc/self/fd/%d", found->second.file->fd);
+    }
+    if (file) {
+        *file = found->second.file->id;
+    }
+    if (offset) {
+        *offset = found->second.offset + position;
+    }
+    return true;
+#else
+    GGML_UNUSED(ptr);
+    GGML_UNUSED(size);
+    GGML_UNUSED(path);
+    GGML_UNUSED(path_size);
+    GGML_UNUSED(file);
+    GGML_UNUSED(offset);
+    return false;
+#endif
 }

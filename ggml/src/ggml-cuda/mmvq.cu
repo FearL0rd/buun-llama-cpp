@@ -3,6 +3,7 @@
 #include "moe-cache-mmv-tuning.h"
 #include "moe-cache.cuh"
 #include "moe-cpu-share.cuh"
+#include "moe-tier.cuh"
 #include "quantize.cuh"
 #include "fwht.cuh"
 #include "unary.cuh"
@@ -2899,13 +2900,15 @@ static void ggml_cuda_mul_mat_vec_q_impl(
         fusion_local.x_table = x_route.table;
         fusion_local.x_route_log = x_route.log;
         ggml_moe_cache_route_table gate_route;
-        if (fusion && fusion->gate && ggml_moe_cache_route_find(fusion->gate->data, gate_route)) {
+        const bool gate_routed = fusion && fusion->gate && ggml_moe_cache_route_find(fusion->gate->data, gate_route);
+        if (gate_routed) {
             fusion_local.gate_table = gate_route.table;
             fusion_local.gate_route_log = gate_route.log;
             fusion_local.share = ggml_moe_cpu_share_begin(src0, fusion->gate, ids, src1, fusion, stream);
         } else if (!fusion) {
             fusion_local.share = ggml_moe_cpu_share_down(src0, ids, dst);
         }
+        ggml_moe_tier_resolve(x_route, gate_routed ? &gate_route : nullptr, ids, src1, stream);
     }
 
     // If src0 is a temporary compute buffer, clear any potential padding.

@@ -6,6 +6,7 @@
 #include "ggml-cuda/allreduce-oneshot.cuh"
 #include "ggml-cuda/common.cuh"
 #include "ggml-cuda/moe-cache.cuh"
+#include "ggml-cuda/moe-tier.cuh"
 #include "ggml-cuda/acc.cuh"
 #include "ggml-cuda/add-id.cuh"
 #include "ggml-cuda/arange.cuh"
@@ -918,10 +919,13 @@ struct ggml_backend_cuda_buffer_context {
 
 static void ggml_backend_cuda_buffer_free_buffer(ggml_backend_buffer_t buffer) {
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *)buffer->context;
+    if (ggml_moe_tier_enabled()) {
+        ggml_moe_tier_forget(ctx->dev_ptr, ggml_backend_buffer_get_size(buffer));
+    }
     delete ctx;
 }
 
-static bool ggml_backend_buffer_is_cuda(ggml_backend_buffer_t buffer) {
+bool ggml_backend_buffer_is_cuda(ggml_backend_buffer_t buffer) {
     return buffer->iface.free_buffer == ggml_backend_cuda_buffer_free_buffer;
 }
 
@@ -3499,10 +3503,11 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
     if (src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 && !ggml_cuda_is_exl3(src0->type)) {
         static_assert(MMVQ_MAX_BATCH_SIZE == MMVF_MAX_BATCH_SIZE);
         if (ne2 <= MMVQ_MAX_BATCH_SIZE) {
-            // experts in pinned host memory are read by MMVQ (through the moe-cache table when
-            // routed) at any batch it takes: MMQ's crossover is tuned for VRAM-resident weights
+            // experts in host memory (pinned, or tiered from a file mapping) are read by MMVQ
+            // (through the moe-cache table when routed) at any batch it takes: MMQ's crossover
+            // is tuned for VRAM-resident weights
             const bool host_experts = ggml_is_quantized(src0->type) && src0->buffer &&
-                src0->buffer->buft == ggml_backend_cuda_host_buffer_type();
+                ggml_backend_buffer_is_host(src0->buffer);
             if (host_experts || ggml_cuda_should_use_mmvq(src0->type, cc, ne2)) {
                 const int mmvq_mmid_max = get_mmvq_mmid_max_batch(src0->type, cc);
                 if (ne2 <= mmvq_mmid_max) {
@@ -8897,6 +8902,10 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     ggml_cuda_canonicalize_unserved_marlin_weights(cuda_ctx, cgraph);
 #endif
     cuda_ctx->precomputed_ssm_convs.clear();
+
+    if (ggml_moe_tier_enabled()) {
+        ggml_moe_tier_scan_graph(cgraph, cuda_ctx->device);
+    }
 
     // VBR S5: if a KV degrade wave is in flight on the side stream, GPU-wait on it here (before
     // any capture/launch) so this graph reads the flipped tensors post-transcode. Host never blocks.

@@ -48,6 +48,7 @@
 #if !defined(GGML_USE_HIP)
 bool ggml_cuda_humming_fp8_is_repacked(const ggml_tensor * tensor);
 #endif
+bool ggml_backend_buffer_is_cuda(ggml_backend_buffer_t buffer);
 
 #if defined(GGML_USE_HIP)
 #include "vendors/hip.h"

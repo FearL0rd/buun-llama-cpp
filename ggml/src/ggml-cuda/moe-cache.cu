@@ -26,11 +26,13 @@ bool ggml_moe_cache_route_find(const void * host_base, ggml_moe_cache_route_tabl
 #include "common.cuh"
 #include "mmvq.cuh"
 #include "moe-cpu-share.cuh"
+#include "moe-tier.cuh"
 #include "quantize.cuh"
 #include "exl3.cuh"
 #include "ggml-backend-impl.h"
 #include "ggml-cuda.h"
 #include "../ggml-backend-moe-cache.h"
+#include "ggml-moe-store.h"
 
 #include <algorithm>
 #include <atomic>
@@ -192,6 +194,8 @@ struct moe_cache_job {
     cudaEvent_t wait_event = nullptr;
     // A warm-start fill: it lands at the LRU head, so real demand evicts it first.
     bool seed = false;
+    // source is the expert's RAM tier copy, pinned until the job ends
+    ggml_moe_tier_route * tier = nullptr;
 };
 
 struct moe_cache_seed {
@@ -199,13 +203,14 @@ struct moe_cache_seed {
     moe_cache_key key;
 };
 
-static constexpr int moe_cache_route_log_max = 512;
-
 // Device-routed expert tensor: table[e] is the expert's cache slot when resident,
 // otherwise its device-accessible host bytes. Kernels log routed experts into log.
+// Tiered routes have no device-accessible host bytes: entries outside VRAM are
+// null or RAM tier copies, filled in by ggml_moe_tier_resolve.
 struct moe_cache_route {
     const void * host_base = nullptr;
     const char * device_base = nullptr;
+    ggml_moe_tier_route * tier = nullptr;
     const void ** table = nullptr;
     int32_t * log = nullptr;      // mapped host view
     int32_t * d_log = nullptr;    // device view of log
@@ -367,6 +372,9 @@ struct moe_cache_device {
     bool route_flush_deferred = false;
     cudaStream_t route_stream = nullptr;
     cudaEvent_t route_event = nullptr;
+    // RAM tier for routes over file mappings, created with the first one
+    ggml_moe_tier * tier = nullptr;
+    bool tier_failed = false;
     // Recorded after each cooling drain's flush, round robin: a fill waiting on a
     // reused event waits for a later repoint, which is only slower.
     cudaEvent_t cool_events[4] = {};
@@ -702,7 +710,7 @@ static size_t moe_cache_budget_claim(
     return claim;
 }
 
-static bool moe_cache_env_i64(
+bool moe_cache_env_i64(
         const char * name, int64_t min_value, int64_t max_value, int64_t & value) {
     const char * text = getenv(name);
     if (!text || !text[0]) {
@@ -1701,7 +1709,16 @@ static void moe_cache_route_push_locked(
     moe_cache_route * route = moe_cache_route_get(device, key.tensor);
     if (route && key.expert >= 0 && key.expert < route->n_expert) {
         device.route_pending.push_back({route->table + key.expert, value});
+        if (route->tier) {
+            ggml_moe_tier_set_vram(route->tier, key.expert, value != nullptr);
+        }
     }
+}
+
+// The table entry of an expert outside VRAM: its device-accessible host bytes,
+// or null for a tiered route.
+static const void * moe_cache_route_host_entry(const moe_cache_route & route, int64_t expert) {
+    return route.tier ? nullptr : route.device_base + (size_t)expert * route.expert_size;
 }
 
 static bool moe_cache_route_capturing(const moe_cache_device & device) {
@@ -1748,7 +1765,10 @@ static bool moe_cache_route_flush_locked(moe_cache_device & device) {
 static cudaError_t moe_cache_route_upload_host_table(const moe_cache_route & route) {
     std::vector<const void *> host(route.n_expert);
     for (int64_t expert = 0; expert < route.n_expert; expert++) {
-        host[expert] = route.device_base + (size_t)expert * route.expert_size;
+        host[expert] = moe_cache_route_host_entry(route, expert);
+        if (route.tier) {
+            ggml_moe_tier_set_vram(route.tier, (int32_t)expert, false);
+        }
     }
     return cudaMemcpy(route.table, host.data(), host.size() * sizeof(void *), cudaMemcpyHostToDevice);
 }
@@ -1783,7 +1803,7 @@ static void moe_cache_route_free(moe_cache_route & route) {
 }
 
 static void moe_cache_route_destroy(moe_cache_device & device) {
-    if (device.routes.empty() && device.retired_routes.empty() && !device.route_event) {
+    if (device.routes.empty() && device.retired_routes.empty() && !device.route_event && !device.tier) {
         return;
     }
     ggml_cuda_set_device(device.logical);
@@ -1815,10 +1835,25 @@ static void moe_cache_route_destroy(moe_cache_device & device) {
             event = nullptr;
         }
     }
+    // the worker has stopped, so no fill still reads the arena
+    ggml_moe_tier_free(device.tier);
+    device.tier = nullptr;
     device.route_stream = nullptr;
 }
 
 static void moe_cache_seed_topup_locked(moe_cache_session & session, moe_cache_device & device);
+
+// Called when a job leaves the queue or the worker, done or not.
+static void moe_cache_job_release(const moe_cache_job & job) {
+    if (job.tier) {
+        ggml_moe_tier_unpin(job.tier, job.key.expert);
+    }
+}
+
+// The expert's bytes in the host tensor; a tiered job's source is a RAM copy instead.
+static const void * moe_cache_job_host(const moe_cache_job & job) {
+    return (const char *)job.key.tensor + (size_t)job.key.expert * job.bytes;
+}
 
 static void moe_cache_worker(moe_cache_session * session, moe_cache_device * device) {
 #if defined(GGML_USE_HIP)
@@ -1963,6 +1998,7 @@ static void moe_cache_worker(moe_cache_session * session, moe_cache_device * dev
             device->inflight.clear();
             for (size_t i = 0; i < batch.size(); i++) {
                 const moe_cache_job & job = batch[i];
+                moe_cache_job_release(job);
                 if (job.pool < 0 || job.pool >= (int)device->pools.size()) {
                     continue;
                 }
@@ -2475,6 +2511,7 @@ static void moe_cache_log_stats(moe_cache_device & device) {
         MOE_CACHE_LOG("[moe-cache] CUDA%d device-routed tensors=%zu rows=%lld\n",
                 device.physical, device.routes.size(), device.route_rows);
     }
+    ggml_moe_tier_log_stats(device.tier, device.physical);
 }
 
 static void moe_cache_log_configuration(moe_cache_session & session) {
@@ -2677,9 +2714,10 @@ static void * moe_cache_session_create(
 static void moe_cache_cancel_queue_locked(
         moe_cache_device & device, const void * base, size_t size, bool all) {
     for (auto it = device.queue.begin(); it != device.queue.end();) {
-        if (all || moe_cache_ranges_overlap(it->source, it->bytes, base, size)) {
+        if (all || moe_cache_ranges_overlap(moe_cache_job_host(*it), it->bytes, base, size)) {
             device.queued_bytes = it->bytes <= device.queued_bytes
                 ? device.queued_bytes - it->bytes : 0;
+            moe_cache_job_release(*it);
             if (it->pool >= 0 && it->pool < (int)device.pools.size()) {
                 moe_cache_pool & pool = *device.pools[it->pool];
                 if (it->slot >= 0 && it->slot < pool.n_slots) {
@@ -3651,8 +3689,7 @@ static int moe_cache_evict_lru_locked(
     wait_event = nullptr;
     if (const moe_cache_route * route = moe_cache_route_get(device, victim.tensor)) {
         try {
-            moe_cache_route_push_locked(device, victim,
-                    route->device_base + (size_t)victim.expert * route->expert_size);
+            moe_cache_route_push_locked(device, victim, moe_cache_route_host_entry(*route, victim.expert));
         } catch (...) {
             return -1;
         }
@@ -3728,6 +3765,15 @@ static bool moe_cache_enqueue_locked(
                 pool_index, slot_index, slot.generation,
                 key, source, expert_size, wait_event, seed});
         device.queued_bytes += expert_size;
+        // a resident RAM tier copy fills without faulting the mapping in
+        const moe_cache_route * route = device.tier ? moe_cache_route_get(device, host_base) : nullptr;
+        if (route && route->tier) {
+            if (const void * copy = ggml_moe_tier_pin(route->tier, expert)) {
+                moe_cache_job & job = device.queue.back();
+                job.source = copy;
+                job.tier = route->tier;
+            }
+        }
     } catch (...) {
         moe_cache_slot_reset(pool, slot_index, true);
         device.insert_skips++;
@@ -4099,9 +4145,11 @@ static bool moe_cache_route_register(
         cudaStream_t stream, const ggml_tensor * op) {
     const ggml_tensor * weights = op->src[0];
     ggml_cuda_set_device(device.logical);
+    // a file mapping is not device-accessible: its experts reach kernels through the RAM tier
+    const bool tiered = weights->buffer->buft != ggml_backend_cuda_host_buffer_type();
     cudaPointerAttributes attributes = {};
-    if (cudaPointerGetAttributes(&attributes, weights->data) != cudaSuccess ||
-        !attributes.devicePointer) {
+    if (!tiered && (cudaPointerGetAttributes(&attributes, weights->data) != cudaSuccess ||
+        !attributes.devicePointer)) {
         (void)cudaGetLastError();
         return false;
     }
@@ -4116,6 +4164,13 @@ static bool moe_cache_route_register(
     if (device.route_stream != stream) {
         return false;
     }
+    if (tiered && !device.tier && !device.tier_failed) {
+        device.tier = ggml_moe_tier_create(device.logical, stream);
+        device.tier_failed = !device.tier;
+    }
+    if (tiered && !device.tier) {
+        return false;
+    }
 
     auto route = std::make_unique<moe_cache_route>();
     route->host_base = weights->data;
@@ -4126,6 +4181,11 @@ static bool moe_cache_route_register(
     route->profile_key = moe_cache_tensor_profile_key(session, weights->name, route->expert_size, route->wtype, route->n_expert);
 
     cudaError_t error = cudaMalloc((void **)&route->table, route->n_expert * sizeof(void *));
+    if (error == cudaSuccess && tiered) {
+        route->tier = ggml_moe_tier_route_add(device.tier, route->host_base, route->n_expert,
+                route->expert_size, route->table);
+        error = route->tier ? cudaSuccess : cudaErrorInvalidValue;
+    }
     if (error == cudaSuccess) {
         error = moe_cache_route_upload_host_table(*route);
     }
@@ -4161,6 +4221,7 @@ static bool moe_cache_route_register(
         ggml_moe_cache_route_table entry;
         entry.table = route->table;
         entry.log = route->d_log;
+        entry.tier = route->tier;
         if (route->d_scales) {
             entry.scales[0] = route->d_scales;
             entry.scales[1] = route->d_scales + ggml_nbytes(op->src[3]);
@@ -4172,9 +4233,24 @@ static bool moe_cache_route_register(
         moe_cache_route_free(*route);
         return false;
     }
-    ggml_moe_cpu_share_note(weights, route->device_base, &session);
+    int layer;
+    if (route->tier && moe_cache_layer_number(weights->name, layer)) {
+        ggml_moe_tier_route_link(route->tier, layer);
+    }
+    if (!route->tier) {
+        ggml_moe_cpu_share_note(weights, route->device_base, &session);
+    }
     device.routes.emplace(route->host_base, std::move(route));
     return true;
+}
+
+// Pinned host experts route directly; a file mapping's route through the RAM tier.
+static bool moe_cache_route_source_supported(const ggml_tensor * weights) {
+    if (weights->buffer->buft == ggml_backend_cuda_host_buffer_type()) {
+        return true;
+    }
+    return ggml_moe_tier_enabled() && ggml_backend_buffer_is_host(weights->buffer) &&
+        ggml_moe_store_find(weights->data, ggml_nbytes(weights), nullptr, 0, nullptr, nullptr);
 }
 
 // The decision depends only on the op's shape and the session, never on which
@@ -4203,7 +4279,6 @@ static int moe_cache_route_supported(void * opaque, void * backend_opaque, const
     const ggml_tensor * ids = op->src[2];
     if (ctx->external_capture || device.dead.load() ||
         !weights || weights->view_src || !weights->data || !weights->buffer ||
-        weights->buffer->buft != ggml_backend_cuda_host_buffer_type() ||
         ggml_backend_buffer_get_usage(weights->buffer) != GGML_BACKEND_BUFFER_USAGE_WEIGHTS ||
         !ggml_is_contiguous(weights) || weights->ne[3] != 1 ||
         !moe_cache_tensor_name_supported(weights->name) ||
@@ -4211,7 +4286,8 @@ static int moe_cache_route_supported(void * opaque, void * backend_opaque, const
         weights->nb[2] != ggml_row_size(weights->type, weights->ne[0]) * weights->ne[1] ||
         weights->nb[2] < ggml_moe_cache_effective_min_expert_bytes(weights->type,
             session->config.min_expert_explicit, session->config.min_expert_bytes) ||
-        op->src[1]->type != GGML_TYPE_F32 || op->type != GGML_TYPE_F32) {
+        op->src[1]->type != GGML_TYPE_F32 || op->type != GGML_TYPE_F32 ||
+        !moe_cache_route_source_supported(weights)) {
         return 0;
     }
     // Mirror ggml_cuda_mul_mat_id's selection: only MMVQ and the grouped EXL3 kernel read the
@@ -5987,7 +6063,7 @@ static void moe_cache_invalidate_session(
         }
         for (const auto & device_ptr : session.devices) {
             for (const moe_cache_job & job : device_ptr->inflight) {
-                if (moe_cache_ranges_overlap(job.source, job.bytes, base, size)) {
+                if (moe_cache_ranges_overlap(moe_cache_job_host(job), job.bytes, base, size)) {
                     return false;
                 }
             }
@@ -6164,6 +6240,7 @@ static void moe_cache_scratch_lend_locked(
     for (auto it = device.queue.begin(); it != device.queue.end();) {
         if (it->pool == pool_index && it->slot >= first && it->slot < last) {
             device.queued_bytes = it->bytes <= device.queued_bytes ? device.queued_bytes - it->bytes : 0;
+            moe_cache_job_release(*it);
             moe_cache_slot_reset(pool, it->slot, false);
             it = device.queue.erase(it);
         } else {
@@ -6183,8 +6260,7 @@ static void moe_cache_scratch_lend_locked(
         GGML_ASSERT(slot.readers == 0);
         if (slot.state == moe_cache_slot_state::valid) {
             if (const moe_cache_route * route = moe_cache_route_get(device, slot.key.tensor)) {
-                moe_cache_route_push_locked(device, slot.key,
-                        route->device_base + (size_t)slot.key.expert * route->expert_size);
+                moe_cache_route_push_locked(device, slot.key, moe_cache_route_host_entry(*route, slot.key.expert));
             }
         }
         if (slot.state != moe_cache_slot_state::free || slot.key.expert >= 0) {
