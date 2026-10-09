@@ -2505,8 +2505,12 @@ ggml_backend_sched_t ggml_backend_sched_new(
     sched->debug_graph_size = 0;
     sched->debug_prev_graph_size = 0;
 
-    const size_t ggml_sched_max_splits = graph_size; // at most there is one split for each node in the graph
-    sched->context_buffer_size = ggml_sched_max_splits*GGML_SCHED_MAX_SPLIT_INPUTS*2*sizeof(struct ggml_tensor) + ggml_graph_overhead_custom(graph_size, false);
+    // sched->ctx holds the split-input copies plus their dependency views. A copy is made once per
+    // (src, backend), so there are at most 2*graph_size*n_backends inputs (nodes + leafs), each with
+    // n_copies copies and one view; graph inputs and alloc-dep views add at most one more per node.
+    // The old graph_size*GGML_SCHED_MAX_SPLIT_INPUTS*2 bound reached 84 GB at a 1.3M-node reserve.
+    const size_t max_ctx_tensors = graph_size*(2*n_backends*(sched->n_copies + 1) + sched->n_copies + 1);
+    sched->context_buffer_size = max_ctx_tensors*ggml_tensor_overhead() + ggml_graph_overhead_custom(graph_size, false);
 
     ggml_backend_sched_init_graph_state(sched);
 
