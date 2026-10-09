@@ -583,6 +583,7 @@ struct common_moe_cache_params {
     int cpu_overlap            = -2; // -2 = inherit provider, -1 = auto, 0..8 = CPU rows
     bool mode_explicit         = false;
     bool fit_selected          = false;
+    bool no_repack             = false; // deprecated "on": auto with canonical expert weights
     bool profile               = true;
     std::string profile_path;
 };

@@ -217,8 +217,9 @@ Leave the other resource knobs unset for the first run. The defaults now:
 - persist a bounded per-model expert heatmap in the normal llama.cpp cache directory for later
   prewarming.
 
-`--moe-cache auto` is the conservative, repack-preserving default and can use one or more eligible
-devices. `--moe-cache on` forces canonical CPU expert weights immediately. `soft` remains available
+`--moe-cache auto` is the default and can use one or more eligible devices; it stays off when less
+than 1 GiB of VRAM is spare. Add `--no-repack` to keep canonical CPU expert weights when you place
+experts yourself with `-ot`; `--moe-cache on` is a deprecated spelling of that. `soft` remains available
 when partial expert eviction is specifically desired: it first tries spare VRAM with stock placement,
 then evicts the minimum expert footprint needed to form cache pools.
 

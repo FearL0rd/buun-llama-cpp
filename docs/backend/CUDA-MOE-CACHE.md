@@ -148,7 +148,7 @@ Measure this model with three separate `llama-bench` arms and otherwise identica
 
 1. `--moe-cache off --repack on`: optimized CPU-expert baseline.
 2. `--moe-cache off --repack off`: canonical CPU-expert baseline.
-3. `--moe-cache on --repack off`, or a fixed cache budget with `--repack off`: cache arm.
+3. `--moe-cache auto --repack off`, or a fixed cache budget: cache arm.
 
 Other programs that use the common argument parser spell the repacking switches as `--repack` and `--no-repack` rather than `--repack on` and `--repack off`.
 

@@ -1520,7 +1520,7 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
     if (params.moe_cache.mode_explicit || params.moe_cache.fit_selected) {
         const char * mode = params.moe_cache.mode == COMMON_MOE_CACHE_MODE_OFF ? "off" :
             params.moe_cache.mode == COMMON_MOE_CACHE_MODE_AUTO ? "auto" :
-            params.moe_cache.mode == COMMON_MOE_CACHE_MODE_SOFT ? "soft" : "on";
+            params.moe_cache.mode == COMMON_MOE_CACHE_MODE_SOFT ? "soft" : "budget";
         const char * placement = params.moe_cache.fit_selected ? " placement=cache-aware-fit" : "";
         if (params.moe_cache.mode == COMMON_MOE_CACHE_MODE_OFF) {
             COM_INF("%s", "MoE cache: mode=off\n");

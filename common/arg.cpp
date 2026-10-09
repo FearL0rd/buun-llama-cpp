@@ -1676,8 +1676,9 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
     // parse all CLI args now, so that -hf is available below for remote preset resolution
     parse_cli_args();
 
-    if (params.moe_cache.mode == COMMON_MOE_CACHE_MODE_ON && !params.no_extra_bufts) {
-        LOG_INF("explicit MoE cache mode disables weight repacking\n");
+    if ((params.moe_cache.mode == COMMON_MOE_CACHE_MODE_ON || params.moe_cache.no_repack) &&
+        !params.no_extra_bufts) {
+        LOG_INF("MoE cache on or a fixed budget disables weight repacking\n");
         params.no_extra_bufts = true;
     }
 
@@ -3808,13 +3809,16 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_env("LLAMA_ARG_N_CPU_MOE"));
     add_opt(common_arg(
         {"--moe-cache"}, "MODE",
-        "adaptively cache the hottest CPU-resident MoE experts in spare VRAM "
-        "(default: auto; auto = preserve weight repacking; on = automatic budget without weight repacking; "
-        "soft = try spare VRAM first, evict experts only as needed; "
-        "off/0 = disabled; N = VRAM budget in MiB per device without weight repacking)",
+        "cache the hottest CPU-resident MoE experts in spare VRAM "
+        "(default: auto; auto = fit may move routed experts to CPU to free VRAM for the cache, "
+        "which stays off below 1 GiB; "
+        "soft = keep the stock expert placement, moving experts to CPU only as needed; "
+        "off/0 = disabled; N = fixed VRAM budget in MiB per device, without weight repacking; "
+        "on = deprecated, same as auto --no-repack)",
         [](common_params & params, const std::string & value) {
             params.moe_cache.mode_explicit = true;
             params.moe_cache.fit_selected = false;
+            params.moe_cache.no_repack = value == "on";
 
             if (value == "off" || value == "0") {
                 params.moe_cache.mode       = COMMON_MOE_CACHE_MODE_OFF;
@@ -3826,7 +3830,8 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
                 params.moe_cache.mode       = COMMON_MOE_CACHE_MODE_SOFT;
                 params.moe_cache.budget_mib = 0;
             } else if (value == "on") {
-                params.moe_cache.mode       = COMMON_MOE_CACHE_MODE_ON;
+                LOG_WRN("DEPRECATED: `--moe-cache on` is `--moe-cache auto --no-repack`\n");
+                params.moe_cache.mode       = COMMON_MOE_CACHE_MODE_AUTO;
                 params.moe_cache.budget_mib = 0;
             } else {
                 char * end = nullptr;
@@ -3834,7 +3839,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
                 const long long budget_mb = strtoll(value.c_str(), &end, 10);
                 if (errno != 0 || end == value.c_str() || *end != '\0' ||
                     budget_mb <= 0 || budget_mb > 1024 * 1024) {
-                    throw std::invalid_argument("expected auto, on, off, 0, or a positive MiB budget");
+                    throw std::invalid_argument("expected auto, soft, off, 0, or a positive MiB budget");
                 }
                 params.moe_cache.mode       = COMMON_MOE_CACHE_MODE_ON;
                 params.moe_cache.budget_mib = (size_t)budget_mb;
