@@ -4966,6 +4966,10 @@ int32_t llama_model_n_expert(const struct llama_model * model) {
     return model->hparams.n_expert;
 }
 
+int32_t llama_model_n_expert_used(const struct llama_model * model) {
+    return model->hparams.n_expert_used_max();
+}
+
 static bool llama_model_is_routed_expert_weight(
         const std::string & name, const ggml_tensor * tensor) {
     if (!tensor) {
@@ -5038,6 +5042,18 @@ bool llama_model_has_host_moe_weights(const llama_model * model) {
         }
     }
     return false;
+}
+
+size_t llama_model_host_offload_weight_bytes(const llama_model * model) {
+    size_t bytes = 0;
+    for (const auto & [name, tensor] : model->tensors_by_name) {
+        // token embeddings are row lookups, which stay on the host
+        if (tensor->view_src == nullptr && tensor->buffer && ggml_backend_buffer_is_host(tensor->buffer) &&
+                name.find("token_embd") == std::string::npos) {
+            bytes += ggml_nbytes(tensor);
+        }
+    }
+    return bytes;
 }
 
 int32_t llama_model_n_devices(const struct llama_model * model) {

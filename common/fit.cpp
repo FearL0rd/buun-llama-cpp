@@ -3,6 +3,7 @@
 #include "llama-vbr-codec.h"
 
 #include "common.h"
+#include "ggml-cpp.h"
 #include "json.h"
 #include "log.h"
 
@@ -32,6 +33,13 @@ enum common_layer_fraction_t {
 
 class common_params_fit_exception : public std::runtime_error {
     using std::runtime_error::runtime_error;
+};
+
+struct common_fit_ubatch_stats {
+    double n_params        = 0.0;
+    double n_expert_used   = 0.0;
+    double host_offload    = 0.0;
+    bool   host_moe        = false;
 };
 
 uint32_t common_fit_extra_context_size(
@@ -510,7 +518,8 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
         std::vector<llama_moe_tensor_info> * moe_tensors = nullptr,
         llama_context * ctx_parent = nullptr,
         bool share_parent_tensors = false,
-        bool optional_if_no_mtp = false) {
+        bool optional_if_no_mtp = false,
+        common_fit_ubatch_stats * ub_stats = nullptr) {
     common_fit_logger_guard logger_guard(log_level);
 
     llama_model_params mparams_copy = *mparams;
@@ -688,6 +697,13 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
         moe_tensors->resize(count);
         const size_t written = llama_model_get_moe_tensor_info(model.get(), moe_tensors->data(), moe_tensors->size());
         GGML_ASSERT(written == count);
+    }
+
+    if (ub_stats) {
+        ub_stats->n_params      = llama_model_n_params(model.get());
+        ub_stats->n_expert_used = llama_model_n_expert_used(model.get());
+        ub_stats->host_offload  = llama_model_host_offload_weight_bytes(model.get());
+        ub_stats->host_moe     = llama_model_has_host_moe_weights(model.get());
     }
 
     common_memory_breakdown_print(ctx.get());
@@ -2303,6 +2319,146 @@ static void common_params_fit_impl(
     set_ngl_tensor_split_tbo(ngl_per_device, overflow_bufts, *mparams);
 }
 
+// pinned host-to-device copy rate in bytes/s, 0 when the device has no pinned host buffer type
+static double common_fit_probe_h2d(ggml_backend_dev_t dev) {
+    constexpr size_t size = 64u << 20;
+    ggml_backend_buffer_type_t host_buft = ggml_backend_dev_host_buffer_type(dev);
+    if (host_buft == nullptr) {
+        return 0.0;
+    }
+    ggml_init_params ip = { ggml_tensor_overhead(), nullptr, true };
+    ggml_context_ptr ctx(ggml_init(ip));
+    ggml_tensor * t = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_I8, size);
+    ggml_backend_buffer_ptr host(ggml_backend_buft_alloc_buffer(host_buft, size));
+    ggml_backend_buffer_ptr device(ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), ggml_backend_dev_buffer_type(dev)));
+    if (!host || !device) {
+        return 0.0;
+    }
+    double best = 0.0;
+    for (int i = 0; i < 3; i++) {
+        const int64_t t0 = ggml_time_us();
+        ggml_backend_tensor_set(t, ggml_backend_buffer_get_base(host.get()), 0, size);
+        best = std::max(best, size * 1e6 / std::max<int64_t>(1, ggml_time_us() - t0));
+    }
+    return best;
+}
+
+// dense f16 matmul rate of the device in FLOP/s, the ceiling a prompt-sized ubatch can reach
+static double common_fit_probe_flops(ggml_backend_dev_t dev) {
+    constexpr int64_t n = 4096;
+    constexpr int64_t m = 2048;
+    ggml_backend_ptr backend(ggml_backend_dev_init(dev, nullptr));
+    if (!backend) {
+        return 0.0;
+    }
+    ggml_init_params ip = { 4*ggml_tensor_overhead() + ggml_graph_overhead(), nullptr, true };
+    ggml_context_ptr ctx(ggml_init(ip));
+    ggml_tensor * w = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F16, n, n);
+    ggml_tensor * x = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, n, m);
+    ggml_cgraph * gf = ggml_new_graph(ctx.get());
+    ggml_build_forward_expand(gf, ggml_mul_mat(ctx.get(), w, x));
+    ggml_backend_buffer_ptr buf(ggml_backend_alloc_ctx_tensors(ctx.get(), backend.get()));
+    if (!buf) {
+        return 0.0;
+    }
+    ggml_backend_buffer_clear(buf.get(), 0);
+    double best = 0.0;
+    for (int i = 0; i < 4; i++) {
+        const int64_t t0 = ggml_time_us();
+        if (ggml_backend_graph_compute(backend.get(), gf) != GGML_STATUS_SUCCESS) {
+            return 0.0;
+        }
+        // the first run sets up the BLAS library
+        if (i > 0) {
+            best = std::max(best, 2.0 * n * n * m * 1e6 / std::max<int64_t>(1, ggml_time_us() - t0));
+        }
+    }
+    return best;
+}
+
+// Picks the ubatch for the fitted placement. A ubatch pays a fixed cost F for the weights that
+// stream to the GPU (op offload of host weights, MoE cache misses), so t(ub) ~ F + ub / C with
+// F = streamed bytes / H2D rate and C = tokens/s of compute. The ubatch doubles until F stays
+// under 10% of the compute time, then halves until the compute buffer, which grows with it,
+// fits under a share of each device: 60% of VRAM when the MoE cache lends its slab to the
+// compute buffer, a quarter otherwise, and a quarter of host memory.
+static uint32_t common_fit_auto_ubatch(
+        const char * path_model, const llama_model_params * mparams, const llama_context_params * cparams,
+        bool moe_cache_active, uint32_t n_ubatch_max, ggml_log_level log_level) {
+    // measured prefill on quantized weights reaches about this share of the dense f16 rate
+    constexpr double compute_efficiency = 0.3;
+    constexpr uint32_t ubatch_limit = 16384;
+    const uint32_t ub0 = cparams->n_ubatch;
+    const uint32_t ub_max = std::min({n_ubatch_max, ubatch_limit, cparams->n_ctx});
+    if ((!cparams->op_offload && !moe_cache_active) || ub_max < 2 * ub0) {
+        return ub0;
+    }
+
+    std::vector<ggml_backend_dev_t> devs;
+    uint32_t hp_ngl = 0;
+    uint32_t hp_nct = 0;
+    uint32_t hp_nex = 0;
+    std::vector<llama_moe_tensor_info> experts;
+    common_fit_ubatch_stats stats;
+    common_get_device_memory_data_impl(path_model, mparams, cparams, devs, hp_ngl, hp_nct, hp_nex,
+            log_level, nullptr, false, &experts, nullptr, false, false, &stats);
+
+    const double streamed = stats.host_offload;
+    if (devs.empty() || streamed == 0.0) {
+        return ub0;
+    }
+    // per-token FLOPs follow the active parameters: a token only runs n_expert_used of the experts
+    double n_params_active = stats.n_params;
+    for (const llama_moe_tensor_info & info : experts) {
+        n_params_active -= (double) info.n_input * info.n_output * std::max(0.0, info.n_expert - stats.n_expert_used);
+    }
+    n_params_active = std::max(1.0, n_params_active);
+    ggml_backend_dev_t dev = devs[0];
+    if (ggml_backend_dev_is_meta(dev)) {
+        dev = ggml_backend_meta_dev_simple_dev(dev, 0);
+    }
+    const double h2d   = common_fit_probe_h2d(dev);
+    const double flops = common_fit_probe_flops(dev);
+    if (h2d == 0.0 || flops == 0.0) {
+        LOG_WRN("%s: ubatch auto: could not probe %s, keeping %u\n", __func__, ggml_backend_dev_name(dev), ub0);
+        return ub0;
+    }
+    const double fixed_s     = streamed / h2d;
+    const double tokens_s    = compute_efficiency * flops / (2.0 * n_params_active);
+    const double knee        = 10.0 * fixed_s * tokens_s;
+
+    uint32_t ub = ub0;
+    while (ub < knee && ub * 2 <= ub_max) {
+        ub *= 2;
+    }
+
+    const double device_share = moe_cache_active && stats.host_moe ? 0.6 : 0.25;
+    for (; ub > ub0; ub /= 2) {
+        llama_context_params cparams_ub = *cparams;
+        cparams_ub.n_ubatch = ub;
+        cparams_ub.n_batch  = std::max(cparams_ub.n_batch, ub);
+        const auto dmds = common_get_device_memory_data_impl(path_model, mparams, &cparams_ub, devs, hp_ngl, hp_nct, hp_nex, log_level);
+        bool fits = (int64_t) dmds.back().mb.compute <= dmds.back().total / 4;
+        for (size_t i = 0; i + 1 < dmds.size(); i++) {
+            fits = fits && dmds[i].mb.compute <= device_share * dmds[i].total;
+        }
+        LOG_TRC("%s: ubatch auto: %u needs %zu MiB of compute buffer on %s (cap %.0f MiB), %zu MiB on the host (cap %" PRId64 " MiB)\n",
+                __func__, ub, dmds[0].mb.compute >> 20, ggml_backend_dev_name(devs[0]), device_share * (dmds[0].total >> 20),
+                dmds.back().mb.compute >> 20, (dmds.back().total / 4) >> 20);
+        if (fits) {
+            break;
+        }
+    }
+
+    LOG_INF("%s: ubatch auto: %.2f GiB of host weights at %.1f GB/s = %.2f s per ubatch, "
+            "%s %.1f TFLOPS for %.2fB active params = %.0f tokens/s -> knee %.0f, "
+            "compute buffer cap (%.0f%% of VRAM) -> %u\n",
+            __func__, streamed / (1024.0*1024.0*1024.0), h2d * 1e-9, fixed_s,
+            ggml_backend_dev_name(dev), flops * 1e-12, n_params_active * 1e-9, tokens_s, knee,
+            100.0 * device_share, ub);
+    return ub;
+}
+
 ggml_type common_vbr_fit_price_type(
         ggml_type entry, double floor_bpv, bool pinned, llama_vbr_codec codec) {
     if (pinned || !llama_vbr_codec_contains(codec, entry)) {
@@ -2324,7 +2480,8 @@ enum common_params_fit_status common_fit_params(
         size_t * margins,
         uint32_t n_ctx_min,
         const common_fit_extra_model * extra,
-        ggml_log_level log_level) {
+        ggml_log_level log_level,
+        uint32_t n_ubatch_max) {
     const int64_t t0_us = llama_time_us();
     common_params_fit_status status = COMMON_PARAMS_FIT_STATUS_SUCCESS;
 
@@ -2368,17 +2525,78 @@ enum common_params_fit_status common_fit_params(
                 both_movable ? "" : " (pinned side at its own cost)");
     }
 
-    try {
-        common_params_fit_impl(path_model, mparams, cparams, tensor_split, tensor_buft_overrides,
-                moe_cache, margins, n_ctx_min, extra, log_level,
-                type_k_entry, type_v_entry);
-        LOG_TRC("%s: successfully fit params to free device memory\n", __func__);
-    } catch (const common_params_fit_exception & e) {
-        LOG_WRN("%s: failed to fit params to free device memory: %s\n", __func__, e.what());
-        status = COMMON_PARAMS_FIT_STATUS_FAILURE;
-    } catch (const std::runtime_error & e) {
-        LOG_ERR("%s: encountered an error while trying to fit params to free device memory: %s\n", __func__, e.what());
-        status = COMMON_PARAMS_FIT_STATUS_ERROR;
+    // the auto ubatch refits from these inputs once the first fit shows what streams
+    const llama_model_params   mparams_in = *mparams;
+    const llama_context_params cparams_in = *cparams;
+    const std::vector<float> tensor_split_in(tensor_split, tensor_split + llama_max_devices());
+    const std::vector<llama_model_tensor_buft_override> tbo_in(
+            tensor_buft_overrides, tensor_buft_overrides + llama_max_tensor_buft_overrides());
+    const common_moe_cache_params moe_cache_in = moe_cache ? *moe_cache : common_moe_cache_params();
+    const auto extra_models = common_fit_extra_model_chain(extra);
+    std::vector<llama_context_params> extra_cparams_in;
+    for (const common_fit_extra_model * e : extra_models) {
+        extra_cparams_in.push_back(*e->cparams);
+    }
+    // extra contexts built with the target's ubatch inherit the chosen one at runtime, so they follow it
+    auto restore_inputs = [&](uint32_t n_ubatch) {
+        *mparams = mparams_in;
+        *cparams = cparams_in;
+        std::copy(tensor_split_in.begin(), tensor_split_in.end(), tensor_split);
+        std::copy(tbo_in.begin(), tbo_in.end(), tensor_buft_overrides);
+        if (moe_cache) {
+            *moe_cache = moe_cache_in;
+        }
+        for (size_t i = 0; i < extra_models.size(); i++) {
+            llama_context_params & ecp = *extra_models[i]->cparams;
+            ecp = extra_cparams_in[i];
+            if (ecp.n_ubatch == cparams_in.n_ubatch) {
+                ecp.n_ubatch = n_ubatch;
+                ecp.n_batch  = std::max(ecp.n_batch, n_ubatch);
+            }
+        }
+        cparams->n_ubatch = n_ubatch;
+        cparams->n_batch  = std::max(cparams->n_batch, n_ubatch);
+    };
+
+    auto fit_once = [&] {
+        try {
+            common_params_fit_impl(path_model, mparams, cparams, tensor_split, tensor_buft_overrides,
+                    moe_cache, margins, n_ctx_min, extra, log_level,
+                    type_k_entry, type_v_entry);
+            LOG_TRC("%s: successfully fit params to free device memory\n", __func__);
+            return COMMON_PARAMS_FIT_STATUS_SUCCESS;
+        } catch (const common_params_fit_exception & e) {
+            LOG_WRN("%s: failed to fit params to free device memory: %s\n", __func__, e.what());
+            return COMMON_PARAMS_FIT_STATUS_FAILURE;
+        } catch (const std::runtime_error & e) {
+            LOG_ERR("%s: encountered an error while trying to fit params to free device memory: %s\n", __func__, e.what());
+            return COMMON_PARAMS_FIT_STATUS_ERROR;
+        }
+    };
+
+    status = fit_once();
+    const uint32_t ub0 = cparams->n_ubatch;
+    if (status == COMMON_PARAMS_FIT_STATUS_SUCCESS && n_ubatch_max > ub0 && !cparams->embeddings) {
+        uint32_t ub = ub0;
+        try {
+            ub = common_fit_auto_ubatch(path_model, mparams, cparams, moe_fit_active, n_ubatch_max, log_level);
+        } catch (const std::runtime_error & e) {
+            LOG_WRN("%s: ubatch auto: measurement failed, keeping %u: %s\n", __func__, ub0, e.what());
+        }
+        if (ub > ub0) {
+            // a larger compute buffer must not cost context or the MoE cache placement
+            const uint32_t n_ctx0     = cparams->n_ctx;
+            const bool     cache_fit0 = moe_cache && moe_cache->fit_selected;
+            restore_inputs(ub);
+            status = fit_once();
+            if (status != COMMON_PARAMS_FIT_STATUS_SUCCESS || cparams->n_ctx < n_ctx0 ||
+                    (moe_cache && moe_cache->fit_selected) != cache_fit0) {
+                // refit rather than restore the first fit: its override patterns live in buffers the refit reused
+                LOG_INF("%s: ubatch auto: the fit at %u loses context or placement, keeping %u\n", __func__, ub, ub0);
+                restore_inputs(ub0);
+                status = fit_once();
+            }
+        }
     }
 
     cparams->type_k = type_k_entry;

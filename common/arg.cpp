@@ -2133,15 +2133,15 @@ bool common_params_parse(int argc, char ** argv, common_params & params, llama_e
                 }
                 return false;
             };
-            const bool b_passed   = arg_passed({"-b", "--batch-size"});
             const bool ub_passed  = arg_passed({"-ub", "--ubatch-size"});
             bool capped = false;
-            if (!b_passed && params.n_batch > 256) {
+            if (!params.n_batch_explicit && params.n_batch > 256) {
                 params.n_batch = 256;
                 capped = true;
             }
             if (!ub_passed && params.n_ubatch > 64) {
                 params.n_ubatch = 64;
+                params.n_ubatch_auto = false;
                 capped = true;
             }
             if (capped) {
@@ -2514,13 +2514,18 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         string_format("logical maximum batch size (default: %d)", params.n_batch),
         [](common_params & params, int value) {
             params.n_batch = value;
+            params.n_batch_explicit = true;
         }
     ).set_env("LLAMA_ARG_BATCH"));
     add_opt(common_arg(
-        {"-ub", "--ubatch-size"}, "N",
-        string_format("physical maximum batch size (default: %d)", params.n_ubatch),
-        [](common_params & params, int value) {
-            params.n_ubatch = value;
+        {"-ub", "--ubatch-size"}, "N|auto",
+        string_format("physical maximum batch size; 'auto' starts at %d and lets the fit raise it "
+            "when weights stream to the GPU every ubatch (default: auto)", params.n_ubatch),
+        [](common_params & params, const std::string & value) {
+            params.n_ubatch_auto = is_autoy(value);
+            if (!params.n_ubatch_auto) {
+                params.n_ubatch = std::stoi(value);
+            }
         }
     ).set_env("LLAMA_ARG_UBATCH"));
     add_opt(common_arg(
