@@ -40,6 +40,11 @@ struct common_fit_ubatch_stats {
     double n_expert_used   = 0.0;
     double host_offload    = 0.0;
     bool   host_moe        = false;
+    // largest block weight, the matmul the dense ubatch probe times
+    bool      has_block    = false;
+    ggml_type block_type   = GGML_TYPE_F32;
+    int64_t   block_ne0    = 0;
+    int64_t   block_ne1    = 0;
 };
 
 uint32_t common_fit_extra_context_size(
@@ -704,6 +709,8 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
         ub_stats->n_expert_used = llama_model_n_expert_used(model.get());
         ub_stats->host_offload  = llama_model_host_offload_weight_bytes(model.get());
         ub_stats->host_moe     = llama_model_has_host_moe_weights(model.get());
+        ub_stats->has_block    = llama_model_largest_block_weight(model.get(), &ub_stats->block_type,
+                &ub_stats->block_ne0, &ub_stats->block_ne1);
     }
 
     common_memory_breakdown_print(ctx.get());
@@ -2343,6 +2350,37 @@ static double common_fit_probe_h2d(ggml_backend_dev_t dev) {
     return best;
 }
 
+// seconds for mul_mat(w, x) with x [w->ne[0], m]: the best of three runs after one that sets up
+// the kernels and BLAS library, 0 when the device cannot run it
+static double common_fit_time_mul_mat(ggml_backend_t backend, ggml_tensor * w, int64_t m) {
+    ggml_init_params ip = { 2*ggml_tensor_overhead() + ggml_graph_overhead(), nullptr, true };
+    ggml_context_ptr ctx(ggml_init(ip));
+    ggml_tensor * x = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, w->ne[0], m);
+    ggml_tensor * y = ggml_mul_mat(ctx.get(), w, x);
+    if (!ggml_backend_supports_op(backend, y)) {
+        return 0.0;
+    }
+    ggml_cgraph * gf = ggml_new_graph(ctx.get());
+    ggml_build_forward_expand(gf, y);
+    ggml_backend_buffer_ptr buf(ggml_backend_alloc_ctx_tensors(ctx.get(), backend));
+    if (!buf) {
+        return 0.0;
+    }
+    ggml_backend_buffer_clear(buf.get(), 0);
+    double best = 0.0;
+    for (int i = 0; i < 4; i++) {
+        const int64_t t0 = ggml_time_us();
+        if (ggml_backend_graph_compute(backend, gf) != GGML_STATUS_SUCCESS) {
+            return 0.0;
+        }
+        const double t = std::max<int64_t>(1, ggml_time_us() - t0) * 1e-6;
+        if (i > 0 && (best == 0.0 || t < best)) {
+            best = t;
+        }
+    }
+    return best;
+}
+
 // dense f16 matmul rate of the device in FLOP/s, the ceiling a prompt-sized ubatch can reach
 static double common_fit_probe_flops(ggml_backend_dev_t dev) {
     constexpr int64_t n = 4096;
@@ -2351,29 +2389,59 @@ static double common_fit_probe_flops(ggml_backend_dev_t dev) {
     if (!backend) {
         return 0.0;
     }
-    ggml_init_params ip = { 4*ggml_tensor_overhead() + ggml_graph_overhead(), nullptr, true };
+    ggml_init_params ip = { ggml_tensor_overhead(), nullptr, true };
     ggml_context_ptr ctx(ggml_init(ip));
     ggml_tensor * w = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F16, n, n);
-    ggml_tensor * x = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, n, m);
-    ggml_cgraph * gf = ggml_new_graph(ctx.get());
-    ggml_build_forward_expand(gf, ggml_mul_mat(ctx.get(), w, x));
     ggml_backend_buffer_ptr buf(ggml_backend_alloc_ctx_tensors(ctx.get(), backend.get()));
     if (!buf) {
         return 0.0;
     }
     ggml_backend_buffer_clear(buf.get(), 0);
-    double best = 0.0;
-    for (int i = 0; i < 4; i++) {
-        const int64_t t0 = ggml_time_us();
-        if (ggml_backend_graph_compute(backend.get(), gf) != GGML_STATUS_SUCCESS) {
-            return 0.0;
-        }
-        // the first run sets up the BLAS library
-        if (i > 0) {
-            best = std::max(best, 2.0 * n * n * m * 1e6 / std::max<int64_t>(1, ggml_time_us() - t0));
-        }
+    const double t = common_fit_time_mul_mat(backend.get(), w, m);
+    return t > 0.0 ? 2.0 * n * n * m / t : 0.0;
+}
+
+// Times a matmul of a (zeroed) type x [ne0, ne1] weight at ub0, 2*ub0, ... up to ub_max tokens,
+// stopping once a doubling gains under 3%, and returns the last ubatch that gained, or ub0 when
+// that one beats ub0 by under 10%. Whether a bigger ubatch pays depends on the kernel the device
+// picks for the type: tensor-core MMQ runs flat from 512, a dequantize + cuBLAS path (no dp4a,
+// e.g. Pascal P100) keeps gaining. rates gets the measured tokens/s for the log.
+static uint32_t common_fit_probe_ubatch(
+        ggml_backend_dev_t dev, ggml_type type, int64_t ne0, int64_t ne1, uint32_t ub0, uint32_t ub_max,
+        std::string & rates) {
+    ggml_backend_ptr backend(ggml_backend_dev_init(dev, nullptr));
+    if (!backend) {
+        return ub0;
     }
-    return best;
+    ggml_init_params ip = { ggml_tensor_overhead(), nullptr, true };
+    ggml_context_ptr ctx(ggml_init(ip));
+    ggml_tensor * w = ggml_new_tensor_2d(ctx.get(), type, ne0, ne1);
+    ggml_backend_buffer_ptr buf(ggml_backend_alloc_ctx_tensors(ctx.get(), backend.get()));
+    if (!buf) {
+        return ub0;
+    }
+    ggml_backend_buffer_clear(buf.get(), 0);
+    uint32_t pick = ub0;
+    double base = 0.0;
+    double prev = 0.0;
+    for (uint32_t ub = ub0; ub <= ub_max; ub *= 2) {
+        const double t = common_fit_time_mul_mat(backend.get(), w, ub);
+        if (t == 0.0) {
+            break;
+        }
+        const double rate = ub / t;
+        rates += string_format("%s%u:%.0f", rates.empty() ? "" : " ", ub, rate);
+        if (ub == ub0) {
+            base = rate;
+        } else if (rate < 1.03 * prev) {
+            break;
+        } else {
+            pick = ub;
+        }
+        prev = rate;
+    }
+    // a 3090 MMQ matmul gained 6% by 2048 while the whole prefill stayed flat
+    return prev >= 1.10 * base ? pick : ub0;
 }
 
 // Picks the ubatch for the fitted placement. A ubatch pays a fixed cost F for the weights that
@@ -2382,7 +2450,8 @@ static double common_fit_probe_flops(ggml_backend_dev_t dev) {
 // under 10% of the compute time, then halves until the compute buffer, which grows with it,
 // fits under a share of each device: 60% of VRAM when the MoE cache lends its slab to the
 // compute buffer, a quarter otherwise, and a quarter of host memory. With resident weights the
-// expert GEMMs set the ubatch instead (see below); resident is set when that rule picked it.
+// expert GEMMs or, for dense models, a timed matmul set the ubatch instead (see below); resident
+// is set when one of those picked it.
 static uint32_t common_fit_auto_ubatch(
         const char * path_model, const llama_model_params * mparams, const llama_context_params * cparams,
         bool moe_cache_active, uint32_t n_ubatch_max, ggml_log_level log_level, bool & resident) {
@@ -2391,6 +2460,8 @@ static uint32_t common_fit_auto_ubatch(
     constexpr uint32_t ubatch_limit = 16384;
     // tokens per expert GEMM where resident MoE prefill peaks (measured on 128- and 256-expert models)
     constexpr double expert_tokens = 256.0;
+    // the dense matmul probe stops here, past every measured knee
+    constexpr uint32_t probe_limit = 4096;
     const uint32_t ub0 = cparams->n_ubatch;
     const uint32_t ub_max = std::min({n_ubatch_max, ubatch_limit, cparams->n_ctx});
     resident = false;
@@ -2411,20 +2482,33 @@ static uint32_t common_fit_auto_ubatch(
     if (devs.empty()) {
         return ub0;
     }
+    ggml_backend_dev_t dev = devs[0];
+    if (ggml_backend_dev_is_meta(dev)) {
+        dev = ggml_backend_meta_dev_simple_dev(dev, 0);
+    }
     // the ubatch doubles up to the token count the rule below asks for
     double target = 0.0;
     std::string why;
-    if (streamed == 0.0) {
+    if (streamed == 0.0 && hp_nex > 0 && stats.n_expert_used > 0.0) {
         // resident weights cost nothing per ubatch, but an expert GEMM only runs
-        // ub * n_expert_used / n_expert tokens and underfills its tiles below expert_tokens;
-        // dense models measured flat to slightly slower above 512
-        if (stats.n_expert_used == 0.0 || hp_nex == 0) {
-            return ub0;
-        }
+        // ub * n_expert_used / n_expert tokens and underfills its tiles below expert_tokens
         target = expert_tokens * hp_nex / stats.n_expert_used;
         resident = true;
         why = string_format("resident weights, %.0f of %u experts per token, %.0f tokens per expert GEMM at %.0f",
                 stats.n_expert_used, hp_nex, expert_tokens, target);
+    } else if (streamed == 0.0) {
+        // dense: the device's kernel for the weight type decides, so time the largest block matmul
+        // a bare MUL_MAT only: the types from F8_E4M3 on (EXL3, BNB, GPTQ, scaled FP8) and I8 take
+        // scale/sign sources the probe graph lacks, and some executors abort without them
+        if (!stats.has_block || stats.block_type >= GGML_TYPE_F8_E4M3 || stats.block_type == GGML_TYPE_I8) {
+            return ub0;
+        }
+        std::string rates;
+        target = common_fit_probe_ubatch(dev, stats.block_type, stats.block_ne0, stats.block_ne1,
+                ub0, std::min(ub_max, probe_limit), rates);
+        resident = true;
+        why = string_format("resident dense weights, %s %s matmul tokens/s by ubatch %s",
+                ggml_backend_dev_name(dev), ggml_type_name(stats.block_type), rates.c_str());
     } else {
         if (!cparams->op_offload && !moe_cache_active) {
             return ub0;
@@ -2435,10 +2519,6 @@ static uint32_t common_fit_auto_ubatch(
             n_params_active -= (double) info.n_input * info.n_output * std::max(0.0, info.n_expert - stats.n_expert_used);
         }
         n_params_active = std::max(1.0, n_params_active);
-        ggml_backend_dev_t dev = devs[0];
-        if (ggml_backend_dev_is_meta(dev)) {
-            dev = ggml_backend_meta_dev_simple_dev(dev, 0);
-        }
         const double h2d   = common_fit_probe_h2d(dev);
         const double flops = common_fit_probe_flops(dev);
         if (h2d == 0.0 || flops == 0.0) {
@@ -2635,10 +2715,21 @@ enum common_params_fit_status common_fit_params(
             const uint32_t n_ctx0     = cparams->n_ctx;
             const bool     cache_fit0 = moe_cache && moe_cache->fit_selected;
             const uint64_t budget0    = cparams->vbr_vram_budget_bytes;
+            // nor GPU residency: fewer layers offloaded, or more tensors overridden off their layer's device
+            auto n_overrides = [&] {
+                size_t n = 0;
+                while (tensor_buft_overrides && tensor_buft_overrides[n].pattern) {
+                    n++;
+                }
+                return n;
+            };
+            const int32_t ngl0 = mparams->n_gpu_layers;
+            const size_t  tbo0 = n_overrides();
             restore_inputs(ub);
             status = fit_once();
             bool loses = status != COMMON_PARAMS_FIT_STATUS_SUCCESS || cparams->n_ctx < n_ctx0 ||
-                    (moe_cache && moe_cache->fit_selected) != cache_fit0;
+                    (moe_cache && moe_cache->fit_selected) != cache_fit0 ||
+                    mparams->n_gpu_layers < ngl0 || n_overrides() > tbo0;
             // nor, for a resident model's smaller gain, KV fidelity: the buffer comes out of the VBR
             // budget, which must still hold the whole context at the entry tier, before any degrade
             if (!loses && resident && cparams->vbr_dynamic && cparams->vbr_vram_budget_bytes < budget0) {
@@ -2647,7 +2738,7 @@ enum common_params_fit_status common_fit_params(
             }
             if (loses) {
                 // refit rather than restore the first fit: its override patterns live in buffers the refit reused
-                LOG_INF("%s: ubatch auto: the fit at %u loses context, placement or KV budget, keeping %u\n", __func__, ub, ub0);
+                LOG_INF("%s: ubatch auto: the fit at %u loses context, placement, GPU layers or KV budget, keeping %u\n", __func__, ub, ub0);
                 restore_inputs(ub0);
                 status = fit_once();
             }

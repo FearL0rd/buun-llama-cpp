@@ -5056,6 +5056,24 @@ size_t llama_model_host_offload_weight_bytes(const llama_model * model) {
     return bytes;
 }
 
+bool llama_model_largest_block_weight(
+        const llama_model * model, ggml_type * type, int64_t * ne0, int64_t * ne1) {
+    const ggml_tensor * best = nullptr;
+    for (const auto & [name, tensor] : model->tensors_by_name) {
+        if (name.compare(0, 4, "blk.") == 0 && ggml_n_dims(tensor) == 2 &&
+                (best == nullptr || ggml_nbytes(tensor) > ggml_nbytes(best))) {
+            best = tensor;
+        }
+    }
+    if (best == nullptr) {
+        return false;
+    }
+    *type = best->type;
+    *ne0  = best->ne[0];
+    *ne1  = best->ne[1];
+    return true;
+}
+
 int32_t llama_model_n_devices(const struct llama_model * model) {
     return (int32_t)model->devices.size();
 }

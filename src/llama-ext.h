@@ -165,6 +165,11 @@ LLAMA_API bool llama_model_has_host_moe_weights(const struct llama_model * model
 // misses), with the resolved placement. Token embeddings are excluded: their row lookups stay on the host.
 LLAMA_API size_t llama_model_host_offload_weight_bytes(const struct llama_model * model);
 
+// The largest 2D block weight (routed experts and the embedding/output matrices aside), the
+// matmul that dominates a dense prefill. Returns false when the model has none.
+LLAMA_API bool llama_model_largest_block_weight(
+        const struct llama_model * model, enum ggml_type * type, int64_t * ne0, int64_t * ne1);
+
 LLAMA_API ggml_backend_dev_t llama_model_get_device(const struct llama_model * model, int i);
 
 LLAMA_API llama_memory_breakdown llama_get_memory_breakdown(const struct llama_context * ctx);
