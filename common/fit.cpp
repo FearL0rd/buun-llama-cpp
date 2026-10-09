@@ -2381,16 +2381,20 @@ static double common_fit_probe_flops(ggml_backend_dev_t dev) {
 // F = streamed bytes / H2D rate and C = tokens/s of compute. The ubatch doubles until F stays
 // under 10% of the compute time, then halves until the compute buffer, which grows with it,
 // fits under a share of each device: 60% of VRAM when the MoE cache lends its slab to the
-// compute buffer, a quarter otherwise, and a quarter of host memory.
+// compute buffer, a quarter otherwise, and a quarter of host memory. With resident weights the
+// expert GEMMs set the ubatch instead (see below); resident is set when that rule picked it.
 static uint32_t common_fit_auto_ubatch(
         const char * path_model, const llama_model_params * mparams, const llama_context_params * cparams,
-        bool moe_cache_active, uint32_t n_ubatch_max, ggml_log_level log_level) {
+        bool moe_cache_active, uint32_t n_ubatch_max, ggml_log_level log_level, bool & resident) {
     // measured prefill on quantized weights reaches about this share of the dense f16 rate
     constexpr double compute_efficiency = 0.3;
     constexpr uint32_t ubatch_limit = 16384;
+    // tokens per expert GEMM where resident MoE prefill peaks (measured on 128- and 256-expert models)
+    constexpr double expert_tokens = 256.0;
     const uint32_t ub0 = cparams->n_ubatch;
     const uint32_t ub_max = std::min({n_ubatch_max, ubatch_limit, cparams->n_ctx});
-    if ((!cparams->op_offload && !moe_cache_active) || ub_max < 2 * ub0) {
+    resident = false;
+    if (ub_max < 2 * ub0) {
         return ub0;
     }
 
@@ -2404,35 +2408,60 @@ static uint32_t common_fit_auto_ubatch(
             log_level, nullptr, false, &experts, nullptr, false, false, &stats);
 
     const double streamed = stats.host_offload;
-    if (devs.empty() || streamed == 0.0) {
+    if (devs.empty()) {
         return ub0;
     }
-    // per-token FLOPs follow the active parameters: a token only runs n_expert_used of the experts
-    double n_params_active = stats.n_params;
-    for (const llama_moe_tensor_info & info : experts) {
-        n_params_active -= (double) info.n_input * info.n_output * std::max(0.0, info.n_expert - stats.n_expert_used);
+    // the ubatch doubles up to the token count the rule below asks for
+    double target = 0.0;
+    std::string why;
+    if (streamed == 0.0) {
+        // resident weights cost nothing per ubatch, but an expert GEMM only runs
+        // ub * n_expert_used / n_expert tokens and underfills its tiles below expert_tokens;
+        // dense models measured flat to slightly slower above 512
+        if (stats.n_expert_used == 0.0 || hp_nex == 0) {
+            return ub0;
+        }
+        target = expert_tokens * hp_nex / stats.n_expert_used;
+        resident = true;
+        why = string_format("resident weights, %.0f of %u experts per token, %.0f tokens per expert GEMM at %.0f",
+                stats.n_expert_used, hp_nex, expert_tokens, target);
+    } else {
+        if (!cparams->op_offload && !moe_cache_active) {
+            return ub0;
+        }
+        // per-token FLOPs follow the active parameters: a token only runs n_expert_used of the experts
+        double n_params_active = stats.n_params;
+        for (const llama_moe_tensor_info & info : experts) {
+            n_params_active -= (double) info.n_input * info.n_output * std::max(0.0, info.n_expert - stats.n_expert_used);
+        }
+        n_params_active = std::max(1.0, n_params_active);
+        ggml_backend_dev_t dev = devs[0];
+        if (ggml_backend_dev_is_meta(dev)) {
+            dev = ggml_backend_meta_dev_simple_dev(dev, 0);
+        }
+        const double h2d   = common_fit_probe_h2d(dev);
+        const double flops = common_fit_probe_flops(dev);
+        if (h2d == 0.0 || flops == 0.0) {
+            LOG_WRN("%s: ubatch auto: could not probe %s, keeping %u\n", __func__, ggml_backend_dev_name(dev), ub0);
+            return ub0;
+        }
+        const double fixed_s  = streamed / h2d;
+        const double tokens_s = compute_efficiency * flops / (2.0 * n_params_active);
+        target = 10.0 * fixed_s * tokens_s;
+        why = string_format("%.2f GiB of host weights at %.1f GB/s = %.2f s per ubatch, "
+                "%s %.1f TFLOPS for %.2fB active params = %.0f tokens/s -> knee %.0f",
+                streamed / (1024.0*1024.0*1024.0), h2d * 1e-9, fixed_s,
+                ggml_backend_dev_name(dev), flops * 1e-12, n_params_active * 1e-9, tokens_s, target);
     }
-    n_params_active = std::max(1.0, n_params_active);
-    ggml_backend_dev_t dev = devs[0];
-    if (ggml_backend_dev_is_meta(dev)) {
-        dev = ggml_backend_meta_dev_simple_dev(dev, 0);
-    }
-    const double h2d   = common_fit_probe_h2d(dev);
-    const double flops = common_fit_probe_flops(dev);
-    if (h2d == 0.0 || flops == 0.0) {
-        LOG_WRN("%s: ubatch auto: could not probe %s, keeping %u\n", __func__, ggml_backend_dev_name(dev), ub0);
-        return ub0;
-    }
-    const double fixed_s     = streamed / h2d;
-    const double tokens_s    = compute_efficiency * flops / (2.0 * n_params_active);
-    const double knee        = 10.0 * fixed_s * tokens_s;
 
     uint32_t ub = ub0;
-    while (ub < knee && ub * 2 <= ub_max) {
+    while (ub < target && ub * 2 <= ub_max) {
         ub *= 2;
     }
 
+    // host MoE weights stream, so a resident model always gets the quarter
     const double device_share = moe_cache_active && stats.host_moe ? 0.6 : 0.25;
+
     for (; ub > ub0; ub /= 2) {
         llama_context_params cparams_ub = *cparams;
         cparams_ub.n_ubatch = ub;
@@ -2450,13 +2479,30 @@ static uint32_t common_fit_auto_ubatch(
         }
     }
 
-    LOG_INF("%s: ubatch auto: %.2f GiB of host weights at %.1f GB/s = %.2f s per ubatch, "
-            "%s %.1f TFLOPS for %.2fB active params = %.0f tokens/s -> knee %.0f, "
-            "compute buffer cap (%.0f%% of VRAM) -> %u\n",
-            __func__, streamed / (1024.0*1024.0*1024.0), h2d * 1e-9, fixed_s,
-            ggml_backend_dev_name(dev), flops * 1e-12, n_params_active * 1e-9, tokens_s, knee,
-            100.0 * device_share, ub);
+    LOG_INF("%s: ubatch auto: %s, compute buffer cap (%.0f%% of VRAM) -> %u\n",
+            __func__, why.c_str(), 100.0 * device_share, ub);
     return ub;
+}
+
+// VBR budget that holds the fitted context at the given K/V types: the device KV bytes plus a
+// VMM page (2 MiB on CUDA) of rounding per K and V extent. The runtime budgets each device's
+// pool on its own, which one aggregate budget cannot vouch for, so more devices answer INT64_MAX.
+static int64_t common_fit_vbr_kv_need(
+        const char * path_model, const llama_model_params * mparams, const llama_context_params * cparams,
+        ggml_type type_k, ggml_type type_v, ggml_log_level log_level) {
+    constexpr int64_t page = 2*1024*1024;
+    llama_context_params cp = *cparams;
+    cp.type_k = type_k;
+    cp.type_v = type_v;
+    std::vector<ggml_backend_dev_t> devs;
+    uint32_t hp_ngl = 0;
+    uint32_t hp_nct = 0;
+    uint32_t hp_nex = 0;
+    const auto dmds = common_get_device_memory_data_impl(path_model, mparams, &cp, devs, hp_ngl, hp_nct, hp_nex, log_level);
+    if (dmds.size() != 2 || ggml_backend_dev_is_meta(devs[0])) {
+        return INT64_MAX;
+    }
+    return (int64_t) dmds[0].mb.context_vbr_managed + 2 * (int64_t) hp_ngl * page;
 }
 
 ggml_type common_vbr_fit_price_type(
@@ -2578,8 +2624,9 @@ enum common_params_fit_status common_fit_params(
     const uint32_t ub0 = cparams->n_ubatch;
     if (status == COMMON_PARAMS_FIT_STATUS_SUCCESS && n_ubatch_max > ub0 && !cparams->embeddings) {
         uint32_t ub = ub0;
+        bool resident = false;
         try {
-            ub = common_fit_auto_ubatch(path_model, mparams, cparams, moe_fit_active, n_ubatch_max, log_level);
+            ub = common_fit_auto_ubatch(path_model, mparams, cparams, moe_fit_active, n_ubatch_max, log_level, resident);
         } catch (const std::runtime_error & e) {
             LOG_WRN("%s: ubatch auto: measurement failed, keeping %u: %s\n", __func__, ub0, e.what());
         }
@@ -2587,12 +2634,20 @@ enum common_params_fit_status common_fit_params(
             // a larger compute buffer must not cost context or the MoE cache placement
             const uint32_t n_ctx0     = cparams->n_ctx;
             const bool     cache_fit0 = moe_cache && moe_cache->fit_selected;
+            const uint64_t budget0    = cparams->vbr_vram_budget_bytes;
             restore_inputs(ub);
             status = fit_once();
-            if (status != COMMON_PARAMS_FIT_STATUS_SUCCESS || cparams->n_ctx < n_ctx0 ||
-                    (moe_cache && moe_cache->fit_selected) != cache_fit0) {
+            bool loses = status != COMMON_PARAMS_FIT_STATUS_SUCCESS || cparams->n_ctx < n_ctx0 ||
+                    (moe_cache && moe_cache->fit_selected) != cache_fit0;
+            // nor, for a resident model's smaller gain, KV fidelity: the buffer comes out of the VBR
+            // budget, which must still hold the whole context at the entry tier, before any degrade
+            if (!loses && resident && cparams->vbr_dynamic && cparams->vbr_vram_budget_bytes < budget0) {
+                loses = (int64_t) cparams->vbr_vram_budget_bytes <
+                    common_fit_vbr_kv_need(path_model, mparams, cparams, type_k_entry, type_v_entry, log_level);
+            }
+            if (loses) {
                 // refit rather than restore the first fit: its override patterns live in buffers the refit reused
-                LOG_INF("%s: ubatch auto: the fit at %u loses context or placement, keeping %u\n", __func__, ub, ub0);
+                LOG_INF("%s: ubatch auto: the fit at %u loses context, placement or KV budget, keeping %u\n", __func__, ub, ub0);
                 restore_inputs(ub0);
                 status = fit_once();
             }

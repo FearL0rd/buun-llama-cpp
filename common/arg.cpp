@@ -2520,7 +2520,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     add_opt(common_arg(
         {"-ub", "--ubatch-size"}, "N|auto",
         string_format("physical maximum batch size; 'auto' starts at %d and lets the fit raise it "
-            "when weights stream to the GPU every ubatch (default: auto)", params.n_ubatch),
+            "when weights stream to the GPU every ubatch or MoE expert GEMMs run short (default: auto)", params.n_ubatch),
         [](common_params & params, const std::string & value) {
             params.n_ubatch_auto = is_autoy(value);
             if (!params.n_ubatch_auto) {
