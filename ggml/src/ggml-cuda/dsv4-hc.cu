@@ -63,6 +63,75 @@ static __device__ void dsv4_hc_comb_norm_rows(float * comb, float eps) {
     }
 }
 
+// pre/post/comb of one token, computed by a full warp: mixes and dst already point at that token
+static __device__ void dsv4_hc_params_token(
+        const float * mixes,
+        const float * scale,
+        const float * base,
+        float * dst,
+        int64_t sm0,
+        int64_t ss0,
+        int64_t sb0,
+        int64_t sd0,
+        float eps,
+        int32_t n_iter) {
+    constexpr int comb_offset = 2*DSV4_HC;
+
+    // lane l < 16 owns comb element l = idst + DSV4_HC*isrc; the row/column sums gather the four
+    // elements by shuffle and add them in the same order as the serial reference
+    const int lane = threadIdx.x % WARP_SIZE;
+
+    if (lane < 2*DSV4_HC) {
+        // The unfused graph stores between MUL and ADD. Explicit round-to-nearest
+        // intrinsics preserve that two-kernel arithmetic instead of contracting an FMA.
+        const float affine = __fadd_rn(__fmul_rn(mixes[lane*sm0], scale[(lane / DSV4_HC)*ss0]), base[lane*sb0]);
+        const float sig = 1.0f/(1.0f + expf(-affine));
+        dst[lane*sd0] = lane < DSV4_HC ? __fadd_rn(sig, eps) : __fmul_rn(sig, 2.0f);
+    }
+
+    const int idx  = lane % (DSV4_HC*DSV4_HC);
+    const int idst = idx % DSV4_HC;
+    const int isrc = idx / DSV4_HC;
+    const int row0 = DSV4_HC*isrc;
+
+    float v = mixes[(comb_offset + idx)*sm0] * scale[2*ss0] + base[(comb_offset + idx)*sb0];
+
+    float max = -INFINITY;
+#pragma unroll
+    for (int j = 0; j < DSV4_HC; ++j) {
+        max = fmaxf(max, __shfl_sync(0xffffffff, v, row0 + j));
+    }
+    v = expf(v - max);
+    float sum = 0.0f;
+#pragma unroll
+    for (int j = 0; j < DSV4_HC; ++j) {
+        sum += __shfl_sync(0xffffffff, v, row0 + j);
+    }
+    v = v*(1.0f/sum) + eps;
+
+    // one column pass even when n_iter is 0, as in the serial reference
+    for (int32_t it = 0; it < (n_iter > 1 ? n_iter : 1); ++it) {
+        if (it > 0) {
+            float row_sum = eps;
+#pragma unroll
+            for (int j = 0; j < DSV4_HC; ++j) {
+                row_sum += __shfl_sync(0xffffffff, v, row0 + j);
+            }
+            v *= 1.0f/row_sum;
+        }
+        float col_sum = eps;
+#pragma unroll
+        for (int j = 0; j < DSV4_HC; ++j) {
+            col_sum += __shfl_sync(0xffffffff, v, idst + DSV4_HC*j);
+        }
+        v *= 1.0f/col_sum;
+    }
+
+    if (lane < DSV4_HC*DSV4_HC) {
+        dst[(comb_offset + idx)*sd0] = v;
+    }
+}
+
 static __global__ void dsv4_hc_params_f32(
         const float * mixes,
         const float * scale,
@@ -77,10 +146,8 @@ static __global__ void dsv4_hc_params_f32(
         int64_t sd1,
         float eps,
         int32_t n_iter) {
-    constexpr int comb_offset = 2*DSV4_HC;
-
     ggml_cuda_pdl_lc();
-    const int64_t it = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    const int64_t it = (int64_t) blockIdx.x * blockDim.y + threadIdx.y;
 
     if (it >= n_tokens) {
         return;
@@ -88,60 +155,158 @@ static __global__ void dsv4_hc_params_f32(
 
     ggml_cuda_pdl_sync();
 
-    const float scale_pre  = scale[0*ss0];
-    const float scale_post = scale[1*ss0];
-    const float scale_comb = scale[2*ss0];
+    dsv4_hc_params_token(mixes + it*sm1, scale, base, dst + it*sd1, sm0, ss0, sb0, sd0, eps, n_iter);
+}
 
-    for (int i = 0; i < DSV4_HC; ++i) {
-        // The unfused graph stores between MUL and ADD. Explicit round-to-nearest
-        // intrinsics preserve that two-kernel arithmetic instead of contracting an FMA.
-        const float pre_mul = __fmul_rn(mixes[i*sm0 + it*sm1], scale_pre);
-        const float pre_affine = __fadd_rn(pre_mul, base[i*sb0]);
-        const float pre = __fadd_rn(1.0f/(1.0f + expf(-pre_affine)), eps);
-        dst[i*sd0 + it*sd1] = pre;
+// RMS_NORM -> MUL_MAT(f32 hc_fn) -> DSV4_HC_PARAMS in one launch. rms_norm only scales each
+// token by a scalar, so every block dots its k slice of the raw stream against the 24 hc_fn
+// rows and accumulates sum(x^2) alongside; the last block to finish sums the slices and
+// applies rsqrt(mean + eps) before the params epilogue.
+static constexpr int DSV4_HC_PRE_FUSED_THREADS = 128;
+static constexpr int DSV4_HC_PRE_FUSED_MAX_TOKENS = 4;
+static constexpr int DSV4_HC_PRE_FUSED_MAX_BLOCKS = 128;
+static constexpr int DSV4_HC_MIX = (2 + DSV4_HC)*DSV4_HC;
 
-        const int post_idx = DSV4_HC + i;
-        const float post_mul = __fmul_rn(mixes[post_idx*sm0 + it*sm1], scale_post);
-        const float post_affine = __fadd_rn(post_mul, base[post_idx*sb0]);
-        const float post = __fmul_rn(1.0f/(1.0f + expf(-post_affine)), 2.0f);
-        dst[post_idx*sd0 + it*sd1] = post;
-    }
+static __device__ unsigned int dsv4_hc_pre_fused_counter;
 
-    float comb[DSV4_HC*DSV4_HC];
-    for (int isrc = 0; isrc < DSV4_HC; ++isrc) {
-        float max = -INFINITY;
-        for (int idst = 0; idst < DSV4_HC; ++idst) {
-            const int idx = idst + DSV4_HC*isrc;
-            const float v = mixes[(comb_offset + idx)*sm0 + it*sm1] * scale_comb +
-                base[(comb_offset + idx)*sb0];
-            comb[idx] = v;
-            max = fmaxf(max, v);
+template <int n_tokens>
+static __global__ void dsv4_hc_pre_fused_f32(
+        const float * x, const float * w, const float * scale, const float * base,
+        float * partials, float * dst, int64_t k, int64_t sx1, int64_t sw1, int64_t ss0, int64_t sb0,
+        int64_t sd1, float rms_eps, float eps, int32_t n_iter) {
+    constexpr int nwarps = DSV4_HC_PRE_FUSED_THREADS/WARP_SIZE;
+    constexpr int nacc = n_tokens*(DSV4_HC_MIX + 1);
+
+    ggml_cuda_pdl_lc();
+    ggml_cuda_pdl_sync();
+
+    float acc[nacc] = {};
+    for (int64_t i = (int64_t) blockIdx.x*blockDim.x + threadIdx.x; i < k; i += (int64_t) gridDim.x*blockDim.x) {
+        float wv[DSV4_HC_MIX];
+#pragma unroll
+        for (int j = 0; j < DSV4_HC_MIX; ++j) {
+            wv[j] = w[j*sw1 + i];
         }
-
-        float sum = 0.0f;
-        for (int idst = 0; idst < DSV4_HC; ++idst) {
-            const int idx = idst + DSV4_HC*isrc;
-            const float v = expf(comb[idx] - max);
-            comb[idx] = v;
-            sum += v;
-        }
-
-        const float inv_sum = 1.0f/sum;
-        for (int idst = 0; idst < DSV4_HC; ++idst) {
-            const int idx = idst + DSV4_HC*isrc;
-            comb[idx] = comb[idx]*inv_sum + eps;
+#pragma unroll
+        for (int t = 0; t < n_tokens; ++t) {
+            const float xv = x[t*sx1 + i];
+#pragma unroll
+            for (int j = 0; j < DSV4_HC_MIX; ++j) {
+                acc[t*(DSV4_HC_MIX + 1) + j] += wv[j]*xv;
+            }
+            acc[t*(DSV4_HC_MIX + 1) + DSV4_HC_MIX] += xv*xv;
         }
     }
 
-    dsv4_hc_comb_norm_cols(comb, eps);
-    for (int32_t i = 1; i < n_iter; ++i) {
-        dsv4_hc_comb_norm_rows(comb, eps);
-        dsv4_hc_comb_norm_cols(comb, eps);
+    __shared__ float red[nwarps][nacc];
+    const int lane = threadIdx.x % WARP_SIZE;
+    const int warp = threadIdx.x / WARP_SIZE;
+#pragma unroll
+    for (int a = 0; a < nacc; ++a) {
+        const float v = warp_reduce_sum(acc[a]);
+        if (lane == 0) {
+            red[warp][a] = v;
+        }
+    }
+    __syncthreads();
+
+    for (int a = threadIdx.x; a < nacc; a += blockDim.x) {
+        float v = 0.0f;
+#pragma unroll
+        for (int iw = 0; iw < nwarps; ++iw) {
+            v += red[iw][a];
+        }
+        partials[blockIdx.x*nacc + a] = v;
     }
 
-    for (int idx = 0; idx < DSV4_HC*DSV4_HC; ++idx) {
-        dst[(comb_offset + idx)*sd0 + it*sd1] = comb[idx];
+    __shared__ bool last;
+    __threadfence();
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        // atomicInc wraps to 0 on the last block, leaving the counter ready for the next launch
+        last = atomicInc(&dsv4_hc_pre_fused_counter, gridDim.x - 1) == gridDim.x - 1;
     }
+    __syncthreads();
+    if (!last) {
+        return;
+    }
+    __threadfence();
+
+    // each warp sums whole accumulators across the block partials, then one warp per token
+    // runs the params epilogue
+    __shared__ float mixes[nacc];
+    for (int a = warp; a < nacc; a += nwarps) {
+        float v = 0.0f;
+        for (unsigned int b = lane; b < gridDim.x; b += WARP_SIZE) {
+            v += __ldcg(partials + b*nacc + a);
+        }
+        v = warp_reduce_sum(v);
+        if (lane == 0) {
+            mixes[a] = v;
+        }
+    }
+    __syncthreads();
+
+    static_assert(n_tokens <= nwarps, "one warp per token");
+    if (warp < n_tokens) {
+        float * m = mixes + warp*(DSV4_HC_MIX + 1);
+        const float rs = rsqrtf(m[DSV4_HC_MIX]/k + rms_eps);
+        if (lane < DSV4_HC_MIX) {
+            m[lane] *= rs;
+        }
+        __syncwarp();
+        dsv4_hc_params_token(m, scale, base, dst + warp*sd1, 1, ss0, sb0, 1, eps, n_iter);
+    }
+}
+
+bool ggml_cuda_dsv4_hc_pre_fused_supported(const ggml_tensor * rms, const ggml_tensor * mm, const ggml_tensor * params) {
+    const ggml_tensor * x = rms->src[0];
+    const ggml_tensor * w = mm->src[0];
+    return x->type == GGML_TYPE_F32 && w->type == GGML_TYPE_F32 && mm->src[1] == rms && params->src[0] == mm &&
+        x->ne[1] >= 1 && x->ne[1] <= DSV4_HC_PRE_FUSED_MAX_TOKENS && x->ne[2] == 1 && x->ne[3] == 1 &&
+        x->nb[0] == sizeof(float) && w->nb[0] == sizeof(float) &&
+        w->ne[0] == x->ne[0] && w->ne[1] == DSV4_HC_MIX && w->ne[2] == 1 && w->ne[3] == 1 &&
+        mm->ne[0] == DSV4_HC_MIX && mm->ne[1] == x->ne[1] && mm->ne[2] == 1 && mm->ne[3] == 1 &&
+        params->src[1]->type == GGML_TYPE_F32 && params->src[2]->type == GGML_TYPE_F32 &&
+        params->type == GGML_TYPE_F32 && params->nb[0] == sizeof(float) &&
+        x->ne[0] % DSV4_HC_PRE_FUSED_THREADS == 0;
+}
+
+void ggml_cuda_op_dsv4_hc_pre_fused(ggml_backend_cuda_context & ctx,
+        const ggml_tensor * rms, const ggml_tensor * mm, ggml_tensor * params) {
+    const ggml_tensor * x     = rms->src[0];
+    const ggml_tensor * w     = mm->src[0];
+    const ggml_tensor * scale = params->src[1];
+    const ggml_tensor * base  = params->src[2];
+
+    const int64_t k  = x->ne[0];
+    const int     nt = (int) x->ne[1];
+    const int nblocks = (int) std::min<int64_t>(DSV4_HC_PRE_FUSED_MAX_BLOCKS, k/DSV4_HC_PRE_FUSED_THREADS);
+
+    ggml_cuda_pool_alloc<float> partials(ctx.pool(), size_t(nblocks)*nt*(DSV4_HC_MIX + 1));
+
+    const float rms_eps = ggml_get_op_params_f32(rms, 0);
+    const float eps     = ggml_get_op_params_f32(params, 0);
+    const int32_t n_iter = ggml_get_op_params_i32(params, 1);
+
+    const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(
+            dim3(nblocks, 1, 1), dim3(DSV4_HC_PRE_FUSED_THREADS, 1, 1), 0, ctx.stream());
+
+#define DSV4_HC_PRE_FUSED_LAUNCH(NT) \
+    ggml_cuda_kernel_launch(dsv4_hc_pre_fused_f32<NT>, launch_params, \
+            (const float *) x->data, (const float *) w->data, (const float *) scale->data, \
+            (const float *) base->data, partials.get(), (float *) params->data, k, \
+            int64_t(x->nb[1]/sizeof(float)), int64_t(w->nb[1]/sizeof(float)), \
+            int64_t(scale->nb[0]/sizeof(float)), int64_t(base->nb[0]/sizeof(float)), \
+            int64_t(params->nb[1]/sizeof(float)), rms_eps, eps, n_iter)
+    switch (nt) {
+        case 1: DSV4_HC_PRE_FUSED_LAUNCH(1); break;
+        case 2: DSV4_HC_PRE_FUSED_LAUNCH(2); break;
+        case 3: DSV4_HC_PRE_FUSED_LAUNCH(3); break;
+        case 4: DSV4_HC_PRE_FUSED_LAUNCH(4); break;
+        default: GGML_ABORT("unsupported token count");
+    }
+#undef DSV4_HC_PRE_FUSED_LAUNCH
 }
 
 static __global__ void dsv4_hc_comb_f32(
@@ -340,9 +505,9 @@ void ggml_cuda_op_dsv4_hc_params(ggml_backend_cuda_context & ctx, ggml_tensor * 
     const float eps = ggml_get_op_params_f32(dst, 0);
     const int32_t n_iter = ggml_get_op_params_i32(dst, 1);
 
-    const int block_size = 256;
-    const dim3 block_dims(block_size, 1, 1);
-    const dim3 grid_dims((n_tokens + block_size - 1) / block_size, 1, 1);
+    const int tokens_per_block = 8;
+    const dim3 block_dims(WARP_SIZE, tokens_per_block, 1);
+    const dim3 grid_dims((n_tokens + tokens_per_block - 1) / tokens_per_block, 1, 1);
     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(
             grid_dims, block_dims, 0, ctx.stream());
 

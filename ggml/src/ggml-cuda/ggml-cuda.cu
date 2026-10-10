@@ -6971,6 +6971,15 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         return hc_grouped_rms.nodes_to_skip;
     }
 
+    const ggml_op hc_pre_ops[] = { GGML_OP_RMS_NORM, GGML_OP_MUL_MAT, GGML_OP_DSV4_HC_PARAMS };
+    const int hc_pre_output = i + 2;
+    if (node->op == GGML_OP_RMS_NORM &&
+            ggml_can_fuse_subgraph(cgraph, i, 3, hc_pre_ops, &hc_pre_output, 1) &&
+            ggml_cuda_dsv4_hc_pre_fused_supported(node, cgraph->nodes[i + 1], cgraph->nodes[i + 2])) {
+        ggml_cuda_op_dsv4_hc_pre_fused(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2]);
+        return 2;
+    }
+
     ggml_cuda_mmvq_post_silu_fusion mmvq_post_silu;
     if (node->op == GGML_OP_MUL_MAT &&
             ggml_cuda_match_mmvq_post_silu(cgraph, i, mmvq_post_silu) &&
