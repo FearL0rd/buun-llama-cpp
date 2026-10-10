@@ -6915,12 +6915,13 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                             !ggml_cuda_tensors_overlap(next, node) && !ggml_cuda_tensors_overlap(next, cpy) &&
                             (!prefill_conv || (ggml_is_contiguous(cand->src[1]) &&
                                 cand->src[1]->op == GGML_OP_NONE))) {
-                        // Prefill moves the SiLU write before any intervening
-                        // state-gather nodes. It must not overwrite their live
-                        // inputs or outputs, even when the allocator reuses storage.
-                        // The leaf weight must also remain unchanged until conv.
+                        // The SiLU write moves before any intervening nodes (state
+                        // gathers, or whole sibling convs when a model builds several
+                        // in one pass). It must not overwrite their live inputs or
+                        // outputs, even when the allocator reuses storage. The leaf
+                        // weight must also remain unchanged until conv.
                         bool safe = true;
-                        if (prefill_conv) {
+                        if (prefill_conv || j > cpy_index + 1) {
                             safe = !ggml_cuda_tensors_overlap(next, cand->src[1]) &&
                                 !ggml_cuda_tensors_overlap(cpy, cand->src[1]);
                             for (int k = cpy_index + 1; safe && k < j; ++k) {

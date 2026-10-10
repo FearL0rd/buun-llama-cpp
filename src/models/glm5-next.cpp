@@ -238,8 +238,10 @@ static ggml_tensor * glm5_conv1d(ggml_cgraph * gf, ggml_context * ctx0,
     }
 
     ggml_tensor * conv_weight = ggml_reshape_2d(ctx0, conv_w, d_conv, d_inner);
-    // SiLU directly on the conv output so the fusion can fold it in
+    // SiLU directly on the conv output, scheduled right behind the state copies, so the
+    // conv-state fusion can fold it in
     ggml_tensor * Xcur = ggml_silu(ctx0, ggml_ssm_conv(ctx0, conv_x, conv_weight));
+    ggml_build_forward_expand(gf, Xcur);
 
     return ggml_reshape_4d(ctx0, Xcur, head_dim, n_head, n_seq_tokens, n_seqs);
 }
