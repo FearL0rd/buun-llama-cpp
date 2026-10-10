@@ -8575,7 +8575,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             const ggml_tensor * gamma = norm->src[1];
             const ggml_tensor * gate = unary->src[0];
             if (norm->src[0] == node && dst->src[0] == norm && dst->src[1] == unary &&
-                    ggml_get_unary_op(unary) == GGML_UNARY_OP_SILU &&
+                    (ggml_get_unary_op(unary) == GGML_UNARY_OP_SILU || ggml_get_unary_op(unary) == GGML_UNARY_OP_SIGMOID) &&
                     x->type == GGML_TYPE_F32 && gamma->type == GGML_TYPE_F32 &&
                     gate->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 &&
                     (x->ne[0] == 256 || x->ne[0] == 128) &&
@@ -8605,7 +8605,8 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                         cgraph, dst, ggml_cuda_info().devices[cuda_ctx->device].cc);
                 }
 #endif
-                ggml_cuda_op_rms_norm_silu(*cuda_ctx, node, gamma, gate, dst, bf16_activation);
+                ggml_cuda_op_rms_norm_silu(*cuda_ctx, node, gamma, gate, dst, bf16_activation,
+                    ggml_get_unary_op(unary) == GGML_UNARY_OP_SIGMOID);
                 return unary_idx + 1 - i;
             }
         }

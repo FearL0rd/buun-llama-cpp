@@ -4161,19 +4161,20 @@ struct test_rms_norm : public test_case {
 // the intermediate live and must prevent a fusion from discarding its output.
 struct test_rms_norm_silu : public test_case {
     const int64_t width, tokens, sequences;
-    const bool strided, expose_norm;
+    const bool strided, expose_norm, sigmoid;
     ggml_tensor * norm = nullptr;
     ggml_tensor * out = nullptr;
 
     test_rms_norm_silu(int64_t width, int64_t tokens, int64_t sequences,
-                      bool strided, bool expose_norm = false) :
-        width(width), tokens(tokens), sequences(sequences), strided(strided), expose_norm(expose_norm) {}
+                      bool strided, bool expose_norm = false, bool sigmoid = false) :
+        width(width), tokens(tokens), sequences(sequences), strided(strided), expose_norm(expose_norm),
+        sigmoid(sigmoid) {}
 
     bool run_whole_graph() override { return true; }
     std::vector<ggml_tensor *> fusion_test_nodes() override {
         return expose_norm ? std::vector<ggml_tensor *>{norm, out} : std::vector<ggml_tensor *>{out};
     }
-    std::string op_desc(ggml_tensor *) override { return "RMS_NORM_SILU"; }
+    std::string op_desc(ggml_tensor *) override { return sigmoid ? "RMS_NORM_SIGMOID" : "RMS_NORM_SILU"; }
     std::string vars() override { return VARS_TO_STR5(width, tokens, sequences, strided, expose_norm); }
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
@@ -4184,7 +4185,7 @@ struct test_rms_norm_silu : public test_case {
             storage->nb[1], storage->nb[2], storage->nb[3], width*8*sizeof(float)) : storage;
         norm = ggml_mul(ctx, ggml_rms_norm(ctx, x, 1e-6f), weight);
         if (expose_norm) { ggml_set_output(norm); }
-        out = ggml_mul(ctx, norm, ggml_silu(ctx, gate));
+        out = ggml_mul(ctx, norm, sigmoid ? ggml_sigmoid(ctx, gate) : ggml_silu(ctx, gate));
         return out;
     }
 };
@@ -12478,6 +12479,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
     test_cases.emplace_back(new test_rms_norm_silu(128, 8, 5, true));
     test_cases.emplace_back(new test_rms_norm_silu(128, 8, 2, true, true));
+    for (int64_t tokens : {1, 3}) {
+        for (bool strided : {false, true}) {
+            test_cases.emplace_back(new test_rms_norm_silu(128, tokens, 1, strided, false, true));
+        }
+    }
+    test_cases.emplace_back(new test_rms_norm_silu(128, 1, 1, false, true, true));
     test_cases.emplace_back(new test_rms_norm_silu(64, 8, 2, false));
     test_cases.emplace_back(new test_rms_norm_silu(512, 8, 2, true));
 
