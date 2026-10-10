@@ -1,5 +1,6 @@
 #include "common.cuh"
 #include "dsv4-hc.cuh"
+#include "unary.cuh"
 
 
 static constexpr int DSV4_HC = 4;
@@ -85,7 +86,7 @@ static __device__ void dsv4_hc_params_pre_post(
         // The unfused graph stores between MUL and ADD. Explicit round-to-nearest
         // intrinsics preserve that two-kernel arithmetic instead of contracting an FMA.
         const float affine = __fadd_rn(__fmul_rn(mixes[lane*sm0], scale[(lane / DSV4_HC)*ss0]), base[lane*sb0]);
-        const float sig = 1.0f/(1.0f + expf(-affine));
+        const float sig = ggml_cuda_op_sigmoid_single(affine);
         dst[lane*sd0] = lane < DSV4_HC ? __fadd_rn(sig, eps) : __fmul_rn(sig, 2.0f);
     }
 }

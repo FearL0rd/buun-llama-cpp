@@ -12,6 +12,7 @@
 // The last block to exit resets the ticket and dependency counters for the next launch.
 
 #include "exl3-gemv-int8.cuh"
+#include "unary.cuh"
 
 namespace exl3_moe_fused {
 
@@ -297,12 +298,9 @@ __global__ void __launch_bounds__(THREADS, MIN_BLOCKS) moe(const args a) {
                     float v[4];
 #pragma unroll
                     for (int i = 0; i < 4; ++i) {
-                        float g = h[0][i], up = h[1][i];
-                        if (a.limit > 0.0f) {
-                            g = fminf(g, a.limit);
-                            up = fmaxf(fminf(up, a.limit), -a.limit);
-                        }
-                        v[i] = g / (1.0f + expf(-g)) * up * sdv[i];
+                        const float g = h[0][i], up = h[1][i];
+                        v[i] = (a.limit > 0.0f ? ggml_cuda_op_swiglu_clamp_single(g, up, a.limit) :
+                                                 ggml_cuda_op_silu_single(g) * up) * sdv[i];
                     }
                     exl3_had::had128(v[0], v[1], v[2], v[3], lane);
                     const float2 gs = quant_group(v, lane, a.xq2 + (size_t(pair) * NB1 + cg) * 128);

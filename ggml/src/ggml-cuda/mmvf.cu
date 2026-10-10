@@ -54,7 +54,7 @@ void ggml_cuda_op_qwen35_recurrent_gates_f16(
 struct mmvf_f16_multi_args {
     const half * w[MMVF_F16_MULTI_MAX];
     float      * dst[MMVF_F16_MULTI_MAX];
-    float      * sigmoid_dst[MMVF_F16_MULTI_MAX]; // optional sigmoid of dst, same layout
+    float      * sigmoid_dst; // optional sigmoid of the last dst, same layout
     int64_t      stride_w[MMVF_F16_MULTI_MAX];   // halves per row
     int64_t      stride_dst[MMVF_F16_MULTI_MAX]; // floats per token
     int          row_end[MMVF_F16_MULTI_MAX];    // cumulative row count
@@ -101,8 +101,8 @@ static __global__ void mul_mat_vec_f16_multi(
         if (lane == 0) {
             const int64_t index = t * args.stride_dst[m] + local;
             args.dst[m][index] = s;
-            if (args.sigmoid_dst[m]) {
-                args.sigmoid_dst[m][index] = 1.0f / (1.0f + expf(-s));
+            if (m == n_mats - 1 && args.sigmoid_dst) {
+                args.sigmoid_dst[index] = ggml_cuda_op_sigmoid_single(s);
             }
         }
     }
@@ -136,7 +136,7 @@ static void mul_mat_vec_f16_multi_launch(const mmvf_f16_multi_args & args, const
 }
 
 void ggml_cuda_mul_mat_vec_f16_multi(ggml_backend_cuda_context & ctx, ggml_tensor * const * mms, int n_mats,
-        const ggml_tensor * sigmoid, int sigmoid_mat) {
+        const ggml_tensor * sigmoid) {
     GGML_ASSERT(n_mats >= 2 && n_mats <= MMVF_F16_MULTI_MAX);
     const ggml_tensor * src1 = mms[0]->src[1];
     mmvf_f16_multi_args args = {};
@@ -151,7 +151,7 @@ void ggml_cuda_mul_mat_vec_f16_multi(ggml_backend_cuda_context & ctx, ggml_tenso
         args.row_end[k]    = rows;
     }
     if (sigmoid) {
-        args.sigmoid_dst[sigmoid_mat] = static_cast<float *>(sigmoid->data);
+        args.sigmoid_dst = static_cast<float *>(sigmoid->data);
     }
     const float * x = static_cast<const float *>(src1->data);
     const int64_t stride_x = src1->nb[1] / sizeof(float);
@@ -215,7 +215,7 @@ static __global__ void mul_mat_vec_f16_kda_gate(const mmvf_kda_gate_args args, c
             // same operations and order as the ADD, MUL, SCALE, SIGMOID, SCALE nodes
             v = (v + args.bias[local]) * args.a[local / args.head_dim];
             v = args.s0 * v + args.b0;
-            v = 1.0f / (1.0f + expf(-v));
+            v = ggml_cuda_op_sigmoid_single(v);
             v = args.s1 * v + args.b1;
         }
         args.dst[m][t * args.stride_dst[m] + local] = v;

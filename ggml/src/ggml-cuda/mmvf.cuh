@@ -18,9 +18,9 @@ void ggml_cuda_op_mul_mat_vec_f(
 bool ggml_cuda_mul_mat_vec_f16_multi_supported(const ggml_tensor * mm, const ggml_tensor * src1);
 
 // Computes n_mats MUL_MATs that share src1 in one launch; sigmoid (optional) also receives the
-// sigmoid of mms[sigmoid_mat], which must be contiguous like it.
+// sigmoid of the last of mms, which must be contiguous like it.
 void ggml_cuda_mul_mat_vec_f16_multi(ggml_backend_cuda_context & ctx, ggml_tensor * const * mms, int n_mats,
-        const ggml_tensor * sigmoid = nullptr, int sigmoid_mat = 0);
+        const ggml_tensor * sigmoid = nullptr);
 
 // mm is a small-batch f16 MUL_MAT the KDA gate launch can compute.
 bool ggml_cuda_mul_mat_vec_f16_kda_gate_supported(const ggml_tensor * mm);

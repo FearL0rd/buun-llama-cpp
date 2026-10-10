@@ -4344,6 +4344,14 @@ static bool ggml_cuda_is_view_or_noop(const ggml_tensor * t) {
            t->op == GGML_OP_VIEW || t->op == GGML_OP_PERMUTE || t->op == GGML_OP_NONE;
 }
 
+// first node index >= j that is not a view or no-op, or n_nodes
+static int ggml_cuda_next_non_view(const ggml_cgraph * cgraph, int j) {
+    while (j < cgraph->n_nodes && ggml_cuda_is_view_or_noop(cgraph->nodes[j])) {
+        j++;
+    }
+    return j;
+}
+
 #ifdef USE_CUDA_GRAPH
 static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
 
@@ -6364,11 +6372,10 @@ static int ggml_cuda_try_fuse_kpool_pool(ggml_backend_cuda_context & ctx, ggml_c
     ggml_tensor * chain[n_ops];
     int j = i;
     for (int n = 0; n < n_ops; ++n) {
-        do {
-            if (++j >= cgraph->n_nodes) {
-                return 0;
-            }
-        } while (ggml_cuda_is_view_or_noop(cgraph->nodes[j]));
+        j = ggml_cuda_next_non_view(cgraph, j + 1);
+        if (j >= cgraph->n_nodes) {
+            return 0;
+        }
         chain[n] = cgraph->nodes[j];
         if (chain[n]->op != ops[n] || chain[n]->type != GGML_TYPE_F32) {
             return 0;
@@ -6474,13 +6481,12 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 match.experts == down && match.expert_scale == nullptr) {
             const int count = 4 + match.node_count;
             const int out_idx = i + count - 1;
-            const ggml_op head[] = { GGML_OP_MUL_MAT_ID, GGML_OP_MUL_MAT_ID, GGML_OP_GLU, GGML_OP_MUL_MAT_ID };
-            std::vector<ggml_op> ops(count);
-            for (int j = 0; j < count; ++j) {
-                ops[j] = j < 4 ? head[j] : cgraph->nodes[i + j]->op;
+            ggml_op ops[32];
+            for (int j = 0; j < count && j < 32; ++j) {
+                ops[j] = cgraph->nodes[i + j]->op;
             }
             const float limit = ggml_get_glu_op(glu) == GGML_GLU_OP_SWIGLU_CLAMP ? ggml_get_op_params_f32(glu, 3) : 0.0f;
-            if (count < 32 && ggml_can_fuse_subgraph(cgraph, i, count, ops.data(), &out_idx, 1) &&
+            if (count < 32 && ggml_can_fuse_subgraph(cgraph, i, count, ops, &out_idx, 1) &&
                     ggml_cuda_exl3_moe_fused(*cuda_ctx, glu->src[1], glu->src[0], down, limit, match.weights, match.dst,
                         !ggml_cuda_check_fusion_memory_ranges(cgraph, i, count, &out_idx, 1))) {
                 return count - 1;
@@ -7096,10 +7102,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             ggml_can_fuse_subgraph(cgraph, i, 3, hc_pre_ops, &hc_pre_output, 1) &&
             ggml_cuda_dsv4_hc_pre_fused_supported(node, cgraph->nodes[i + 1], cgraph->nodes[i + 2])) {
         // fold in the DSV4_HC_PRE that consumes pre, when only views sit between them
-        int j = i + 3;
-        while (j < cgraph->n_nodes && ggml_cuda_is_view_or_noop(cgraph->nodes[j])) {
-            j++;
-        }
+        const int j = ggml_cuda_next_non_view(cgraph, i + 3);
         ggml_tensor * hc_pre = j < cgraph->n_nodes && ggml_cuda_dsv4_hc_pre_apply_supported(cgraph->nodes[i + 2], cgraph->nodes[j]) ?
             cgraph->nodes[j] : nullptr;
         ggml_cuda_op_dsv4_hc_pre_fused(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2], hc_pre);
@@ -8858,10 +8861,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         if (n_mats >= 2) {
             // fold in a SIGMOID of the last result when only views sit between them
             const ggml_tensor * last = mms[n_mats - 1];
-            int j = i + n_mats;
-            while (j < cgraph->n_nodes && ggml_cuda_is_view_or_noop(cgraph->nodes[j])) {
-                j++;
-            }
+            const int j = ggml_cuda_next_non_view(cgraph, i + n_mats);
             const ggml_tensor * sig = j < cgraph->n_nodes ? cgraph->nodes[j] : nullptr;
             bool fuse_sig = sig && sig->op == GGML_OP_UNARY && ggml_get_unary_op(sig) == GGML_UNARY_OP_SIGMOID &&
                 sig->type == GGML_TYPE_F32 && sig->src[0]->data == last->data &&
@@ -8870,7 +8870,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             for (int k = 0; fuse_sig && k < n_mats - 1; ++k) {
                 fuse_sig = !ggml_cuda_tensors_overlap(sig, mms[k]);
             }
-            ggml_cuda_mul_mat_vec_f16_multi(*cuda_ctx, mms, n_mats, fuse_sig ? sig : nullptr, n_mats - 1);
+            ggml_cuda_mul_mat_vec_f16_multi(*cuda_ctx, mms, n_mats, fuse_sig ? sig : nullptr);
             return fuse_sig ? j - i : n_mats - 1;
         }
     }
