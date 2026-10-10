@@ -44,6 +44,7 @@
 #include "ggml-cuda/moe-cpu-share.cuh"
 #include "ggml-cuda/kpool-pool.cuh"
 #include "ggml-cuda/sel-mask.cuh"
+#include "ggml-cuda/set-rows-concat.cuh"
 #include "ggml-cuda/norm.cuh"
 #include "ggml-cuda/opt-step-adamw.cuh"
 #include "ggml-cuda/opt-step-sgd.cuh"
@@ -6504,6 +6505,61 @@ static int ggml_cuda_try_fuse_sel_mask(ggml_backend_cuda_context & ctx, ggml_cgr
     return j - i;
 }
 
+// CONCAT(a, b) in dim 0, a zero right PAD in dim 0, then a SET_ROWS of its rows. Returns the number of
+// nodes fused after the CONCAT, or 0.
+static int ggml_cuda_try_fuse_set_rows_concat(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph, int i) {
+    const ggml_tensor * cat = cgraph->nodes[i];
+    const ggml_tensor * a = cat->src[0];
+    const ggml_tensor * b = cat->src[1];
+    if (ggml_get_op_params_i32(cat, 0) != 0 || cat->type != GGML_TYPE_F32 || a->type != GGML_TYPE_F32 ||
+            b->type != GGML_TYPE_F32 || a->nb[0] != sizeof(float) || b->nb[0] != sizeof(float) ||
+            a->ne[2] != 1 || a->ne[3] != 1 || b->ne[2] != 1 || b->ne[3] != 1) {
+        return 0;
+    }
+    const int j_pad = ggml_cuda_next_non_view(cgraph, i + 1);
+    if (j_pad >= cgraph->n_nodes) {
+        return 0;
+    }
+    const ggml_tensor * pad = cgraph->nodes[j_pad];
+    if (pad->op != GGML_OP_PAD || pad->src[0] != cat || ggml_get_op_params_i32(pad, 0) != 0 ||
+            ggml_get_op_params_i32(pad, 8) != 0) {
+        return 0;
+    }
+    for (int p = 2; p < 8; ++p) {
+        if (ggml_get_op_params_i32(pad, p) != 0) {
+            return 0;
+        }
+    }
+    const int j = ggml_cuda_next_non_view(cgraph, j_pad + 1);
+    if (j >= cgraph->n_nodes) {
+        return 0;
+    }
+    ggml_tensor * sr = cgraph->nodes[j];
+    const ggml_tensor * val = sr->src[0];
+    const ggml_tensor * idx = sr->src[1];
+    if (sr->op != GGML_OP_SET_ROWS || val->data != pad->data || !ggml_is_contiguous(val) ||
+            val->ne[0] != pad->ne[0] || val->ne[1] != a->ne[1] || ggml_nelements(val) != ggml_nelements(pad) ||
+            sr->ne[0] != pad->ne[0] || sr->nb[0] != ggml_type_size(sr->type) ||
+            (sr->type != GGML_TYPE_F32 && sr->type != GGML_TYPE_F16 && sr->type != GGML_TYPE_BF16) ||
+            (idx->type != GGML_TYPE_I32 && idx->type != GGML_TYPE_I64) || idx->ne[0] != a->ne[1] ||
+            ggml_nelements(idx) != idx->ne[0] ||
+            ggml_cuda_tensors_overlap(sr, a) || ggml_cuda_tensors_overlap(sr, b) || ggml_cuda_tensors_overlap(sr, idx)) {
+        return 0;
+    }
+    // cat, pad and the views between pad and the SET_ROWS have no other consumers
+    for (int k = i; k < j; ++k) {
+        const ggml_tensor * t = cgraph->nodes[k];
+        const size_t pos = ggml_hash_find(&cgraph->visited_hash_set, t);
+        if ((t->flags & GGML_TENSOR_FLAG_OUTPUT) || !ggml_bitset_get(cgraph->visited_hash_set.used, pos) ||
+                cgraph->use_counts[pos] != 1) {
+            return 0;
+        }
+    }
+
+    ggml_cuda_op_set_rows_concat(ctx, a, b, idx, sr);
+    return j - i;
+}
+
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
     static const bool disable_fusion = [] {
@@ -8805,6 +8861,13 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
     if (node->op == GGML_OP_FILL) {
         const int n_fused = ggml_cuda_try_fuse_sel_mask(*cuda_ctx, cgraph, i);
+        if (n_fused) {
+            return n_fused;
+        }
+    }
+
+    if (node->op == GGML_OP_CONCAT) {
+        const int n_fused = ggml_cuda_try_fuse_set_rows_concat(*cuda_ctx, cgraph, i);
         if (n_fused) {
             return n_fused;
         }

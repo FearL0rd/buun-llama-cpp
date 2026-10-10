@@ -4184,6 +4184,68 @@ struct test_sel_mask : public test_case {
     }
 };
 
+// CONCAT + PAD + SET_ROWS: rows of key | gate | zeros written into a cache
+struct test_set_rows_concat : public test_case {
+    const ggml_type type;
+    const ggml_type type_idx;
+    const int64_t n_embd;
+    const int64_t n_rows;
+    const int64_t n_cells;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "SET_ROWS_CONCAT";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override {
+        return VARS_TO_STR5(type, type_idx, n_embd, n_rows, n_cells);
+    }
+
+    test_set_rows_concat(ggml_type type = GGML_TYPE_F16, ggml_type type_idx = GGML_TYPE_I64,
+            int64_t n_embd = 128, int64_t n_rows = 3, int64_t n_cells = 16)
+        : type(type), type_idx(type_idx), n_embd(n_embd), n_rows(n_rows), n_cells(n_cells) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a     = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_rows);
+        ggml_tensor * b     = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_rows);
+        ggml_tensor * cache = ggml_new_tensor_2d(ctx, type, 3*n_embd, n_cells);
+        ggml_tensor * idx   = ggml_new_tensor_1d(ctx, type_idx, n_rows);
+        ggml_set_name(a, "a");
+        ggml_set_name(b, "b");
+        ggml_set_name(cache, "cache");
+        ggml_set_name(idx, "idx");
+
+        ggml_tensor * packed = ggml_pad(ctx, ggml_concat(ctx, a, b, 0), n_embd, 0, 0, 0);
+        packed = ggml_reshape_3d(ctx, packed, 3*n_embd, 1, n_rows);
+        packed = ggml_view_2d(ctx, packed, 3*n_embd, n_rows, packed->nb[2], 0);
+        ggml_tensor * out = ggml_set_rows(ctx, cache, packed, idx);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        std::mt19937 rng(1234);
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->type != GGML_TYPE_I32 && t->type != GGML_TYPE_I64) {
+                init_tensor_uniform(t);
+                continue;
+            }
+            // distinct cells, so the scatter order does not matter
+            std::vector<int64_t> cells(n_cells);
+            std::iota(cells.begin(), cells.end(), 0);
+            std::shuffle(cells.begin(), cells.end(), rng);
+            if (t->type == GGML_TYPE_I64) {
+                ggml_backend_tensor_set(t, cells.data(), 0, n_rows*sizeof(int64_t));
+            } else {
+                std::vector<int32_t> cells32(cells.begin(), cells.begin() + n_rows);
+                ggml_backend_tensor_set(t, cells32.data(), 0, n_rows*sizeof(int32_t));
+            }
+        }
+    }
+};
+
 // GGML_OP_NORM/RMS_NORM + GGML_OP_SCALE
 struct test_norm_scale : public test_case {
     const ggml_type type;
@@ -12677,6 +12739,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_sel_mask(type, 64, n_tokens, 12, 3));
             test_cases.emplace_back(new test_sel_mask(type, 64, n_tokens, 12, 0));
             test_cases.emplace_back(new test_sel_mask(type, 1000, n_tokens, 300, 7));
+        }
+    }
+    for (ggml_type type : { GGML_TYPE_F16, GGML_TYPE_F32, GGML_TYPE_BF16 }) {
+        for (ggml_type type_idx : { GGML_TYPE_I64, GGML_TYPE_I32 }) {
+            test_cases.emplace_back(new test_set_rows_concat(type, type_idx, 128, 1, 16));
+            test_cases.emplace_back(new test_set_rows_concat(type, type_idx, 128, 7, 16));
         }
     }
     for (uint32_t n : {1, 511, 1025, 8192, 33*512}) {
