@@ -6418,9 +6418,7 @@ static int ggml_cuda_try_fuse_kpool_pool(ggml_backend_cuda_context & ctx, ggml_c
             sum->src[0] != mul || !ggml_is_contiguous(sum) ||
             !ggml_are_same_shape(gate, add) || !ggml_are_same_shape(key, add) || add->ne[3] != 1 ||
             ape->ne[0] != add->ne[0] || ape->ne[1] != add->ne[1] || ggml_nrows(ape) != ape->ne[1] ||
-            gate->nb[0] != sizeof(float) || key->nb[0] != sizeof(float) || ape->nb[0] != sizeof(float) ||
-            ggml_cuda_tensors_overlap(sum, gate) || ggml_cuda_tensors_overlap(sum, key) ||
-            ggml_cuda_tensors_overlap(sum, ape)) {
+            gate->nb[0] != sizeof(float) || key->nb[0] != sizeof(float) || ape->nb[0] != sizeof(float)) {
         return 0;
     }
     for (const ggml_tensor * t : { add, cont_g->src[0], cont_g, sm->src[0], sm, mul->src[0], cont_k, mul }) {
@@ -6429,6 +6427,28 @@ static int ggml_cuda_try_fuse_kpool_pool(ggml_backend_cuda_context & ctx, ggml_c
         }
     }
 
+    // fold in the SET_ROWS that scatters the pooled keys
+    const int j_sr = ggml_cuda_next_non_view(cgraph, j + 1);
+    if (j_sr < cgraph->n_nodes && single_use(sum)) {
+        ggml_tensor * sr = cgraph->nodes[j_sr];
+        const ggml_tensor * val  = sr->src[0];
+        const ggml_tensor * rows = sr->src[1];
+        if (sr->op == GGML_OP_SET_ROWS && (val == sum || (val->op == GGML_OP_RESHAPE && val->src[0] == sum &&
+                    single_use(val))) &&
+                val->ne[0] == sum->ne[1] && val->ne[1] == sum->ne[2] && sr->ne[0] == val->ne[0] &&
+                (sr->type == GGML_TYPE_F32 || sr->type == GGML_TYPE_F16 || sr->type == GGML_TYPE_BF16) &&
+                sr->nb[0] == ggml_type_size(sr->type) && rows->type == GGML_TYPE_I64 &&
+                ggml_nelements(rows) == val->ne[1] && ggml_is_contiguous(rows) &&
+                !ggml_cuda_tensors_overlap(sr, gate) && !ggml_cuda_tensors_overlap(sr, key) &&
+                !ggml_cuda_tensors_overlap(sr, ape) && !ggml_cuda_tensors_overlap(sr, rows)) {
+            ggml_cuda_op_kpool_pool(ctx, gate, ape, key, sr, rows);
+            return j_sr - i;
+        }
+    }
+
+    if (ggml_cuda_tensors_overlap(sum, gate) || ggml_cuda_tensors_overlap(sum, key) || ggml_cuda_tensors_overlap(sum, ape)) {
+        return 0;
+    }
     ggml_cuda_op_kpool_pool(ctx, gate, ape, key, sum);
     return j - i;
 }

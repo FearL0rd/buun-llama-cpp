@@ -4072,6 +4072,7 @@ struct test_kpool_pool : public test_case {
     const int64_t n_embd;
     const int64_t kpool;
     const int64_t n_pool;
+    const ggml_type type_cache; // GGML_TYPE_COUNT: no scatter of the pooled keys into a cache
 
     std::string op_desc(ggml_tensor * t) override {
         GGML_UNUSED(t);
@@ -4081,11 +4082,27 @@ struct test_kpool_pool : public test_case {
     bool run_whole_graph() override { return true; }
 
     std::string vars() override {
-        return VARS_TO_STR3(n_embd, kpool, n_pool);
+        return VARS_TO_STR4(n_embd, kpool, n_pool, type_cache);
     }
 
-    test_kpool_pool(int64_t n_embd = 128, int64_t kpool = 4, int64_t n_pool = 3)
-        : n_embd(n_embd), kpool(kpool), n_pool(n_pool) {}
+    test_kpool_pool(int64_t n_embd = 128, int64_t kpool = 4, int64_t n_pool = 3,
+            ggml_type type_cache = GGML_TYPE_COUNT)
+        : n_embd(n_embd), kpool(kpool), n_pool(n_pool), type_cache(type_cache) {}
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->type != GGML_TYPE_I64) {
+                init_tensor_uniform(t);
+                continue;
+            }
+            // distinct rows in reverse order
+            std::vector<int64_t> rows(n_pool);
+            for (int64_t n = 0; n < n_pool; ++n) {
+                rows[n] = 2*(n_pool - 1 - n);
+            }
+            ggml_backend_tensor_set(t, rows.data(), 0, n_pool*sizeof(int64_t));
+        }
+    }
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         // cache rows hold key | gate
@@ -4105,6 +4122,16 @@ struct test_kpool_pool : public test_case {
 
         key = ggml_cont(ctx, ggml_permute(ctx, key, 1, 0, 2, 3));
         ggml_tensor * out = ggml_sum_rows(ctx, ggml_mul(ctx, probs, key));
+        if (type_cache != GGML_TYPE_COUNT) {
+            // cache rows are key | gate | pooled; the pooled part receives the result
+            ggml_tensor * cache = ggml_new_tensor_2d(ctx, type_cache, 3*n_embd, 2*n_pool);
+            ggml_tensor * idx   = ggml_new_tensor_1d(ctx, GGML_TYPE_I64, n_pool);
+            ggml_set_name(cache, "cache");
+            ggml_set_name(idx, "idx");
+            ggml_tensor * pooled = ggml_view_2d(ctx, cache, n_embd, 2*n_pool, cache->nb[1],
+                ggml_row_size(cache->type, 2*n_embd));
+            out = ggml_set_rows(ctx, pooled, ggml_reshape_2d(ctx, out, n_embd, n_pool), idx);
+        }
         ggml_set_name(out, "out");
         return out;
     }
@@ -12732,6 +12759,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     for (int64_t kpool : { 4, 16 }) {
         for (int64_t n_pool : { 1, 7 }) {
             test_cases.emplace_back(new test_kpool_pool(128, kpool, n_pool));
+            for (ggml_type type_cache : { GGML_TYPE_F16, GGML_TYPE_F32 }) {
+                test_cases.emplace_back(new test_kpool_pool(128, kpool, n_pool, type_cache));
+            }
         }
     }
     for (ggml_type type : { GGML_TYPE_F16, GGML_TYPE_F32 }) {
