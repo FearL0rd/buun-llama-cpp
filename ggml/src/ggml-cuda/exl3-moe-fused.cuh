@@ -10,6 +10,8 @@
 //   D  item (128-col block, pair, k-range): down partials
 //   E  warp (128-col group): sums down partials per pair, had + svh, * router weight, sum over experts
 // The last block to exit resets the ticket and dependency counters for the next launch.
+// An optional dense shared expert (same n1, own bit width) joins as one extra pair per token with weight 1;
+// its wider strips stream through a ring of the routed experts' per-warp weight buffers.
 
 #include "exl3-gemv-int8.cuh"
 #include "unary.cuh"
@@ -23,16 +25,18 @@ constexpr int MIN_BLOCKS = 4;
 constexpr int LAG     = 8;   // pairs of gate/up issued ahead of the down pass
 constexpr int MAX_TOKENS = 8;
 
+// one projection: weights with expert stride s (bytes, 0 for the shared expert), input/output signs
+struct proj {
+    const uint8_t * B; size_t s;
+    const half * suh; const half * svh;
+};
+
 struct args {
-    const uint8_t * Bg; const uint8_t * Bu; const uint8_t * Bd;
-    size_t sg, su, sd;   // expert strides (bytes)
-    const half * suh_g; const half * svh_g;
-    const half * suh_u; const half * svh_u;
-    const half * suh_d; const half * svh_d;
+    proj m[2][3];                        // [routed, shared][gate, up, down]
     const float * x; int x_nb1;          // [n_tokens][k1]
     const int32_t * ids; int ids_nb1;    // [n_tokens][n_used]
     const float * w; int w_nb1;          // [n_tokens][n_used]
-    int n_used, pairs;
+    int n_used, n_tok, n_shared, pairs;  // pairs = n_shared + n_tok * n_used, shared pairs first
     float limit;                         // 0: plain swiglu
     float * out;                         // [n_tokens][k1]
     float * part1;                       // [pairs][2][KW1][n1]
@@ -106,42 +110,54 @@ __device__ __forceinline__ float4 ld_half4(const half * p) {
     return make_float4(__low2float(a), __high2float(a), __low2float(b), __high2float(b));
 }
 
-template <int bits, int NG>
-__device__ __forceinline__ void load_weights(uint32_t * sw, const uint8_t * B, int nt, int kslices, int kt0, int lane) {
-    constexpr int TW = 8 * bits;
-    const uint32_t * src = reinterpret_cast<const uint32_t *>(B) + (size_t(nt) * kslices + kt0) * TW;
+// the 16-column strip starting at k-tile kt0 of column tile nt
+template <int bits>
+__device__ __forceinline__ const uint32_t * strip(const uint8_t * B, int nt, int kslices, int kt0) {
+    return reinterpret_cast<const uint32_t *>(B) + (size_t(nt) * kslices + kt0) * 8 * bits;
+}
+
+__device__ __forceinline__ void cp_async_wait_n(int n) {
+    if      (n <= 0) exl3_int8::cp_async_wait<0>();
+    else if (n == 1) exl3_int8::cp_async_wait<1>();
+    else if (n == 2) exl3_int8::cp_async_wait<2>();
+    else if (n == 3) exl3_int8::cp_async_wait<3>();
+    else             exl3_int8::cp_async_wait<4>();
+}
+
+// one 128-group of a strip (8 k-tiles) into a warp buffer slot, as its own cp.async group
+template <int bits>
+__device__ __forceinline__ void load_group(uint32_t * dst, const uint32_t * src, int lane) {
 #pragma unroll
-    for (int g = 0; g < NG; ++g) {
+    for (int i = lane * 4; i < 64 * bits; i += 128) exl3_int8::cp_async16(dst + i, src + i);
+    exl3_int8::cp_async_commit();
+}
+
+// prime the warp's SLOTS group buffers with the strip's first groups; dot_tile streams the rest
+template <int bits, int NG, int SLOTS>
+__device__ __forceinline__ void load_weights(uint32_t * sw, const uint32_t * src, int lane) {
 #pragma unroll
-        for (int i = lane * 4; i < 8 * TW; i += 128) exl3_int8::cp_async16(sw + g * 8 * TW + i, src + g * 8 * TW + i);
-        exl3_int8::cp_async_commit();
-    }
+    for (int g = 0; g < (NG < SLOTS ? NG : SLOTS); ++g) load_group<bits>(sw + g * 64 * bits, src + g * 64 * bits, lane);
 }
 
 // one warp: 16 columns x NG groups; sa pre-splatted; lane g < NG holds gs = group g scales
-template <int bits, int NG, bool PIPE>
-__device__ __forceinline__ float2 dot_tile(const uint32_t * sw, const uint32_t * sa, float2 gs, int lane) {
-    static_assert(NG <= 5, "cp.async wait depth");
+template <int bits, int NG, int SLOTS>
+__device__ __forceinline__ float2 dot_tile(uint32_t * sw, const uint32_t * src, const uint32_t * sa, float2 gs, int lane) {
+    static_assert(NG <= 5 && SLOTS >= 1, "cp.async wait depth");
     constexpr int TW = 8 * bits;
     const int t0 = lane << 3;
     float f0 = 0.0f, f1 = 0.0f;
 #pragma unroll
     for (int g = 0; g < NG; ++g) {
-        if constexpr (PIPE) {
-            if      (g == NG - 1) exl3_int8::cp_async_wait<0>();
-            else if (g == NG - 2) exl3_int8::cp_async_wait<1>();
-            else if (g == NG - 3) exl3_int8::cp_async_wait<2>();
-            else if (g == NG - 4) exl3_int8::cp_async_wait<3>();
-            else                  exl3_int8::cp_async_wait<4>();
-            __syncwarp();
-        }
+        cp_async_wait_n((g + SLOTS < NG ? g + SLOTS : NG) - g - 1);
+        __syncwarp();
+        const uint32_t * sg = sw + (g % SLOTS) * 8 * TW;
         int a0 = 0, a1 = 0;
 #pragma unroll
         for (int j = 0; j < 8; ++j) {
             const int kb = g * 8 + j;
             uint32_t w[8];
-            if constexpr (bits == 2) ext8w_2(sw + kb * TW, t0, w);
-            else exl3_int8::ext8w<bits>(sw + kb * TW, t0, w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7]);
+            if constexpr (bits == 2) ext8w_2(sg + j * TW, t0, w);
+            else exl3_int8::ext8w<bits>(sg + j * TW, t0, w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7]);
 #pragma unroll
             for (int i = 0; i < 8; ++i) w[i] *= 0x83DCD12Du;
             const uint4 av = *reinterpret_cast<const uint4 *>(sa + kb * 16 + (lane & 3) * 4);
@@ -153,6 +169,11 @@ __device__ __forceinline__ float2 dot_tile(const uint32_t * sw, const uint32_t *
         const float qk = __shfl_sync(0xffffffffu, gs.x, g);
         f0 += qk * float(a0);
         f1 += qk * float(a1);
+        if (g + SLOTS < NG) {
+            // every lane is done reading the slot before the next group lands in it
+            __syncwarp();
+            load_group<bits>(sw + (g % SLOTS) * 8 * TW, src + (g + SLOTS) * 8 * TW, lane);
+        }
     }
     f0 += __shfl_xor_sync(0xffffffffu, f0, 1); f0 += __shfl_xor_sync(0xffffffffu, f0, 2);
     f1 += __shfl_xor_sync(0xffffffffu, f1, 1); f1 += __shfl_xor_sync(0xffffffffu, f1, 2);
@@ -176,25 +197,31 @@ __device__ __forceinline__ void signal_block(int * ctr) {
 }
 #endif // !defined(GGML_USE_HIP) && __CUDA_ARCH__ >= GGML_CUDA_CC_AMPERE
 
-template <int BG, int BD>
+// BS: shared expert bits (0: none). Weight buffers are sized for the routed strips only.
+template <int BG, int BD, int BS>
 struct cfg {
-    static constexpr int SW = 8 * (NG1 * 8 * 8 * BG > NG2 * 8 * 8 * BD ? NG1 * 8 * 8 * BG : NG2 * 8 * 8 * BD);
+    static constexpr int WW = NG1 * 64 * BG > NG2 * 64 * BD ? NG1 * 64 * BG : NG2 * 64 * BD;  // words per warp
     static constexpr int SA = (NG1 > NG2 ? NG1 : NG2) * 128;
+    static constexpr int BSX = BS ? BS : BG;
+    static constexpr int SLOTS1 = WW / (64 * BSX) < NG1 ? WW / (64 * BSX) : NG1;
+    static constexpr int SLOTS2 = WW / (64 * BSX) < NG2 ? WW / (64 * BSX) : NG2;
 };
 
 // grid = resident blocks, block = THREADS
-template <int BG, int BD>
+template <int BG, int BD, int BS>
 __global__ void __launch_bounds__(THREADS, MIN_BLOCKS) moe(const args a) {
 #if !defined(GGML_USE_HIP) && __CUDA_ARCH__ >= GGML_CUDA_CC_AMPERE
-    using C = cfg<BG, BD>;
-    __shared__ __align__(16) uint32_t sw_all[C::SW];
+    using C = cfg<BG, BD, BS>;
+    constexpr int BSX = C::BSX;
+    __shared__ __align__(16) uint32_t sw_all[8 * C::WW];
     __shared__ __align__(16) uint32_t sa[C::SA];
     __shared__ __align__(16) float sfin[128];
     __shared__ float2 sgs[8];
     __shared__ int s_ticket;
 
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
-    const int k1 = a.k1, n1 = a.n1, P = a.pairs;
+    const int k1 = a.k1, n1 = a.n1, P = a.pairs, NS = BS ? a.n_shared : 0;
+    uint32_t * sw = sw_all + warp * C::WW;
     const int NB1 = n1 / 128, KW1 = k1 / 128 / NG1;
     const int NB2 = k1 / 128, KW2 = n1 / 128 / NG2;
     // per pair: G gate/up items, then Cp glu items + Dp down items issued lag pairs later; E items last
@@ -228,22 +255,23 @@ __global__ void __launch_bounds__(THREADS, MIN_BLOCKS) moe(const args a) {
             kind = 3; r = it - head - mid - tail;
         }
         if (kind == 1 && r >= Cp) { kind = 2; r -= Cp; }
-        const int t = pair / a.n_used, e = pair - t * a.n_used;
-        const int expert = kind == 3 ? 0 : a.ids[size_t(t) * a.ids_nb1 + e];
+        const bool sh = pair < NS;
+        const int t = sh ? pair : (pair - NS) / a.n_used, e = sh ? 0 : pair - NS - t * a.n_used;
+        const int expert = kind == 3 || sh ? 0 : a.ids[size_t(t) * a.ids_nb1 + e];
 
         if (kind == 0) {
             const int mat = r / (NB1 * KW1); r -= mat * NB1 * KW1;
             const int nb = r / KW1, wk = r - nb * KW1;
             if (expert >= 0) {
-                constexpr int TW = 8 * BG;
-                uint32_t * sw = sw_all + warp * NG1 * 8 * TW;
-                const uint8_t * B = (mat ? a.Bu : a.Bg) + size_t(expert) * (mat ? a.su : a.sg);
+                const proj & p = a.m[sh][mat];
+                const uint8_t * B = p.B + size_t(expert) * p.s;
                 const int nt = nb * 8 + warp, kt0 = wk * NG1 * 8;
-                load_weights<BG, NG1>(sw, B, nt, k1 / 16, kt0, lane);
+                if (BS && sh) load_weights<BSX, NG1, C::SLOTS1>(sw, strip<BSX>(B, nt, k1 / 16, kt0), lane);
+                else          load_weights<BG,  NG1, NG1>      (sw, strip<BG> (B, nt, k1 / 16, kt0), lane);
                 if (warp < NG1) {
                     const int col = (wk * NG1 + warp) * 128 + lane * 4;
                     const float4 xv = *reinterpret_cast<const float4 *>(a.x + size_t(t) * a.x_nb1 + col);
-                    const float4 s = ld_half4((mat ? a.suh_u : a.suh_g) + size_t(expert) * k1 + col);
+                    const float4 s = ld_half4(p.suh + size_t(expert) * k1 + col);
                     float v[4] = { xv.x * s.x, xv.y * s.y, xv.z * s.z, xv.w * s.w };
                     exl3_had::had128(v[0], v[1], v[2], v[3], lane);
                     const float2 gs = quant_group(v, lane, sa + warp * 128);
@@ -251,7 +279,8 @@ __global__ void __launch_bounds__(THREADS, MIN_BLOCKS) moe(const args a) {
                 }
                 __syncthreads();
                 const float2 gs = lane < NG1 ? sgs[lane] : make_float2(0.0f, 0.0f);
-                const float2 f = dot_tile<BG, NG1, true>(sw, sa, gs, lane);
+                const float2 f = BS && sh ? dot_tile<BSX, NG1, C::SLOTS1>(sw, strip<BSX>(B, nt, k1 / 16, kt0), sa, gs, lane)
+                                          : dot_tile<BG,  NG1, NG1>      (sw, strip<BG> (B, nt, k1 / 16, kt0), sa, gs, lane);
                 store_tile(a.part1 + ((size_t(pair) * 2 + mat) * KW1 + wk) * n1 + nt * 16, f, lane);
             }
             signal_block(ctr_gu + pair);
@@ -289,11 +318,11 @@ __global__ void __launch_bounds__(THREADS, MIN_BLOCKS) moe(const args a) {
                     for (int mat = 0; mat < 2; ++mat) {
                         float4 acc = accs[mat];
                         exl3_had::had128(acc.x, acc.y, acc.z, acc.w, lane);
-                        const float4 sv = ld_half4((mat ? a.svh_u : a.svh_g) + size_t(expert) * n1 + c);
+                        const float4 sv = ld_half4(a.m[sh][mat].svh + size_t(expert) * n1 + c);
                         h[mat][0] = acc.x * exl3_had::SCALE * sv.x; h[mat][1] = acc.y * exl3_had::SCALE * sv.y;
                         h[mat][2] = acc.z * exl3_had::SCALE * sv.z; h[mat][3] = acc.w * exl3_had::SCALE * sv.w;
                     }
-                    const float4 sd = ld_half4(a.suh_d + size_t(expert) * n1 + c);
+                    const float4 sd = ld_half4(a.m[sh][2].suh + size_t(expert) * n1 + c);
                     const float sdv[4] = { sd.x, sd.y, sd.z, sd.w };
                     float v[4];
 #pragma unroll
@@ -312,10 +341,11 @@ __global__ void __launch_bounds__(THREADS, MIN_BLOCKS) moe(const args a) {
         } else if (kind == 2) {
             const int nb = r / KW2, wk = r - nb * KW2;
             if (expert >= 0) {
-                constexpr int TW = 8 * BD;
-                uint32_t * sw = sw_all + warp * NG2 * 8 * TW;
+                const proj & p = a.m[sh][2];
+                const uint8_t * B = p.B + size_t(expert) * p.s;
                 const int nt = nb * 8 + warp, kt0 = wk * NG2 * 8;
-                load_weights<BD, NG2>(sw, a.Bd + size_t(expert) * a.sd, nt, n1 / 16, kt0, lane);
+                if (BS && sh) load_weights<BSX, NG2, C::SLOTS2>(sw, strip<BSX>(B, nt, n1 / 16, kt0), lane);
+                else          load_weights<BD,  NG2, NG2>      (sw, strip<BD> (B, nt, n1 / 16, kt0), lane);
                 if (threadIdx.x == 0) wait_ge(ctr_c + pair, NB1);
                 __syncthreads();
                 const uint32_t * xsrc = a.xq2 + (size_t(pair) * NB1 + wk * NG2) * 128;
@@ -324,7 +354,8 @@ __global__ void __launch_bounds__(THREADS, MIN_BLOCKS) moe(const args a) {
                 const float2 gs = lane < NG2 ? __ldcg(a.xs2 + size_t(pair) * NB1 + wk * NG2 + lane) : make_float2(0.0f, 0.0f);
                 exl3_int8::cp_async_wait<0>();
                 __syncthreads();
-                const float2 f = dot_tile<BD, NG2, false>(sw, sa, gs, lane);
+                const float2 f = BS && sh ? dot_tile<BSX, NG2, C::SLOTS2>(sw, strip<BSX>(B, nt, n1 / 16, kt0), sa, gs, lane)
+                                          : dot_tile<BD,  NG2, NG2>      (sw, strip<BD> (B, nt, n1 / 16, kt0), sa, gs, lane);
                 if (KW2 == 1) {
                     // whole k range: finish the 128 columns here, pre-scaled by the router weight
                     store_tile(sfin + warp * 16, f, lane);
@@ -333,8 +364,8 @@ __global__ void __launch_bounds__(THREADS, MIN_BLOCKS) moe(const args a) {
                         float4 v = *reinterpret_cast<const float4 *>(sfin + lane * 4);
                         exl3_had::had128(v.x, v.y, v.z, v.w, lane);
                         const int c = nb * 128 + lane * 4;
-                        const float4 sv = ld_half4(a.svh_d + size_t(expert) * k1 + c);
-                        const float wt = a.w[size_t(t) * a.w_nb1 + e] * exl3_had::SCALE;
+                        const float4 sv = ld_half4(p.svh + size_t(expert) * k1 + c);
+                        const float wt = (sh ? 1.0f : a.w[size_t(t) * a.w_nb1 + e]) * exl3_had::SCALE;
                         *reinterpret_cast<float4 *>(a.part2 + size_t(pair) * k1 + c) =
                             make_float4(v.x * sv.x * wt, v.y * sv.y * wt, v.z * sv.z * wt, v.w * sv.w * wt);
                     }
@@ -349,25 +380,29 @@ __global__ void __launch_bounds__(THREADS, MIN_BLOCKS) moe(const args a) {
                 if (lane == 0) wait_ge(ctr_d + cg, P * KW2);
                 __syncwarp();
                 const int c = cg * 128 + lane * 4;
-                for (int t = 0; t < P / a.n_used; ++t) {
+                for (int t = 0; t < a.n_tok; ++t) {
                     float4 o = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
                     if (KW2 == 1 && a.n_used <= 8) {
                         // independent loads; skipped experts contribute zero via the predicate
-                        float4 q[8];
+                        float4 q[9];
 #pragma unroll
                         for (int e = 0; e < 8; ++e) {
                             const bool ok = e < a.n_used && a.ids[size_t(t) * a.ids_nb1 + e] >= 0;
-                            q[e] = ok ? __ldcg(reinterpret_cast<const float4 *>(a.part2 + size_t(t * a.n_used + e) * k1 + c))
+                            q[e] = ok ? __ldcg(reinterpret_cast<const float4 *>(a.part2 + size_t(NS + t * a.n_used + e) * k1 + c))
                                       : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
                         }
+                        q[8] = NS ? __ldcg(reinterpret_cast<const float4 *>(a.part2 + size_t(t) * k1 + c))
+                                  : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
 #pragma unroll
-                        for (int e = 0; e < 8; ++e) { o.x += q[e].x; o.y += q[e].y; o.z += q[e].z; o.w += q[e].w; }
+                        for (int e = 0; e < 9; ++e) { o.x += q[e].x; o.y += q[e].y; o.z += q[e].z; o.w += q[e].w; }
                         *reinterpret_cast<float4 *>(a.out + size_t(t) * k1 + c) = o;
                         continue;
                     }
-                    for (int e = 0; e < a.n_used; ++e) {
-                        const int pr = t * a.n_used + e;
-                        const int ex = a.ids[size_t(t) * a.ids_nb1 + e];
+                    // e = -1: the shared expert
+                    for (int e = NS ? -1 : 0; e < a.n_used; ++e) {
+                        const bool se = e < 0;
+                        const int pr = se ? t : NS + t * a.n_used + e;
+                        const int ex = se ? 0 : a.ids[size_t(t) * a.ids_nb1 + e];
                         if (ex < 0) continue;
                         const float * p = a.part2 + size_t(pr) * KW2 * k1 + c;
                         float4 acc = __ldcg(reinterpret_cast<const float4 *>(p));
@@ -377,8 +412,8 @@ __global__ void __launch_bounds__(THREADS, MIN_BLOCKS) moe(const args a) {
                                 acc.x += q.x; acc.y += q.y; acc.z += q.z; acc.w += q.w;
                             }
                             exl3_had::had128(acc.x, acc.y, acc.z, acc.w, lane);
-                            const float4 sv = ld_half4(a.svh_d + size_t(ex) * k1 + c);
-                            const float wt = a.w[size_t(t) * a.w_nb1 + e] * exl3_had::SCALE;
+                            const float4 sv = ld_half4(a.m[se][2].svh + size_t(ex) * k1 + c);
+                            const float wt = (se ? 1.0f : a.w[size_t(t) * a.w_nb1 + e]) * exl3_had::SCALE;
                             acc.x *= sv.x * wt; acc.y *= sv.y * wt; acc.z *= sv.z * wt; acc.w *= sv.w * wt;
                         }
                         o.x += acc.x; o.y += acc.y; o.z += acc.z; o.w += acc.w;

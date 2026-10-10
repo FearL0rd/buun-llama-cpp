@@ -780,9 +780,9 @@ void ggml_cuda_mul_mat_id_exl3(ggml_backend_cuda_context & ctx, ggml_tensor * ds
         static_cast<const uint8_t *>(w->data), static_cast<const half *>(svh_data), static_cast<float *>(dst->data), k, n, pairs, ga, stream);
 }
 
-template <int BG, int BD>
+template <int BG, int BD, int BS>
 static void exl3_moe_fused_launch(ggml_backend_cuda_context & ctx, const exl3_moe_fused::args & a) {
-    const auto kernel = exl3_moe_fused::moe<BG, BD>;
+    const auto kernel = exl3_moe_fused::moe<BG, BD, BS>;
     static int occ[GGML_CUDA_MAX_DEVICES] = {};
     if (occ[ctx.device] == 0) {
         CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occ[ctx.device], kernel, exl3_moe_fused::THREADS, 0));
@@ -793,7 +793,8 @@ static void exl3_moe_fused_launch(ggml_backend_cuda_context & ctx, const exl3_mo
 }
 
 bool ggml_cuda_exl3_moe_fused(ggml_backend_cuda_context & ctx, const ggml_tensor * up, const ggml_tensor * gate,
-        const ggml_tensor * down, float limit, const ggml_tensor * weights, ggml_tensor * dst, bool dst_aliases_src) {
+        const ggml_tensor * down, float limit, const ggml_tensor * weights, const ggml_tensor * sh_up,
+        const ggml_tensor * sh_gate, const ggml_tensor * sh_down, ggml_tensor * dst, bool dst_aliases_src) {
     static const bool enabled = [] {
         const char * e = getenv("GGML_EXL3_MOE_FUSED");
         return e == nullptr || atoi(e) != 0;
@@ -807,7 +808,25 @@ bool ggml_cuda_exl3_moe_fused(ggml_backend_cuda_context & ctx, const ggml_tensor
     const ggml_tensor * x = up->src[1], * ids = up->src[2];
     const int bg = ggml_cuda_exl3_bits(wg->type), bd = ggml_cuda_exl3_bits(wd->type);
     const int k1 = int(wg->ne[0]), n1 = int(wg->ne[1]);
-    const int n_used = int(ids->ne[0]), n_tok = int(ids->ne[1]), pairs = n_used * n_tok;
+    const int n_used = int(ids->ne[0]), n_tok = int(ids->ne[1]);
+    // shared expert: plain MUL_MATs on the same rows, n1 wide, one bit width
+    const int bs = sh_gate ? ggml_cuda_exl3_bits(sh_gate->src[0]->type) : 0;
+    if (sh_gate) {
+        const ggml_tensor * sx = sh_gate->src[1];
+        for (const ggml_tensor * mm : { sh_up, sh_gate, sh_down }) {
+            if (!ggml_cuda_exl3_supports_mul_mat(mm) || mm->src[2] == nullptr || mm->src[3] == nullptr ||
+                    ggml_cuda_exl3_codebook(mm->src[0]->type) != 2 || ggml_cuda_exl3_bits(mm->src[0]->type) != bs ||
+                    exl3_int8_resid(bs, false)) {
+                return false;
+            }
+        }
+        if ((bs != bg && bs != 4) || sh_up->src[1] != sx || sx->data != x->data || sx->ne[1] != n_tok || sx->nb[1] != x->nb[2] ||
+                sh_gate->src[0]->ne[0] != k1 || sh_gate->src[0]->ne[1] != n1 || !ggml_are_same_shape(sh_up->src[0], sh_gate->src[0]) ||
+                sh_down->src[0]->ne[0] != n1 || sh_down->src[0]->ne[1] != k1) {
+            return false;
+        }
+    }
+    const int n_shared = sh_gate ? n_tok : 0, pairs = n_shared + n_used * n_tok;
     for (const ggml_tensor * mm : { up, gate, down }) {
         ggml_moe_cache_route_table route;
         if (!ggml_cuda_is_exl3(mm->src[0]->type) || ggml_cuda_exl3_codebook(mm->src[0]->type) != 2 ||
@@ -839,26 +858,36 @@ bool ggml_cuda_exl3_moe_fused(ggml_backend_cuda_context & ctx, const ggml_tensor
     }
 
     exl3_moe_fused::args a {};
-    a.Bg = static_cast<const uint8_t *>(wg->data); a.sg = wg->nb[2];
-    a.Bu = static_cast<const uint8_t *>(wu->data); a.su = wu->nb[2];
-    a.Bd = static_cast<const uint8_t *>(wd->data); a.sd = wd->nb[2];
-    a.svh_g = static_cast<const half *>(gate->src[3]->data); a.suh_g = static_cast<const half *>(gate->src[4]->data);
-    a.svh_u = static_cast<const half *>(up->src[3]->data);   a.suh_u = static_cast<const half *>(up->src[4]->data);
-    a.svh_d = static_cast<const half *>(down->src[3]->data); a.suh_d = static_cast<const half *>(down->src[4]->data);
+    const ggml_tensor * mats[2][3] = { { gate, up, down }, { sh_gate, sh_up, sh_down } };
+    for (int s = 0; s < (sh_gate ? 2 : 1); ++s) {
+        for (int m = 0; m < 3; ++m) {
+            // MUL_MAT_ID carries svh/suh in src[3]/src[4], MUL_MAT in src[2]/src[3]
+            const ggml_tensor * mm = mats[s][m];
+            a.m[s][m] = { static_cast<const uint8_t *>(mm->src[0]->data), s ? 0 : mm->src[0]->nb[2],
+                static_cast<const half *>(mm->src[s ? 3 : 4]->data), static_cast<const half *>(mm->src[s ? 2 : 3]->data) };
+        }
+    }
     a.x = static_cast<const float *>(x->data);           a.x_nb1 = int(x->nb[2] / sizeof(float));
     a.ids = static_cast<const int32_t *>(ids->data);     a.ids_nb1 = int(ids->nb[1] / sizeof(int32_t));
     a.w = static_cast<const float *>(weights->data);     a.w_nb1 = int(weights->nb[2] / sizeof(float));
     a.n_used = n_used;
+    a.n_tok = n_tok;
+    a.n_shared = n_shared;
     a.pairs = pairs;
     a.limit = limit;
     a.out = dst_aliases_src ? out_tmp.get() : static_cast<float *>(dst->data);
     a.part1 = part1.get(); a.part2 = part2.get(); a.xq2 = xq2.get(); a.xs2 = xs2.get();
     a.sync = exl3_int8_counters(ctx);
     a.k1 = k1; a.n1 = n1;
-    switch (bg) {
-        case 2: exl3_moe_fused_launch<2, 2>(ctx, a); break;
-        case 3: exl3_moe_fused_launch<3, 3>(ctx, a); break;
-        case 4: exl3_moe_fused_launch<4, 4>(ctx, a); break;
+    switch (bg * 10 + bs) {
+        case 20: exl3_moe_fused_launch<2, 2, 0>(ctx, a); break;
+        case 22: exl3_moe_fused_launch<2, 2, 2>(ctx, a); break;
+        case 24: exl3_moe_fused_launch<2, 2, 4>(ctx, a); break;
+        case 30: exl3_moe_fused_launch<3, 3, 0>(ctx, a); break;
+        case 33: exl3_moe_fused_launch<3, 3, 3>(ctx, a); break;
+        case 34: exl3_moe_fused_launch<3, 3, 4>(ctx, a); break;
+        case 40: exl3_moe_fused_launch<4, 4, 0>(ctx, a); break;
+        case 44: exl3_moe_fused_launch<4, 4, 4>(ctx, a); break;
         default: GGML_ABORT("unreachable");
     }
     if (dst_aliases_src) {

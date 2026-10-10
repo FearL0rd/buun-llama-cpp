@@ -6696,18 +6696,47 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 ggml_cuda_match_moe_weighted_reduction(cgraph, i + 4, match) &&
                 match.experts == down && match.expert_scale == nullptr) {
             const int count = 4 + match.node_count;
-            const int out_idx = i + count - 1;
-            ggml_op ops[32];
-            for (int j = 0; j < count && j < 32; ++j) {
-                ops[j] = cgraph->nodes[i + j]->op;
-            }
             // the kernel treats a zero limit as plain SWIGLU, so a nonpositive clamp stays unfused
             const float limit = ggml_get_glu_op(glu) == GGML_GLU_OP_SWIGLU_CLAMP ? ggml_get_op_params_f32(glu, 3) : 0.0f;
             const bool limit_ok = ggml_get_glu_op(glu) == GGML_GLU_OP_SWIGLU || limit > 0.0f;
-            if (count < 32 && limit_ok && ggml_can_fuse_subgraph(cgraph, i, count, ops, &out_idx, 1) &&
-                    ggml_cuda_exl3_moe_fused(*cuda_ctx, glu->src[1], glu->src[0], down, limit, match.weights, match.dst,
-                        !ggml_cuda_check_fusion_memory_ranges(cgraph, i, count, &out_idx, 1))) {
-                return count - 1;
+            // a following shared expert with the same swiglu, added to the expert sum, joins the launch:
+            // gate and up MUL_MAT (either order), GLU, down MUL_MAT, ADD
+            const ggml_tensor * sh_glu = nullptr, * sh_down = nullptr;
+            ggml_tensor * sh_add = nullptr;
+            if (i + count + 4 < cgraph->n_nodes) {
+                const ggml_tensor * m0 = cgraph->nodes[i + count], * m1 = cgraph->nodes[i + count + 1];
+                sh_glu  = cgraph->nodes[i + count + 2];
+                sh_down = cgraph->nodes[i + count + 3];
+                sh_add  = cgraph->nodes[i + count + 4];
+                const bool ok = m0->op == GGML_OP_MUL_MAT && m1->op == GGML_OP_MUL_MAT &&
+                    sh_glu->op == GGML_OP_GLU && ggml_get_glu_op(sh_glu) == ggml_get_glu_op(glu) &&
+                    ggml_get_op_params_i32(sh_glu, 1) == 0 && (limit == 0.0f || ggml_get_op_params_f32(sh_glu, 3) == limit) &&
+                    ((sh_glu->src[0] == m0 && sh_glu->src[1] == m1) || (sh_glu->src[0] == m1 && sh_glu->src[1] == m0)) &&
+                    sh_down->op == GGML_OP_MUL_MAT && sh_down->src[1] == sh_glu &&
+                    sh_add->op == GGML_OP_ADD && ggml_are_same_shape(sh_add, match.dst) &&
+                    ((sh_add->src[0] == match.dst && sh_add->src[1] == sh_down) ||
+                     (sh_add->src[0] == sh_down && sh_add->src[1] == match.dst));
+                if (!ok) {
+                    sh_glu = sh_down = nullptr;
+                    sh_add = nullptr;
+                }
+            }
+            ggml_op ops[32];
+            for (int n_sh : { sh_add ? 5 : 0, 0 }) {
+                const int n = count + n_sh;
+                const int out_idx = i + n - 1;
+                for (int j = 0; j < n && j < 32; ++j) {
+                    ops[j] = cgraph->nodes[i + j]->op;
+                }
+                if (n < 32 && limit_ok && ggml_can_fuse_subgraph(cgraph, i, n, ops, &out_idx, 1) &&
+                        ggml_cuda_exl3_moe_fused(*cuda_ctx, glu->src[1], glu->src[0], down, limit, match.weights,
+                            n_sh ? sh_glu->src[1] : nullptr, n_sh ? sh_glu->src[0] : nullptr, n_sh ? sh_down : nullptr,
+                            n_sh ? sh_add : match.dst, !ggml_cuda_check_fusion_memory_ranges(cgraph, i, n, &out_idx, 1))) {
+                    return n - 1;
+                }
+                if (!n_sh) {
+                    break;
+                }
             }
         }
     }

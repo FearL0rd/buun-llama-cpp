@@ -45,11 +45,13 @@ bool ggml_cuda_exl3_mul_mat_id_fast(const ggml_tensor * dst);
 void ggml_cuda_mul_mat_id_exl3(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 
 // Whole decode-sized mul1 MoE layer in one launch: up/gate MUL_MAT_ID -> swiglu (clamped when limit > 0)
-// -> down MUL_MAT_ID -> router-weighted expert sum into dst [k, n_tokens]. dst_aliases_src: dst overlaps a
-// source, so the result goes through scratch. False (nothing launched) when the shape, routing or arch is
-// unsupported.
+// -> down MUL_MAT_ID -> router-weighted expert sum into dst [k, n_tokens]. sh_up/sh_gate/sh_down (all or
+// none): a dense shared expert MUL_MAT FFN on the same rows with the same swiglu, added to dst. dst_aliases_src:
+// dst overlaps a source, so the result goes through scratch. False (nothing launched) when the shape, routing
+// or arch is unsupported.
 bool ggml_cuda_exl3_moe_fused(ggml_backend_cuda_context & ctx, const ggml_tensor * up, const ggml_tensor * gate,
-    const ggml_tensor * down, float limit, const ggml_tensor * weights, ggml_tensor * dst, bool dst_aliases_src);
+    const ggml_tensor * down, float limit, const ggml_tensor * weights, const ggml_tensor * sh_up,
+    const ggml_tensor * sh_gate, const ggml_tensor * sh_down, ggml_tensor * dst, bool dst_aliases_src);
 
 // CPU MoE-cache bridge: dot products of packed weights and pre-transformed
 // F16-rounded F32 activations. The caller owns both Hadamard transforms.
