@@ -768,6 +768,11 @@ ggml_tensor * llama_model_glm5_next::graph::build_kda_layer(
         g1 = ggml_mul(ctx0, g1, A);
     }
     cb(g1, "kda_g1", il);
+    ggml_build_forward_expand(gf, g1);
+
+    // output gate projection right after the decay gate, so a backend can compute both in one pass
+    ggml_tensor * g2 = ggml_mul_mat(ctx0, layer.ssm_g_b, g_a);
+    ggml_build_forward_expand(gf, g2);
 
     g1 = ggml_reshape_4d(ctx0, g1, head_dim, n_head_kda, n_seq_tokens, n_seqs);
 
@@ -787,7 +792,6 @@ ggml_tensor * llama_model_glm5_next::graph::build_kda_layer(
     cb(output, "kda_scan_out", il);
 
     // output gate, then RMSNorm(o) * Sigmoid(g2)
-    ggml_tensor * g2  = ggml_mul_mat(ctx0, layer.ssm_g_b, g_a);
     g2 = ggml_reshape_3d(ctx0, g2, head_dim, n_head_kda, n_tokens);
 
     ggml_tensor * o      = ggml_reshape_3d(ctx0, output, head_dim, n_head_kda, n_tokens);

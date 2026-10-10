@@ -22,6 +22,15 @@ bool ggml_cuda_mul_mat_vec_f16_multi_supported(const ggml_tensor * mm, const ggm
 void ggml_cuda_mul_mat_vec_f16_multi(ggml_backend_cuda_context & ctx, ggml_tensor * const * mms, int n_mats,
         const ggml_tensor * sigmoid = nullptr, int sigmoid_mat = 0);
 
+// mm is a small-batch f16 MUL_MAT the KDA gate launch can compute.
+bool ggml_cuda_mul_mat_vec_f16_kda_gate_supported(const ggml_tensor * mm);
+
+// KDA decay gate in one launch: g1 = SCALE(SIGMOID(scale0(MUL(ADD(mm, bias), a)))), with a broadcast
+// over equal row groups and bias over tokens. mm2 (optional, same token count) is computed alongside.
+void ggml_cuda_mul_mat_vec_f16_kda_gate(ggml_backend_cuda_context & ctx, const ggml_tensor * mm,
+        const ggml_tensor * bias, const ggml_tensor * a, const ggml_tensor * scale0, ggml_tensor * g1,
+        ggml_tensor * mm2 = nullptr);
+
 bool ggml_cuda_should_use_mmvf(enum ggml_type type, int cc, int warp_size, const int64_t * src0_ne, const size_t * src0_nb, int64_t ne11);
 
 void ggml_cuda_op_qwen35_recurrent_gates_f16(

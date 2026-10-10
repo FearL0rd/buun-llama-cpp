@@ -165,6 +165,110 @@ void ggml_cuda_mul_mat_vec_f16_multi(ggml_backend_cuda_context & ctx, ggml_tenso
     }
 }
 
+struct mmvf_kda_gate_args {
+    const half  * w[2];
+    const float * x[2];
+    float       * dst[2];
+    int64_t       stride_w[2];   // halves per row
+    int64_t       stride_x[2];   // floats per token
+    int64_t       stride_dst[2]; // floats per token
+    int           rows0;
+    int           rows;
+    const float * bias;
+    const float * a;
+    int           head_dim;
+    float         s0, b0, s1, b1;
+};
+
+// One warp per output row; rows [0, rows0) get the gate epilogue, the rest of matrix 1 is a plain product.
+template <int n_tokens>
+static __global__ void mul_mat_vec_f16_kda_gate(const mmvf_kda_gate_args args, const int ncols) {
+    const int row  = blockIdx.x * (blockDim.x / WARP_SIZE) + threadIdx.x / WARP_SIZE;
+    const int lane = threadIdx.x % WARP_SIZE;
+    if (row >= args.rows) {
+        return;
+    }
+    const int m     = row >= args.rows0;
+    const int local = m ? row - args.rows0 : row;
+    const half  * w = args.w[m] + local * args.stride_w[m];
+    const float * x = args.x[m];
+
+    float sum[n_tokens] = { 0.0f };
+    for (int c = lane * 4; c < ncols; c += WARP_SIZE * 4) {
+        const int2 raw = *reinterpret_cast<const int2 *>(w + c);
+        const half2 * h = reinterpret_cast<const half2 *>(&raw);
+        const float2 w0 = __half22float2(h[0]);
+        const float2 w1 = __half22float2(h[1]);
+#pragma unroll
+        for (int t = 0; t < n_tokens; ++t) {
+            const float4 xv = *reinterpret_cast<const float4 *>(x + t * args.stride_x[m] + c);
+            sum[t] += w0.x * xv.x + w0.y * xv.y + w1.x * xv.z + w1.y * xv.w;
+        }
+    }
+#pragma unroll
+    for (int t = 0; t < n_tokens; ++t) {
+        float v = warp_reduce_sum(sum[t]);
+        if (lane != 0) {
+            continue;
+        }
+        if (m == 0) {
+            // same operations and order as the ADD, MUL, SCALE, SIGMOID, SCALE nodes
+            v = (v + args.bias[local]) * args.a[local / args.head_dim];
+            v = args.s0 * v + args.b0;
+            v = 1.0f / (1.0f + expf(-v));
+            v = args.s1 * v + args.b1;
+        }
+        args.dst[m][t * args.stride_dst[m] + local] = v;
+    }
+}
+
+bool ggml_cuda_mul_mat_vec_f16_kda_gate_supported(const ggml_tensor * mm) {
+    const ggml_tensor * src0 = mm->src[0];
+    const ggml_tensor * src1 = mm->src[1];
+    return mm->op == GGML_OP_MUL_MAT && src0->type == GGML_TYPE_F16 && src1->type == GGML_TYPE_F32 &&
+        mm->type == GGML_TYPE_F32 && ggml_is_contiguous(mm) &&
+        src0->ne[0] % 4 == 0 && src0->nb[0] == sizeof(half) && src0->nb[1] % 8 == 0 && (uintptr_t) src0->data % 8 == 0 &&
+        src0->ne[2] == 1 && src0->ne[3] == 1 &&
+        src1->ne[1] >= 1 && src1->ne[1] <= MMVF_F16_MULTI_MAX_TOKENS && src1->ne[2] == 1 && src1->ne[3] == 1 &&
+        src1->nb[0] == sizeof(float) && src1->nb[1] % 16 == 0 && (uintptr_t) src1->data % 16 == 0;
+}
+
+void ggml_cuda_mul_mat_vec_f16_kda_gate(ggml_backend_cuda_context & ctx, const ggml_tensor * mm,
+        const ggml_tensor * bias, const ggml_tensor * a, const ggml_tensor * scale0, ggml_tensor * g1, ggml_tensor * mm2) {
+    mmvf_kda_gate_args args = {};
+    const ggml_tensor * mms[2] = { mm, mm2 };
+    float * dsts[2] = { static_cast<float *>(g1->data), mm2 ? static_cast<float *>(mm2->data) : nullptr };
+    for (int k = 0; k < (mm2 ? 2 : 1); ++k) {
+        args.w[k]          = static_cast<const half *>(mms[k]->src[0]->data);
+        args.x[k]          = static_cast<const float *>(mms[k]->src[1]->data);
+        args.dst[k]        = dsts[k];
+        args.stride_w[k]   = mms[k]->src[0]->nb[1] / sizeof(half);
+        args.stride_x[k]   = mms[k]->src[1]->nb[1] / sizeof(float);
+        args.stride_dst[k] = mms[k]->nb[1] / sizeof(float);
+        args.rows         += mms[k]->ne[0];
+    }
+    args.rows0    = mm->ne[0];
+    args.bias     = static_cast<const float *>(bias->data);
+    args.a        = static_cast<const float *>(a->data);
+    args.head_dim = mm->ne[0] / ggml_nelements(a);
+    args.s0       = ggml_get_op_params_f32(scale0, 0);
+    args.b0       = ggml_get_op_params_f32(scale0, 1);
+    args.s1       = ggml_get_op_params_f32(g1, 0);
+    args.b1       = ggml_get_op_params_f32(g1, 1);
+
+    constexpr int warps = 4;
+    const dim3 grid((args.rows + warps - 1) / warps);
+    const dim3 block(warps * WARP_SIZE);
+    const int ncols = mm->src[0]->ne[0];
+    switch (mm->ne[1]) {
+        case 1: mul_mat_vec_f16_kda_gate<1><<<grid, block, 0, ctx.stream()>>>(args, ncols); break;
+        case 2: mul_mat_vec_f16_kda_gate<2><<<grid, block, 0, ctx.stream()>>>(args, ncols); break;
+        case 3: mul_mat_vec_f16_kda_gate<3><<<grid, block, 0, ctx.stream()>>>(args, ncols); break;
+        case 4: mul_mat_vec_f16_kda_gate<4><<<grid, block, 0, ctx.stream()>>>(args, ncols); break;
+        default: GGML_ABORT("fatal error");
+    }
+}
+
 template <int block_size, int fixed_ncols = 0>
 static __global__ void qwen35_recurrent_gates_bf16(
         const nv_bfloat16 * alpha_weight, const nv_bfloat16 * beta_weight,

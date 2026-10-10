@@ -5000,6 +5000,65 @@ struct test_mul_mat_shared_src1 : public test_case {
     }
 };
 
+// GLM-5 KDA decay gate chain on an f16 projection, optionally followed by a second f16 projection
+struct test_kda_gate : public test_case {
+    const int64_t k;
+    const int64_t head_dim;
+    const int64_t n_head;
+    const int64_t n_tokens;
+    const bool    mm2;
+    std::vector<ggml_tensor *> outs;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "KDA_GATE";
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR5(k, head_dim, n_head, n_tokens, mm2);
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::vector<ggml_tensor *> fusion_test_nodes() override {
+        return outs;
+    }
+
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+
+    test_kda_gate(int64_t k = 128, int64_t head_dim = 128, int64_t n_head = 16, int64_t n_tokens = 1, bool mm2 = true)
+        : k(k), head_dim(head_dim), n_head(n_head), n_tokens(n_tokens), mm2(mm2) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t rows = head_dim * n_head;
+        ggml_tensor * x    = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n_tokens);
+        ggml_tensor * w    = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, k, rows);
+        ggml_tensor * bias = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, rows);
+        ggml_tensor * a    = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 1, n_head, 1);
+        ggml_set_name(x, "x");
+
+        ggml_tensor * g1 = ggml_add(ctx, ggml_mul_mat(ctx, w, x), bias);
+        g1 = ggml_mul(ctx, ggml_reshape_3d(ctx, g1, head_dim, n_head, n_tokens), a);
+        g1 = ggml_sigmoid(ctx, ggml_scale(ctx, g1, -1.0f));
+        g1 = ggml_scale(ctx, g1, -5.0f);
+        outs = { g1 };
+        if (!mm2) {
+            ggml_set_name(g1, "out");
+            return g1;
+        }
+        ggml_tensor * x2 = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n_tokens);
+        ggml_tensor * w2 = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, k, rows);
+        ggml_tensor * g2 = ggml_mul_mat(ctx, w2, x2);
+        outs.push_back(g2);
+        // the concat visits g1's chain first, then g2, keeping the two adjacent
+        ggml_tensor * out = ggml_concat(ctx, g1, ggml_reshape_3d(ctx, g2, head_dim, n_head, n_tokens), 1);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 struct test_dsv4_hc_post : public test_dsv4_hc {
     const int64_t n_embd;
     const int64_t n_tokens;
@@ -11540,6 +11599,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         for (bool sigmoid : {false, true}) {
             test_cases.emplace_back(new test_mul_mat_shared_src1(4096, n_tokens, {128, 128, 16}, sigmoid));
             test_cases.emplace_back(new test_mul_mat_shared_src1(264, n_tokens, {37, 64, 0}, sigmoid));
+        }
+    }
+    // 5 tokens exceeds the fused path
+    for (int64_t n_tokens : {1, 2, 4, 5}) {
+        for (bool mm2 : {false, true}) {
+            test_cases.emplace_back(new test_kda_gate(128, 128, 16, n_tokens, mm2));
+            test_cases.emplace_back(new test_kda_gate(36, 8, 5, n_tokens, mm2));
         }
     }
 

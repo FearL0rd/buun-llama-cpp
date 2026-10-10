@@ -8325,6 +8325,64 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     }
 
 #endif
+    // KDA decay gate MUL_MAT -> ADD -> MUL -> SCALE -> SIGMOID -> SCALE, plus an f16 MUL_MAT right after it
+    if (node->op == GGML_OP_MUL_MAT && ggml_cuda_mul_mat_vec_f16_kda_gate_supported(node)) {
+        const ggml_op chain_ops[] = { GGML_OP_MUL_MAT, GGML_OP_ADD, GGML_OP_MUL, GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_SCALE, GGML_OP_MUL_MAT };
+        constexpr int max_nodes = 16;
+        int idxs[max_nodes];
+        ggml_op ops[max_nodes];
+        ggml_tensor * chain[7];
+        int end[7]; // subgraph size up to and including chain[k]
+        int n = 0;
+        int n_chain = 0;
+        for (int j = i; j < cgraph->n_nodes && n < max_nodes && n_chain < 7; ++j) {
+            ggml_tensor * t = cgraph->nodes[j];
+            const bool view = ggml_cuda_is_view_or_noop(t);
+            if (!view && t->op != chain_ops[n_chain]) {
+                break;
+            }
+            idxs[n] = j;
+            ops[n++] = t->op;
+            if (!view) {
+                chain[n_chain] = t;
+                end[n_chain++] = n;
+            }
+        }
+        if (n_chain >= 6) {
+            ggml_tensor * add = chain[1];
+            ggml_tensor * mul = chain[2];
+            ggml_tensor * g1  = chain[5];
+            const ggml_tensor * x    = node->src[1];
+            const ggml_tensor * bias = add->src[0] == node ? add->src[1] : add->src[1] == node ? add->src[0] : nullptr;
+            const ggml_tensor * a    = mul->src[1];
+            const int64_t rows = node->ne[0];
+            const bool ok = bias && bias->type == GGML_TYPE_F32 && ggml_is_contiguous(bias) && ggml_nelements(bias) == rows &&
+                add->type == GGML_TYPE_F32 && ggml_are_same_shape(add, node) &&
+                (mul->src[0] == add || mul->src[0]->view_src == add) && mul->type == GGML_TYPE_F32 &&
+                a->type == GGML_TYPE_F32 && ggml_is_contiguous(a) && a->ne[0] == 1 && ggml_nelements(a) == a->ne[1] &&
+                mul->ne[1] == a->ne[1] && mul->ne[0] * a->ne[1] == rows &&
+                chain[3]->src[0] == mul && chain[3]->type == GGML_TYPE_F32 &&
+                ggml_get_unary_op(chain[4]) == GGML_UNARY_OP_SIGMOID && chain[4]->src[0] == chain[3] &&
+                chain[4]->type == GGML_TYPE_F32 &&
+                g1->src[0] == chain[4] && g1->type == GGML_TYPE_F32 && ggml_is_contiguous(g1) &&
+                !ggml_cuda_tensors_overlap(g1, x) && !ggml_cuda_tensors_overlap(g1, bias) && !ggml_cuda_tensors_overlap(g1, a);
+            ggml_tensor * mm2 = n_chain == 7 ? chain[6] : nullptr;
+            if (mm2 && !(ggml_cuda_mul_mat_vec_f16_kda_gate_supported(mm2) && mm2->ne[1] == node->ne[1] &&
+                    mm2->src[0]->ne[0] == node->src[0]->ne[0] &&
+                    !ggml_cuda_tensors_overlap(g1, mm2->src[1]) && !ggml_cuda_tensors_overlap(mm2, mm2->src[1]) &&
+                    !ggml_cuda_tensors_overlap(mm2, x) && !ggml_cuda_tensors_overlap(mm2, bias) &&
+                    !ggml_cuda_tensors_overlap(mm2, a) && !ggml_cuda_tensors_overlap(mm2, g1))) {
+                mm2 = nullptr;
+            }
+            const int count = end[mm2 ? 6 : 5];
+            const int outputs[2] = { idxs[end[5] - 1], mm2 ? idxs[end[6] - 1] : -1 };
+            if (ok && ggml_can_fuse_subgraph_ext(cgraph, idxs, count, ops, outputs, mm2 ? 2 : 1)) {
+                ggml_cuda_mul_mat_vec_f16_kda_gate(*cuda_ctx, node, bias, a, chain[3], g1, mm2);
+                return idxs[count - 1] - i;
+            }
+        }
+    }
+
     // mul_mat + scale + optional bias
     for (ggml_op op : { GGML_OP_MUL_MAT, GGML_OP_MUL_MAT_ID }) {
         const ggml_op bias_op = op == GGML_OP_MUL_MAT ? GGML_OP_ADD : GGML_OP_ADD_ID;
