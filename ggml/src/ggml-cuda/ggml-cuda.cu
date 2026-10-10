@@ -8641,6 +8641,24 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         return 2;
     }
 
+    if (node->op == GGML_OP_MUL_MAT && i + 1 < cgraph->n_nodes && cgraph->nodes[i + 1]->op == GGML_OP_MUL_MAT) {
+        // consecutive small-batch f16 MUL_MATs reading the same activations (e.g. low-rank gate projections)
+        ggml_tensor * mms[MMVF_F16_MULTI_MAX];
+        int n_mats = 0;
+        const ggml_tensor * src1 = node->src[1];
+        while (n_mats < MMVF_F16_MULTI_MAX && i + n_mats < cgraph->n_nodes) {
+            ggml_tensor * mm = cgraph->nodes[i + n_mats];
+            if (!ggml_cuda_mul_mat_vec_f16_multi_supported(mm, src1) || ggml_cuda_tensors_overlap(mm, src1)) {
+                break;
+            }
+            mms[n_mats++] = mm;
+        }
+        if (n_mats >= 2) {
+            ggml_cuda_mul_mat_vec_f16_multi(*cuda_ctx, mms, n_mats);
+            return n_mats - 1;
+        }
+    }
+
     return 0;
 }
 

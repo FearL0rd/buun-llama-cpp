@@ -4944,6 +4944,55 @@ struct test_dsv4_hc_pre_chain : public test_dsv4_hc {
     }
 };
 
+// consecutive f16 MUL_MATs sharing src1 (GLM-5 KDA f_a/g_a/beta projections)
+struct test_mul_mat_shared_src1 : public test_case {
+    const int64_t k;
+    const int64_t n_tokens;
+    const std::array<int64_t, 3> rows;
+    std::vector<ggml_tensor *> mms;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MUL_MAT_SHARED_SRC1";
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR3(k, n_tokens, rows);
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::vector<ggml_tensor *> fusion_test_nodes() override {
+        return mms;
+    }
+
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+
+    test_mul_mat_shared_src1(int64_t k = 4096, int64_t n_tokens = 1, std::array<int64_t, 3> rows = {128, 128, 16})
+        : k(k), n_tokens(n_tokens), rows(rows) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n_tokens);
+        ggml_set_name(x, "x");
+        mms.clear();
+        for (int64_t r : rows) {
+            if (r == 0) {
+                continue;
+            }
+            ggml_tensor * w = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, k, r);
+            mms.push_back(ggml_mul_mat(ctx, w, x));
+        }
+        ggml_tensor * out = mms[0];
+        for (size_t m = 1; m < mms.size(); ++m) {
+            out = ggml_concat(ctx, out, mms[m], 0);
+        }
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 struct test_dsv4_hc_post : public test_dsv4_hc {
     const int64_t n_embd;
     const int64_t n_tokens;
@@ -11478,6 +11527,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         for (int64_t n_tokens : {1, 2, 4, 5}) {
             test_cases.emplace_back(new test_dsv4_hc_pre_chain(n_embd, n_tokens, 20));
         }
+    }
+    // 5 tokens exceeds the fused path; {64, 0} pairs two matrices
+    for (int64_t n_tokens : {1, 2, 3, 4, 5}) {
+        test_cases.emplace_back(new test_mul_mat_shared_src1(4096, n_tokens, {128, 128, 16}));
+        test_cases.emplace_back(new test_mul_mat_shared_src1(264, n_tokens, {37, 64, 0}));
     }
 
     test_cases.emplace_back(new test_dsv4_hc_post(1, 1));

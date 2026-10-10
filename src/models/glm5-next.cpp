@@ -740,8 +740,15 @@ ggml_tensor * llama_model_glm5_next::graph::build_kda_layer(
     cb(Kcur, "kda_k_conv", il);
     cb(Vcur, "kda_v_conv", il);
 
+    // The three low-rank projections share cur; keeping them adjacent lets a backend batch them.
+    ggml_tensor * f_a    = ggml_mul_mat(ctx0, layer.ssm_f_a, cur);
+    ggml_tensor * g_a    = ggml_mul_mat(ctx0, layer.ssm_g_a, cur);
+    ggml_tensor * beta_a = ggml_mul_mat(ctx0, layer.ssm_beta, cur);
+    ggml_build_forward_expand(gf, f_a);
+    ggml_build_forward_expand(gf, g_a);
+    ggml_build_forward_expand(gf, beta_a);
+
     // Decay gate, ssm_a holds -exp(A_log)
-    ggml_tensor * f_a = ggml_mul_mat(ctx0, layer.ssm_f_a, cur);
     ggml_tensor * g1  = ggml_mul_mat(ctx0, layer.ssm_f_b, f_a);
     g1 = ggml_add(ctx0, g1, layer.ssm_dt_b);
 
@@ -761,8 +768,7 @@ ggml_tensor * llama_model_glm5_next::graph::build_kda_layer(
 
     g1 = ggml_reshape_4d(ctx0, g1, head_dim, n_head_kda, n_seq_tokens, n_seqs);
 
-    ggml_tensor * beta = ggml_mul_mat(ctx0, layer.ssm_beta, cur);
-    beta = ggml_reshape_4d(ctx0, beta, 1, n_head_kda, n_seq_tokens, n_seqs);
+    ggml_tensor * beta = ggml_reshape_4d(ctx0, beta_a, 1, n_head_kda, n_seq_tokens, n_seqs);
     beta = ggml_sigmoid(ctx0, beta);
     cb(beta, "kda_beta", il);
 
@@ -776,11 +782,12 @@ ggml_tensor * llama_model_glm5_next::graph::build_kda_layer(
     Kcur = build_gdn_l2_norm(ctx0, Kcur, l2_eps);
 
     ggml_tensor * output = build_recurrent_attn(inp_rs, ssm_states_all, Qcur, Kcur, Vcur, g1, beta, state, il);
-    output = ggml_cont(ctx0, output);
+    if (!ggml_is_contiguous(output)) {
+        output = ggml_cont(ctx0, output);
+    }
     cb(output, "kda_scan_out", il);
 
     // output gate, then RMSNorm(o) * Sigmoid(g2)
-    ggml_tensor * g_a = ggml_mul_mat(ctx0, layer.ssm_g_a, cur);
     ggml_tensor * g2  = ggml_mul_mat(ctx0, layer.ssm_g_b, g_a);
     g2 = ggml_reshape_3d(ctx0, g2, head_dim, n_head_kda, n_tokens);
 
@@ -790,7 +797,7 @@ ggml_tensor * llama_model_glm5_next::graph::build_kda_layer(
     cb(normed, "kda_normed", il);
     ggml_tensor * gated = ggml_mul(ctx0, normed, ggml_sigmoid(ctx0, g2));
 
-    gated = ggml_cont_2d(ctx0, gated, d_inner, n_tokens);
+    gated = ggml_reshape_2d(ctx0, gated, d_inner, n_tokens);
     cur   = build_lora_mm(layer.wo, gated, layer.wo_s, layer.wo_in_s);
     cb(cur, "kda_out", il);
 
