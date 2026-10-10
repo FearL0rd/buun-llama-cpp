@@ -36,6 +36,7 @@
 #include <fstream>
 #include <memory>
 #include <mutex>
+#include <numeric>
 #include <random>
 #include <regex>
 #include <set>
@@ -4106,6 +4107,80 @@ struct test_kpool_pool : public test_case {
         ggml_tensor * out = ggml_sum_rows(ctx, ggml_mul(ctx, probs, key));
         ggml_set_name(out, "out");
         return out;
+    }
+};
+
+// DSA selection mask: FILL(-inf), SET_ROWS of the pool slots, SET_ROWS of the tail slots, ADD of the KQ mask
+struct test_sel_mask : public test_case {
+    const ggml_type type;
+    const int64_t n_kv;
+    const int64_t n_tokens;
+    const int64_t n_pool_sel;
+    const int64_t n_tail;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "SEL_MASK";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override {
+        return VARS_TO_STR5(type, n_kv, n_tokens, n_pool_sel, n_tail);
+    }
+
+    test_sel_mask(ggml_type type = GGML_TYPE_F16, int64_t n_kv = 64, int64_t n_tokens = 3,
+            int64_t n_pool_sel = 12, int64_t n_tail = 3)
+        : type(type), n_kv(n_kv), n_tokens(n_tokens), n_pool_sel(n_pool_sel), n_tail(n_tail) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t n_sel = n_pool_sel + n_tail;
+        ggml_tensor * sel_mask = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, n_sel, 1, 1, n_tokens);
+        ggml_tensor * pool_idx = ggml_new_tensor_3d(ctx, GGML_TYPE_I32, n_pool_sel, n_tokens, 1);
+        ggml_tensor * kq_mask  = ggml_new_tensor_2d(ctx, type, n_kv, n_tokens);
+        ggml_set_name(sel_mask, "sel_mask");
+        ggml_set_name(pool_idx, "pool_idx");
+        ggml_set_name(kq_mask, "kq_mask");
+
+        const auto sel_val = [&](int64_t n, int64_t i0) {
+            return ggml_view_3d(ctx, sel_mask, 1, n, n_tokens, sel_mask->nb[0], sel_mask->nb[3],
+                ggml_row_size(sel_mask->type, i0));
+        };
+        ggml_tensor * sel = ggml_fill(ctx, ggml_new_tensor_3d(ctx, type, 1, n_kv + 1, n_tokens), -INFINITY);
+        sel = ggml_set_rows(ctx, sel, sel_val(n_pool_sel, 0), pool_idx);
+        if (n_tail > 0) {
+            ggml_tensor * tail_idx = ggml_new_tensor_3d(ctx, GGML_TYPE_I32, n_tail, n_tokens, 1);
+            ggml_set_name(tail_idx, "tail_idx");
+            sel = ggml_set_rows(ctx, sel, sel_val(n_tail, n_pool_sel), tail_idx);
+        }
+        sel = ggml_view_2d(ctx, sel, n_kv, n_tokens, sel->nb[2], 0);
+        ggml_tensor * out = ggml_add(ctx, sel, kq_mask);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        std::mt19937 rng(1234);
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->type != GGML_TYPE_I32) {
+                init_tensor_uniform(t);
+                continue;
+            }
+            // distinct cells within a scatter, plus repeats of the dropped n_kv column; the tail
+            // overlaps the pool cells so its later write must win
+            std::vector<int32_t> data(ggml_nelements(t));
+            std::vector<int32_t> cells(n_kv);
+            for (int64_t r = 0; r < n_tokens; ++r) {
+                std::iota(cells.begin(), cells.end(), 0);
+                std::shuffle(cells.begin(), cells.end(), rng);
+                const bool tail = std::string(t->name) == "tail_idx";
+                for (int64_t s = 0; s < t->ne[0]; ++s) {
+                    const int64_t pos = tail ? s*2 : s;
+                    data[r*t->ne[0] + s] = s % 5 == 4 ? int32_t(n_kv) : cells[pos % n_kv];
+                }
+            }
+            ggml_backend_tensor_set(t, data.data(), 0, data.size()*sizeof(int32_t));
+        }
     }
 };
 
@@ -12595,6 +12670,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     for (int64_t kpool : { 4, 16 }) {
         for (int64_t n_pool : { 1, 7 }) {
             test_cases.emplace_back(new test_kpool_pool(128, kpool, n_pool));
+        }
+    }
+    for (ggml_type type : { GGML_TYPE_F16, GGML_TYPE_F32 }) {
+        for (int64_t n_tokens : { 1, 5 }) {
+            test_cases.emplace_back(new test_sel_mask(type, 64, n_tokens, 12, 3));
+            test_cases.emplace_back(new test_sel_mask(type, 64, n_tokens, 12, 0));
+            test_cases.emplace_back(new test_sel_mask(type, 1000, n_tokens, 300, 7));
         }
     }
     for (uint32_t n : {1, 511, 1025, 8192, 33*512}) {

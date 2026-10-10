@@ -43,6 +43,7 @@
 #include "ggml-cuda/moe-weighted-reduction.cuh"
 #include "ggml-cuda/moe-cpu-share.cuh"
 #include "ggml-cuda/kpool-pool.cuh"
+#include "ggml-cuda/sel-mask.cuh"
 #include "ggml-cuda/norm.cuh"
 #include "ggml-cuda/opt-step-adamw.cuh"
 #include "ggml-cuda/opt-step-sgd.cuh"
@@ -6431,6 +6432,78 @@ static int ggml_cuda_try_fuse_kpool_pool(ggml_backend_cuda_context & ctx, ggml_c
     return j - i;
 }
 
+// FILL(-inf), one or two SET_ROWS into it, then a view of its first ne[0] - 1 rows added to a mask: the
+// DSA selection mask. Returns the number of nodes fused after the FILL, or 0.
+static int ggml_cuda_try_fuse_sel_mask(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph, int i) {
+    const ggml_tensor * fill = cgraph->nodes[i];
+    if (ggml_get_op_params_f32(fill, 0) != -INFINITY || fill->ne[0] != 1 || fill->ne[3] != 1 ||
+            (fill->type != GGML_TYPE_F16 && fill->type != GGML_TYPE_F32)) {
+        return 0;
+    }
+    const auto single_use = [cgraph](const ggml_tensor * t) {
+        const size_t pos = ggml_hash_find(&cgraph->visited_hash_set, t);
+        return !(t->flags & GGML_TENSOR_FLAG_OUTPUT) && ggml_bitset_get(cgraph->visited_hash_set.used, pos) &&
+            cgraph->use_counts[pos] == 1;
+    };
+    if (!single_use(fill)) {
+        return 0;
+    }
+
+    sel_mask_scatter sc[2];
+    const ggml_tensor * srs[2];
+    int n_sc = 0;
+    const ggml_tensor * prev = fill;
+    int j = i;
+    ggml_tensor * add = nullptr;
+    while (true) {
+        j = ggml_cuda_next_non_view(cgraph, j + 1);
+        if (j >= cgraph->n_nodes) {
+            return 0;
+        }
+        add = cgraph->nodes[j];
+        if (add->op != GGML_OP_SET_ROWS || n_sc == 2) {
+            break;
+        }
+        const ggml_tensor * val = add->src[0];
+        const ggml_tensor * idx = add->src[1];
+        if (add->src[2] != prev || !single_use(add) || val->type != GGML_TYPE_F32 || idx->type != GGML_TYPE_I32 ||
+                val->ne[1] != idx->ne[0] || val->ne[2] != fill->ne[2] || idx->ne[1] != fill->ne[2] ||
+                val->ne[3] != 1 || idx->ne[2] != 1 || idx->nb[0] != sizeof(int32_t) ||
+                val->nb[1] % sizeof(float) != 0 || val->nb[2] % sizeof(float) != 0) {
+            return 0;
+        }
+        sc[n_sc] = { (const float *) val->data, (const int32_t *) idx->data, (int) idx->ne[0],
+            int64_t(val->nb[1]/sizeof(float)), int64_t(val->nb[2]/sizeof(float)),
+            1, int64_t(idx->nb[1]/sizeof(int32_t)) };
+        srs[n_sc++] = add;
+        prev = add;
+    }
+    if (n_sc == 0 || add->op != GGML_OP_ADD) {
+        return 0;
+    }
+
+    // the add reads the first n_kv columns of the last scatter, at offset 0
+    const ggml_tensor * view = add->src[0];
+    const ggml_tensor * mask = add->src[1];
+    const size_t ts = ggml_type_size(fill->type);
+    if (view->op != GGML_OP_VIEW || view->src[0] != prev || view->data != fill->data || !single_use(view) ||
+            view->ne[0] != fill->ne[1] - 1 || view->ne[1] != fill->ne[2] || view->ne[2] != 1 || view->ne[3] != 1 ||
+            view->nb[0] != ts || view->nb[1] != fill->nb[2] ||
+            add->type != fill->type || mask->type != fill->type || !ggml_are_same_shape(add, view) ||
+            !ggml_are_same_shape(mask, add) || mask->nb[0] != ts || add->nb[0] != ts ||
+            ggml_cuda_tensors_overlap(add, mask)) {
+        return 0;
+    }
+    for (int k = 0; k < n_sc; ++k) {
+        if (ggml_cuda_tensors_overlap(add, srs[k]->src[0]) || ggml_cuda_tensors_overlap(add, srs[k]->src[1])) {
+            return 0;
+        }
+    }
+
+    ggml_cuda_op_sel_mask(ctx, mask, sc, n_sc, add);
+    return j - i;
+}
+
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
     static const bool disable_fusion = [] {
@@ -8725,6 +8798,13 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
     if (node->op == GGML_OP_ADD) {
         const int n_fused = ggml_cuda_try_fuse_kpool_pool(*cuda_ctx, cgraph, i);
+        if (n_fused) {
+            return n_fused;
+        }
+    }
+
+    if (node->op == GGML_OP_FILL) {
+        const int n_fused = ggml_cuda_try_fuse_sel_mask(*cuda_ctx, cgraph, i);
         if (n_fused) {
             return n_fused;
         }
