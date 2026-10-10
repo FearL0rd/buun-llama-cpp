@@ -6388,6 +6388,36 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             return 1;
         }
     }
+    // Whole EXL3 MoE layer at decode: up, gate, swiglu, down, then the weighted expert reduction
+    if (node->op == GGML_OP_MUL_MAT_ID && ggml_cuda_is_exl3(node->src[0]->type) && i + 4 < cgraph->n_nodes &&
+            cuda_ctx->stream_context().concurrent_events.empty()) {
+        const ggml_tensor * glu  = cgraph->nodes[i + 2];
+        const ggml_tensor * down = cgraph->nodes[i + 3];
+        ggml_cuda_moe_weighted_reduction_match match;
+        if (cgraph->nodes[i + 1]->op == GGML_OP_MUL_MAT_ID && glu->op == GGML_OP_GLU && glu->src[1] != nullptr &&
+                ggml_get_op_params_i32(glu, 1) == 0 &&
+                (ggml_get_glu_op(glu) == GGML_GLU_OP_SWIGLU || ggml_get_glu_op(glu) == GGML_GLU_OP_SWIGLU_CLAMP) &&
+                ((glu->src[0] == node && glu->src[1] == cgraph->nodes[i + 1]) ||
+                 (glu->src[1] == node && glu->src[0] == cgraph->nodes[i + 1])) &&
+                down->op == GGML_OP_MUL_MAT_ID && down->src[1] == glu &&
+                ggml_cuda_match_moe_weighted_reduction(cgraph, i + 4, match) &&
+                match.experts == down && match.expert_scale == nullptr) {
+            const int count = 4 + match.node_count;
+            const int out_idx = i + count - 1;
+            const ggml_op head[] = { GGML_OP_MUL_MAT_ID, GGML_OP_MUL_MAT_ID, GGML_OP_GLU, GGML_OP_MUL_MAT_ID };
+            std::vector<ggml_op> ops(count);
+            for (int j = 0; j < count; ++j) {
+                ops[j] = j < 4 ? head[j] : cgraph->nodes[i + j]->op;
+            }
+            const float limit = ggml_get_glu_op(glu) == GGML_GLU_OP_SWIGLU_CLAMP ? ggml_get_op_params_f32(glu, 3) : 0.0f;
+            if (count < 32 && ggml_can_fuse_subgraph(cgraph, i, count, ops.data(), &out_idx, 1) &&
+                    ggml_cuda_exl3_moe_fused(*cuda_ctx, glu->src[1], glu->src[0], down, limit, match.weights, match.dst,
+                        !ggml_cuda_check_fusion_memory_ranges(cgraph, i, count, &out_idx, 1))) {
+                return count - 1;
+            }
+        }
+    }
+
     // EXL3 projections retain independent input signs even when sharing a launch.
     if ((node->op == GGML_OP_MUL_MAT || node->op == GGML_OP_MUL_MAT_ID) &&
             node->src[0] != nullptr && ggml_cuda_is_exl3(node->src[0]->type)) {
