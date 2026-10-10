@@ -54,6 +54,7 @@ void ggml_cuda_op_qwen35_recurrent_gates_f16(
 struct mmvf_f16_multi_args {
     const half * w[MMVF_F16_MULTI_MAX];
     float      * dst[MMVF_F16_MULTI_MAX];
+    float      * sigmoid_dst[MMVF_F16_MULTI_MAX]; // optional sigmoid of dst, same layout
     int64_t      stride_w[MMVF_F16_MULTI_MAX];   // halves per row
     int64_t      stride_dst[MMVF_F16_MULTI_MAX]; // floats per token
     int          row_end[MMVF_F16_MULTI_MAX];    // cumulative row count
@@ -98,7 +99,11 @@ static __global__ void mul_mat_vec_f16_multi(
     for (int t = 0; t < n_tokens; ++t) {
         const float s = warp_reduce_sum(sum[t]);
         if (lane == 0) {
-            args.dst[m][t * args.stride_dst[m] + local] = s;
+            const int64_t index = t * args.stride_dst[m] + local;
+            args.dst[m][index] = s;
+            if (args.sigmoid_dst[m]) {
+                args.sigmoid_dst[m][index] = 1.0f / (1.0f + expf(-s));
+            }
         }
     }
 }
@@ -130,7 +135,8 @@ static void mul_mat_vec_f16_multi_launch(const mmvf_f16_multi_args & args, const
     }
 }
 
-void ggml_cuda_mul_mat_vec_f16_multi(ggml_backend_cuda_context & ctx, ggml_tensor * const * mms, int n_mats) {
+void ggml_cuda_mul_mat_vec_f16_multi(ggml_backend_cuda_context & ctx, ggml_tensor * const * mms, int n_mats,
+        const ggml_tensor * sigmoid, int sigmoid_mat) {
     GGML_ASSERT(n_mats >= 2 && n_mats <= MMVF_F16_MULTI_MAX);
     const ggml_tensor * src1 = mms[0]->src[1];
     mmvf_f16_multi_args args = {};
@@ -143,6 +149,9 @@ void ggml_cuda_mul_mat_vec_f16_multi(ggml_backend_cuda_context & ctx, ggml_tenso
         args.stride_w[k]   = src0->nb[1] / sizeof(half);
         args.stride_dst[k] = mms[k]->nb[1] / sizeof(float);
         args.row_end[k]    = rows;
+    }
+    if (sigmoid) {
+        args.sigmoid_dst[sigmoid_mat] = static_cast<float *>(sigmoid->data);
     }
     const float * x = static_cast<const float *>(src1->data);
     const int64_t stride_x = src1->nb[1] / sizeof(float);

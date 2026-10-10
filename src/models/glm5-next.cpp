@@ -743,10 +743,13 @@ ggml_tensor * llama_model_glm5_next::graph::build_kda_layer(
     // The three low-rank projections share cur; keeping them adjacent lets a backend batch them.
     ggml_tensor * f_a    = ggml_mul_mat(ctx0, layer.ssm_f_a, cur);
     ggml_tensor * g_a    = ggml_mul_mat(ctx0, layer.ssm_g_a, cur);
-    ggml_tensor * beta_a = ggml_mul_mat(ctx0, layer.ssm_beta, cur);
+    ggml_tensor * beta   = ggml_mul_mat(ctx0, layer.ssm_beta, cur);
     ggml_build_forward_expand(gf, f_a);
     ggml_build_forward_expand(gf, g_a);
-    ggml_build_forward_expand(gf, beta_a);
+    beta = ggml_reshape_4d(ctx0, beta, 1, n_head_kda, n_seq_tokens, n_seqs);
+    beta = ggml_sigmoid(ctx0, beta);
+    cb(beta, "kda_beta", il);
+    ggml_build_forward_expand(gf, beta);
 
     // Decay gate, ssm_a holds -exp(A_log)
     ggml_tensor * g1  = ggml_mul_mat(ctx0, layer.ssm_f_b, f_a);
@@ -767,10 +770,6 @@ ggml_tensor * llama_model_glm5_next::graph::build_kda_layer(
     cb(g1, "kda_g1", il);
 
     g1 = ggml_reshape_4d(ctx0, g1, head_dim, n_head_kda, n_seq_tokens, n_seqs);
-
-    ggml_tensor * beta = ggml_reshape_4d(ctx0, beta_a, 1, n_head_kda, n_seq_tokens, n_seqs);
-    beta = ggml_sigmoid(ctx0, beta);
-    cb(beta, "kda_beta", il);
 
     ggml_tensor * ssm_states_all = mctx_cur->get_s_l(il);
     ggml_tensor * state = build_rs_in(inp_rs, ssm_states_all, hparams.n_embd_s(), n_seqs);

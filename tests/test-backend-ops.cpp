@@ -4949,7 +4949,8 @@ struct test_mul_mat_shared_src1 : public test_case {
     const int64_t k;
     const int64_t n_tokens;
     const std::array<int64_t, 3> rows;
-    std::vector<ggml_tensor *> mms;
+    const bool sigmoid;
+    std::vector<ggml_tensor *> outs;
 
     std::string op_desc(ggml_tensor * t) override {
         GGML_UNUSED(t);
@@ -4957,36 +4958,42 @@ struct test_mul_mat_shared_src1 : public test_case {
     }
 
     std::string vars() override {
-        return VARS_TO_STR3(k, n_tokens, rows);
+        return VARS_TO_STR4(k, n_tokens, rows, sigmoid);
     }
 
     bool run_whole_graph() override { return true; }
 
     std::vector<ggml_tensor *> fusion_test_nodes() override {
-        return mms;
+        return outs;
     }
 
     double max_nmse_err() override {
         return 5e-4;
     }
 
-    test_mul_mat_shared_src1(int64_t k = 4096, int64_t n_tokens = 1, std::array<int64_t, 3> rows = {128, 128, 16})
-        : k(k), n_tokens(n_tokens), rows(rows) {}
+    test_mul_mat_shared_src1(int64_t k = 4096, int64_t n_tokens = 1, std::array<int64_t, 3> rows = {128, 128, 16},
+            bool sigmoid = false)
+        : k(k), n_tokens(n_tokens), rows(rows), sigmoid(sigmoid) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n_tokens);
         ggml_set_name(x, "x");
-        mms.clear();
+        outs.clear();
         for (int64_t r : rows) {
             if (r == 0) {
                 continue;
             }
             ggml_tensor * w = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, k, r);
-            mms.push_back(ggml_mul_mat(ctx, w, x));
+            outs.push_back(ggml_mul_mat(ctx, w, x));
         }
-        ggml_tensor * out = mms[0];
-        for (size_t m = 1; m < mms.size(); ++m) {
-            out = ggml_concat(ctx, out, mms[m], 0);
+        if (sigmoid) {
+            ggml_tensor * last = outs.back();
+            outs.push_back(ggml_sigmoid(ctx, ggml_reshape_3d(ctx, last, 1, last->ne[0], n_tokens)));
+        }
+        // right-nested so the graph visits the outputs in order and keeps them adjacent
+        ggml_tensor * out = ggml_reshape_2d(ctx, outs.back(), ggml_nelements(outs.back()) / n_tokens, n_tokens);
+        for (int m = (int) outs.size() - 2; m >= 0; --m) {
+            out = ggml_concat(ctx, outs[m], out, 0);
         }
         ggml_set_name(out, "out");
         return out;
@@ -11530,8 +11537,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
     // 5 tokens exceeds the fused path; {64, 0} pairs two matrices
     for (int64_t n_tokens : {1, 2, 3, 4, 5}) {
-        test_cases.emplace_back(new test_mul_mat_shared_src1(4096, n_tokens, {128, 128, 16}));
-        test_cases.emplace_back(new test_mul_mat_shared_src1(264, n_tokens, {37, 64, 0}));
+        for (bool sigmoid : {false, true}) {
+            test_cases.emplace_back(new test_mul_mat_shared_src1(4096, n_tokens, {128, 128, 16}, sigmoid));
+            test_cases.emplace_back(new test_mul_mat_shared_src1(264, n_tokens, {37, 64, 0}, sigmoid));
+        }
     }
 
     test_cases.emplace_back(new test_dsv4_hc_post(1, 1));

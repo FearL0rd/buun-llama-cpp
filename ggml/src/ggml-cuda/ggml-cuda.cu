@@ -8654,8 +8654,22 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             mms[n_mats++] = mm;
         }
         if (n_mats >= 2) {
-            ggml_cuda_mul_mat_vec_f16_multi(*cuda_ctx, mms, n_mats);
-            return n_mats - 1;
+            // fold in a SIGMOID of the last result when only views sit between them
+            const ggml_tensor * last = mms[n_mats - 1];
+            int j = i + n_mats;
+            while (j < cgraph->n_nodes && ggml_cuda_is_view_or_noop(cgraph->nodes[j])) {
+                j++;
+            }
+            const ggml_tensor * sig = j < cgraph->n_nodes ? cgraph->nodes[j] : nullptr;
+            bool fuse_sig = sig && sig->op == GGML_OP_UNARY && ggml_get_unary_op(sig) == GGML_UNARY_OP_SIGMOID &&
+                sig->type == GGML_TYPE_F32 && sig->src[0]->data == last->data &&
+                ggml_nelements(sig) == ggml_nelements(last) && ggml_is_contiguous(sig) &&
+                ggml_is_contiguous(sig->src[0]) && ggml_is_contiguous(last) && !ggml_cuda_tensors_overlap(sig, src1);
+            for (int k = 0; fuse_sig && k < n_mats - 1; ++k) {
+                fuse_sig = !ggml_cuda_tensors_overlap(sig, mms[k]);
+            }
+            ggml_cuda_mul_mat_vec_f16_multi(*cuda_ctx, mms, n_mats, fuse_sig ? sig : nullptr, n_mats - 1);
+            return fuse_sig ? j - i : n_mats - 1;
         }
     }
 

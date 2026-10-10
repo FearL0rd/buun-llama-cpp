@@ -17,8 +17,10 @@ void ggml_cuda_op_mul_mat_vec_f(
 // mm is a MUL_MAT whose f16 weights can be batched with others that read src1.
 bool ggml_cuda_mul_mat_vec_f16_multi_supported(const ggml_tensor * mm, const ggml_tensor * src1);
 
-// Computes n_mats MUL_MATs that share src1 in one launch.
-void ggml_cuda_mul_mat_vec_f16_multi(ggml_backend_cuda_context & ctx, ggml_tensor * const * mms, int n_mats);
+// Computes n_mats MUL_MATs that share src1 in one launch; sigmoid (optional) also receives the
+// sigmoid of mms[sigmoid_mat], which must be contiguous like it.
+void ggml_cuda_mul_mat_vec_f16_multi(ggml_backend_cuda_context & ctx, ggml_tensor * const * mms, int n_mats,
+        const ggml_tensor * sigmoid = nullptr, int sigmoid_mat = 0);
 
 bool ggml_cuda_should_use_mmvf(enum ggml_type type, int cc, int warp_size, const int64_t * src0_ne, const size_t * src0_nb, int64_t ne11);
 
