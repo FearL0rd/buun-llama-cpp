@@ -194,6 +194,7 @@ static constexpr int DSV4_HC_MIX = (2 + DSV4_HC)*DSV4_HC;
 static __device__ unsigned int dsv4_hc_pre_fused_counter;
 static __device__ unsigned int dsv4_hc_pre_fused_released;
 static __device__ int dsv4_hc_pre_fused_ready;
+static __device__ unsigned int dsv4_hc_pre_fused_norm_arrived;
 
 // ungated DSV4_HC_PRE: dst[i0, it] = scale * sum_ih x[i0, ih, it]*pre[ih, it]
 struct dsv4_hc_pre_apply_args {
@@ -205,11 +206,38 @@ struct dsv4_hc_pre_apply_args {
     float scale;
 };
 
-template <int n_tokens, bool apply>
+// DSV4_HC_POST with comb, producing the stream x of the fused hc_pre: dst[i0, ih, it] =
+// x[i0, it]*post[ih, it] + sum_isrc residual[i0, isrc, it]*comb[ih, isrc, it]
+struct dsv4_hc_post_fold_args {
+    const float * x;
+    const float * residual;
+    const float * post;
+    const float * comb;
+    float * dst;
+    int64_t n_embd;
+    int64_t sx0, sx1;
+    int64_t sr0, sr1, sr2;
+    int64_t sp0, sp1;
+    int64_t sc0, sc1, sc2;
+    int64_t sd0, sd1, sd2;
+};
+
+// RMS_NORM -> MUL(w) of the DSV4_HC_PRE output into dst (contiguous rows)
+struct dsv4_hc_pre_norm_args {
+    const float * w;
+    float * dst;
+    float * partials; // [n_blocks - 1, n_tokens]
+    int64_t sd1;
+    float eps;
+};
+
+template <int n_tokens, bool apply, bool fold, bool norm>
 static __global__ void dsv4_hc_pre_fused_f32(
         const float * x, const float * w, const float * scale, const float * base,
         float * partials, float * dst, int64_t k, int64_t sx1, int64_t sw1, int64_t ss0, int64_t sb0,
-        int64_t sd1, float rms_eps, float eps, int32_t n_iter, const dsv4_hc_pre_apply_args ap) {
+        int64_t sd1, float rms_eps, float eps, int32_t n_iter, const dsv4_hc_pre_apply_args ap,
+        const dsv4_hc_post_fold_args hp, const dsv4_hc_pre_norm_args np) {
+    static_assert(apply || !norm, "norm needs apply");
     constexpr int nwarps = DSV4_HC_PRE_FUSED_THREADS/WARP_SIZE;
     constexpr int nacc = n_tokens*(DSV4_HC_MIX + 1);
 
@@ -225,7 +253,20 @@ static __global__ void dsv4_hc_pre_fused_f32(
         }
 #pragma unroll
         for (int t = 0; t < n_tokens; ++t) {
-            const float xv = x[t*sx1 + i];
+            float xv;
+            if constexpr (fold) {
+                // same product and order as dsv4_hc_post_f32<true>; the apply below reads it back after the ticket
+                const int64_t i0 = i % hp.n_embd;
+                const int64_t ih = i / hp.n_embd;
+                xv = __fmul_rn(hp.x[i0*hp.sx0 + t*hp.sx1], hp.post[ih*hp.sp0 + t*hp.sp1]);
+#pragma unroll
+                for (int isrc = 0; isrc < DSV4_HC; ++isrc) {
+                    xv += hp.residual[i0*hp.sr0 + isrc*hp.sr1 + t*hp.sr2] * hp.comb[ih*hp.sc0 + isrc*hp.sc1 + t*hp.sc2];
+                }
+                hp.dst[i0*hp.sd0 + ih*hp.sd1 + t*hp.sd2] = xv;
+            } else {
+                xv = x[t*sx1 + i];
+            }
 #pragma unroll
             for (int j = 0; j < DSV4_HC_MIX; ++j) {
                 acc[t*(DSV4_HC_MIX + 1) + j] += wv[j]*xv;
@@ -286,7 +327,8 @@ static __global__ void dsv4_hc_pre_fused_f32(
                 float sum = 0.0f;
 #pragma unroll
                 for (int ih = 0; ih < DSV4_HC; ++ih) {
-                    const float xv = ap.x[i0*ap.sx0 + ih*ap.sx1 + it*ap.sx2];
+                    // with fold, other blocks wrote x in this launch: bypass L1
+                    const float xv = fold ? __ldcg(ap.x + i0*ap.sx0 + ih*ap.sx1 + it*ap.sx2) : ap.x[i0*ap.sx0 + ih*ap.sx1 + it*ap.sx2];
                     const float wv = pre[it*DSV4_HC + ih];
                     if (ih == 0) {
                         sum = xv * wv;
@@ -297,9 +339,69 @@ static __global__ void dsv4_hc_pre_fused_f32(
                 ap.dst[i0*ap.sd0 + it*ap.sd1] = ap.scale * sum;
             }
 
-            // the last waiter through re-arms the flag for the next launch
+            if constexpr (norm) {
+                // RMS_NORM -> MUL over each DSV4_HC_PRE output row: the waiters publish their sum(x^2) slices,
+                // meet at a second barrier, and each one scales the elements it wrote
+                float ss[n_tokens] = {};
+                for (int64_t ir = (int64_t) ticket*blockDim.x + threadIdx.x; ir < nr; ir += (int64_t) (gridDim.x - 1)*blockDim.x) {
+                    const int64_t it = ir / ap.n_embd;
+                    const float   v  = ap.dst[(ir % ap.n_embd)*ap.sd0 + it*ap.sd1];
+#pragma unroll
+                    for (int t = 0; t < n_tokens; ++t) {
+                        ss[t] += t == it ? v*v : 0.0f;
+                    }
+                }
+#pragma unroll
+                for (int t = 0; t < n_tokens; ++t) {
+                    const float v = warp_reduce_sum(ss[t]);
+                    if (lane == 0) {
+                        red[warp][t] = v;
+                    }
+                }
+                __syncthreads();
+                if (threadIdx.x < n_tokens) {
+                    float v = 0.0f;
+#pragma unroll
+                    for (int iw = 0; iw < nwarps; ++iw) {
+                        v += red[iw][threadIdx.x];
+                    }
+                    np.partials[ticket*n_tokens + threadIdx.x] = v;
+                }
+                __threadfence();
+                __syncthreads();
+                if (threadIdx.x == 0) {
+                    atomicAdd(&dsv4_hc_pre_fused_norm_arrived, 1u);
+                    while (*(volatile unsigned int *) &dsv4_hc_pre_fused_norm_arrived < gridDim.x - 1) {}
+                    __threadfence();
+                }
+                __syncthreads();
+
+                __shared__ float rs[n_tokens];
+                if (warp < n_tokens) {
+                    float v = 0.0f;
+                    for (unsigned int b = lane; b < gridDim.x - 1; b += WARP_SIZE) {
+                        v += __ldcg(np.partials + b*n_tokens + warp);
+                    }
+                    v = warp_reduce_sum(v);
+                    if (lane == 0) {
+                        rs[warp] = rsqrtf(v/ap.n_embd + np.eps);
+                    }
+                }
+                __syncthreads();
+                for (int64_t ir = (int64_t) ticket*blockDim.x + threadIdx.x; ir < nr; ir += (int64_t) (gridDim.x - 1)*blockDim.x) {
+                    const int64_t i0 = ir % ap.n_embd;
+                    const int64_t it = ir / ap.n_embd;
+                    // same order as rms_norm_f32 with a fused MUL
+                    np.dst[i0 + it*np.sd1] = rs[it] * ap.dst[i0*ap.sd0 + it*ap.sd1] * np.w[i0];
+                }
+            }
+
+            // the last waiter through re-arms the flags for the next launch
             if (threadIdx.x == 0 && atomicInc(&dsv4_hc_pre_fused_released, gridDim.x - 2) == gridDim.x - 2) {
                 dsv4_hc_pre_fused_ready = 0;
+                if constexpr (norm) {
+                    dsv4_hc_pre_fused_norm_arrived = 0;
+                }
             }
         }
         return;
@@ -373,6 +475,28 @@ bool ggml_cuda_dsv4_hc_pre_fused_supported(const ggml_tensor * rms, const ggml_t
         x->ne[0] % DSV4_HC_PRE_FUSED_THREADS == 0;
 }
 
+bool ggml_cuda_dsv4_hc_post_fold_supported(const ggml_tensor * hc_post, const ggml_tensor * rms) {
+    const ggml_tensor * x = rms->src[0];
+    const ggml_tensor * residual = hc_post->src[1];
+    const ggml_tensor * comb = hc_post->src[3];
+    return hc_post->op == GGML_OP_DSV4_HC_POST && comb != nullptr && ggml_get_op_params_i32(hc_post, 0) == 0 &&
+        hc_post->type == GGML_TYPE_F32 && hc_post->src[0]->type == GGML_TYPE_F32 && residual->type == GGML_TYPE_F32 &&
+        hc_post->src[2]->type == GGML_TYPE_F32 && comb->type == GGML_TYPE_F32 &&
+        residual->ne[1] == DSV4_HC && hc_post->ne[1] == DSV4_HC && ggml_is_contiguous(hc_post) &&
+        (x == hc_post || (x->view_src == hc_post && x->view_offs == 0)) && ggml_is_contiguous(x) &&
+        ggml_nelements(x) == ggml_nelements(hc_post) && x->ne[1] == hc_post->ne[2];
+}
+
+bool ggml_cuda_dsv4_hc_pre_norm_supported(const ggml_tensor * hc_pre, const ggml_tensor * rms, const ggml_tensor * mul) {
+    if (rms->op != GGML_OP_RMS_NORM || rms->src[0] != hc_pre || rms->type != GGML_TYPE_F32 ||
+            mul->op != GGML_OP_MUL || (mul->src[0] != rms && mul->src[1] != rms)) {
+        return false;
+    }
+    const ggml_tensor * w = mul->src[0] == rms ? mul->src[1] : mul->src[0];
+    return w->type == GGML_TYPE_F32 && ggml_is_contiguous(w) && w->ne[0] == hc_pre->ne[0] && ggml_nrows(w) == 1 &&
+        mul->type == GGML_TYPE_F32 && ggml_are_same_shape(mul, hc_pre) && mul->nb[0] == sizeof(float);
+}
+
 bool ggml_cuda_dsv4_hc_pre_apply_supported(const ggml_tensor * params, const ggml_tensor * hc_pre) {
     const ggml_tensor * x   = hc_pre->src[0];
     const ggml_tensor * pre = hc_pre->src[1];
@@ -384,12 +508,24 @@ bool ggml_cuda_dsv4_hc_pre_apply_supported(const ggml_tensor * params, const ggm
         hc_pre->ne[0] == x->ne[0] && hc_pre->ne[1] == x->ne[2];
 }
 
+// the fewest co-resident blocks over the apply variants, so any of them can spin on the others
 template <int n_tokens>
 static int dsv4_hc_pre_fused_max_resident(int device) {
     static int occ[GGML_CUDA_MAX_DEVICES] = {};
     if (occ[device] == 0) {
-        CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occ[device], dsv4_hc_pre_fused_f32<n_tokens, true>,
-            DSV4_HC_PRE_FUSED_THREADS, 0));
+        const void * kernels[] = {
+            (const void *) dsv4_hc_pre_fused_f32<n_tokens, true, false, false>,
+            (const void *) dsv4_hc_pre_fused_f32<n_tokens, true, false, true>,
+            (const void *) dsv4_hc_pre_fused_f32<n_tokens, true, true, false>,
+            (const void *) dsv4_hc_pre_fused_f32<n_tokens, true, true, true>,
+        };
+        int occ_min = 0;
+        for (size_t i = 0; i < sizeof(kernels)/sizeof(kernels[0]); ++i) {
+            int o = 0;
+            CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&o, kernels[i], DSV4_HC_PRE_FUSED_THREADS, 0));
+            occ_min = i == 0 ? o : std::min(occ_min, o);
+        }
+        occ[device] = occ_min;
     }
     return occ[device] * ggml_cuda_info().devices[device].nsm;
 }
@@ -405,7 +541,9 @@ static int dsv4_hc_pre_fused_max_resident(int device, int n_tokens) {
 }
 
 void ggml_cuda_op_dsv4_hc_pre_fused(ggml_backend_cuda_context & ctx,
-        const ggml_tensor * rms, const ggml_tensor * mm, ggml_tensor * params, ggml_tensor * hc_pre) {
+        const ggml_tensor * rms, const ggml_tensor * mm, ggml_tensor * params, ggml_tensor * hc_pre,
+        ggml_tensor * hc_post, ggml_tensor * norm) {
+    GGML_ASSERT(hc_pre || !norm);
     const ggml_tensor * x     = rms->src[0];
     const ggml_tensor * w     = mm->src[0];
     const ggml_tensor * scale = params->src[1];
@@ -420,7 +558,8 @@ void ggml_cuda_op_dsv4_hc_pre_fused(ggml_backend_cuda_context & ctx,
         nblocks = std::min(nblocks, dsv4_hc_pre_fused_max_resident(ctx.device, nt));
     }
 
-    ggml_cuda_pool_alloc<float> partials(ctx.pool(), size_t(nblocks)*nt*(DSV4_HC_MIX + 1));
+    // the norm's sum(x^2) slices follow the mix partials
+    ggml_cuda_pool_alloc<float> partials(ctx.pool(), size_t(nblocks)*nt*(DSV4_HC_MIX + 2));
 
     const float rms_eps = ggml_get_op_params_f32(rms, 0);
     const float eps     = ggml_get_op_params_f32(params, 0);
@@ -440,16 +579,48 @@ void ggml_cuda_op_dsv4_hc_pre_fused(ggml_backend_cuda_context & ctx,
         ap.scale  = ggml_get_op_params_f32(hc_pre, 0);
     }
 
+    dsv4_hc_post_fold_args hp = {};
+    if (hc_post) {
+        const ggml_tensor * px = hc_post->src[0];
+        const ggml_tensor * pr = hc_post->src[1];
+        const ggml_tensor * pp = hc_post->src[2];
+        const ggml_tensor * pc = hc_post->src[3];
+        hp.x        = (const float *) px->data;
+        hp.residual = (const float *) pr->data;
+        hp.post     = (const float *) pp->data;
+        hp.comb     = (const float *) pc->data;
+        hp.dst      = (float *) hc_post->data;
+        hp.n_embd   = px->ne[0];
+        hp.sx0 = px->nb[0]/sizeof(float); hp.sx1 = px->nb[1]/sizeof(float);
+        hp.sr0 = pr->nb[0]/sizeof(float); hp.sr1 = pr->nb[1]/sizeof(float); hp.sr2 = pr->nb[2]/sizeof(float);
+        hp.sp0 = pp->nb[0]/sizeof(float); hp.sp1 = pp->nb[1]/sizeof(float);
+        hp.sc0 = pc->nb[0]/sizeof(float); hp.sc1 = pc->nb[1]/sizeof(float); hp.sc2 = pc->nb[2]/sizeof(float);
+        hp.sd0 = hc_post->nb[0]/sizeof(float); hp.sd1 = hc_post->nb[1]/sizeof(float); hp.sd2 = hc_post->nb[2]/sizeof(float);
+    }
+
+    dsv4_hc_pre_norm_args np = {};
+    if (norm) {
+        const bool rms_first = norm->src[0]->op == GGML_OP_RMS_NORM;
+        np.w        = (const float *) norm->src[rms_first ? 1 : 0]->data;
+        np.dst      = (float *) norm->data;
+        np.partials = partials.get() + size_t(nblocks)*nt*(DSV4_HC_MIX + 1);
+        np.sd1      = norm->nb[1]/sizeof(float);
+        np.eps      = ggml_get_op_params_f32(norm->src[rms_first ? 0 : 1], 0);
+    }
+
     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(
             dim3(nblocks, 1, 1), dim3(DSV4_HC_PRE_FUSED_THREADS, 1, 1), 0, ctx.stream());
 
 #define DSV4_HC_PRE_FUSED_LAUNCH(NT) \
-    ggml_cuda_kernel_launch(hc_pre ? dsv4_hc_pre_fused_f32<NT, true> : dsv4_hc_pre_fused_f32<NT, false>, launch_params, \
+    ggml_cuda_kernel_launch( \
+            !hc_pre ? (hc_post ? dsv4_hc_pre_fused_f32<NT, false, true, false> : dsv4_hc_pre_fused_f32<NT, false, false, false>) : \
+            norm    ? (hc_post ? dsv4_hc_pre_fused_f32<NT, true, true, true>   : dsv4_hc_pre_fused_f32<NT, true, false, true>) : \
+                      (hc_post ? dsv4_hc_pre_fused_f32<NT, true, true, false>  : dsv4_hc_pre_fused_f32<NT, true, false, false>), launch_params, \
             (const float *) x->data, (const float *) w->data, (const float *) scale->data, \
             (const float *) base->data, partials.get(), (float *) params->data, k, \
             int64_t(x->nb[1]/sizeof(float)), int64_t(w->nb[1]/sizeof(float)), \
             int64_t(scale->nb[0]/sizeof(float)), int64_t(base->nb[0]/sizeof(float)), \
-            int64_t(params->nb[1]/sizeof(float)), rms_eps, eps, n_iter, ap)
+            int64_t(params->nb[1]/sizeof(float)), rms_eps, eps, n_iter, ap, hp, np)
     switch (nt) {
         case 1: DSV4_HC_PRE_FUSED_LAUNCH(1); break;
         case 2: DSV4_HC_PRE_FUSED_LAUNCH(2); break;

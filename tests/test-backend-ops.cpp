@@ -5175,7 +5175,11 @@ struct test_dsv4_hc_pre_chain : public test_dsv4_hc {
     const int64_t n_embd;
     const int64_t n_tokens;
     const int32_t n_iter;
+    const bool    post_in;  // x comes from the previous layer's DSV4_HC_POST
+    const bool    norm_out; // the DSV4_HC_PRE output feeds RMS_NORM -> MUL
     ggml_tensor * params = nullptr;
+    ggml_tensor * stream = nullptr;
+    ggml_tensor * mixed  = nullptr;
 
     std::string op_desc(ggml_tensor * t) override {
         GGML_UNUSED(t);
@@ -5183,21 +5187,44 @@ struct test_dsv4_hc_pre_chain : public test_dsv4_hc {
     }
 
     std::string vars() override {
-        return VARS_TO_STR3(n_embd, n_tokens, n_iter);
+        return VARS_TO_STR5(n_embd, n_tokens, n_iter, post_in, norm_out);
     }
 
     bool run_whole_graph() override { return true; }
 
     std::vector<ggml_tensor *> fusion_test_nodes() override {
-        return {params, out};
+        std::vector<ggml_tensor *> nodes = {params, mixed};
+        if (post_in) {
+            nodes.push_back(stream);
+        }
+        if (norm_out) {
+            nodes.push_back(out);
+        }
+        return nodes;
     }
 
-    test_dsv4_hc_pre_chain(int64_t n_embd = 4096, int64_t n_tokens = 1, int32_t n_iter = 20)
-        : n_embd(n_embd), n_tokens(n_tokens), n_iter(n_iter) {}
+    test_dsv4_hc_pre_chain(int64_t n_embd = 4096, int64_t n_tokens = 1, int32_t n_iter = 20, bool post_in = false,
+                           bool norm_out = false)
+        : n_embd(n_embd), n_tokens(n_tokens), n_iter(n_iter), post_in(post_in), norm_out(norm_out) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
-        ggml_tensor * x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, hc, n_tokens);
-        ggml_set_name(x, "x");
+        ggml_tensor * x;
+        if (post_in) {
+            ggml_tensor * block = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tokens);
+            ggml_set_name(block, "x");
+            ggml_tensor * residual = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, hc, n_tokens);
+            ggml_set_name(residual, "residual");
+            ggml_tensor * post = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hc, n_tokens);
+            ggml_set_name(post, "post");
+            ggml_tensor * comb = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, hc, hc, n_tokens);
+            ggml_set_name(comb, "comb");
+            x = ggml_dsv4_hc_post(ctx, block, residual, post, comb);
+            ggml_set_name(x, "stream");
+            stream = x;
+        } else {
+            x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, hc, n_tokens);
+            ggml_set_name(x, "x");
+        }
 
         ggml_tensor * hc_fn = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hc*n_embd, (2 + hc)*hc);
         ggml_set_name(hc_fn, "hc_fn");
@@ -5214,8 +5241,15 @@ struct test_dsv4_hc_pre_chain : public test_dsv4_hc {
         ggml_set_name(params, "params");
 
         ggml_tensor * pre = ggml_view_2d(ctx, params, hc, n_tokens, params->nb[1], 0);
-        out = ggml_dsv4_hc_pre(ctx, x, pre);
-        ggml_set_name(out, "out");
+        mixed = ggml_dsv4_hc_pre(ctx, x, pre);
+        ggml_set_name(mixed, "mixed");
+        out = mixed;
+        if (norm_out) {
+            ggml_tensor * w = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_embd);
+            ggml_set_name(w, "w");
+            out = ggml_mul(ctx, ggml_rms_norm(ctx, mixed, 1e-6f), w);
+            ggml_set_name(out, "out");
+        }
         return out;
     }
 };
@@ -11954,6 +11988,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     for (int64_t n_embd : {64, 1024, 4096}) {
         for (int64_t n_tokens : {1, 2, 4, 5}) {
             test_cases.emplace_back(new test_dsv4_hc_pre_chain(n_embd, n_tokens, 20));
+            test_cases.emplace_back(new test_dsv4_hc_pre_chain(n_embd, n_tokens, 20, true));
+            test_cases.emplace_back(new test_dsv4_hc_pre_chain(n_embd, n_tokens, 20, true, true));
+            test_cases.emplace_back(new test_dsv4_hc_pre_chain(n_embd, n_tokens, 20, false, true));
         }
     }
     // 5 tokens exceeds the fused path; {64, 0} pairs two matrices

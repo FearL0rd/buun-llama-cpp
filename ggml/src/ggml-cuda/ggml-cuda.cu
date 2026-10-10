@@ -7345,16 +7345,33 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     }
 
     const ggml_op hc_pre_ops[] = { GGML_OP_RMS_NORM, GGML_OP_MUL_MAT, GGML_OP_DSV4_HC_PARAMS };
-    const int hc_pre_output = i + 2;
-    if (node->op == GGML_OP_RMS_NORM &&
-            ggml_can_fuse_subgraph(cgraph, i, 3, hc_pre_ops, &hc_pre_output, 1) &&
-            ggml_cuda_dsv4_hc_pre_fused_supported(node, cgraph->nodes[i + 1], cgraph->nodes[i + 2])) {
+    // a DSV4_HC_POST whose output the hc_pre RMS_NORM reads (through views) is computed by the same launch
+    int ir = i;
+    ggml_tensor * hc_post = nullptr;
+    if (node->op == GGML_OP_DSV4_HC_POST) {
+        ir = ggml_cuda_next_non_view(cgraph, i + 1);
+        if (ir < cgraph->n_nodes && cgraph->nodes[ir]->op == GGML_OP_RMS_NORM &&
+                ggml_cuda_dsv4_hc_post_fold_supported(node, cgraph->nodes[ir])) {
+            hc_post = node;
+        }
+    }
+    const int hc_pre_output = ir + 2;
+    if ((node->op == GGML_OP_RMS_NORM || hc_post) &&
+            ggml_can_fuse_subgraph(cgraph, ir, 3, hc_pre_ops, &hc_pre_output, 1) &&
+            ggml_cuda_dsv4_hc_pre_fused_supported(cgraph->nodes[ir], cgraph->nodes[ir + 1], cgraph->nodes[ir + 2])) {
         // fold in the DSV4_HC_PRE that consumes pre, when only views sit between them
-        const int j = ggml_cuda_next_non_view(cgraph, i + 3);
-        ggml_tensor * hc_pre = j < cgraph->n_nodes && ggml_cuda_dsv4_hc_pre_apply_supported(cgraph->nodes[i + 2], cgraph->nodes[j]) ?
+        const int j = ggml_cuda_next_non_view(cgraph, ir + 3);
+        ggml_tensor * hc_pre = j < cgraph->n_nodes && ggml_cuda_dsv4_hc_pre_apply_supported(cgraph->nodes[ir + 2], cgraph->nodes[j]) ?
             cgraph->nodes[j] : nullptr;
-        ggml_cuda_op_dsv4_hc_pre_fused(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2], hc_pre);
-        return hc_pre ? j - i : 2;
+        // and the RMS_NORM -> MUL of its output
+        const ggml_op norm_ops[] = { GGML_OP_RMS_NORM, GGML_OP_MUL };
+        const int n = hc_pre ? ggml_cuda_next_non_view(cgraph, j + 1) : cgraph->n_nodes;
+        const int norm_output = n + 1;
+        ggml_tensor * norm = n + 1 < cgraph->n_nodes &&
+            ggml_can_fuse_subgraph(cgraph, n, 2, norm_ops, &norm_output, 1) &&
+            ggml_cuda_dsv4_hc_pre_norm_supported(hc_pre, cgraph->nodes[n], cgraph->nodes[n + 1]) ? cgraph->nodes[n + 1] : nullptr;
+        ggml_cuda_op_dsv4_hc_pre_fused(*cuda_ctx, cgraph->nodes[ir], cgraph->nodes[ir + 1], cgraph->nodes[ir + 2], hc_pre, hc_post, norm);
+        return (norm ? n + 1 : hc_pre ? j : ir + 2) - i;
     }
 
     ggml_cuda_mmvq_post_silu_fusion mmvq_post_silu;
