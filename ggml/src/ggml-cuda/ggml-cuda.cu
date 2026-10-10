@@ -42,6 +42,7 @@
 #include "ggml-cuda/mmvq-post-silu-match.h"
 #include "ggml-cuda/moe-weighted-reduction.cuh"
 #include "ggml-cuda/moe-cpu-share.cuh"
+#include "ggml-cuda/dsa-topk.cuh"
 #include "ggml-cuda/kpool-pool.cuh"
 #include "ggml-cuda/sel-mask.cuh"
 #include "ggml-cuda/set-rows-concat.cuh"
@@ -6580,6 +6581,70 @@ static int ggml_cuda_try_fuse_set_rows_concat(ggml_backend_cuda_context & ctx, g
     return j - i;
 }
 
+// TOP_K -> GET_ROWS(scores) -> ARGSORT(DESC) -> GET_ROWS(reorder) -> GET_ROWS(pool cells): the DSA indexer
+// selection. Returns the number of nodes fused after the TOP_K, or 0.
+static int ggml_cuda_try_fuse_dsa_topk(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph, int i) {
+    const ggml_tensor * tk    = cgraph->nodes[i];
+    const ggml_tensor * score = tk->src[0];
+    const int64_t       k     = tk->ne[0];
+    if (ggml_top_k_is_stable(tk) || score->type != GGML_TYPE_F32 || score->nb[0] != sizeof(float) ||
+            score->ne[2] != 1 || score->ne[3] != 1 || tk->ne[1] != score->ne[1] || k > DSA_TOPK_MAX_K) {
+        return 0;
+    }
+    // t is s, or a whole contiguous reshape of it
+    const auto reshape_of = [](const ggml_tensor * t, const ggml_tensor * s) {
+        return t == s || (t->view_src == s && t->view_offs == 0 && ggml_is_contiguous(t) &&
+            ggml_nelements(t) == ggml_nelements(s));
+    };
+    ggml_tensor * nodes[4];
+    int j = i;
+    for (int n = 0; n < 4; ++n) {
+        j = ggml_cuda_next_non_view(cgraph, j + 1);
+        if (j >= cgraph->n_nodes) {
+            return 0;
+        }
+        nodes[n] = cgraph->nodes[j];
+    }
+    const ggml_tensor * g_score = nodes[0];
+    const ggml_tensor * order   = nodes[1];
+    const ggml_tensor * g_top   = nodes[2];
+    ggml_tensor *       g_cells = nodes[3];
+    const ggml_tensor * pidx    = g_cells->src[0];
+    if (g_score->op != GGML_OP_GET_ROWS || g_score->src[1] != tk || !reshape_of(g_score->src[0], score) ||
+            g_score->src[0]->ne[0] != 1 ||
+            order->op != GGML_OP_ARGSORT || !reshape_of(order->src[0], g_score) ||
+            ggml_get_op_params_i32(order, 0) != GGML_SORT_ORDER_DESC || order->ne[0] != k ||
+            g_top->op != GGML_OP_GET_ROWS || !reshape_of(g_top->src[0], tk) || g_top->src[0]->ne[0] != 1 ||
+            g_top->src[1] != order ||
+            g_cells->op != GGML_OP_GET_ROWS || !reshape_of(g_cells->src[1], g_top) ||
+            pidx->type != GGML_TYPE_I32 || pidx->nb[0] != sizeof(int32_t) || pidx->ne[2] != 1 || pidx->ne[3] != 1 ||
+            g_cells->type != GGML_TYPE_I32 || !ggml_is_contiguous(g_cells) || g_cells->ne[0] != pidx->ne[0] ||
+            ggml_nelements(g_cells) != pidx->ne[0]*k*score->ne[1] ||
+            ggml_cuda_tensors_overlap(g_cells, score) || ggml_cuda_tensors_overlap(g_cells, pidx)) {
+        return 0;
+    }
+    // everything before the last GET_ROWS is consumed inside the chain only
+    for (int m = i; m < j; ++m) {
+        const ggml_tensor * t = cgraph->nodes[m];
+        const size_t pos = ggml_hash_find(&cgraph->visited_hash_set, t);
+        if ((t->flags & GGML_TENSOR_FLAG_OUTPUT) || !ggml_bitset_get(cgraph->visited_hash_set.used, pos)) {
+            return 0;
+        }
+        int refs = 0;
+        for (int n = m + 1; n <= j; ++n) {
+            for (const ggml_tensor * s : cgraph->nodes[n]->src) {
+                refs += s == t;
+            }
+        }
+        if (refs != cgraph->use_counts[pos]) {
+            return 0;
+        }
+    }
+
+    ggml_cuda_op_dsa_topk(ctx, score, pidx, (int) k, g_cells);
+    return j - i;
+}
+
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
     static const bool disable_fusion = [] {
@@ -8888,6 +8953,13 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
     if (node->op == GGML_OP_CONCAT) {
         const int n_fused = ggml_cuda_try_fuse_set_rows_concat(*cuda_ctx, cgraph, i);
+        if (n_fused) {
+            return n_fused;
+        }
+    }
+
+    if (node->op == GGML_OP_TOP_K) {
+        const int n_fused = ggml_cuda_try_fuse_dsa_topk(*cuda_ctx, cgraph, i);
         if (n_fused) {
             return n_fused;
         }

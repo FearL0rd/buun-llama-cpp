@@ -4211,6 +4211,71 @@ struct test_sel_mask : public test_case {
     }
 };
 
+// TOP_K -> GET_ROWS -> ARGSORT(DESC) -> GET_ROWS -> GET_ROWS: the DSA indexer pool selection
+struct test_dsa_topk : public test_case {
+    const int64_t n_pool;
+    const int64_t n_tokens;
+    const int64_t k;
+    const int64_t kpool;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "DSA_TOPK";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override {
+        return VARS_TO_STR4(n_pool, n_tokens, k, kpool);
+    }
+
+    double max_nmse_err() override { return 0.0; }
+
+    test_dsa_topk(int64_t n_pool = 40, int64_t n_tokens = 3, int64_t k = 8, int64_t kpool = 4)
+        : n_pool(n_pool), n_tokens(n_tokens), k(k), kpool(kpool) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * score     = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_pool, n_tokens);
+        ggml_tensor * pool_idxs = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, kpool, n_pool);
+        ggml_set_name(score, "score");
+        ggml_set_name(pool_idxs, "pool_idxs");
+
+        ggml_tensor * top_k = ggml_top_k(ctx, score, k);
+        ggml_tensor * sel_score = ggml_get_rows(ctx, ggml_reshape_3d(ctx, score, 1, n_pool, n_tokens), top_k);
+        ggml_tensor * sel_order = ggml_argsort(ctx, ggml_reshape_2d(ctx, sel_score, k, n_tokens),
+            GGML_SORT_ORDER_DESC);
+        top_k = ggml_get_rows(ctx, ggml_reshape_3d(ctx, top_k, 1, k, n_tokens), sel_order);
+        top_k = ggml_reshape_2d(ctx, top_k, k, n_tokens);
+        ggml_tensor * out = ggml_get_rows(ctx, pool_idxs, ggml_reshape_1d(ctx, top_k, k*n_tokens));
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        // only the two inputs: the reshape views of score would overwrite it with one value per row
+        std::mt19937 rng(1234);
+        ggml_tensor * score     = ggml_get_tensor(ctx, "score");
+        ggml_tensor * pool_idxs = ggml_get_tensor(ctx, "pool_idxs");
+
+        // distinct scores per row, mixed sign, a few -inf (masked pools) at the bottom
+        std::vector<float> s(ggml_nelements(score));
+        std::vector<int> perm(n_pool);
+        for (int64_t r = 0; r < n_tokens; ++r) {
+            std::iota(perm.begin(), perm.end(), 0);
+            std::shuffle(perm.begin(), perm.end(), rng);
+            for (int64_t i = 0; i < n_pool; ++i) {
+                s[r*n_pool + i] = perm[i] < 2 && n_pool > k + 2 ? -INFINITY : (perm[i] - 0.5f*n_pool)*0.37f;
+            }
+        }
+        ggml_backend_tensor_set(score, s.data(), 0, s.size()*sizeof(float));
+
+        std::vector<int32_t> p(ggml_nelements(pool_idxs));
+        std::iota(p.begin(), p.end(), 0);
+        std::shuffle(p.begin(), p.end(), rng);
+        ggml_backend_tensor_set(pool_idxs, p.data(), 0, p.size()*sizeof(int32_t));
+    }
+};
+
 // CONCAT + PAD + SET_ROWS: rows of key | gate | zeros written into a cache
 struct test_set_rows_concat : public test_case {
     const ggml_type type;
@@ -12770,6 +12835,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_sel_mask(type, 64, n_tokens, 12, 0));
             test_cases.emplace_back(new test_sel_mask(type, 1000, n_tokens, 300, 7));
         }
+    }
+    for (int64_t n_tokens : { 1, 5 }) {
+        test_cases.emplace_back(new test_dsa_topk(40, n_tokens, 8, 4));
+        test_cases.emplace_back(new test_dsa_topk(8, n_tokens, 8, 4));
+        test_cases.emplace_back(new test_dsa_topk(1000, n_tokens, 512, 4));
+        test_cases.emplace_back(new test_dsa_topk(3000, n_tokens, 1024, 2));
     }
     for (ggml_type type : { GGML_TYPE_F16, GGML_TYPE_F32, GGML_TYPE_BF16 }) {
         for (ggml_type type_idx : { GGML_TYPE_I64, GGML_TYPE_I32 }) {
