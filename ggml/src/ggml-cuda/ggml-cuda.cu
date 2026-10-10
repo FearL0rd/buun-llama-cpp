@@ -6971,6 +6971,10 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                                 !ggml_cuda_tensors_overlap(cpy, cand->src[1]);
                             for (int k = cpy_index + 1; safe && k < j; ++k) {
                                 const ggml_tensor * between = cgraph->nodes[k];
+                                // Views (e.g. the conv weight reshape) neither read nor write.
+                                if (ggml_cuda_is_view_or_noop(between)) {
+                                    continue;
+                                }
                                 if (ggml_cuda_tensors_overlap(next, between) ||
                                         ggml_cuda_tensors_overlap(cand->src[1], between)) {
                                     safe = false;

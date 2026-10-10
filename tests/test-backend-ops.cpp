@@ -5310,6 +5310,54 @@ struct test_ssm_conv_bias_silu : public test_case {
     }
 };
 
+// Recurrent conv state update as the GLM KDA graph builds it: CONCAT of the saved
+// prefix and the projection, tail copied back to the state slot, then a weight
+// RESHAPE ahead of SSM_CONV + SiLU. Checks both the SiLU output and the new state.
+struct test_conv_state_silu : public test_case {
+    const int64_t channels;
+    const int64_t n_t;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "CONV_STATE_SILU";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override {
+        return VARS_TO_STR2(channels, n_t);
+    }
+
+    test_conv_state_silu(int64_t channels, int64_t n_t) : channels(channels), n_t(n_t) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t n_prefix = 3;
+        ggml_tensor * prefix = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_prefix, channels, 1);
+        ggml_tensor * cache  = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_prefix * channels);
+        ggml_tensor * x      = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, channels, n_t);
+        ggml_tensor * w      = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_prefix + 1, 1, channels);
+        ggml_set_name(prefix, "prefix");
+        ggml_set_name(cache, "cache");
+        ggml_set_name(x, "x");
+        ggml_set_name(w, "w");
+
+        ggml_tensor * body = ggml_transpose(ctx, ggml_reshape_3d(ctx, x, channels, n_t, 1));
+        ggml_tensor * conv_x = ggml_concat(ctx, prefix, body, 0);
+        ggml_tensor * tail = ggml_view_3d(ctx, conv_x, n_prefix, channels, 1,
+            conv_x->nb[1], conv_x->nb[2], n_t * conv_x->nb[0]);
+        ggml_tensor * state = ggml_cpy(ctx, tail, ggml_view_2d(ctx, cache, n_prefix * channels, 1, ggml_nbytes(cache), 0));
+        ggml_build_forward_expand(gf, state);
+
+        ggml_tensor * out = ggml_silu(ctx, ggml_ssm_conv(ctx, conv_x, ggml_reshape_2d(ctx, w, n_prefix + 1, channels)));
+        ggml_build_forward_expand(gf, out);
+
+        out = ggml_concat(ctx, ggml_reshape_1d(ctx, out, ggml_nelements(out)),
+            ggml_reshape_1d(ctx, state, ggml_nelements(state)), 0);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 // GGML_OP_SSM_SCAN
 struct test_ssm_scan : public test_case {
     const ggml_type type;
@@ -12557,6 +12605,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_ssm_conv(GGML_TYPE_F32, {d_conv - 1 + 64, d_inner, 1, 1}, {d_conv, d_inner, 1, 1}));
             test_cases.emplace_back(new test_ssm_conv(GGML_TYPE_F32, {d_conv - 1 + 64, d_inner, 4, 1}, {d_conv, d_inner, 1, 1}));
         }
+    }
+
+    for (int64_t n_t : {1, 2, 4}) {
+        test_cases.emplace_back(new test_conv_state_silu(512, n_t));
     }
 
     // fused ssm_conv + (optional) bias_add + silu. The bias-only graph (no silu) is intentionally
