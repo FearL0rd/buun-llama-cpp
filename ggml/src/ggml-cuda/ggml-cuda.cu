@@ -6416,7 +6416,9 @@ static int ggml_cuda_try_fuse_kpool_pool(ggml_backend_cuda_context & ctx, ggml_c
             sum->src[0] != mul || !ggml_is_contiguous(sum) ||
             !ggml_are_same_shape(gate, add) || !ggml_are_same_shape(key, add) || add->ne[3] != 1 ||
             ape->ne[0] != add->ne[0] || ape->ne[1] != add->ne[1] || ggml_nrows(ape) != ape->ne[1] ||
-            gate->nb[0] != sizeof(float) || key->nb[0] != sizeof(float) || ape->nb[0] != sizeof(float)) {
+            gate->nb[0] != sizeof(float) || key->nb[0] != sizeof(float) || ape->nb[0] != sizeof(float) ||
+            ggml_cuda_tensors_overlap(sum, gate) || ggml_cuda_tensors_overlap(sum, key) ||
+            ggml_cuda_tensors_overlap(sum, ape)) {
         return 0;
     }
     for (const ggml_tensor * t : { add, cont_g->src[0], cont_g, sm->src[0], sm, mul->src[0], cont_k, mul }) {
@@ -6485,8 +6487,10 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             for (int j = 0; j < count && j < 32; ++j) {
                 ops[j] = cgraph->nodes[i + j]->op;
             }
+            // the kernel treats a zero limit as plain SWIGLU, so a nonpositive clamp stays unfused
             const float limit = ggml_get_glu_op(glu) == GGML_GLU_OP_SWIGLU_CLAMP ? ggml_get_op_params_f32(glu, 3) : 0.0f;
-            if (count < 32 && ggml_can_fuse_subgraph(cgraph, i, count, ops, &out_idx, 1) &&
+            const bool limit_ok = ggml_get_glu_op(glu) == GGML_GLU_OP_SWIGLU || limit > 0.0f;
+            if (count < 32 && limit_ok && ggml_can_fuse_subgraph(cgraph, i, count, ops, &out_idx, 1) &&
                     ggml_cuda_exl3_moe_fused(*cuda_ctx, glu->src[1], glu->src[0], down, limit, match.weights, match.dst,
                         !ggml_cuda_check_fusion_memory_ranges(cgraph, i, count, &out_idx, 1))) {
                 return count - 1;
@@ -8448,18 +8452,33 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             const ggml_tensor * bias = add->src[0] == node ? add->src[1] : add->src[1] == node ? add->src[0] : nullptr;
             const ggml_tensor * a    = mul->src[1];
             const int64_t rows = node->ne[0];
+            const ggml_tensor * gate_in = mul->src[0];
+            // the gate may be viewed per head, but only as an in-place reshape of the whole ADD
+            const bool gate_in_ok = gate_in == add || (gate_in->view_src == add && gate_in->view_offs == 0 &&
+                ggml_is_contiguous(gate_in) && ggml_nelements(gate_in) == ggml_nelements(add));
             const bool ok = bias && bias->type == GGML_TYPE_F32 && ggml_is_contiguous(bias) && ggml_nelements(bias) == rows &&
-                add->type == GGML_TYPE_F32 && ggml_are_same_shape(add, node) &&
-                (mul->src[0] == add || mul->src[0]->view_src == add) && mul->type == GGML_TYPE_F32 &&
+                add->type == GGML_TYPE_F32 && ggml_are_same_shape(add, node) && ggml_is_contiguous(add) &&
+                gate_in_ok && mul->type == GGML_TYPE_F32 &&
                 a->type == GGML_TYPE_F32 && ggml_is_contiguous(a) && a->ne[0] == 1 && ggml_nelements(a) == a->ne[1] &&
                 mul->ne[1] == a->ne[1] && mul->ne[0] * a->ne[1] == rows &&
                 chain[3]->src[0] == mul && chain[3]->type == GGML_TYPE_F32 &&
                 ggml_get_unary_op(chain[4]) == GGML_UNARY_OP_SIGMOID && chain[4]->src[0] == chain[3] &&
                 chain[4]->type == GGML_TYPE_F32 &&
                 g1->src[0] == chain[4] && g1->type == GGML_TYPE_F32 && ggml_is_contiguous(g1) &&
+                ggml_nelements(g1) == ggml_nelements(node) &&
                 !ggml_cuda_tensors_overlap(g1, x) && !ggml_cuda_tensors_overlap(g1, bias) && !ggml_cuda_tensors_overlap(g1, a);
+            // the gate intermediates are never materialized, so the second product must not read them
+            const auto from_gate = [&](const ggml_tensor * t) {
+                for (int k = 0; k < end[5]; ++k) {
+                    if (t == cgraph->nodes[idxs[k]] || t->view_src == cgraph->nodes[idxs[k]]) {
+                        return true;
+                    }
+                }
+                return false;
+            };
             ggml_tensor * mm2 = n_chain == 7 ? chain[6] : nullptr;
             if (mm2 && !(ggml_cuda_mul_mat_vec_f16_kda_gate_supported(mm2) && mm2->ne[1] == node->ne[1] &&
+                    !from_gate(mm2->src[0]) && !from_gate(mm2->src[1]) &&
                     mm2->src[0]->ne[0] == node->src[0]->ne[0] &&
                     !ggml_cuda_tensors_overlap(g1, mm2->src[1]) && !ggml_cuda_tensors_overlap(mm2, mm2->src[1]) &&
                     !ggml_cuda_tensors_overlap(mm2, x) && !ggml_cuda_tensors_overlap(mm2, bias) &&
@@ -8716,7 +8735,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         ggml_tensor * mul = cgraph->nodes[i + 1];
         ggml_tensor * add = cgraph->nodes[i + 2];
         const auto is_col_vector = [node](const ggml_tensor * t) {
-            return t->type == GGML_TYPE_F32 && ggml_is_contiguous(t) && ggml_nelements(t) == node->ne[0];
+            return t->type == GGML_TYPE_F32 && ggml_is_contiguous(t) && t->ne[0] == node->ne[0] && ggml_nelements(t) == t->ne[0];
         };
         const int out_node = i + 2;
         if (node->type == GGML_TYPE_F32 && node->src[0]->type == GGML_TYPE_F32 &&

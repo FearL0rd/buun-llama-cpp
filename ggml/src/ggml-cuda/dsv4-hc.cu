@@ -266,8 +266,7 @@ static __global__ void dsv4_hc_pre_fused_f32(
 
     if (ticket != gridDim.x - 1) {
         if constexpr (apply) {
-            // every block holds its ticket before the last one publishes pre, so this wait cannot
-            // deadlock whatever the residency
+            // the host caps the grid at the resident block count, so the last ticket always gets scheduled
             __shared__ float pre[n_tokens*DSV4_HC];
             if (threadIdx.x == 0) {
                 while (*(volatile int *) &dsv4_hc_pre_fused_ready == 0) {}
@@ -385,6 +384,26 @@ bool ggml_cuda_dsv4_hc_pre_apply_supported(const ggml_tensor * params, const ggm
         hc_pre->ne[0] == x->ne[0] && hc_pre->ne[1] == x->ne[2];
 }
 
+template <int n_tokens>
+static int dsv4_hc_pre_fused_max_resident(int device) {
+    static int occ[GGML_CUDA_MAX_DEVICES] = {};
+    if (occ[device] == 0) {
+        CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occ[device], dsv4_hc_pre_fused_f32<n_tokens, true>,
+            DSV4_HC_PRE_FUSED_THREADS, 0));
+    }
+    return occ[device] * ggml_cuda_info().devices[device].nsm;
+}
+
+static int dsv4_hc_pre_fused_max_resident(int device, int n_tokens) {
+    switch (n_tokens) {
+        case 1: return dsv4_hc_pre_fused_max_resident<1>(device);
+        case 2: return dsv4_hc_pre_fused_max_resident<2>(device);
+        case 3: return dsv4_hc_pre_fused_max_resident<3>(device);
+        case 4: return dsv4_hc_pre_fused_max_resident<4>(device);
+        default: GGML_ABORT("unsupported token count");
+    }
+}
+
 void ggml_cuda_op_dsv4_hc_pre_fused(ggml_backend_cuda_context & ctx,
         const ggml_tensor * rms, const ggml_tensor * mm, ggml_tensor * params, ggml_tensor * hc_pre) {
     const ggml_tensor * x     = rms->src[0];
@@ -395,7 +414,11 @@ void ggml_cuda_op_dsv4_hc_pre_fused(ggml_backend_cuda_context & ctx,
     const int64_t k  = x->ne[0];
     const int     nt = (int) x->ne[1];
     // at least two blocks: with apply, the last block computes params while the others mix
-    const int nblocks = (int) std::max<int64_t>(2, std::min<int64_t>(DSV4_HC_PRE_FUSED_MAX_BLOCKS, k/DSV4_HC_PRE_FUSED_K_PER_BLOCK));
+    int nblocks = (int) std::max<int64_t>(2, std::min<int64_t>(DSV4_HC_PRE_FUSED_MAX_BLOCKS, k/DSV4_HC_PRE_FUSED_K_PER_BLOCK));
+    if (hc_pre) {
+        // the mixing blocks spin until the last block publishes, so every block must be resident at once
+        nblocks = std::min(nblocks, dsv4_hc_pre_fused_max_resident(ctx.device, nt));
+    }
 
     ggml_cuda_pool_alloc<float> partials(ctx.pool(), size_t(nblocks)*nt*(DSV4_HC_MIX + 1));
 

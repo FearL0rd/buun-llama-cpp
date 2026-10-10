@@ -244,7 +244,8 @@ void ggml_cuda_mul_mat_vec_f16_kda_gate(ggml_backend_cuda_context & ctx, const g
         args.dst[k]        = dsts[k];
         args.stride_w[k]   = mms[k]->src[0]->nb[1] / sizeof(half);
         args.stride_x[k]   = mms[k]->src[1]->nb[1] / sizeof(float);
-        args.stride_dst[k] = mms[k]->nb[1] / sizeof(float);
+        // the gate output is contiguous but may be shaped per head
+        args.stride_dst[k] = k == 0 ? mm->ne[0] : mms[k]->nb[1] / sizeof(float);
         args.rows         += mms[k]->ne[0];
     }
     args.rows0    = mm->ne[0];

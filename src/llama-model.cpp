@@ -624,6 +624,9 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             if (std::regex_match(tensor_name, pattern_attn_q_b_weight)) {
                 return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1, "attn_output.weight");
             }
+            if (ggml_nelements(tensor) > 1 && std::regex_match(tensor_name, pattern_attn_q_b_scale)) {
+                return get_tensor_config_impl(scale_rows_axis(tensor), "attn_output.weight");
+            }
             if (std::regex_match(tensor_name, pattern_glm_mla_kv_b)) {
                 return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_2, "attn_output.weight");
             }
@@ -935,6 +938,8 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
                 const int64_t head_dim = hparams.n_embd_head_kda;
                 const int64_t g        = std::lcm(blck_size_perf, head_dim); // channels of whole heads
                 if (std::regex_match(tensor_name, pattern_qkv_weight) || std::regex_match(tensor_name, pattern_qkv_scale) ||
+                        std::regex_match(tensor_name, pattern_q_weight) || std::regex_match(tensor_name, pattern_kv_weight) ||
+                        std::regex_match(tensor_name, pattern_q_scale) || std::regex_match(tensor_name, pattern_kv_scale) ||
                         std::regex_match(tensor_name, pattern_glm_kda_conv) || std::regex_match(tensor_name, pattern_glm_kda_gate_b) ||
                         std::regex_match(tensor_name, pattern_ssm_dt) || std::regex_match(tensor_name, pattern_attn_out_weight)) {
                     return std::vector<int64_t>(segments.size(), g);
@@ -952,7 +957,7 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
                 const int64_t head_k  = hparams.n_embd_head_k_mla();
                 const int64_t head_v  = hparams.n_embd_head_v_mla();
                 const int64_t g_heads = std::lcm(std::lcm(blck_size_perf, head_k) / head_k, std::lcm(blck_size_perf, head_v) / head_v);
-                if (std::regex_match(tensor_name, pattern_attn_q_b_weight)) {
+                if (std::regex_match(tensor_name, pattern_attn_q_b_weight) || std::regex_match(tensor_name, pattern_attn_q_b_scale)) {
                     return {g_heads * head_k};
                 }
                 if (std::regex_match(tensor_name, pattern_glm_mla_kv_b)) {
