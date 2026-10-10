@@ -4066,6 +4066,49 @@ struct test_norm_mul_add : public test_case {
         return out;
     }
 };
+// Gated key pooling (glm5-next indexer): softmax over the pool axis of gate + ape, weighted sum of keys
+struct test_kpool_pool : public test_case {
+    const int64_t n_embd;
+    const int64_t kpool;
+    const int64_t n_pool;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "KPOOL_POOL";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override {
+        return VARS_TO_STR3(n_embd, kpool, n_pool);
+    }
+
+    test_kpool_pool(int64_t n_embd = 128, int64_t kpool = 4, int64_t n_pool = 3)
+        : n_embd(n_embd), kpool(kpool), n_pool(n_pool) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        // cache rows hold key | gate
+        ggml_tensor * rows = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 2*n_embd, kpool, n_pool);
+        ggml_tensor * ape  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, kpool);
+        ggml_set_name(rows, "rows");
+        ggml_set_name(ape, "ape");
+        rows = ggml_scale(ctx, rows, 1.0f);
+
+        ggml_tensor * key  = ggml_view_3d(ctx, rows, n_embd, kpool, n_pool, rows->nb[1], rows->nb[2], 0);
+        ggml_tensor * gate = ggml_view_3d(ctx, rows, n_embd, kpool, n_pool, rows->nb[1], rows->nb[2],
+            ggml_row_size(rows->type, n_embd));
+
+        ggml_tensor * logits = ggml_cont(ctx, ggml_permute(ctx, ggml_add(ctx, gate, ape), 1, 0, 2, 3));
+        ggml_tensor * probs  = ggml_soft_max(ctx, ggml_reshape_2d(ctx, logits, kpool, n_embd*n_pool));
+        probs = ggml_reshape_3d(ctx, probs, kpool, n_embd, n_pool);
+
+        key = ggml_cont(ctx, ggml_permute(ctx, key, 1, 0, 2, 3));
+        ggml_tensor * out = ggml_sum_rows(ctx, ggml_mul(ctx, probs, key));
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 // GGML_OP_NORM/RMS_NORM + GGML_OP_SCALE
 struct test_norm_scale : public test_case {
     const ggml_type type;
@@ -12547,6 +12590,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_norm_mul_add(GGML_TYPE_F32, { n, 5, 4, 3 }, eps, false, true));
             test_cases.emplace_back(new test_add_rms_norm(GGML_TYPE_F32, { n, 5, 4, 3 }, eps, false));
             test_cases.emplace_back(new test_add_rms_norm(GGML_TYPE_F32, { n, 5, 4, 3 }, eps, true));
+        }
+    }
+    for (int64_t kpool : { 4, 16 }) {
+        for (int64_t n_pool : { 1, 7 }) {
+            test_cases.emplace_back(new test_kpool_pool(128, kpool, n_pool));
         }
     }
     for (uint32_t n : {1, 511, 1025, 8192, 33*512}) {

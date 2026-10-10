@@ -42,6 +42,7 @@
 #include "ggml-cuda/mmvq-post-silu-match.h"
 #include "ggml-cuda/moe-weighted-reduction.cuh"
 #include "ggml-cuda/moe-cpu-share.cuh"
+#include "ggml-cuda/kpool-pool.cuh"
 #include "ggml-cuda/norm.cuh"
 #include "ggml-cuda/opt-step-adamw.cuh"
 #include "ggml-cuda/opt-step-sgd.cuh"
@@ -6352,6 +6353,75 @@ static void ggml_cuda_prepare_q8_activation_reuse(
 
 #endif
 
+// Gated key pooling: ADD (gate + ape) -> CONT(permute) -> SOFT_MAX over the pool axis ->
+// MUL with CONT(permute(key)) -> SUM_ROWS, views in between, as one kernel.
+// Returns the number of extra nodes consumed, 0 when the pattern does not match.
+static int ggml_cuda_try_fuse_kpool_pool(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph, int i) {
+    static constexpr ggml_op ops[] = { GGML_OP_CONT, GGML_OP_SOFT_MAX, GGML_OP_CONT, GGML_OP_MUL, GGML_OP_SUM_ROWS };
+    constexpr int n_ops = sizeof(ops)/sizeof(ops[0]);
+
+    ggml_tensor * add = cgraph->nodes[i];
+    ggml_tensor * chain[n_ops];
+    int j = i;
+    for (int n = 0; n < n_ops; ++n) {
+        do {
+            if (++j >= cgraph->n_nodes) {
+                return 0;
+            }
+        } while (ggml_cuda_is_view_or_noop(cgraph->nodes[j]));
+        chain[n] = cgraph->nodes[j];
+        if (chain[n]->op != ops[n] || chain[n]->type != GGML_TYPE_F32) {
+            return 0;
+        }
+    }
+    ggml_tensor * cont_g = chain[0];
+    ggml_tensor * sm     = chain[1];
+    ggml_tensor * cont_k = chain[2];
+    ggml_tensor * mul    = chain[3];
+    ggml_tensor * sum    = chain[4];
+
+    const auto single_use = [cgraph](const ggml_tensor * t) {
+        const size_t pos = ggml_hash_find(&cgraph->visited_hash_set, t);
+        return !(t->flags & GGML_TENSOR_FLAG_OUTPUT) && ggml_bitset_get(cgraph->visited_hash_set.used, pos) &&
+            cgraph->use_counts[pos] == 1;
+    };
+    // the src of a (1, 0, 2, 3) permute, or nullptr
+    const auto unswap = [](const ggml_tensor * t) -> ggml_tensor * {
+        const int32_t * p = (const int32_t *) t->op_params;
+        return t->op == GGML_OP_PERMUTE && p[0] == 1 && p[1] == 0 && p[2] == 2 && p[3] == 3 ? t->src[0] : nullptr;
+    };
+    // the src of a reshape, else t
+    const auto unreshape = [](ggml_tensor * t) {
+        return t->op == GGML_OP_RESHAPE ? t->src[0] : t;
+    };
+
+    ggml_tensor * gate = add->src[0];
+    ggml_tensor * ape  = add->src[1];
+    ggml_tensor * key  = unswap(cont_k->src[0]);
+    float sm_params[2];
+    memcpy(sm_params, sm->op_params, sizeof(sm_params));
+
+    if (add->type != GGML_TYPE_F32 || gate->type != GGML_TYPE_F32 || ape->type != GGML_TYPE_F32 ||
+            !key || key->type != GGML_TYPE_F32 ||
+            unswap(cont_g->src[0]) != add || unreshape(sm->src[0]) != cont_g ||
+            sm->src[1] || sm->src[2] || sm_params[0] != 1.0f || sm_params[1] != 0.0f || sm->ne[0] != add->ne[1] ||
+            unreshape(mul->src[0]) != sm || mul->src[1] != cont_k || !ggml_are_same_shape(mul, cont_k) ||
+            sum->src[0] != mul || !ggml_is_contiguous(sum) ||
+            !ggml_are_same_shape(gate, add) || !ggml_are_same_shape(key, add) || add->ne[3] != 1 ||
+            ape->ne[0] != add->ne[0] || ape->ne[1] != add->ne[1] || ggml_nrows(ape) != ape->ne[1] ||
+            gate->nb[0] != sizeof(float) || key->nb[0] != sizeof(float) || ape->nb[0] != sizeof(float)) {
+        return 0;
+    }
+    for (const ggml_tensor * t : { add, cont_g->src[0], cont_g, sm->src[0], sm, mul->src[0], cont_k, mul }) {
+        if (!single_use(t)) {
+            return 0;
+        }
+    }
+
+    ggml_cuda_op_kpool_pool(ctx, gate, ape, key, sum);
+    return j - i;
+}
+
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
     static const bool disable_fusion = [] {
@@ -8628,6 +8698,13 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                     ggml_get_unary_op(unary) == GGML_UNARY_OP_SIGMOID);
                 return unary_idx + 1 - i;
             }
+        }
+    }
+
+    if (node->op == GGML_OP_ADD) {
+        const int n_fused = ggml_cuda_try_fuse_kpool_pool(*cuda_ctx, cgraph, i);
+        if (n_fused) {
+            return n_fused;
         }
     }
 
