@@ -8631,6 +8631,24 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         }
     }
 
+    // LayerNorm with a per-column weight and bias.
+    if (node->op == GGML_OP_NORM && ggml_can_fuse(cgraph, i, { GGML_OP_NORM, GGML_OP_MUL, GGML_OP_ADD })) {
+        ggml_tensor * mul = cgraph->nodes[i + 1];
+        ggml_tensor * add = cgraph->nodes[i + 2];
+        const auto is_col_vector = [node](const ggml_tensor * t) {
+            return t->type == GGML_TYPE_F32 && ggml_is_contiguous(t) && ggml_nelements(t) == node->ne[0];
+        };
+        const int out_node = i + 2;
+        if (node->type == GGML_TYPE_F32 && node->src[0]->type == GGML_TYPE_F32 &&
+                mul->src[0] == node && is_col_vector(mul->src[1]) && mul->type == GGML_TYPE_F32 &&
+                add->src[0] == mul && is_col_vector(add->src[1]) && add->type == GGML_TYPE_F32 &&
+                ggml_are_same_shape(node, add) && ggml_is_contiguous(add) &&
+                ggml_cuda_check_fusion_memory_ranges(cgraph, i, 3, &out_node, 1)) {
+            ggml_cuda_op_norm(*cuda_ctx, node, mul->src[1], add->src[1], add);
+            return 2;
+        }
+    }
+
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ADD }, {})) {
         ggml_cuda_op_rms_norm_fused_add(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2]);
         return 2;

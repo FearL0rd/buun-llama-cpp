@@ -1,6 +1,8 @@
 #include "common.cuh"
 
-void ggml_cuda_op_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+// gamma/beta (optional, [ne0] F32) fold a following MUL/ADD; the result then goes to out.
+void ggml_cuda_op_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst,
+        const ggml_tensor * gamma = nullptr, const ggml_tensor * beta = nullptr, ggml_tensor * out = nullptr);
 
 void ggml_cuda_op_group_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 

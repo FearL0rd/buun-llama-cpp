@@ -72,10 +72,11 @@ void ggml_cuda_op_rms_norm_silu(
     CUDA_CHECK(cudaGetLastError());
 }
 
+// gamma/beta, when set, fold a following per-column MUL/ADD with the unfused roundings.
 template <int block_size>
 static __global__ void norm_f32(
         const float * x, float * dst, const int ncols, const int64_t stride_row, const int64_t stride_channel,
-        const int64_t stride_sample, const float eps) {
+        const int64_t stride_sample, const float eps, const float * gamma, const float * beta) {
     const int nrows     = gridDim.x;
     const int nchannels = gridDim.y;
 
@@ -105,7 +106,14 @@ static __global__ void norm_f32(
     const float inv_std = rsqrtf(var + eps);
 
     for (int col = tid; col < ncols; col += block_size) {
-        dst[col] = (x[col] - mean) * inv_std;
+        float v = (x[col] - mean) * inv_std;
+        if (gamma != nullptr) {
+            v = __fmul_rn(v, gamma[col]);
+        }
+        if (beta != nullptr) {
+            v = __fadd_rn(v, beta[col]);
+        }
+        dst[col] = v;
     }
 }
 
@@ -546,14 +554,17 @@ static __global__ void l2_norm_pair_f32(
 
 static void norm_f32_cuda(
         const float * x, float * dst, const int ncols, const int nrows, const int nchannels, const int nsamples,
-        const int64_t stride_row, const int64_t stride_channel, const int64_t stride_sample, const float eps, cudaStream_t stream) {
+        const int64_t stride_row, const int64_t stride_channel, const int64_t stride_sample, const float eps,
+        const float * gamma, const float * beta, cudaStream_t stream) {
     const dim3 blocks_num(nrows, nchannels, nsamples);
     if (ncols < 1024) {
         const dim3 block_dims(WARP_SIZE, 1, 1);
-        norm_f32<WARP_SIZE><<<blocks_num, block_dims, 0, stream>>>(x, dst, ncols, stride_row, stride_channel, stride_sample, eps);
+        norm_f32<WARP_SIZE><<<blocks_num, block_dims, 0, stream>>>(
+            x, dst, ncols, stride_row, stride_channel, stride_sample, eps, gamma, beta);
     } else {
         const dim3 block_dims(1024, 1, 1);
-        norm_f32<1024><<<blocks_num, block_dims, block_dims.x > WARP_SIZE ? 32 * sizeof(float2): 0, stream>>>(x, dst, ncols, stride_row, stride_channel, stride_sample, eps);
+        norm_f32<1024><<<blocks_num, block_dims, block_dims.x > WARP_SIZE ? 32 * sizeof(float2): 0, stream>>>(
+            x, dst, ncols, stride_row, stride_channel, stride_sample, eps, gamma, beta);
     }
 }
 
@@ -760,10 +771,11 @@ static void l2_norm_f32_cuda(
     }
 }
 
-void ggml_cuda_op_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+void ggml_cuda_op_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst,
+        const ggml_tensor * gamma, const ggml_tensor * beta, ggml_tensor * out) {
     const ggml_tensor * src0 = dst->src[0];
     const float * src0_d = (const float *) src0->data;
-    float * dst_d = (float *) dst->data;
+    float * dst_d = (float *) (out ? out : dst)->data;
     cudaStream_t stream = ctx.stream();
 
     GGML_ASSERT(src0->type == GGML_TYPE_F32);
@@ -781,7 +793,8 @@ void ggml_cuda_op_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const int64_t s02 = nb02 / ts0;
     const int64_t s03 = nb03 / ts0;
 
-    norm_f32_cuda(src0_d, dst_d, ne00, ne01, ne02, ne03, s01, s02, s03, eps, stream);
+    norm_f32_cuda(src0_d, dst_d, ne00, ne01, ne02, ne03, s01, s02, s03, eps,
+        gamma ? (const float *) gamma->data : nullptr, beta ? (const float *) beta->data : nullptr, stream);
 }
 
 void ggml_cuda_op_group_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {

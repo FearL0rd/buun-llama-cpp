@@ -834,8 +834,7 @@ ggml_tensor * llama_model_glm5_next::graph::build_kpool_select(
     cb(ig, "indexer_gate", il);
 
     // Cache rows store key | gate | pooled
-    ggml_tensor * pzero = ggml_fill(ctx0, ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd_indexer, n_tokens), 0.0f);
-    ggml_tensor * packed = ggml_concat(ctx0, ggml_concat(ctx0, ik, ig, 0), pzero, 0);
+    ggml_tensor * packed = ggml_pad(ctx0, ggml_concat(ctx0, ik, ig, 0), n_embd_indexer, 0, 0, 0);
     packed = ggml_reshape_3d(ctx0, packed, 3*n_embd_indexer, 1, n_tokens);
     ggml_build_forward_expand(gf, mctx_lid->cpy_k(ctx0, packed, inp_kpool->k_idxs, il));
 
@@ -899,44 +898,38 @@ ggml_tensor * llama_model_glm5_next::graph::build_kpool_select(
                 ggml_reshape_3d(ctx0, score, 1, n_pool, n_tokens), top_k); // [1, n_top_pool, n_tokens]
         ggml_tensor * sel_order = ggml_argsort(ctx0,
                 ggml_reshape_2d(ctx0, sel_score, n_top_pool, n_tokens), GGML_SORT_ORDER_DESC);
-        top_k = ggml_get_rows(ctx0,
-                ggml_reshape_3d(ctx0, ggml_cast(ctx0, top_k, GGML_TYPE_F32), 1, n_top_pool, n_tokens), sel_order);
-        top_k = ggml_cast(ctx0, ggml_cont(ctx0, ggml_reshape_2d(ctx0, top_k, n_top_pool, n_tokens)), GGML_TYPE_I32);
+        top_k = ggml_get_rows(ctx0, ggml_reshape_3d(ctx0, top_k, 1, n_top_pool, n_tokens), sel_order);
+        top_k = ggml_reshape_2d(ctx0, top_k, n_top_pool, n_tokens);
         cb(top_k, "indexer_top_k", il);
 
         sel_idx = ggml_get_rows(ctx0, inp_kpool->pool_idxs,
                 ggml_reshape_1d(ctx0, top_k, n_top_pool*n_tokens));  // [kpool, n_top_pool*n_tokens]
-        sel_idx = ggml_reshape_2d(ctx0, sel_idx, kpool*n_top_pool, n_tokens);
-
-        if (hparams.indexer_kpool_select_tail) {
-            // Append the incomplete tail with n_kv for missing cells.
-            sel_idx = ggml_concat(ctx0, sel_idx, inp_kpool->tail_idxs, 0);
-        }
+        sel_idx = ggml_reshape_3d(ctx0, sel_idx, kpool*n_top_pool, n_tokens, 1);
     }
-    const int64_t n_sel = sel_idx->ne[0];
+    const int64_t n_pool_sel = sel_idx->ne[0];
+    const int64_t n_sel      = inp_kpool->sel_mask->ne[0];
 
     ggml_build_forward_expand(gf, sel_idx);
 
-    ggml_tensor * mask_all = ggml_new_tensor_4d(ctx0, kq_mask->type, n_kv + n_sel, 1, 1, 1);
-    mask_all = ggml_fill(ctx0, mask_all, -INFINITY);
-    mask_all = ggml_repeat_4d(ctx0, mask_all, n_kv + n_sel, n_tokens, 1, 1);
-    mask_all = ggml_reshape_3d(ctx0, mask_all, 1, n_kv + n_sel, n_tokens);
+    // Column n_kv is the dump for the n_kv sentinel of padded pools and absent tail cells.
+    ggml_tensor * sel = ggml_new_tensor_3d(ctx0, kq_mask->type, 1, n_kv + 1, n_tokens);
+    sel = ggml_fill(ctx0, sel, -INFINITY);
 
-    ggml_tensor * zeros = ggml_new_tensor_4d(ctx0, kq_mask->type, n_sel, 1, 1, 1);
-    zeros = ggml_fill(ctx0, zeros, 0.0f);
-    zeros = ggml_repeat_4d(ctx0, zeros, n_sel, n_tokens, 1, 1);
-    zeros = ggml_reshape_3d(ctx0, zeros, 1, n_sel, n_tokens);
-
-    // Live slots (visible pools, real tail cells) address disjoint cells. Each dead slot writes its own dump row
-    // n_kv + slot, so the scatter indices of a token are unique: idx = dump + live*(idx - dump), live = exp(mask).
-    GGML_ASSERT(inp_kpool->sel_mask->ne[0] == n_sel && inp_kpool->sel_mask->ne[3] == n_tokens);
-    ggml_tensor * live  = ggml_exp(ctx0, ggml_reshape_2d(ctx0, inp_kpool->sel_mask, n_sel, n_tokens));
-    ggml_tensor * dump  = ggml_arange(ctx0, (float) n_kv, (float) (n_kv + n_sel), 1.0f);
-    ggml_tensor * idx_f = ggml_cast(ctx0, sel_idx, GGML_TYPE_F32);
-    idx_f   = ggml_add(ctx0, ggml_mul(ctx0, ggml_sub(ctx0, idx_f, dump), live), dump);
-    sel_idx = ggml_cast(ctx0, idx_f, GGML_TYPE_I32);
-
-    ggml_tensor * sel = ggml_set_rows(ctx0, mask_all, zeros, ggml_reshape_3d(ctx0, sel_idx, n_sel, n_tokens, 1));
+    // Scatter each slot's own mask value: 0 for live slots (visible pools, real tail cells), -inf for dead ones.
+    // Live pools are disjoint, and a dead pool is invisible to the token, so it holds no live pool cell. It can
+    // hold the token's tail cells though (a pool completed later in the ubatch): the tail scatter goes last.
+    GGML_ASSERT(inp_kpool->sel_mask->ne[3] == n_tokens);
+    GGML_ASSERT(n_sel == n_pool_sel + (hparams.indexer_kpool_select_tail ? inp_kpool->tail_idxs->ne[0] : 0));
+    const auto sel_val = [&](int64_t n, int64_t i0) {
+        const ggml_tensor * m = inp_kpool->sel_mask;
+        return ggml_view_3d(ctx0, inp_kpool->sel_mask, 1, n, n_tokens, m->nb[0], m->nb[3], ggml_row_size(m->type, i0));
+    };
+    sel = ggml_set_rows(ctx0, sel, sel_val(n_pool_sel, 0), sel_idx);
+    if (hparams.indexer_kpool_select_tail) {
+        ggml_tensor * tail_idxs = inp_kpool->tail_idxs;
+        sel = ggml_set_rows(ctx0, sel, sel_val(tail_idxs->ne[0], n_pool_sel),
+            ggml_reshape_3d(ctx0, tail_idxs, tail_idxs->ne[0], n_tokens, 1));
+    }
     sel = ggml_view_2d(ctx0, sel, n_kv, n_tokens, sel->nb[2], 0);
 
     // Fold causal visibility before shared-indexer reuse.
