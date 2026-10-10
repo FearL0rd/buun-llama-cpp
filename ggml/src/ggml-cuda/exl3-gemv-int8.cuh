@@ -22,6 +22,7 @@
 #include "exl3-dq.cuh"
 #include "exl3-had.cuh"
 #include "exl3-gemv.cuh"
+#include "unary.cuh"
 
 namespace exl3_int8 {
 
@@ -300,10 +301,20 @@ struct bundle_args {
     int n, nrows, ksplit, first_blocks, second_blocks;
 };
 
-template <int bits, int cb, int M, bool RESID, bool GROUPED, bool BUNDLE = false, input_mode INPUT = input_mode::inline_quantize>
+// Clamped SwiGLU applied while loading the input: x holds the gate, up the same-shaped up rows.
+// add (optional): [M][n] rows added to the output; y may alias it.
+struct glu_args {
+    const float * up;
+    float limit;
+    const float * add;
+};
+
+template <int bits, int cb, int M, bool RESID, bool GROUPED, bool BUNDLE = false, input_mode INPUT = input_mode::inline_quantize, bool GLU = false>
 __global__ void __launch_bounds__(THREADS) gemv_int8_kernel(const uint8_t * __restrict__ B,
         const float * __restrict__ x, const half * __restrict__ suh, const half * __restrict__ svh, float * __restrict__ y,
-        float * __restrict__ partials, int * __restrict__ counters, int k, int n, int nrows_max, grouped_args ga, bundle_args bundle = {}, uint8_t * prepared = nullptr) {
+        float * __restrict__ partials, int * __restrict__ counters, int k, int n, int nrows_max, grouped_args ga, bundle_args bundle = {}, uint8_t * prepared = nullptr,
+        glu_args glu = {}) {
+    static_assert(!GLU || (INPUT == input_mode::inline_quantize && !GROUPED && !BUNDLE));
     int column_block = blockIdx.x, k_block = blockIdx.y, k_blocks = gridDim.y;
     if constexpr (BUNDLE) {
         static_assert(!GROUPED);
@@ -408,7 +419,14 @@ __global__ void __launch_bounds__(THREADS) gemv_int8_kernel(const uint8_t * __re
         for (int b = warp; b < (kn / 128) * M; b += THREADS / 32) {
             const int r   = b / (kn / 128);
             const int col = kb0 * 16 + (b - r * (kn / 128)) * 128 + lane * 4;
-            const float4 xv = *reinterpret_cast<const float4 *>(x + size_t(r) * k + col);
+            float4 xv = *reinterpret_cast<const float4 *>(x + size_t(r) * k + col);
+            if constexpr (GLU) {
+                const float4 uv = *reinterpret_cast<const float4 *>(glu.up + size_t(r) * k + col);
+                xv.x = ggml_cuda_op_swiglu_clamp_single(xv.x, uv.x, glu.limit);
+                xv.y = ggml_cuda_op_swiglu_clamp_single(xv.y, uv.y, glu.limit);
+                xv.z = ggml_cuda_op_swiglu_clamp_single(xv.z, uv.z, glu.limit);
+                xv.w = ggml_cuda_op_swiglu_clamp_single(xv.w, uv.w, glu.limit);
+            }
             const half2 s01 = *reinterpret_cast<const half2 *>(suh + col);
             const half2 s23 = *reinterpret_cast<const half2 *>(suh + col + 2);
             float v0 = xv.x * __low2float(s01);
@@ -1093,6 +1111,16 @@ __global__ void __launch_bounds__(THREADS) gemv_int8_kernel(const uint8_t * __re
         o.y = v1 * exl3_had::SCALE * __high2float(s01);
         o.z = v2 * exl3_had::SCALE * __low2float(s23);
         o.w = v3 * exl3_had::SCALE * __high2float(s23);
+        if constexpr (GLU) {
+            if (glu.add) {
+                // explicit adds: no FMA contraction, matching a separate ADD
+                const float4 a = *reinterpret_cast<const float4 *>(glu.add + size_t(r) * n + gc);
+                o.x = __fadd_rn(a.x, o.x);
+                o.y = __fadd_rn(a.y, o.y);
+                o.z = __fadd_rn(a.z, o.z);
+                o.w = __fadd_rn(a.w, o.w);
+            }
+        }
         *reinterpret_cast<float4 *>(y + size_t(r) * n + gc) = o;
     }
 }

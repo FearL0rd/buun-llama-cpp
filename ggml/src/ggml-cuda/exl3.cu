@@ -313,10 +313,10 @@ static void exl3_warpk_launch(ggml_backend_cuda_context & ctx, const uint8_t * w
 
 // One launch = grid (n/256, ksplit, pairs); dense calls pass pairs = 1 with M tokens, the grouped
 // MoE path M = 1 with one (token, expert) pair per block-z.
-template <int bits, int cb, int M, bool RESID, bool GROUPED>
+template <int bits, int cb, int M, bool RESID, bool GROUPED, bool GLU = false>
 void exl3_gemv_int8_launch(ggml_backend_cuda_context & ctx, const uint8_t * B, const float * x, const half * suh, const half * svh,
-        float * y, int k, int n, int pairs, exl3_int8::grouped_args ga, cudaStream_t stream) {
-    const auto kernel = exl3_int8::gemv_int8_kernel<bits, cb, M, RESID, GROUPED>;
+        float * y, int k, int n, int pairs, exl3_int8::grouped_args ga, cudaStream_t stream, exl3_int8::glu_args glu = {}) {
+    const auto kernel = exl3_int8::gemv_int8_kernel<bits, cb, M, RESID, GROUPED, false, exl3_int8::input_mode::inline_quantize, GLU>;
     const size_t cap = M > exl3_int8::MAX_M
         ? std::min(exl3_int8_smem_cap(ctx.device),
                 size_t(ggml_cuda_info().devices[ctx.device].smpbo) - size_t(M) * exl3_int8::COLS * sizeof(float) - 4096)
@@ -345,7 +345,7 @@ void exl3_gemv_int8_launch(ggml_backend_cuda_context & ctx, const uint8_t * B, c
         }
     }
     GGML_ASSERT(smem <= cap);
-    if constexpr (cb == 2 && !GROUPED && ((bits == 4 && !RESID && M >= 4 && M <= 8) || (bits == 6 && RESID && M >= 5 && M <= 8))) {
+    if constexpr (cb == 2 && !GLU && !GROUPED && ((bits == 4 && !RESID && M >= 4 && M <= 8) || (bits == 6 && RESID && M >= 5 && M <= 8))) {
         if (exl3_sm86_available(ggml_cuda_info().devices[ctx.device].cc) && exl3_warpk_shape(bits, RESID, n, ksplit)) {
             exl3_warpk_launch<bits, RESID, false>(ctx, B, x, suh, svh, y, k, n, nrows, ksplit, M);
             return;
@@ -353,7 +353,7 @@ void exl3_gemv_int8_launch(ggml_backend_cuda_context & ctx, const uint8_t * B, c
     }
     ggml_cuda_pool_alloc<float> partials(ctx.pool(), size_t(ksplit) * M * pairs * n);
     int * counters = exl3_int8_counters(ctx);
-    if constexpr (cb == 2 && bits == 6 && M >= 3 && M <= 8 && RESID && !GROUPED) {
+    if constexpr (cb == 2 && bits == 6 && M >= 3 && M <= 8 && RESID && !GROUPED && !GLU) {
         if (exl3_sm86_available(ggml_cuda_info().devices[ctx.device].cc)) {
             const auto prepare = exl3_int8::gemv_int8_kernel<bits, cb, M, RESID, false, false, exl3_int8::input_mode::prepare>;
             const auto consume = exl3_int8::gemv_int8_kernel<bits, cb, M, RESID, false, false, exl3_int8::input_mode::consume>;
@@ -365,15 +365,15 @@ void exl3_gemv_int8_launch(ggml_backend_cuda_context & ctx, const uint8_t * B, c
             }
             ggml_cuda_pool_alloc<uint8_t> prepared(ctx.pool(), size_t(ksplit) * (2 * nacc * sizeof(uint32_t) + nacc * nrows * 16));
             prepare<<<dim3(1, ksplit), exl3_int8::THREADS, smem, stream>>>(
-                B, x, suh, svh, y, partials.get(), counters, k, n, nrows, ga, {}, prepared.get());
+                B, x, suh, svh, y, partials.get(), counters, k, n, nrows, ga, {}, prepared.get(), {});
             const size_t consume_smem = size_t(nacc) * nrows * 16 + exl3_int8::head_stage_bytes(bits);
             consume<<<dim3(colblocks, ksplit), exl3_int8::THREADS, consume_smem, stream>>>(
-                B, x, suh, svh, y, partials.get(), counters, k, n, nrows, ga, {}, prepared.get());
+                B, x, suh, svh, y, partials.get(), counters, k, n, nrows, ga, {}, prepared.get(), {});
             return;
         }
     }
     kernel<<<dim3(colblocks, ksplit, pairs), exl3_int8::THREADS, smem, stream>>>(
-        B, x, suh, svh, y, partials.get(), counters, k, n, nrows, ga, {}, nullptr);
+        B, x, suh, svh, y, partials.get(), counters, k, n, nrows, ga, {}, nullptr, glu);
 }
 
 template <int bits, bool RESID>
@@ -474,7 +474,7 @@ static bool exl3_int8_bundle_launch(ggml_backend_cuda_context & ctx, ggml_tensor
     kernel<<<c0 * s0 + c1 * s1, exl3_int8::THREADS, std::max(sm0, sm1), ctx.stream()>>>(
         static_cast<const uint8_t *>(a->src[0]->data), static_cast<const float *>(a->src[1]->data),
         static_cast<const half *>(a->src[3]->data), static_cast<const half *>(a->src[2]->data),
-        static_cast<float *>(a->data), partials.get(), counters, k, n0, r0, {}, args, nullptr);
+        static_cast<float *>(a->data), partials.get(), counters, k, n0, r0, {}, args, nullptr, {});
     return true;
 }
 
@@ -707,6 +707,41 @@ void ggml_cuda_mul_mat_exl3(ggml_backend_cuda_context & ctx, const ggml_tensor *
     }
     // output transform in place: y = had128(y) / sqrt(128) * svh
     exl3_had_out_kernel<<<dim3(n / 128, m), 32, 0, stream>>>(y, svh, n);
+}
+
+bool ggml_cuda_mul_mat_exl3_glu(ggml_backend_cuda_context & ctx, const ggml_tensor * glu, ggml_tensor * dst,
+        const ggml_tensor * residual, ggml_tensor * sum) {
+    const ggml_tensor * src0 = dst->src[0];
+    const ggml_tensor * gate = glu->src[0];
+    const ggml_tensor * up   = glu->src[1];
+    if (!ggml_cuda_exl3_supports_mul_mat(dst) || dst->src[1] != glu || dst->src[2] == nullptr || dst->src[3] == nullptr ||
+            glu->op != GGML_OP_GLU || ggml_get_glu_op(glu) != GGML_GLU_OP_SWIGLU_CLAMP || up == nullptr ||
+            ggml_get_op_params_i32(glu, 1) != 0 || gate->type != GGML_TYPE_F32 || up->type != GGML_TYPE_F32 ||
+            !ggml_is_contiguous(gate) || !ggml_is_contiguous(up) ||
+            !ggml_are_same_shape(gate, glu) || !ggml_are_same_shape(up, glu)) {
+        return false;
+    }
+    const int k = int(src0->ne[0]);
+    const int n = int(src0->ne[1]);
+    const int bits = ggml_cuda_exl3_bits(src0->type);
+    // Single-row plain int8 only: the one executor the int8 path reaches for these shapes.
+    if (glu->ne[1] != 1 || ggml_cuda_exl3_codebook(src0->type) != 2 || strcmp(src0->name, "output.weight") == 0 ||
+            !exl3_int8_applicable(bits, 1, k, n, ggml_cuda_info().devices[ctx.device].cc) || exl3_int8_resid(bits, false)) {
+        return false;
+    }
+    const uint8_t * B = static_cast<const uint8_t *>(src0->data);
+    const float * x = static_cast<const float *>(gate->data);
+    const half * suh = static_cast<const half *>(dst->src[3]->data);
+    const half * svh = static_cast<const half *>(dst->src[2]->data);
+    float * y = static_cast<float *>(sum ? sum->data : dst->data);
+    const exl3_int8::glu_args args { static_cast<const float *>(up->data), ggml_get_op_params_f32(glu, 3),
+        sum ? static_cast<const float *>(residual->data) : nullptr };
+    switch (bits) {
+#define EXL3_GLU_CASE(K) case K: exl3_gemv_int8_launch<K, 2, 1, false, false, true>(ctx, B, x, suh, svh, y, k, n, 1, {}, ctx.stream(), args); return true;
+        EXL3_GLU_CASE(2) EXL3_GLU_CASE(3) EXL3_GLU_CASE(4) EXL3_GLU_CASE(5) EXL3_GLU_CASE(6)
+#undef EXL3_GLU_CASE
+        default: return false;
+    }
 }
 
 bool ggml_cuda_exl3_mul_mat_id_fast(const ggml_tensor * dst) {

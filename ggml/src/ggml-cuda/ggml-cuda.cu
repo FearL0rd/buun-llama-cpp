@@ -8641,6 +8641,35 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         return 2;
     }
 
+    // clamped SwiGLU computed inside the input load of the EXL3 projection consuming it
+    ggml_tensor * down = node->op == GGML_OP_GLU && node->src[1] && i + 1 < cgraph->n_nodes ? cgraph->nodes[i + 1] : nullptr;
+    if (down && down->op == GGML_OP_MUL_MAT && down->src[1] == node && ggml_cuda_is_exl3(down->src[0]->type)) {
+        // and the ADD of another contiguous row set (e.g. routed experts + shared expert);
+        // the sum may reuse the residual's memory in place
+        ggml_tensor * add = i + 2 < cgraph->n_nodes ? cgraph->nodes[i + 2] : nullptr;
+        if (add && add->op == GGML_OP_ADD && (add->src[0] == down) != (add->src[1] == down)) {
+            const ggml_tensor * residual = add->src[add->src[0] == down ? 1 : 0];
+            const ggml_op ops3[] = { GGML_OP_GLU, GGML_OP_MUL_MAT, GGML_OP_ADD };
+            const int sum_idx = i + 2;
+            if (residual->type == GGML_TYPE_F32 && add->type == GGML_TYPE_F32 &&
+                    ggml_are_same_shape(residual, down) && ggml_are_same_shape(add, down) &&
+                    ggml_is_contiguous(residual) && ggml_is_contiguous(add) &&
+                    (add->data == residual->data || !ggml_cuda_tensors_overlap(add, residual)) &&
+                    !ggml_cuda_tensors_overlap(add, node->src[0]) && !ggml_cuda_tensors_overlap(add, node->src[1]) &&
+                    ggml_can_fuse_subgraph(cgraph, i, 3, ops3, &sum_idx, 1) &&
+                    ggml_cuda_mul_mat_exl3_glu(*cuda_ctx, node, down, residual, add)) {
+                return 2;
+            }
+        }
+        const ggml_op ops[] = { GGML_OP_GLU, GGML_OP_MUL_MAT };
+        const int out_idx = i + 1;
+        if (ggml_can_fuse_subgraph(cgraph, i, 2, ops, &out_idx, 1) &&
+                ggml_cuda_check_fusion_memory_ranges(cgraph, i, 2, &out_idx, 1) &&
+                ggml_cuda_mul_mat_exl3_glu(*cuda_ctx, node, down)) {
+            return 1;
+        }
+    }
+
     if (node->op == GGML_OP_MUL_MAT && i + 1 < cgraph->n_nodes && cgraph->nodes[i + 1]->op == GGML_OP_MUL_MAT) {
         // consecutive small-batch f16 MUL_MATs reading the same activations (e.g. low-rank gate projections)
         ggml_tensor * mms[MMVF_F16_MULTI_MAX];

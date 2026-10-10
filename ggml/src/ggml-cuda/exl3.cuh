@@ -29,6 +29,12 @@ static inline bool ggml_cuda_exl3_turing_gemm_supported(int cc, int compiled_cc,
 
 void ggml_cuda_mul_mat_exl3(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst);
 
+// dst = MUL_MAT(exl3, glu) with glu a SWIGLU_CLAMP of separate gate/up rows, computed inside the
+// down projection's input load. With sum, writes residual + dst there instead of dst (sum may
+// alias residual). False (nothing launched) outside its single-token int8 shapes.
+bool ggml_cuda_mul_mat_exl3_glu(ggml_backend_cuda_context & ctx, const ggml_tensor * glu, ggml_tensor * dst,
+        const ggml_tensor * residual = nullptr, ggml_tensor * sum = nullptr);
+
 // Pair independent dense projections sharing an input, preserving both outputs.
 // Caller validates graph dependencies and memory ranges; false retains ordinary execution.
 bool ggml_cuda_exl3_bundle(ggml_backend_cuda_context & ctx, ggml_tensor * a, ggml_tensor * b);
