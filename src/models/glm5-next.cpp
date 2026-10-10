@@ -206,7 +206,7 @@ static ggml_tensor * glm5_conv1d(ggml_cgraph * gf, ggml_context * ctx0,
                                  ggml_tensor * conv_states_all, ggml_tensor * conv_state_all,
                                  int64_t qkv, ggml_tensor * x, ggml_tensor * conv_w,
                                  int64_t d_conv, int64_t head_dim, int64_t n_head,
-                                 int64_t n_seq_tokens, int64_t n_seqs, int64_t n_tokens, int64_t kv_head,
+                                 int64_t n_seq_tokens, int64_t n_seqs, int64_t kv_head,
                                  int64_t mem_size, int64_t K_rs) {
     const int64_t d_inner         = head_dim * n_head;
     const int64_t conv_state_size = (d_conv - 1) * d_inner;
@@ -229,18 +229,17 @@ static ggml_tensor * glm5_conv1d(ggml_cgraph * gf, ggml_context * ctx0,
         const int64_t s_idx = std::max<int64_t>(0, n_seq_tokens - s);
         ggml_tensor * conv_x_s = ggml_view_3d(ctx0, conv_x, d_conv - 1, d_inner, n_seqs,
             conv_x->nb[1], conv_x->nb[2], s_idx * conv_x->nb[0]);
+        // flat [state, seq] destination: the CUDA conv-state fusion matches this shape
         ggml_build_forward_expand(gf,
             ggml_cpy(ctx0, conv_x_s,
-                ggml_view_3d(ctx0, conv_states_all, d_conv - 1, d_inner, n_seqs,
-                    (d_conv - 1)   * ggml_element_size(conv_states_all),
+                ggml_view_2d(ctx0, conv_states_all, conv_state_size, n_seqs,
                     n_embd_r_total * ggml_element_size(conv_states_all),
                     ((s * mem_size + kv_head) * n_embd_r_total + qkv * conv_state_size) * ggml_element_size(conv_states_all))));
     }
 
     ggml_tensor * conv_weight = ggml_reshape_2d(ctx0, conv_w, d_conv, d_inner);
-    ggml_tensor * Xcur = ggml_ssm_conv(ctx0, conv_x, conv_weight);
-    Xcur = ggml_reshape_2d(ctx0, Xcur, d_inner, n_tokens);
-    Xcur = ggml_silu(ctx0, Xcur);
+    // SiLU directly on the conv output so the fusion can fold it in
+    ggml_tensor * Xcur = ggml_silu(ctx0, ggml_ssm_conv(ctx0, conv_x, conv_weight));
 
     return ggml_reshape_4d(ctx0, Xcur, head_dim, n_head, n_seq_tokens, n_seqs);
 }
@@ -710,7 +709,7 @@ ggml_tensor * llama_model_glm5_next::graph::build_kda_layer(
     const auto   kv_head  = mctx_cur->get_head();
 
     ggml_tensor * conv_states_all = mctx_cur->get_r_l(il);
-    ggml_tensor * conv_state_all  = build_rs(inp_rs, conv_states_all, hparams.n_embd_r(), n_seqs);
+    ggml_tensor * conv_state_all  = build_rs_in(inp_rs, conv_states_all, hparams.n_embd_r(), n_seqs);
 
     const int64_t mem_size = mctx_cur->get_size();
     const int64_t K_rs     = (int64_t) cparams.n_rs_seq + 1;
@@ -732,9 +731,9 @@ ggml_tensor * llama_model_glm5_next::graph::build_kda_layer(
         v_in = build_lora_mm(layer.wv, cur, layer.wv_s, layer.wv_in_s);
     }
 
-    ggml_tensor * Qcur = glm5_conv1d(gf, ctx0, conv_states_all, conv_state_all, 0, q_in, layer.ssm_q_conv, d_conv, head_dim, n_head_kda, n_seq_tokens, n_seqs, n_tokens, kv_head, mem_size, K_rs);
-    ggml_tensor * Kcur = glm5_conv1d(gf, ctx0, conv_states_all, conv_state_all, 1, k_in, layer.ssm_k_conv, d_conv, head_dim, n_head_kda, n_seq_tokens, n_seqs, n_tokens, kv_head, mem_size, K_rs);
-    ggml_tensor * Vcur = glm5_conv1d(gf, ctx0, conv_states_all, conv_state_all, 2, v_in, layer.ssm_v_conv, d_conv, head_dim, n_head_kda, n_seq_tokens, n_seqs, n_tokens, kv_head, mem_size, K_rs);
+    ggml_tensor * Qcur = glm5_conv1d(gf, ctx0, conv_states_all, conv_state_all, 0, q_in, layer.ssm_q_conv, d_conv, head_dim, n_head_kda, n_seq_tokens, n_seqs, kv_head, mem_size, K_rs);
+    ggml_tensor * Kcur = glm5_conv1d(gf, ctx0, conv_states_all, conv_state_all, 1, k_in, layer.ssm_k_conv, d_conv, head_dim, n_head_kda, n_seq_tokens, n_seqs, kv_head, mem_size, K_rs);
+    ggml_tensor * Vcur = glm5_conv1d(gf, ctx0, conv_states_all, conv_state_all, 2, v_in, layer.ssm_v_conv, d_conv, head_dim, n_head_kda, n_seq_tokens, n_seqs, kv_head, mem_size, K_rs);
     cb(Qcur, "kda_q_conv", il);
     cb(Kcur, "kda_k_conv", il);
     cb(Vcur, "kda_v_conv", il);
@@ -766,7 +765,7 @@ ggml_tensor * llama_model_glm5_next::graph::build_kda_layer(
     cb(beta, "kda_beta", il);
 
     ggml_tensor * ssm_states_all = mctx_cur->get_s_l(il);
-    ggml_tensor * state = build_rs(inp_rs, ssm_states_all, hparams.n_embd_s(), n_seqs);
+    ggml_tensor * state = build_rs_in(inp_rs, ssm_states_all, hparams.n_embd_s(), n_seqs);
     state = ggml_reshape_4d(ctx0, state, head_dim, head_dim, n_head_kda, n_seqs);
 
     // Match FLA l2 norm
