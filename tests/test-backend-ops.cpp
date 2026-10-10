@@ -4749,6 +4749,10 @@ struct test_dsv4_hc : public test_case {
         if (name == "base") {
             lo = -0.25f; hi = 0.25f; return true;
         }
+        if (name == "hc_fn") {
+            // keeps the 24 mixes O(1) after rms_norm, like trained weights
+            lo = -0.02f; hi = 0.02f; return true;
+        }
         if (name == "weights" || name == "comb") {
             lo = 0.0f; hi = 1.0f; return true;
         }
@@ -4885,6 +4889,56 @@ struct test_dsv4_hc_pre : public test_dsv4_hc {
 
             out = ggml_dsv4_hc_pre(ctx, x, weights);
         }
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
+// GLM-5 / DeepSeek-V4 hc pre chain: RMS_NORM -> MUL_MAT -> DSV4_HC_PARAMS -> DSV4_HC_PRE(view of pre)
+struct test_dsv4_hc_pre_chain : public test_dsv4_hc {
+    const int64_t n_embd;
+    const int64_t n_tokens;
+    const int32_t n_iter;
+    ggml_tensor * params = nullptr;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "DSV4_HC_PRE_CHAIN";
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR3(n_embd, n_tokens, n_iter);
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::vector<ggml_tensor *> fusion_test_nodes() override {
+        return {params, out};
+    }
+
+    test_dsv4_hc_pre_chain(int64_t n_embd = 4096, int64_t n_tokens = 1, int32_t n_iter = 20)
+        : n_embd(n_embd), n_tokens(n_tokens), n_iter(n_iter) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, hc, n_tokens);
+        ggml_set_name(x, "x");
+
+        ggml_tensor * hc_fn = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hc*n_embd, (2 + hc)*hc);
+        ggml_set_name(hc_fn, "hc_fn");
+
+        ggml_tensor * scale = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 3);
+        ggml_set_name(scale, "scale");
+
+        ggml_tensor * base = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, (2 + hc)*hc);
+        ggml_set_name(base, "base");
+
+        ggml_tensor * flat  = ggml_reshape_2d(ctx, x, hc*n_embd, n_tokens);
+        ggml_tensor * mixes = ggml_mul_mat(ctx, hc_fn, ggml_rms_norm(ctx, flat, 1e-6f));
+        params = ggml_dsv4_hc_params(ctx, mixes, scale, base, 1e-6f, n_iter);
+        ggml_set_name(params, "params");
+
+        ggml_tensor * pre = ggml_view_2d(ctx, params, hc, n_tokens, params->nb[1], 0);
+        out = ggml_dsv4_hc_pre(ctx, x, pre);
         ggml_set_name(out, "out");
         return out;
     }
@@ -11418,6 +11472,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     for (int64_t n_hc : {1, 2, 3, 5, 8, 65}) {
         test_cases.emplace_back(new test_dsv4_hc_pre(128, n_hc, 17));
         test_cases.emplace_back(new test_dsv4_hc_pre(128, n_hc, 17, true));
+    }
+    // 4096 = GLM-5 decode shape; 64 runs the minimum grid; 5 tokens exceeds the fused path
+    for (int64_t n_embd : {64, 1024, 4096}) {
+        for (int64_t n_tokens : {1, 2, 4, 5}) {
+            test_cases.emplace_back(new test_dsv4_hc_pre_chain(n_embd, n_tokens, 20));
+        }
     }
 
     test_cases.emplace_back(new test_dsv4_hc_post(1, 1));

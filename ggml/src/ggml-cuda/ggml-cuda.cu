@@ -7006,8 +7006,15 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     if (node->op == GGML_OP_RMS_NORM &&
             ggml_can_fuse_subgraph(cgraph, i, 3, hc_pre_ops, &hc_pre_output, 1) &&
             ggml_cuda_dsv4_hc_pre_fused_supported(node, cgraph->nodes[i + 1], cgraph->nodes[i + 2])) {
-        ggml_cuda_op_dsv4_hc_pre_fused(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2]);
-        return 2;
+        // fold in the DSV4_HC_PRE that consumes pre, when only views sit between them
+        int j = i + 3;
+        while (j < cgraph->n_nodes && ggml_cuda_is_view_or_noop(cgraph->nodes[j])) {
+            j++;
+        }
+        ggml_tensor * hc_pre = j < cgraph->n_nodes && ggml_cuda_dsv4_hc_pre_apply_supported(cgraph->nodes[i + 2], cgraph->nodes[j]) ?
+            cgraph->nodes[j] : nullptr;
+        ggml_cuda_op_dsv4_hc_pre_fused(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2], hc_pre);
+        return hc_pre ? j - i : 2;
     }
 
     ggml_cuda_mmvq_post_silu_fusion mmvq_post_silu;

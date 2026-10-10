@@ -63,8 +63,35 @@ static __device__ void dsv4_hc_comb_norm_rows(float * comb, float eps) {
     }
 }
 
-// pre/post/comb of one token, computed by a full warp: mixes and dst already point at that token
-static __device__ void dsv4_hc_params_token(
+// 1/x without the IEEE division slow-path branch; bit-identical to 1.0f/x for x in [1e-30, 1e30]
+// (checked exhaustively). Every sinkhorn sum here is >= eps > 0.
+static __device__ __forceinline__ float dsv4_hc_rcp(float x) {
+#if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
+    return 1.0f/x;
+#else
+    float r;
+    asm("rcp.approx.ftz.f32 %0, %1;" : "=f"(r) : "f"(x));
+    return __fmaf_rn(r, __fmaf_rn(-x, r, 1.0f), r);
+#endif
+}
+
+// pre/post of one token, lanes 0..2*DSV4_HC-1: mixes and dst already point at that token
+static __device__ void dsv4_hc_params_pre_post(
+        const float * mixes, const float * scale, const float * base, float * dst,
+        int64_t sm0, int64_t ss0, int64_t sb0, int64_t sd0, float eps) {
+    const int lane = threadIdx.x % WARP_SIZE;
+
+    if (lane < 2*DSV4_HC) {
+        // The unfused graph stores between MUL and ADD. Explicit round-to-nearest
+        // intrinsics preserve that two-kernel arithmetic instead of contracting an FMA.
+        const float affine = __fadd_rn(__fmul_rn(mixes[lane*sm0], scale[(lane / DSV4_HC)*ss0]), base[lane*sb0]);
+        const float sig = 1.0f/(1.0f + expf(-affine));
+        dst[lane*sd0] = lane < DSV4_HC ? __fadd_rn(sig, eps) : __fmul_rn(sig, 2.0f);
+    }
+}
+
+// comb of one token, computed by a full warp
+static __device__ void dsv4_hc_params_comb(
         const float * mixes,
         const float * scale,
         const float * base,
@@ -80,14 +107,6 @@ static __device__ void dsv4_hc_params_token(
     // lane l < 16 owns comb element l = idst + DSV4_HC*isrc; the row/column sums gather the four
     // elements by shuffle and add them in the same order as the serial reference
     const int lane = threadIdx.x % WARP_SIZE;
-
-    if (lane < 2*DSV4_HC) {
-        // The unfused graph stores between MUL and ADD. Explicit round-to-nearest
-        // intrinsics preserve that two-kernel arithmetic instead of contracting an FMA.
-        const float affine = __fadd_rn(__fmul_rn(mixes[lane*sm0], scale[(lane / DSV4_HC)*ss0]), base[lane*sb0]);
-        const float sig = 1.0f/(1.0f + expf(-affine));
-        dst[lane*sd0] = lane < DSV4_HC ? __fadd_rn(sig, eps) : __fmul_rn(sig, 2.0f);
-    }
 
     const int idx  = lane % (DSV4_HC*DSV4_HC);
     const int idst = idx % DSV4_HC;
@@ -107,7 +126,7 @@ static __device__ void dsv4_hc_params_token(
     for (int j = 0; j < DSV4_HC; ++j) {
         sum += __shfl_sync(0xffffffff, v, row0 + j);
     }
-    v = v*(1.0f/sum) + eps;
+    v = v*dsv4_hc_rcp(sum) + eps;
 
     // one column pass even when n_iter is 0, as in the serial reference
     for (int32_t it = 0; it < (n_iter > 1 ? n_iter : 1); ++it) {
@@ -117,14 +136,14 @@ static __device__ void dsv4_hc_params_token(
             for (int j = 0; j < DSV4_HC; ++j) {
                 row_sum += __shfl_sync(0xffffffff, v, row0 + j);
             }
-            v *= 1.0f/row_sum;
+            v *= dsv4_hc_rcp(row_sum);
         }
         float col_sum = eps;
 #pragma unroll
         for (int j = 0; j < DSV4_HC; ++j) {
             col_sum += __shfl_sync(0xffffffff, v, idst + DSV4_HC*j);
         }
-        v *= 1.0f/col_sum;
+        v *= dsv4_hc_rcp(col_sum);
     }
 
     if (lane < DSV4_HC*DSV4_HC) {
@@ -155,25 +174,41 @@ static __global__ void dsv4_hc_params_f32(
 
     ggml_cuda_pdl_sync();
 
-    dsv4_hc_params_token(mixes + it*sm1, scale, base, dst + it*sd1, sm0, ss0, sb0, sd0, eps, n_iter);
+    dsv4_hc_params_pre_post(mixes + it*sm1, scale, base, dst + it*sd1, sm0, ss0, sb0, sd0, eps);
+    dsv4_hc_params_comb(mixes + it*sm1, scale, base, dst + it*sd1, sm0, ss0, sb0, sd0, eps, n_iter);
 }
 
-// RMS_NORM -> MUL_MAT(f32 hc_fn) -> DSV4_HC_PARAMS in one launch. rms_norm only scales each
-// token by a scalar, so every block dots its k slice of the raw stream against the 24 hc_fn
-// rows and accumulates sum(x^2) alongside; the last block to finish sums the slices and
-// applies rsqrt(mean + eps) before the params epilogue.
+// RMS_NORM -> MUL_MAT(f32 hc_fn) -> DSV4_HC_PARAMS [-> DSV4_HC_PRE] in one launch. rms_norm only
+// scales each token by a scalar, so every block dots its k slice of the raw stream against the 24
+// hc_fn rows and accumulates sum(x^2) alongside; the last block to finish sums the slices and
+// applies rsqrt(mean + eps) before the params epilogue. With apply, the other blocks wait for the
+// last block to publish pre, then mix the streams into the DSV4_HC_PRE output while it runs the
+// sinkhorn.
 static constexpr int DSV4_HC_PRE_FUSED_THREADS = 128;
 static constexpr int DSV4_HC_PRE_FUSED_MAX_TOKENS = 4;
 static constexpr int DSV4_HC_PRE_FUSED_MAX_BLOCKS = 128;
+static constexpr int DSV4_HC_PRE_FUSED_K_PER_BLOCK = 256;
 static constexpr int DSV4_HC_MIX = (2 + DSV4_HC)*DSV4_HC;
 
 static __device__ unsigned int dsv4_hc_pre_fused_counter;
+static __device__ unsigned int dsv4_hc_pre_fused_released;
+static __device__ int dsv4_hc_pre_fused_ready;
 
-template <int n_tokens>
+// ungated DSV4_HC_PRE: dst[i0, it] = scale * sum_ih x[i0, ih, it]*pre[ih, it]
+struct dsv4_hc_pre_apply_args {
+    const float * x;
+    float * dst;
+    int64_t n_embd;
+    int64_t sx0, sx1, sx2;
+    int64_t sd0, sd1;
+    float scale;
+};
+
+template <int n_tokens, bool apply>
 static __global__ void dsv4_hc_pre_fused_f32(
         const float * x, const float * w, const float * scale, const float * base,
         float * partials, float * dst, int64_t k, int64_t sx1, int64_t sw1, int64_t ss0, int64_t sb0,
-        int64_t sd1, float rms_eps, float eps, int32_t n_iter) {
+        int64_t sd1, float rms_eps, float eps, int32_t n_iter, const dsv4_hc_pre_apply_args ap) {
     constexpr int nwarps = DSV4_HC_PRE_FUSED_THREADS/WARP_SIZE;
     constexpr int nacc = n_tokens*(DSV4_HC_MIX + 1);
 
@@ -219,43 +254,109 @@ static __global__ void dsv4_hc_pre_fused_f32(
         partials[blockIdx.x*nacc + a] = v;
     }
 
-    __shared__ bool last;
+    __shared__ unsigned int ticket;
     __threadfence();
     __syncthreads();
     if (threadIdx.x == 0) {
         // atomicInc wraps to 0 on the last block, leaving the counter ready for the next launch
-        last = atomicInc(&dsv4_hc_pre_fused_counter, gridDim.x - 1) == gridDim.x - 1;
+        ticket = atomicInc(&dsv4_hc_pre_fused_counter, gridDim.x - 1);
     }
     __syncthreads();
-    if (!last) {
+
+    if (ticket != gridDim.x - 1) {
+        if constexpr (apply) {
+            // every block holds its ticket before the last one publishes pre, so this wait cannot
+            // deadlock whatever the residency
+            __shared__ float pre[n_tokens*DSV4_HC];
+            if (threadIdx.x == 0) {
+                while (*(volatile int *) &dsv4_hc_pre_fused_ready == 0) {}
+                __threadfence();
+            }
+            __syncthreads();
+            if (threadIdx.x < n_tokens*DSV4_HC) {
+                pre[threadIdx.x] = __ldcg(dst + (threadIdx.x / DSV4_HC)*sd1 + threadIdx.x % DSV4_HC);
+            }
+            __syncthreads();
+
+            const int64_t nr = ap.n_embd*n_tokens;
+            for (int64_t ir = (int64_t) ticket*blockDim.x + threadIdx.x; ir < nr; ir += (int64_t) (gridDim.x - 1)*blockDim.x) {
+                const int64_t i0 = ir % ap.n_embd;
+                const int64_t it = ir / ap.n_embd;
+                // same product and order as dsv4_hc_pre_f32<false>
+                float sum = 0.0f;
+#pragma unroll
+                for (int ih = 0; ih < DSV4_HC; ++ih) {
+                    const float xv = ap.x[i0*ap.sx0 + ih*ap.sx1 + it*ap.sx2];
+                    const float wv = pre[it*DSV4_HC + ih];
+                    if (ih == 0) {
+                        sum = xv * wv;
+                    } else {
+                        sum += xv * wv;
+                    }
+                }
+                ap.dst[i0*ap.sd0 + it*ap.sd1] = ap.scale * sum;
+            }
+
+            // the last waiter through re-arms the flag for the next launch
+            if (threadIdx.x == 0 && atomicInc(&dsv4_hc_pre_fused_released, gridDim.x - 2) == gridDim.x - 2) {
+                dsv4_hc_pre_fused_ready = 0;
+            }
+        }
         return;
     }
     __threadfence();
 
-    // each warp sums whole accumulators across the block partials, then one warp per token
-    // runs the params epilogue
-    __shared__ float mixes[nacc];
-    for (int a = warp; a < nacc; a += nwarps) {
-        float v = 0.0f;
-        for (unsigned int b = lane; b < gridDim.x; b += WARP_SIZE) {
-            v += __ldcg(partials + b*nacc + a);
+    // each thread loads whole partial rows, so the cross-block sum costs one L2 round trip
+#pragma unroll
+    for (int a = 0; a < nacc; ++a) {
+        acc[a] = 0.0f;
+    }
+    for (unsigned int b = threadIdx.x; b < gridDim.x; b += blockDim.x) {
+#pragma unroll
+        for (int a = 0; a < nacc; ++a) {
+            acc[a] += __ldcg(partials + b*nacc + a);
         }
-        v = warp_reduce_sum(v);
+    }
+#pragma unroll
+    for (int a = 0; a < nacc; ++a) {
+        const float v = warp_reduce_sum(acc[a]);
         if (lane == 0) {
-            mixes[a] = v;
+            red[warp][a] = v;
         }
     }
     __syncthreads();
 
+    __shared__ float mixes[nacc];
+    for (int a = threadIdx.x; a < nacc; a += blockDim.x) {
+        float v = 0.0f;
+#pragma unroll
+        for (int iw = 0; iw < nwarps; ++iw) {
+            v += red[iw][a];
+        }
+        mixes[a] = v;
+    }
+    __syncthreads();
+
+    // one warp per token: pre/post first so the waiting blocks can start, then the sinkhorn
     static_assert(n_tokens <= nwarps, "one warp per token");
+    float * m = mixes + warp*(DSV4_HC_MIX + 1);
     if (warp < n_tokens) {
-        float * m = mixes + warp*(DSV4_HC_MIX + 1);
         const float rs = rsqrtf(m[DSV4_HC_MIX]/k + rms_eps);
         if (lane < DSV4_HC_MIX) {
             m[lane] *= rs;
         }
         __syncwarp();
-        dsv4_hc_params_token(m, scale, base, dst + warp*sd1, 1, ss0, sb0, 1, eps, n_iter);
+        dsv4_hc_params_pre_post(m, scale, base, dst + warp*sd1, 1, ss0, sb0, 1, eps);
+    }
+    if constexpr (apply) {
+        __syncthreads();
+        if (threadIdx.x == 0) {
+            __threadfence();
+            atomicExch(&dsv4_hc_pre_fused_ready, 1);
+        }
+    }
+    if (warp < n_tokens) {
+        dsv4_hc_params_comb(m, scale, base, dst + warp*sd1, 1, ss0, sb0, 1, eps, n_iter);
     }
 }
 
@@ -272,8 +373,19 @@ bool ggml_cuda_dsv4_hc_pre_fused_supported(const ggml_tensor * rms, const ggml_t
         x->ne[0] % DSV4_HC_PRE_FUSED_THREADS == 0;
 }
 
+bool ggml_cuda_dsv4_hc_pre_apply_supported(const ggml_tensor * params, const ggml_tensor * hc_pre) {
+    const ggml_tensor * x   = hc_pre->src[0];
+    const ggml_tensor * pre = hc_pre->src[1];
+    return hc_pre->op == GGML_OP_DSV4_HC_PRE && ggml_get_op_params_i32(hc_pre, 1) == 0 &&
+        hc_pre->type == GGML_TYPE_F32 && x->type == GGML_TYPE_F32 &&
+        pre->view_src == params && pre->view_offs == 0 && pre->nb[0] == params->nb[0] && pre->nb[1] == params->nb[1] &&
+        pre->ne[0] == DSV4_HC && pre->ne[1] == params->ne[1] &&
+        x->ne[1] == DSV4_HC && x->ne[2] == params->ne[1] && x->ne[3] == 1 &&
+        hc_pre->ne[0] == x->ne[0] && hc_pre->ne[1] == x->ne[2];
+}
+
 void ggml_cuda_op_dsv4_hc_pre_fused(ggml_backend_cuda_context & ctx,
-        const ggml_tensor * rms, const ggml_tensor * mm, ggml_tensor * params) {
+        const ggml_tensor * rms, const ggml_tensor * mm, ggml_tensor * params, ggml_tensor * hc_pre) {
     const ggml_tensor * x     = rms->src[0];
     const ggml_tensor * w     = mm->src[0];
     const ggml_tensor * scale = params->src[1];
@@ -281,7 +393,8 @@ void ggml_cuda_op_dsv4_hc_pre_fused(ggml_backend_cuda_context & ctx,
 
     const int64_t k  = x->ne[0];
     const int     nt = (int) x->ne[1];
-    const int nblocks = (int) std::min<int64_t>(DSV4_HC_PRE_FUSED_MAX_BLOCKS, k/DSV4_HC_PRE_FUSED_THREADS);
+    // at least two blocks: with apply, the last block computes params while the others mix
+    const int nblocks = (int) std::max<int64_t>(2, std::min<int64_t>(DSV4_HC_PRE_FUSED_MAX_BLOCKS, k/DSV4_HC_PRE_FUSED_K_PER_BLOCK));
 
     ggml_cuda_pool_alloc<float> partials(ctx.pool(), size_t(nblocks)*nt*(DSV4_HC_MIX + 1));
 
@@ -289,16 +402,30 @@ void ggml_cuda_op_dsv4_hc_pre_fused(ggml_backend_cuda_context & ctx,
     const float eps     = ggml_get_op_params_f32(params, 0);
     const int32_t n_iter = ggml_get_op_params_i32(params, 1);
 
+    dsv4_hc_pre_apply_args ap = {};
+    if (hc_pre) {
+        const ggml_tensor * hx = hc_pre->src[0];
+        ap.x      = (const float *) hx->data;
+        ap.dst    = (float *) hc_pre->data;
+        ap.n_embd = hx->ne[0];
+        ap.sx0    = hx->nb[0]/sizeof(float);
+        ap.sx1    = hx->nb[1]/sizeof(float);
+        ap.sx2    = hx->nb[2]/sizeof(float);
+        ap.sd0    = hc_pre->nb[0]/sizeof(float);
+        ap.sd1    = hc_pre->nb[1]/sizeof(float);
+        ap.scale  = ggml_get_op_params_f32(hc_pre, 0);
+    }
+
     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(
             dim3(nblocks, 1, 1), dim3(DSV4_HC_PRE_FUSED_THREADS, 1, 1), 0, ctx.stream());
 
 #define DSV4_HC_PRE_FUSED_LAUNCH(NT) \
-    ggml_cuda_kernel_launch(dsv4_hc_pre_fused_f32<NT>, launch_params, \
+    ggml_cuda_kernel_launch(hc_pre ? dsv4_hc_pre_fused_f32<NT, true> : dsv4_hc_pre_fused_f32<NT, false>, launch_params, \
             (const float *) x->data, (const float *) w->data, (const float *) scale->data, \
             (const float *) base->data, partials.get(), (float *) params->data, k, \
             int64_t(x->nb[1]/sizeof(float)), int64_t(w->nb[1]/sizeof(float)), \
             int64_t(scale->nb[0]/sizeof(float)), int64_t(base->nb[0]/sizeof(float)), \
-            int64_t(params->nb[1]/sizeof(float)), rms_eps, eps, n_iter)
+            int64_t(params->nb[1]/sizeof(float)), rms_eps, eps, n_iter, ap)
     switch (nt) {
         case 1: DSV4_HC_PRE_FUSED_LAUNCH(1); break;
         case 2: DSV4_HC_PRE_FUSED_LAUNCH(2); break;
