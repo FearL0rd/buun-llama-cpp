@@ -6513,7 +6513,8 @@ static int ggml_cuda_try_fuse_sel_mask(ggml_backend_cuda_context & ctx, ggml_cgr
             view->nb[0] != ts || view->nb[1] != fill->nb[2] ||
             add->type != fill->type || mask->type != fill->type || !ggml_are_same_shape(add, view) ||
             !ggml_are_same_shape(mask, add) || mask->nb[0] != ts || add->nb[0] != ts ||
-            ggml_cuda_tensors_overlap(add, mask)) {
+            (ggml_cuda_tensors_overlap(add, mask) && (add->data != mask->data || add->nb[1] != mask->nb[1])) ||
+            sc[0].n + (n_sc > 1 ? sc[1].n : 0) > SEL_MASK_MAX_SLOTS) {
         return 0;
     }
     for (int k = 0; k < n_sc; ++k) {
