@@ -5681,6 +5681,44 @@ struct test_gated_delta_net_norm : public test_gated_delta_net {
     }
 };
 
+// GLM KDA order: separate Q/K/V convolutions (SiLU outputs) computed first, so the
+// Q/K inputs are dead after their norms unless the deferred-norm GDN keeps them.
+struct test_gated_delta_net_norm_split : public test_gated_delta_net {
+    bool run_whole_graph() override { return true; }
+
+    test_gated_delta_net_norm_split(int64_t tokens, bool kda)
+        : test_gated_delta_net(GGML_TYPE_F32, 4, 128, tokens, 1, 1, false, kda, 1) {}
+
+    std::string vars() override {
+        return test_gated_delta_net::vars() + ",split_conv=1";
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const auto conv = [&](const char * name) {
+            ggml_tensor * x = ggml_new_tensor_2d(ctx, type, head_size*head_count, n_seq_tokens);
+            ggml_set_name(x, name);
+            ggml_tensor * y = ggml_silu(ctx, x);
+            ggml_build_forward_expand(gf, y);
+            return ggml_reshape_4d(ctx, y, head_size, head_count, n_seq_tokens, 1);
+        };
+        const auto norm = [&](ggml_tensor * x) {
+            return ggml_scale(ctx, ggml_rms_norm(ctx, x, 1e-6f/head_size), 1.0f/sqrtf(float(head_size)));
+        };
+        ggml_tensor * q = conv("xq");
+        ggml_tensor * k = conv("xk");
+        ggml_tensor * v = conv("v");
+        q = norm(q);
+        k = norm(k);
+        ggml_tensor * g = ggml_new_tensor_4d(ctx, type, kda ? head_size : 1, head_count, n_seq_tokens, 1);
+        ggml_tensor * beta = ggml_new_tensor_4d(ctx, type, 1, head_count, n_seq_tokens, 1);
+        ggml_tensor * state = ggml_new_tensor_4d(ctx, type, head_size, head_size, head_count, 1);
+        ggml_set_name(g, "g");
+        ggml_set_name(beta, "beta");
+        ggml_set_name(state, "state");
+        return ggml_gated_delta_net(ctx, q, k, v, g, beta, state, K);
+    }
+};
+
 // GGML_OP_GATED_DELTA_NET + GGML_OP_CPY (recurrent cache fusion)
 struct test_gated_delta_net_cache_fusion : public test_case {
     const ggml_type type;
@@ -14198,6 +14236,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     for (int64_t tokens : {1, 4}) {
         for (bool deferred : {false, true}) {
             test_cases.emplace_back(new test_gated_delta_net_norm(tokens, 1e-4f, deferred, 128, 0.75f));
+        }
+    }
+    for (int64_t tokens : {1, 4}) {
+        for (bool kda : {false, true}) {
+            test_cases.emplace_back(new test_gated_delta_net_norm_split(tokens, kda));
         }
     }
 

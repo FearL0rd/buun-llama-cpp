@@ -6657,8 +6657,12 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 node->type == GGML_TYPE_F32 && k_rms->type == GGML_TYPE_F32 &&
                 ggml_cuda_check_fusion_memory_ranges(cgraph, i, norm_nodes, outputs, 2);
         }
-        const bool valid = chain_valid && k_view->op == GGML_OP_VIEW && k_input == k_view && q_view && q_view->op == GGML_OP_VIEW &&
-            q_view->view_src && k_view->view_src == q_view->view_src &&
+        // Q and K are views of one shared convolution (Qwen) or reshapes of
+        // separate ones (GLM KDA).
+        const auto is_norm_input = [](const ggml_tensor * t) {
+            return t && (t->op == GGML_OP_VIEW || t->op == GGML_OP_RESHAPE) && t->view_src;
+        };
+        const bool valid = chain_valid && is_norm_input(k_view) && k_input == k_view && is_norm_input(q_view) &&
             q_view->type == GGML_TYPE_F32 && k_view->type == GGML_TYPE_F32 &&
             q_norm->type == GGML_TYPE_F32 && k_norm->type == GGML_TYPE_F32 &&
             ggml_are_same_shape(q_view, k_view) && ggml_are_same_shape(q_norm, k_norm) &&
@@ -6685,8 +6689,19 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                     }
                     const ggml_tensor * v = gdn->src[2];
                     const bool same_conv = v && v->op == GGML_OP_VIEW &&
-                        v->view_src == q_view->view_src;
-                    const bool supported = same_conv &&
+                        k_view->view_src == q_view->view_src && v->view_src == q_view->view_src;
+                    // Separate Q/K convolutions are otherwise dead after their norms;
+                    // deferral needs every node executed up to the GDN to leave them intact.
+                    bool live = same_conv;
+                    if (!same_conv && k_view->view_src != q_view->view_src) {
+                        live = true;
+                        for (int m = i + norm_nodes; live && m <= j; ++m) {
+                            const ggml_tensor * t = cgraph->nodes[m];
+                            live = ggml_cuda_is_view_or_noop(t) ||
+                                (!ggml_cuda_tensors_overlap(t, q_view) && !ggml_cuda_tensors_overlap(t, k_view));
+                        }
+                    }
+                    const bool supported = live &&
                         ggml_cuda_gdn_fla_ptx_supported(
                             ggml_cuda_info().devices[cuda_ctx->device].cc,
                             gdn->src[3]->ne[0] == v->ne[0],
@@ -6697,8 +6712,8 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                     // In a long recurrent batch each value column otherwise
                     // repeats the same Q/K norm at every token. Normalize once
                     // in the paired kernel; retain launch fusion for decode.
-                    const bool standard = (!gdn_rms || same_conv) &&
-                        gdn->src[3] && gdn->src[3]->ne[0] == 1 && v->ne[2] <= 16;
+                    const bool standard = (!gdn_rms || live) && gdn->src[3] &&
+                        (gdn->src[3]->ne[0] == 1 || gdn->src[3]->ne[0] == v->ne[0]) && v->ne[2] <= 16;
 #else
                     const bool standard = false;
 #endif
