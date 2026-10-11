@@ -1040,11 +1040,17 @@ static bool mul_mat_vec_f_try_short_rows(
         const int64_t nsamples_x, const int64_t nsamples_dst,
         const int64_t stride_sample_x, const int64_t stride_sample_y, const int64_t stride_sample_dst, cudaStream_t stream) {
     constexpr int64_t vals = 16/sizeof(T);
-    // Long rows already fill a block; few rows would leave most SMs idle with one warp per row.
+    // Long rows already fill a block; few rows (across all channels/samples) would leave most SMs idle
+    // with one warp per row.
     if (ids || fusion.gate || fusion.x_bias || fusion.gate_bias ||
-            ncols*(int64_t) sizeof(T) > 2048 || ncols % vals != 0 || nrows < 1024 ||
+            ncols*(int64_t) sizeof(T) > 2048 || ncols % vals != 0 || nrows*nchannels_dst*nsamples_dst < 1024 ||
             (uintptr_t) x % 16 != 0 || stride_row % vals != 0 || stride_channel_x % vals != 0 || stride_sample_x % vals != 0 ||
             (uintptr_t) y % 16 != 0 || stride_col_y % 4 != 0 || stride_channel_y % 4 != 0 || stride_sample_y % 4 != 0) {
+        return false;
+    }
+    // the kernel takes its strides, and the column offsets they scale, as int
+    if (std::max({stride_row, stride_channel_x, stride_sample_x, stride_channel_y, stride_sample_y,
+            stride_channel_dst, stride_sample_dst, ncols_dst*stride_col_y, ncols_dst*stride_col_dst}) > INT_MAX) {
         return false;
     }
 #define MMVF_SHORT_ROWS_CASE(n) \

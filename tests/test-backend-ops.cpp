@@ -14791,6 +14791,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         test_cases.emplace_back(new test_dsv4_hc_pre_chain(4096, nt, 20, true, true));
     }
 
+    // GLM-5 MLA per-head absorb (q -> kv_lora) and v_mla (kv_lora -> v), 16 heads per device
+    for (int64_t nt : {1, 4}) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 256, nt, 512, {16, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 512, nt, 256, {16, 1}, {1, 1}));
+        // router matmul fused into the sigmoid gating
+        test_cases.emplace_back(new test_topk_moe({288, nt, 1, 1}, 8, true, true, GATING_FUNC_SIGMOID, 2.5f, 4096));
+    }
+
     // Qwen3.8-Flash-Next decode shape: 512 experts, top-10, hidden 2560, expert width 640.
     // up/gate (k=2560) for every type; down (k=640) only for block-32/64 types (K-quants need k % 256 == 0).
     for (ggml_type type : {GGML_TYPE_Q4_K, GGML_TYPE_Q4_1, GGML_TYPE_Q4_0, GGML_TYPE_Q5_1, GGML_TYPE_Q8_0, GGML_TYPE_MXFP4, GGML_TYPE_NVFP4}) {
