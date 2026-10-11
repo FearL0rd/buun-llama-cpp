@@ -426,6 +426,17 @@ static __global__ void dsv4_hc_pre_fused_f32(
     }
     __threadfence();
 
+    // the params scale and base, loaded now so their latency hides under the partials round trip
+    constexpr int nscale = 3; // pre, post, comb
+    constexpr int nsb = nscale + DSV4_HC_MIX;
+    static_assert(nsb <= nwarps*WARP_SIZE, "a thread per params weight");
+    float sbv = 0.0f;
+    if (threadIdx.x < nscale) {
+        sbv = scale[threadIdx.x*ss0];
+    } else if (threadIdx.x < nsb) {
+        sbv = base[(threadIdx.x - nscale)*sb0];
+    }
+
     // warp w sums partial rows w, w + nwarps, ...; lane a owns accumulator a, so the loads coalesce
     // and no shuffles are needed
     // a single token takes two accumulators per lane per pass, so its partials load in one round; more
@@ -466,19 +477,32 @@ static __global__ void dsv4_hc_pre_fused_f32(
         }
         mixes[a] = v;
     }
+    __shared__ float scale_base[nsb];
+    if (threadIdx.x < nsb) {
+        scale_base[threadIdx.x] = sbv;
+    }
     __syncthreads();
 
-    // one warp per token: pre/post first so the waiting blocks can start, then the sinkhorn
+    // one warp per token: pre/post first so the waiting blocks can start, then the sinkhorn. A single token
+    // runs its sinkhorn on the second warp instead, alongside pre/post; each warp scales the mixes it reads.
     static_assert(n_tokens <= nwarps, "one warp per token");
-    const int t = warp;
+    constexpr bool comb_apart = n_tokens == 1;
+    static_assert(!comb_apart || nwarps >= 2, "the sinkhorn needs its own warp");
+    const int t = comb_apart ? 0 : warp;
+    const bool pre_warp  = warp < n_tokens;
+    const bool comb_warp = comb_apart ? warp == 1 : pre_warp;
     float * m = mixes + t*nmix;
-    if (t < n_tokens) {
+    if (pre_warp || comb_warp) {
         const float rs = rsqrtf(m[DSV4_HC_MIX]/k + rms_eps);
-        if (lane < DSV4_HC_MIX) {
+        const int lo = pre_warp  ? 0           : 2*DSV4_HC;
+        const int hi = comb_warp ? DSV4_HC_MIX : 2*DSV4_HC;
+        if (lane >= lo && lane < hi) {
             m[lane] *= rs;
         }
         __syncwarp();
-        const float p = dsv4_hc_params_pre_post(m, scale, base, dst + t*sd1, 1, ss0, sb0, 1, eps);
+    }
+    if (pre_warp) {
+        const float p = dsv4_hc_params_pre_post(m, scale_base, scale_base + nscale, dst + t*sd1, 1, 1, 1, 1, eps);
         if constexpr (norm) {
             // sum(y^2) = scale^2 pre^T G pre over the stored upper triangle of G
             float pre[DSV4_HC];
@@ -502,14 +526,19 @@ static __global__ void dsv4_hc_pre_fused_f32(
         }
     }
     if constexpr (apply) {
-        __syncthreads();
+        // with comb_apart only warp 0 wrote what is published, so the sinkhorn warp starts without waiting on it
+        if constexpr (comb_apart) {
+            __syncwarp();
+        } else {
+            __syncthreads();
+        }
         if (threadIdx.x == 0) {
             __threadfence();
             atomicExch(launch_epoch, epoch + 1);
         }
     }
-    if (t < n_tokens) {
-        dsv4_hc_params_comb(m, scale, base, dst + t*sd1, 1, ss0, sb0, 1, eps, n_iter);
+    if (comb_warp) {
+        dsv4_hc_params_comb(m, scale_base, scale_base + nscale, dst + t*sd1, 1, 1, 1, 1, eps, n_iter);
     }
 }
 
