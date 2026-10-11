@@ -1692,12 +1692,15 @@ static __global__ void moe_cache_route_apply(const moe_cache_route_batch batch) 
 }
 
 static std::mutex g_route_mu;
-static std::unordered_map<const void *, ggml_moe_cache_route_table> g_routes;
+// one table per device: under tensor split every device routes the same host
+// experts through its own table, which another device cannot read
+static std::unordered_map<const void *, ggml_moe_cache_route_table> g_routes[GGML_CUDA_MAX_DEVICES];
 
 bool ggml_moe_cache_route_find(const void * host_base, ggml_moe_cache_route_table & route) {
+    const int device = ggml_cuda_get_device();
     std::lock_guard<std::mutex> lock(g_route_mu);
-    auto found = g_routes.find(host_base);
-    if (found == g_routes.end()) {
+    auto found = g_routes[device].find(host_base);
+    if (found == g_routes[device].end()) {
         return false;
     }
     route = found->second;
@@ -1821,7 +1824,7 @@ static void moe_cache_route_destroy(moe_cache_device & device) {
     {
         std::lock_guard<std::mutex> lock(g_route_mu);
         for (auto & entry : device.routes) {
-            g_routes.erase(entry.first);
+            g_routes[device.physical].erase(entry.first);
         }
     }
     for (auto & entry : device.routes) {
@@ -4260,7 +4263,7 @@ static bool moe_cache_route_register(
     }
     bool claimed;
     {
-        // g_routes is keyed by host address alone: weights another session routes stay its own
+        // weights another session routes on this device stay its own
         std::lock_guard<std::mutex> lock(g_route_mu);
         ggml_moe_cache_route_table entry;
         entry.table = route->table;
@@ -4270,7 +4273,7 @@ static bool moe_cache_route_register(
             entry.scales[0] = route->d_scales;
             entry.scales[1] = route->d_scales + ggml_nbytes(op->src[3]);
         }
-        claimed = g_routes.emplace(route->host_base, entry).second;
+        claimed = g_routes[device.physical].emplace(route->host_base, entry).second;
     }
     if (!claimed) {
         // freed outside g_route_mu: cudaFree may wait on a replay whose reduction needs the share's lock
@@ -6124,7 +6127,7 @@ static void moe_cache_invalidate_session(
                     (size_t)route.n_expert * route.expert_size, base, size)) {
                 {
                     std::lock_guard<std::mutex> route_lock(g_route_mu);
-                    g_routes.erase(it->first);
+                    g_routes[device.physical].erase(it->first);
                 }
                 device.retired_routes.push_back(std::move(it->second));
                 it = device.routes.erase(it);

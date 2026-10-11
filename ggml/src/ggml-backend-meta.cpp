@@ -2932,6 +2932,14 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
         // captures on its own stream, so the recording threads are independent too.
         std::vector<ggml_status> status_j(n_backends, GGML_STATUS_SUCCESS);
 
+        // A backend's compute only waits on the async input uploads of its calling thread, and the inputs
+        // were uploaded from this one; a capture already ordered them before it began.
+        if (!capturing && backend_ctx->step_wait_uploads != nullptr) {
+            for (size_t j = 0; j < n_backends; j++) {
+                backend_ctx->step_wait_uploads(backend_ctx->backend_configs[j].backend);
+            }
+        }
+
         // Persistent issuer threads:
         // device j's thread enqueues subgraph i and then its own rank's part of reduce i, back to back over all
         // subgraphs — the one-shot reduce synchronizes the ranks on-device, so there is no thread spawn/join per
