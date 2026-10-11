@@ -216,11 +216,50 @@ static __device__ __forceinline__ float4 ar1_ld_line(const float4 * p) {
     return v;
 }
 
+// Weights the next subgraph reads first, prefetched into L2 by the LL kernel while it waits for its peers: in
+// decode those small weights were evicted by the layer's large matmuls and would otherwise be read from DRAM by
+// a latency-bound kernel right after the reduce.
+static constexpr int AR1_PF_MAX   = 4;
+static constexpr int AR1_PF_NODES = 8;
+struct ar1_prefetch {
+    const char * p[AR1_PF_MAX];
+    int64_t      bytes[AR1_PF_MAX];
+};
+
+// the device weights read by the first AR1_PF_NODES nodes of `next`, up to the first one that exceeds `budget`
+// (a larger weight streams through L2 and would evict the rest before use)
+static ar1_prefetch ar1_prefetch_plan(const ggml_cgraph * next, size_t budget) {
+    ar1_prefetch pf = {};
+    if (next == nullptr) {
+        return pf;
+    }
+    int n = 0;
+    for (int i = 0; i < next->n_nodes && i < AR1_PF_NODES && n < AR1_PF_MAX; i++) {
+        for (int s = 0; s < GGML_MAX_SRC && n < AR1_PF_MAX; s++) {
+            const ggml_tensor * w = next->nodes[i]->src[s];
+            if (w == nullptr || w->buffer == nullptr || ggml_backend_buffer_is_host(w->buffer) ||
+                    ggml_backend_buffer_get_usage(w->buffer) != GGML_BACKEND_BUFFER_USAGE_WEIGHTS ||
+                    std::find(pf.p, pf.p + n, (const char *) w->data) != pf.p + n) {
+                continue;
+            }
+            const size_t bytes = ggml_nbytes(w);
+            if (bytes > budget) {
+                return pf;
+            }
+            budget -= bytes;
+            pf.p[n]     = (const char *) w->data;
+            pf.bytes[n] = (int64_t) bytes;
+            n++;
+        }
+    }
+    return pf;
+}
+
 // grid-strided over lines: a thread owns the floats of its lines, so it publishes, reduces and overwrites them
 // without any barrier
 static __global__ void __launch_bounds__(AR1_LL_THREADS)
 k_ar1_ll(float * __restrict__ dst, int * state, const ar1_bases bases, const size_t max_bytes,
-        const int n_ranks, const int rank, const int n, const int active) {
+        const int n_ranks, const int rank, const int n, const int active, const ar1_prefetch pf) {
 #if __CUDA_ARCH__ >= GGML_CUDA_CC_VOLTA
     __shared__ int s_token;
     if (threadIdx.x == 0) {
@@ -245,6 +284,11 @@ k_ar1_ll(float * __restrict__ dst, int * state, const ar1_bases bases, const siz
             v[k] = active && 3 * l + k < n ? dst[3 * l + k] : 0.0f;
         }
         ar1_st_line(mine + l, make_float4(v[0], v[1], v[2], tag));
+    }
+    // after publishing, so the prefetches do not delay the peers
+#pragma unroll
+    for (int j = 0; j < AR1_PF_MAX; j++) {
+        ggml_cuda_prefetch_l2(pf.p[j], pf.bytes[j]);
     }
     for (int l = t0; l < nl; l += nt) {
         float4 o[AR1_LL_MAX_RANKS];
@@ -275,7 +319,7 @@ k_ar1_ll(float * __restrict__ dst, int * state, const ar1_bases bases, const siz
         }
     }
 #else
-    GGML_UNUSED_VARS(dst, state, bases, max_bytes, n_ranks, rank, n, active);
+    GGML_UNUSED_VARS(dst, state, bases, max_bytes, n_ranks, rank, n, active, pf);
     NO_DEVICE_CODE;
 #endif
 }
@@ -681,7 +725,8 @@ bool ggml_cuda_ar_oneshot_eligible(const ggml_cuda_ar_oneshot * st, ggml_tensor 
 
 // Every rank's launches go to that rank's own stream and the mode decisions depend only on the message, so
 // the ranks can be enqueued independently (one issuer thread per device); the kernels synchronize on-device.
-bool ggml_cuda_ar_oneshot_allreduce_rank(ggml_cuda_ar_oneshot * st, ggml_backend_t backend, ggml_tensor ** tensors, int rank) {
+bool ggml_cuda_ar_oneshot_allreduce_rank(ggml_cuda_ar_oneshot * st, ggml_backend_t backend, ggml_tensor ** tensors, int rank,
+        const ggml_cgraph * next) {
     const int n4 = (int) (ggml_nbytes(tensors[0]) / 16);
     // reduce-scatter mode from this message size on (GGML_CUDA_AR1_SCATTER=<bytes>, 0 = never)
     static const size_t scatter_from = getenv("GGML_CUDA_AR1_SCATTER") != nullptr ? (size_t) atoll(getenv("GGML_CUDA_AR1_SCATTER")) : (size_t) 32 * 1024;
@@ -736,8 +781,11 @@ bool ggml_cuda_ar_oneshot_allreduce_rank(ggml_cuda_ar_oneshot * st, ggml_backend
                     st->data_bytes, st->max_bytes, st->n_ranks, i, n4);
             }
         } else if (ll) {
+            // half of L2 for the prefetch (GGML_CUDA_AR1_PREFETCH=0 disables it)
+            static const bool prefetch = getenv("GGML_CUDA_AR1_PREFETCH") == nullptr || atoi(getenv("GGML_CUDA_AR1_PREFETCH")) != 0;
             k_ar1_ll<<<AR1_LL_BLOCKS, AR1_LL_THREADS, 0, stream>>>(
-                (float *) tensors[i]->data, st->dev_state[i], bases, st->max_bytes, st->n_ranks, i, n, active);
+                (float *) tensors[i]->data, st->dev_state[i], bases, st->max_bytes, st->n_ranks, i, n, active,
+                ar1_prefetch_plan(prefetch ? next : nullptr, ggml_cuda_info().devices[st->devices[i]].l2_size / 2));
         } else {
             k_ar1_allreduce<<<1, AR1_THREADS, 0, stream>>>(
                 (float4 *) tensors[i]->data, st->dev_base[i], bases, st->dev_state[i],
@@ -750,7 +798,7 @@ bool ggml_cuda_ar_oneshot_allreduce_rank(ggml_cuda_ar_oneshot * st, ggml_backend
 
 bool ggml_cuda_ar_oneshot_allreduce(ggml_cuda_ar_oneshot * st, ggml_backend_t * backends, ggml_tensor ** tensors) {
     for (int i = 0; i < st->n_ranks; i++) {
-        ggml_cuda_ar_oneshot_allreduce_rank(st, backends[i], tensors, i);
+        ggml_cuda_ar_oneshot_allreduce_rank(st, backends[i], tensors, i, nullptr);
     }
     return true;
 }
@@ -763,6 +811,6 @@ ggml_cuda_ar_oneshot * ggml_cuda_ar_oneshot_init(const int *, size_t, size_t) { 
 void ggml_cuda_ar_oneshot_free(ggml_cuda_ar_oneshot *) {}
 bool ggml_cuda_ar_oneshot_eligible(const ggml_cuda_ar_oneshot *, ggml_tensor **) { return false; }
 bool ggml_cuda_ar_oneshot_allreduce(ggml_cuda_ar_oneshot *, ggml_backend_t *, ggml_tensor **) { return false; }
-bool ggml_cuda_ar_oneshot_allreduce_rank(ggml_cuda_ar_oneshot *, ggml_backend_t, ggml_tensor **, int) { return false; }
+bool ggml_cuda_ar_oneshot_allreduce_rank(ggml_cuda_ar_oneshot *, ggml_backend_t, ggml_tensor **, int, const ggml_cgraph *) { return false; }
 
 #endif

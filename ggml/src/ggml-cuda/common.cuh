@@ -160,6 +160,19 @@ static __device__ __forceinline__ void ggml_cuda_pdl_lc() {
 #endif // defined(GGML_CUDA_USE_PDL) && __CUDA_ARCH__ >= GGML_CUDA_CC_HOPPER
 }
 
+// Grid-strided L2 prefetch (evict_last) of n_bytes at p for a later kernel; a no-op before Ampere and on HIP/MUSA.
+static __device__ __forceinline__ void ggml_cuda_prefetch_l2(const char * p, const int64_t n_bytes) {
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= GGML_CUDA_CC_AMPERE
+    const int64_t stride = 128*(int64_t) gridDim.x*blockDim.x;
+    for (int64_t o = 128*((int64_t) blockIdx.x*blockDim.x + threadIdx.x); o < n_bytes; o += stride) {
+        asm volatile("prefetch.global.L2::evict_last [%0];" :: "l"(p + o));
+    }
+#else
+    GGML_UNUSED(p);
+    GGML_UNUSED(n_bytes);
+#endif
+}
+
 // Completion order of this block within the grid, after its global writes are visible device-wide:
 // the block that gets gridDim.x - 1 is the last one and may read every other block's results with __ldcg.
 // Every thread of the block must call it. atomicInc wraps the counter to 0 on the last block,
@@ -1283,7 +1296,8 @@ struct ggml_cuda_device_info {
         int     nsm;                            // number of streaming multiprocessors
         size_t  smpb;                           // max. shared memory per block
         size_t  smpbo;                          // max. shared memory per block (with opt-in)
-        bool    integrated;                     // Device is integrated as opposed to discrete
+        size_t  l2_size;                        // L2 cache size in bytes (of the physical GPU)
+        bool    integrated;                    // Device is integrated as opposed to discrete
         bool    vmm;                            // virtual memory support
         size_t  vmm_granularity;                // granularity of virtual memory
         size_t  total_vram;

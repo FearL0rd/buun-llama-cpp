@@ -2012,8 +2012,10 @@ struct ggml_backend_meta_context {
 
     void *                               comm_ctx       = nullptr;
     ggml_backend_comm_allreduce_tensor_t comm_allreduce = nullptr;
-    // optional per-rank enqueue (one issuer thread per device); returns false when the message needs the collective
-    typedef bool (*comm_allreduce_rank_t)(void * comm_ctx, struct ggml_tensor ** tensors, int rank);
+    // optional per-rank enqueue (one issuer thread per device); returns false when the message needs the collective.
+    // `next` is the rank's subgraph that follows the reduce (the backend may prefetch its weights); the proc name
+    // carries _v2 since `next` was added, so a core and a backend of mismatched versions fall back to the collective.
+    typedef bool (*comm_allreduce_rank_t)(void * comm_ctx, struct ggml_tensor ** tensors, int rank, const struct ggml_cgraph * next);
     comm_allreduce_rank_t comm_allreduce_rank = nullptr;
 
     // whole-step capture (see ggml_backend_step_*_t): one recorded device graph per backend per
@@ -2123,7 +2125,7 @@ struct ggml_backend_meta_context {
             GGML_ASSERT(comm_allreduce != nullptr);
             comm_allreduce_rank = (comm_allreduce_rank_t)
                 ggml_backend_reg_get_proc_address(ggml_backend_dev_backend_reg(
-                    ggml_backend_get_device(simple_backends[0])), "ggml_backend_comm_allreduce_tensor_rank");
+                    ggml_backend_get_device(simple_backends[0])), "ggml_backend_comm_allreduce_tensor_rank_v2");
 
             ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(simple_backends[0]));
             step_capturable    = (ggml_backend_step_capturable_t)    ggml_backend_reg_get_proc_address(reg, "ggml_backend_step_capturable");
@@ -3009,7 +3011,8 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                     barrier_only();
                     if (i + 1 < n_sub) {
                         // the per-rank decision is a pure function of the message, so all threads take the same branch
-                        if (!backend_ctx->comm_allreduce_rank(backend_ctx->comm_ctx, boundary[i].data(), (int) j)) {
+                        if (!backend_ctx->comm_allreduce_rank(backend_ctx->comm_ctx, boundary[i].data(), (int) j,
+                                                              bcj.cgraphs[i + 1].cgraph_main)) {
                             rendezvous(i);
                         }
                     }

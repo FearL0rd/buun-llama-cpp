@@ -352,6 +352,7 @@ static ggml_cuda_device_info ggml_cuda_init() {
         info.devices[id].integrated = false; // Temporarily disabled due to issues with corrupted output (e.g. #15034)
         info.devices[id].nsm        = prop.multiProcessorCount;
         info.devices[id].smpb       = prop.sharedMemPerBlock;
+        info.devices[id].l2_size    = prop.l2CacheSize;
         info.devices[id].warp_size  = prop.warpSize;
 
         int supports_coop_launch = 0;
@@ -2094,7 +2095,8 @@ static bool ggml_backend_cuda_comm_allreduce_tensor(void * comm_ctx_v, struct gg
 
 // Per-rank enqueue of the one-shot all-reduce for concurrent issuer threads; false when this message needs a
 // collective (NCCL fallback), which the caller then issues from one thread for all ranks.
-static bool ggml_backend_cuda_comm_allreduce_tensor_rank(void * comm_ctx_v, struct ggml_tensor ** tensors, int rank) {
+static bool ggml_backend_cuda_comm_allreduce_tensor_rank(void * comm_ctx_v, struct ggml_tensor ** tensors, int rank,
+        const struct ggml_cgraph * next) {
     if (comm_ctx_v == nullptr) {
         return false;
     }
@@ -2102,7 +2104,7 @@ static bool ggml_backend_cuda_comm_allreduce_tensor_rank(void * comm_ctx_v, stru
     if (comm_ctx->oneshot == nullptr || !ggml_cuda_ar_oneshot_eligible(comm_ctx->oneshot, tensors)) {
         return false;
     }
-    return ggml_cuda_ar_oneshot_allreduce_rank(comm_ctx->oneshot, comm_ctx->backends[rank], tensors, rank);
+    return ggml_cuda_ar_oneshot_allreduce_rank(comm_ctx->oneshot, comm_ctx->backends[rank], tensors, rank, next);
 }
 
 // host buffer type
@@ -11342,7 +11344,7 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     if (strcmp(name, "ggml_backend_comm_allreduce_tensor") == 0) {
         return (void *)ggml_backend_cuda_comm_allreduce_tensor;
     }
-    if (strcmp(name, "ggml_backend_comm_allreduce_tensor_rank") == 0) {
+    if (strcmp(name, "ggml_backend_comm_allreduce_tensor_rank_v2") == 0) {
         return (void *)ggml_backend_cuda_comm_allreduce_tensor_rank;
     }
     if (strcmp(name, "ggml_backend_register_host_buffer") == 0) {

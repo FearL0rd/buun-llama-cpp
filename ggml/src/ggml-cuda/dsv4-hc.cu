@@ -1059,20 +1059,6 @@ static constexpr int DSV4_HC_MIX_DOWN_ROWS  = 8; // rows per block, sharing each
 static constexpr int DSV4_HC_MIX_UP_WARPS   = 8;
 static constexpr int DSV4_HC_MIX_UP_COLS    = 2; // output columns per warp; hc == 4 rows each
 
-// The down matvec does not saturate DRAM, so it also pulls the first half of the up weights
-// into L2 (the whole of them would not fit).
-static __device__ __forceinline__ void dsv4_hc_prefetch_l2(const char * p, const int64_t n_bytes) {
-#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= GGML_CUDA_CC_AMPERE
-    const int64_t stride = 128*(int64_t) gridDim.x*blockDim.x;
-    for (int64_t o = 128*((int64_t) blockIdx.x*blockDim.x + threadIdx.x); o < n_bytes; o += stride) {
-        asm volatile("prefetch.global.L2::evict_last [%0];" :: "l"(p + o));
-    }
-#else
-    GGML_UNUSED(p);
-    GGML_UNUSED(n_bytes);
-#endif
-}
-
 static __device__ __forceinline__ void dsv4_hc_bf16x8(const uint4 v, float * f) {
     const uint32_t u[4] = { v.x, v.y, v.z, v.w };
 #pragma unroll
@@ -1094,7 +1080,9 @@ static __global__ void dsv4_hc_mix_down_bf16(
     constexpr int W     = DSV4_HC_MIX_DOWN_WARPS;
     constexpr int R     = DSV4_HC_MIX_DOWN_ROWS;
     constexpr int parts = W/DSV4_HC;
-    dsv4_hc_prefetch_l2(pf, pf_bytes);
+    // the down matvec does not saturate DRAM, so it also pulls the first half of the up weights into L2
+    // (the whole of them would not fit)
+    ggml_cuda_prefetch_l2(pf, pf_bytes);
 
     const int warp   = threadIdx.x / WARP_SIZE;
     const int lane   = threadIdx.x % WARP_SIZE;
