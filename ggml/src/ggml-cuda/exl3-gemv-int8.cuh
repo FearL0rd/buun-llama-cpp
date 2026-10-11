@@ -409,6 +409,22 @@ __global__ void __launch_bounds__(THREADS) gemv_int8_kernel(const uint8_t * __re
         static_assert(M >= 3 && M <= 8 && bits == 6 && RESID && !GROUPED && !BUNDLE);
         prepared += size_t(k_block) * (HEADER_BYTES + NACC * nrows_max * 16);
     }
+    const uint32_t * B32 = reinterpret_cast<const uint32_t *>(B);
+    const int n_tiles = n / 16;
+#if !defined(GGML_USE_HIP)
+    // Start the weight stream into L2 before the input transform: each warp owns two
+    // tiles whose k range is contiguous (128 B per K4 slice), one line per half-warp lane.
+    // Measured on dense single-row decode only; MoE/bundle fills would evict each other.
+    if constexpr (WIDE && !WMMA && M == 1 && !GROUPED && !BUNDLE) {
+        const int nt = column_block * 16 + warp * 2 + (lane >> 4);
+        if (nt < n_tiles) {
+            const uint32_t * tile = B32 + (size_t(nt) * kslices + kb0) * TWORDS;
+            for (int kb = lq; kb < nrows; kb += 16) {
+                asm volatile("prefetch.global.L2 [%0];" :: "l"(tile + size_t(kb) * TWORDS));
+            }
+        }
+    }
+#endif
 
     // input transform of this block's own k range (128-aligned: nrows % 8 == 0): xh = had128(x * suh) / sqrt(128),
     // F16 in smem, with the per-slice max |xh| per row
@@ -536,9 +552,7 @@ __global__ void __launch_bounds__(THREADS) gemv_int8_kernel(const uint8_t * __re
     const float k_inv = __half2float(__ushort_as_half(0x1eee));
     const float bias  = __half2float(__ushort_as_half(0xc931));
     const float cbias = 1024.0f * k_inv + bias;
-    const uint32_t * B32 = reinterpret_cast<const uint32_t *>(B);
 
-    const int n_tiles = n / 16;
     if constexpr (WMMA) {
         static_assert(bits >= 2 && bits <= 6 && NACC <= 16);
         const int nt = column_block * 16 + warp * 2;
