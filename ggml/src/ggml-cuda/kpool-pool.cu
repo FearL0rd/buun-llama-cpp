@@ -13,6 +13,10 @@ static __global__ void kpool_pool(
     }
 
     for (int64_t n = blockIdx.y; n < n_pool; n += gridDim.y) {
+        const int64_t row = rows ? rows[n] : n;
+        if (row < 0) {
+            continue; // as in SET_ROWS
+        }
         const float * g = gate + n*s_g2 + d;
         const float * k = key  + n*s_k2 + d;
         const float * a = ape  + d;
@@ -30,7 +34,7 @@ static __global__ void kpool_pool(
             acc += e*k[i*s_k1];
         }
 
-        dst[(rows ? rows[n] : n)*s_d + d] = ggml_cuda_cast<dst_t>(acc/sum);
+        dst[row*s_d + d] =ggml_cuda_cast<dst_t>(acc/sum);
     }
 }
 

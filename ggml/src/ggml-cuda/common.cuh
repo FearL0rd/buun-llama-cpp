@@ -405,6 +405,12 @@ static bool ggml_cuda_is_aligned(const ggml_tensor * tensor, const size_t alignm
            tensor->nb[3] % alignment == 0;
 }
 
+// t is s, or a contiguous view of all of s at offset 0 (a reshape)
+static bool ggml_cuda_is_whole_reshape(const ggml_tensor * t, const ggml_tensor * s) {
+    return t == s || (t->view_src == s && t->view_offs == 0 && ggml_is_contiguous(t) &&
+        ggml_nelements(t) == ggml_nelements(s));
+}
+
 static constexpr __device__ int ggml_cuda_get_physical_warp_size() {
 #if defined(GGML_USE_HIP) && (defined(__GFX9__) || defined(__GFX8__))
     return 64;

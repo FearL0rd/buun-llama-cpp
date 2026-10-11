@@ -820,7 +820,10 @@ bool ggml_cuda_exl3_moe_fused(ggml_backend_cuda_context & ctx, const ggml_tensor
                 return false;
             }
         }
-        if ((bs != bg && bs != 4) || sh_up->src[1] != sx || sx->data != x->data || sx->ne[1] != n_tok || sx->nb[1] != x->nb[2] ||
+        // same rows of the same tensor: equal addresses alone could be a reused buffer
+        const ggml_tensor * sroot = sx->view_src ? sx->view_src : sx;
+        const ggml_tensor * xroot = x->view_src ? x->view_src : x;
+        if ((bs != bg && bs != 4) || sh_up->src[1] != sx || sroot != xroot || sx->data != x->data ||sx->ne[1] != n_tok || sx->nb[1] != x->nb[2] ||
                 sh_gate->src[0]->ne[0] != k1 || sh_gate->src[0]->ne[1] != n1 || !ggml_are_same_shape(sh_up->src[0], sh_gate->src[0]) ||
                 sh_down->src[0]->ne[0] != n1 || sh_down->src[0]->ne[1] != k1) {
             return false;
@@ -872,7 +875,6 @@ bool ggml_cuda_exl3_moe_fused(ggml_backend_cuda_context & ctx, const ggml_tensor
     a.w = static_cast<const float *>(weights->data);     a.w_nb1 = int(weights->nb[2] / sizeof(float));
     a.n_used = n_used;
     a.n_tok = n_tok;
-    a.n_shared = n_shared;
     a.pairs = pairs;
     a.limit = limit;
     a.out = dst_aliases_src ? out_tmp.get() : static_cast<float *>(dst->data);

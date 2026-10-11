@@ -4093,14 +4093,9 @@ struct test_kpool_pool : public test_case {
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
             if (t->type != GGML_TYPE_I64) {
                 init_tensor_uniform(t);
-                continue;
+            } else {
+                init_set_rows_row_ids(t, 2*n_pool);
             }
-            // distinct rows in reverse order
-            std::vector<int64_t> rows(n_pool);
-            for (int64_t n = 0; n < n_pool; ++n) {
-                rows[n] = 2*(n_pool - 1 - n);
-            }
-            ggml_backend_tensor_set(t, rows.data(), 0, n_pool*sizeof(int64_t));
         }
     }
 
@@ -4318,21 +4313,12 @@ struct test_set_rows_concat : public test_case {
     }
 
     void initialize_tensors(ggml_context * ctx) override {
-        std::mt19937 rng(1234);
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
             if (t->type != GGML_TYPE_I32 && t->type != GGML_TYPE_I64) {
                 init_tensor_uniform(t);
-                continue;
-            }
-            // distinct cells, so the scatter order does not matter
-            std::vector<int64_t> cells(n_cells);
-            std::iota(cells.begin(), cells.end(), 0);
-            std::shuffle(cells.begin(), cells.end(), rng);
-            if (t->type == GGML_TYPE_I64) {
-                ggml_backend_tensor_set(t, cells.data(), 0, n_rows*sizeof(int64_t));
             } else {
-                std::vector<int32_t> cells32(cells.begin(), cells.begin() + n_rows);
-                ggml_backend_tensor_set(t, cells32.data(), 0, n_rows*sizeof(int32_t));
+                // distinct cells, so the scatter order does not matter
+                init_set_rows_row_ids(t, n_cells);
             }
         }
     }

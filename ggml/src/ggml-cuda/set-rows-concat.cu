@@ -1,13 +1,17 @@
 #include "set-rows-concat.cuh"
 #include "convert.cuh"
 
-// one block per row
+// one block per row; negative rows are skipped, as in SET_ROWS
 template <typename idx_t, typename dst_t>
 static __global__ void set_rows_concat(const float * __restrict__ a, const float * __restrict__ b,
         const idx_t * __restrict__ idx, dst_t * __restrict__ dst, const int na, const int nb, const int ne0,
         const int64_t s_a, const int64_t s_b, const int64_t s_idx, const int64_t s_dst) {
-    const int64_t r = blockIdx.x;
-    dst_t * d = dst + int64_t(idx[r*s_idx])*s_dst;
+    const int64_t r   = blockIdx.x;
+    const int64_t row = idx[r*s_idx];
+    if (row < 0) {
+        return;
+    }
+    dst_t * d = dst + row*s_dst;
     for (int c = threadIdx.x; c < ne0; c += blockDim.x) {
         const float v = c < na ? a[r*s_a + c] : c < na + nb ? b[r*s_b + c - na] : 0.0f;
         d[c] = ggml_cuda_cast<dst_t>(v);
@@ -26,19 +30,13 @@ static void set_rows_concat_cuda(ggml_backend_cuda_context & ctx, const ggml_ten
     const idx_t * i_d = (const idx_t *) idx->data;
     const int64_t s_a = a->nb[1]/sizeof(float), s_b = b->nb[1]/sizeof(float);
     const int64_t s_i = idx->nb[0]/sizeof(idx_t), s_d = dst->nb[1]/ts;
+    const auto launch = [&](auto * d) {
+        set_rows_concat<<<n_rows, block, 0, ctx.stream()>>>(a_d, b_d, i_d, d, a->ne[0], b->ne[0], ne0, s_a, s_b, s_i, s_d);
+    };
     switch (dst->type) {
-        case GGML_TYPE_F32:
-            set_rows_concat<<<n_rows, block, 0, ctx.stream()>>>(a_d, b_d, i_d, (float *) dst->data,
-                a->ne[0], b->ne[0], ne0, s_a, s_b, s_i, s_d);
-            break;
-        case GGML_TYPE_F16:
-            set_rows_concat<<<n_rows, block, 0, ctx.stream()>>>(a_d, b_d, i_d, (half *) dst->data,
-                a->ne[0], b->ne[0], ne0, s_a, s_b, s_i, s_d);
-            break;
-        case GGML_TYPE_BF16:
-            set_rows_concat<<<n_rows, block, 0, ctx.stream()>>>(a_d, b_d, i_d, (nv_bfloat16 *) dst->data,
-                a->ne[0], b->ne[0], ne0, s_a, s_b, s_i, s_d);
-            break;
+        case GGML_TYPE_F32:  launch((float *)       dst->data); break;
+        case GGML_TYPE_F16:  launch((half *)        dst->data); break;
+        case GGML_TYPE_BF16: launch((nv_bfloat16 *) dst->data); break;
         default:
             GGML_ABORT("unsupported type");
     }

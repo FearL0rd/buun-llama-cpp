@@ -208,6 +208,7 @@ struct dsv4_hc_pre_apply_args {
 
 // DSV4_HC_POST with comb, producing the stream x of the fused hc_pre: dst[i0, ih, it] =
 // x[i0, it]*post[ih, it] + sum_isrc residual[i0, isrc, it]*comb[ih, isrc, it]
+// dst is contiguous and laid out like the stream, so it shares the stream's indexing
 struct dsv4_hc_post_fold_args {
     const float * x;
     const float * residual;
@@ -219,7 +220,6 @@ struct dsv4_hc_post_fold_args {
     int64_t sr0, sr1, sr2;
     int64_t sp0, sp1;
     int64_t sc0, sc1, sc2;
-    int64_t sd0, sd1, sd2;
 };
 
 // RMS_NORM -> MUL(w) of the DSV4_HC_PRE output into dst (contiguous rows)
@@ -263,7 +263,7 @@ static __global__ void dsv4_hc_pre_fused_f32(
                 for (int isrc = 0; isrc < DSV4_HC; ++isrc) {
                     xv += hp.residual[i0*hp.sr0 + isrc*hp.sr1 + t*hp.sr2] * hp.comb[ih*hp.sc0 + isrc*hp.sc1 + t*hp.sc2];
                 }
-                hp.dst[i0*hp.sd0 + ih*hp.sd1 + t*hp.sd2] = xv;
+                hp.dst[t*sx1 + i] = xv;
             } else {
                 xv = x[t*sx1 + i];
             }
@@ -320,6 +320,7 @@ static __global__ void dsv4_hc_pre_fused_f32(
             __syncthreads();
 
             const int64_t nr = ap.n_embd*n_tokens;
+            float ss[n_tokens] = {}; // norm: this thread's sum(x^2) per token
             for (int64_t ir = (int64_t) ticket*blockDim.x + threadIdx.x; ir < nr; ir += (int64_t) (gridDim.x - 1)*blockDim.x) {
                 const int64_t i0 = ir % ap.n_embd;
                 const int64_t it = ir / ap.n_embd;
@@ -336,21 +337,19 @@ static __global__ void dsv4_hc_pre_fused_f32(
                         sum += xv * wv;
                     }
                 }
-                ap.dst[i0*ap.sd0 + it*ap.sd1] = ap.scale * sum;
-            }
-
-            if constexpr (norm) {
-                // RMS_NORM -> MUL over each DSV4_HC_PRE output row: the waiters publish their sum(x^2) slices,
-                // meet at a second barrier, and each one scales the elements it wrote
-                float ss[n_tokens] = {};
-                for (int64_t ir = (int64_t) ticket*blockDim.x + threadIdx.x; ir < nr; ir += (int64_t) (gridDim.x - 1)*blockDim.x) {
-                    const int64_t it = ir / ap.n_embd;
-                    const float   v  = ap.dst[(ir % ap.n_embd)*ap.sd0 + it*ap.sd1];
+                const float v = ap.scale * sum;
+                ap.dst[i0*ap.sd0 + it*ap.sd1] = v;
+                if constexpr (norm) {
 #pragma unroll
                     for (int t = 0; t < n_tokens; ++t) {
                         ss[t] += t == it ? v*v : 0.0f;
                     }
                 }
+            }
+
+            if constexpr (norm) {
+                // RMS_NORM -> MUL over each DSV4_HC_PRE output row: the waiters publish their sum(x^2) slices,
+                // meet at a second barrier, and each one scales the elements it wrote
 #pragma unroll
                 for (int t = 0; t < n_tokens; ++t) {
                     const float v = warp_reduce_sum(ss[t]);
@@ -483,8 +482,7 @@ bool ggml_cuda_dsv4_hc_post_fold_supported(const ggml_tensor * hc_post, const gg
         hc_post->type == GGML_TYPE_F32 && hc_post->src[0]->type == GGML_TYPE_F32 && residual->type == GGML_TYPE_F32 &&
         hc_post->src[2]->type == GGML_TYPE_F32 && comb->type == GGML_TYPE_F32 &&
         residual->ne[1] == DSV4_HC && hc_post->ne[1] == DSV4_HC && ggml_is_contiguous(hc_post) &&
-        (x == hc_post || (x->view_src == hc_post && x->view_offs == 0)) && ggml_is_contiguous(x) &&
-        ggml_nelements(x) == ggml_nelements(hc_post) && x->ne[1] == hc_post->ne[2];
+        ggml_cuda_is_whole_reshape(x, hc_post) && x->ne[1] == hc_post->ne[2];
 }
 
 bool ggml_cuda_dsv4_hc_pre_norm_supported(const ggml_tensor * hc_pre, const ggml_tensor * rms, const ggml_tensor * mul) {
@@ -508,36 +506,41 @@ bool ggml_cuda_dsv4_hc_pre_apply_supported(const ggml_tensor * params, const ggm
         hc_pre->ne[0] == x->ne[0] && hc_pre->ne[1] == x->ne[2];
 }
 
-// the fewest co-resident blocks over the apply variants, so any of them can spin on the others
-template <int n_tokens>
-static int dsv4_hc_pre_fused_max_resident(int device) {
-    static int occ[GGML_CUDA_MAX_DEVICES] = {};
-    if (occ[device] == 0) {
-        const void * kernels[] = {
-            (const void *) dsv4_hc_pre_fused_f32<n_tokens, true, false, false>,
-            (const void *) dsv4_hc_pre_fused_f32<n_tokens, true, false, true>,
-            (const void *) dsv4_hc_pre_fused_f32<n_tokens, true, true, false>,
-            (const void *) dsv4_hc_pre_fused_f32<n_tokens, true, true, true>,
-        };
-        int occ_min = 0;
-        for (size_t i = 0; i < sizeof(kernels)/sizeof(kernels[0]); ++i) {
-            int o = 0;
-            CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&o, kernels[i], DSV4_HC_PRE_FUSED_THREADS, 0));
-            occ_min = i == 0 ? o : std::min(occ_min, o);
-        }
-        occ[device] = occ_min;
-    }
-    return occ[device] * ggml_cuda_info().devices[device].nsm;
+typedef void (*dsv4_hc_pre_fused_kernel_t)(
+        const float *, const float *, const float *, const float *, float *, float *, int64_t, int64_t, int64_t,
+        int64_t, int64_t, int64_t, float, float, int32_t, dsv4_hc_pre_apply_args, dsv4_hc_post_fold_args,
+        dsv4_hc_pre_norm_args);
+
+// indexed [apply][fold][norm]; norm needs apply
+template <int NT>
+static dsv4_hc_pre_fused_kernel_t dsv4_hc_pre_fused_kernel(bool apply, bool fold, bool norm) {
+    static const dsv4_hc_pre_fused_kernel_t kernels[2][2][2] = {
+        { { dsv4_hc_pre_fused_f32<NT, false, false, false>, nullptr },
+          { dsv4_hc_pre_fused_f32<NT, false, true,  false>, nullptr } },
+        { { dsv4_hc_pre_fused_f32<NT, true,  false, false>, dsv4_hc_pre_fused_f32<NT, true, false, true> },
+          { dsv4_hc_pre_fused_f32<NT, true,  true,  false>, dsv4_hc_pre_fused_f32<NT, true, true,  true> } },
+    };
+    return kernels[apply][fold][norm];
 }
 
-static int dsv4_hc_pre_fused_max_resident(int device, int n_tokens) {
+static dsv4_hc_pre_fused_kernel_t dsv4_hc_pre_fused_kernel(int n_tokens, bool apply, bool fold, bool norm) {
     switch (n_tokens) {
-        case 1: return dsv4_hc_pre_fused_max_resident<1>(device);
-        case 2: return dsv4_hc_pre_fused_max_resident<2>(device);
-        case 3: return dsv4_hc_pre_fused_max_resident<3>(device);
-        case 4: return dsv4_hc_pre_fused_max_resident<4>(device);
+        case 1: return dsv4_hc_pre_fused_kernel<1>(apply, fold, norm);
+        case 2: return dsv4_hc_pre_fused_kernel<2>(apply, fold, norm);
+        case 3: return dsv4_hc_pre_fused_kernel<3>(apply, fold, norm);
+        case 4: return dsv4_hc_pre_fused_kernel<4>(apply, fold, norm);
         default: GGML_ABORT("unsupported token count");
     }
+}
+
+// co-resident blocks of an apply kernel, whose mixing blocks spin until the last block publishes
+static int dsv4_hc_pre_fused_max_resident(int device, dsv4_hc_pre_fused_kernel_t kernel, int n_tokens, bool fold, bool norm) {
+    static int occ[GGML_CUDA_MAX_DEVICES][DSV4_HC_PRE_FUSED_MAX_TOKENS][2][2] = {};
+    int & o = occ[device][n_tokens - 1][fold][norm];
+    if (o == 0) {
+        CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&o, (const void *) kernel, DSV4_HC_PRE_FUSED_THREADS, 0));
+    }
+    return o * ggml_cuda_info().devices[device].nsm;
 }
 
 void ggml_cuda_op_dsv4_hc_pre_fused(ggml_backend_cuda_context & ctx,
@@ -551,15 +554,15 @@ void ggml_cuda_op_dsv4_hc_pre_fused(ggml_backend_cuda_context & ctx,
 
     const int64_t k  = x->ne[0];
     const int     nt = (int) x->ne[1];
+    const dsv4_hc_pre_fused_kernel_t kernel = dsv4_hc_pre_fused_kernel(nt, hc_pre, hc_post, norm);
     // at least two blocks: with apply, the last block computes params while the others mix
     int nblocks = (int) std::max<int64_t>(2, std::min<int64_t>(DSV4_HC_PRE_FUSED_MAX_BLOCKS, k/DSV4_HC_PRE_FUSED_K_PER_BLOCK));
     if (hc_pre) {
-        // the mixing blocks spin until the last block publishes, so every block must be resident at once
-        nblocks = std::min(nblocks, dsv4_hc_pre_fused_max_resident(ctx.device, nt));
+        nblocks = std::min(nblocks, dsv4_hc_pre_fused_max_resident(ctx.device, kernel, nt, hc_post, norm));
     }
 
     // the norm's sum(x^2) slices follow the mix partials
-    ggml_cuda_pool_alloc<float> partials(ctx.pool(), size_t(nblocks)*nt*(DSV4_HC_MIX + 2));
+    ggml_cuda_pool_alloc<float> partials(ctx.pool(), size_t(nblocks)*nt*(DSV4_HC_MIX + (norm ? 2 : 1)));
 
     const float rms_eps = ggml_get_op_params_f32(rms, 0);
     const float eps     = ggml_get_op_params_f32(params, 0);
@@ -595,12 +598,11 @@ void ggml_cuda_op_dsv4_hc_pre_fused(ggml_backend_cuda_context & ctx,
         hp.sr0 = pr->nb[0]/sizeof(float); hp.sr1 = pr->nb[1]/sizeof(float); hp.sr2 = pr->nb[2]/sizeof(float);
         hp.sp0 = pp->nb[0]/sizeof(float); hp.sp1 = pp->nb[1]/sizeof(float);
         hp.sc0 = pc->nb[0]/sizeof(float); hp.sc1 = pc->nb[1]/sizeof(float); hp.sc2 = pc->nb[2]/sizeof(float);
-        hp.sd0 = hc_post->nb[0]/sizeof(float); hp.sd1 = hc_post->nb[1]/sizeof(float); hp.sd2 = hc_post->nb[2]/sizeof(float);
     }
 
     dsv4_hc_pre_norm_args np = {};
     if (norm) {
-        const bool rms_first = norm->src[0]->op == GGML_OP_RMS_NORM;
+        const bool rms_first = norm->src[0]->op == GGML_OP_RMS_NORM && norm->src[0]->src[0] == hc_pre;
         np.w        = (const float *) norm->src[rms_first ? 1 : 0]->data;
         np.dst      = (float *) norm->data;
         np.partials = partials.get() + size_t(nblocks)*nt*(DSV4_HC_MIX + 1);
@@ -611,24 +613,12 @@ void ggml_cuda_op_dsv4_hc_pre_fused(ggml_backend_cuda_context & ctx,
     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(
             dim3(nblocks, 1, 1), dim3(DSV4_HC_PRE_FUSED_THREADS, 1, 1), 0, ctx.stream());
 
-#define DSV4_HC_PRE_FUSED_LAUNCH(NT) \
-    ggml_cuda_kernel_launch( \
-            !hc_pre ? (hc_post ? dsv4_hc_pre_fused_f32<NT, false, true, false> : dsv4_hc_pre_fused_f32<NT, false, false, false>) : \
-            norm    ? (hc_post ? dsv4_hc_pre_fused_f32<NT, true, true, true>   : dsv4_hc_pre_fused_f32<NT, true, false, true>) : \
-                      (hc_post ? dsv4_hc_pre_fused_f32<NT, true, true, false>  : dsv4_hc_pre_fused_f32<NT, true, false, false>), launch_params, \
-            (const float *) x->data, (const float *) w->data, (const float *) scale->data, \
-            (const float *) base->data, partials.get(), (float *) params->data, k, \
-            int64_t(x->nb[1]/sizeof(float)), int64_t(w->nb[1]/sizeof(float)), \
-            int64_t(scale->nb[0]/sizeof(float)), int64_t(base->nb[0]/sizeof(float)), \
-            int64_t(params->nb[1]/sizeof(float)), rms_eps, eps, n_iter, ap, hp, np)
-    switch (nt) {
-        case 1: DSV4_HC_PRE_FUSED_LAUNCH(1); break;
-        case 2: DSV4_HC_PRE_FUSED_LAUNCH(2); break;
-        case 3: DSV4_HC_PRE_FUSED_LAUNCH(3); break;
-        case 4: DSV4_HC_PRE_FUSED_LAUNCH(4); break;
-        default: GGML_ABORT("unsupported token count");
-    }
-#undef DSV4_HC_PRE_FUSED_LAUNCH
+    ggml_cuda_kernel_launch(kernel, launch_params,
+            (const float *) x->data, (const float *) w->data, (const float *) scale->data,
+            (const float *) base->data, partials.get(), (float *) params->data, k,
+            int64_t(x->nb[1]/sizeof(float)), int64_t(w->nb[1]/sizeof(float)),
+            int64_t(scale->nb[0]/sizeof(float)), int64_t(base->nb[0]/sizeof(float)),
+            int64_t(params->nb[1]/sizeof(float)), rms_eps, eps, n_iter, ap, hp, np);
 }
 
 static __global__ void dsv4_hc_comb_f32(

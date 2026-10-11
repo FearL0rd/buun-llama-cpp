@@ -11,10 +11,12 @@ static __global__ void sel_mask_f(T * dst, const T * mask, const int64_t n_kv, c
     const int64_t t = blockIdx.x;
     T       * d = dst  + t*s_dst;
     const T * m = mask + t*s_mask;
+    const sel_mask_scatter scs[2] = { sc0, sc1 };
+    const int              off[2] = { 0, sc0.n };
 
     for (int k = 0; k < 2; ++k) {
-        const sel_mask_scatter & sc = k == 0 ? sc0 : sc1;
-        float * sm = smask + (k == 0 ? 0 : sc0.n);
+        const sel_mask_scatter & sc = scs[k];
+        float * sm = smask + off[k];
         for (int s = threadIdx.x; s < sc.n; s += blockDim.x) {
             const int64_t c = sc.idx[s*sc.s_idx0 + t*sc.s_idx1];
             sm[s] = c < n_kv ? ggml_cuda_cast<float>(m[c]) : 0.0f;
@@ -25,8 +27,8 @@ static __global__ void sel_mask_f(T * dst, const T * mask, const int64_t n_kv, c
         d[c] = ggml_cuda_cast<T>(-INFINITY);
     }
     for (int k = 0; k < 2; ++k) {
-        const sel_mask_scatter & sc = k == 0 ? sc0 : sc1;
-        const float * sm = smask + (k == 0 ? 0 : sc0.n);
+        const sel_mask_scatter & sc = scs[k];
+        const float * sm = smask + off[k];
         __syncthreads();
         for (int s = threadIdx.x; s < sc.n; s += blockDim.x) {
             const int64_t c = sc.idx[s*sc.s_idx0 + t*sc.s_idx1];

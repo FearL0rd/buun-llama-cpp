@@ -36,7 +36,7 @@ struct args {
     const float * x; int x_nb1;          // [n_tokens][k1]
     const int32_t * ids; int ids_nb1;    // [n_tokens][n_used]
     const float * w; int w_nb1;          // [n_tokens][n_used]
-    int n_used, n_tok, n_shared, pairs;  // pairs = n_shared + n_tok * n_used, shared pairs first
+    int n_used, n_tok, pairs;            // pairs = (shared ? n_tok : 0) + n_tok * n_used, shared pairs first
     float limit;                         // 0: plain swiglu
     float * out;                         // [n_tokens][k1]
     float * part1;                       // [pairs][2][KW1][n1]
@@ -148,7 +148,7 @@ __device__ __forceinline__ float2 dot_tile(uint32_t * sw, const uint32_t * src, 
     float f0 = 0.0f, f1 = 0.0f;
 #pragma unroll
     for (int g = 0; g < NG; ++g) {
-        cp_async_wait_n((g + SLOTS < NG ? g + SLOTS : NG) - g - 1);
+        cp_async_wait_n(min(SLOTS, NG - g) - 1);
         __syncwarp();
         const uint32_t * sg = sw + (g % SLOTS) * 8 * TW;
         int a0 = 0, a1 = 0;
@@ -220,7 +220,7 @@ __global__ void __launch_bounds__(THREADS, MIN_BLOCKS) moe(const args a) {
     __shared__ int s_ticket;
 
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
-    const int k1 = a.k1, n1 = a.n1, P = a.pairs, NS = BS ? a.n_shared : 0;
+    const int k1 = a.k1, n1 = a.n1, P = a.pairs, NS = BS ? a.n_tok : 0;
     uint32_t * sw = sw_all + warp * C::WW;
     const int NB1 = n1 / 128, KW1 = k1 / 128 / NG1;
     const int NB2 = k1 / 128, KW2 = n1 / 128 / NG2;
