@@ -14786,6 +14786,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         test_cases.emplace_back(new test_dsv4_hc_mix(GGML_TYPE_BF16, 2560, 320, nt));
     }
 
+    // GLM-5 decode hyper-connection fold: HC_POST -> hc_pre params -> HC_PRE -> RMS_NORM -> MUL
+    for (int64_t nt : {1, 4}) {
+        test_cases.emplace_back(new test_dsv4_hc_pre_chain(4096, nt, 20, true, true));
+    }
+
     // Qwen3.8-Flash-Next decode shape: 512 experts, top-10, hidden 2560, expert width 640.
     // up/gate (k=2560) for every type; down (k=640) only for block-32/64 types (K-quants need k % 256 == 0).
     for (ggml_type type : {GGML_TYPE_Q4_K, GGML_TYPE_Q4_1, GGML_TYPE_Q4_0, GGML_TYPE_Q5_1, GGML_TYPE_Q8_0, GGML_TYPE_MXFP4, GGML_TYPE_NVFP4}) {

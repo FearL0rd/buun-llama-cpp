@@ -1892,10 +1892,13 @@ struct ggml_backend_cuda_context {
 
 enum ggml_cuda_ticket_slot {
     GGML_CUDA_TICKET_ROUTER_TOPK_MOE,
+    GGML_CUDA_TICKET_DSV4_HC_PRE,
+    GGML_CUDA_TICKET_DSV4_HC_PRE_EPOCH, // not a ticket: a monotonic launch epoch that publishes pre
     GGML_CUDA_TICKET_COUNT,
 };
 
-// Zero-at-rest counter for ggml_cuda_block_ticket on the current stream of ctx.
+// Zero-at-rest counter for ggml_cuda_block_ticket on the current stream of ctx (an _EPOCH slot only
+// ever increments instead).
 unsigned int * ggml_cuda_ticket_counter(ggml_backend_cuda_context & ctx, ggml_cuda_ticket_slot slot);
 
 struct ggml_cuda_mm_fusion_args_host {

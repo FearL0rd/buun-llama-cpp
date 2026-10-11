@@ -11,8 +11,9 @@ bool ggml_cuda_dsv4_hc_pre_fused_supported(const ggml_tensor * rms, const ggml_t
 bool ggml_cuda_dsv4_hc_pre_apply_supported(const ggml_tensor * params, const ggml_tensor * hc_pre);
 // hc_post feeding rms: a DSV4_HC_POST with comb whose output rms normalizes, computed by the same pass
 bool ggml_cuda_dsv4_hc_post_fold_supported(const ggml_tensor * hc_post, const ggml_tensor * rms);
-// rms -> mul: RMS_NORM of the DSV4_HC_PRE output times a weight row
-bool ggml_cuda_dsv4_hc_pre_norm_supported(const ggml_tensor * hc_pre, const ggml_tensor * rms, const ggml_tensor * mul);
+// rms -> mul: RMS_NORM of the DSV4_HC_PRE output times a weight row; x is the stream the hc_pre RMS_NORM reads
+bool ggml_cuda_dsv4_hc_pre_norm_supported(const ggml_tensor * x, const ggml_tensor * hc_pre, const ggml_tensor * rms,
+        const ggml_tensor * mul);
 // hc_pre (optional): an ungated DSV4_HC_PRE reading pre from params, computed in the same launch
 // hc_post (optional): a DSV4_HC_POST passing ggml_cuda_dsv4_hc_post_fold_supported, computed in the same launch
 // norm (optional, needs hc_pre): the MUL passing ggml_cuda_dsv4_hc_pre_norm_supported, computed in the same launch

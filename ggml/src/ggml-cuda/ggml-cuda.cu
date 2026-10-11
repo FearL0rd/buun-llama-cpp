@@ -7463,13 +7463,15 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         ggml_tensor * hc_pre = j < cgraph->n_nodes && ggml_cuda_dsv4_hc_pre_apply_supported(cgraph->nodes[ir + 2], cgraph->nodes[j]) ?
             cgraph->nodes[j] : nullptr;
         // and the RMS_NORM -> MUL of its output, which the waiters write while the last block still writes params
+        // and other waiters still read the streams
         const ggml_op norm_ops[] = { GGML_OP_RMS_NORM, GGML_OP_MUL };
         const int n = hc_pre ? ggml_cuda_next_non_view(cgraph, j + 1) : cgraph->n_nodes;
         const int norm_output = n + 1;
         ggml_tensor * norm = n + 1 < cgraph->n_nodes &&
             ggml_can_fuse_subgraph(cgraph, n, 2, norm_ops, &norm_output, 1) &&
-            ggml_cuda_dsv4_hc_pre_norm_supported(hc_pre, cgraph->nodes[n], cgraph->nodes[n + 1]) &&
-            !ggml_cuda_tensors_overlap(cgraph->nodes[n + 1], cgraph->nodes[ir + 2]) ? cgraph->nodes[n + 1] : nullptr;
+            ggml_cuda_dsv4_hc_pre_norm_supported(cgraph->nodes[ir]->src[0], hc_pre, cgraph->nodes[n], cgraph->nodes[n + 1]) &&
+            !ggml_cuda_tensors_overlap(cgraph->nodes[n + 1], cgraph->nodes[ir + 2]) &&
+            !ggml_cuda_tensors_overlap(cgraph->nodes[n + 1], hc_pre->src[0]) ? cgraph->nodes[n + 1] : nullptr;
         ggml_cuda_op_dsv4_hc_pre_fused(*cuda_ctx, cgraph->nodes[ir], cgraph->nodes[ir + 1], cgraph->nodes[ir + 2], hc_pre, hc_post, norm);
         return (norm ? n + 1 : hc_pre ? j : ir + 2) - i;
     }
