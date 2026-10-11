@@ -14,6 +14,30 @@ void ggml_cuda_op_mul_mat_vec_f(
 #define MMVF_F16_MULTI_MAX        4 // Max. matrices sharing src1 in one fused launch.
 #define MMVF_F16_MULTI_MAX_TOKENS 4
 
+// One warp's partial dot products of an f16 row w with n_tokens f32 rows of x, 8 columns per lane
+// per step; w, x and stride_x must keep 16-byte alignment. The caller reduces sum across the warp.
+template <int n_tokens>
+static __device__ __forceinline__ void mmvf_f16_row_dot(const half * w, const float * x, const int64_t stride_x,
+        const int ncols, const int lane, float (&sum)[n_tokens]) {
+#pragma unroll 4
+    for (int c = lane * 8; c < ncols; c += WARP_SIZE * 8) {
+        const int4 raw = *reinterpret_cast<const int4 *>(w + c);
+        const half2 * h = reinterpret_cast<const half2 *>(&raw);
+        float2 wf[4];
+#pragma unroll
+        for (int k = 0; k < 4; ++k) {
+            wf[k] = __half22float2(h[k]);
+        }
+#pragma unroll
+        for (int t = 0; t < n_tokens; ++t) {
+            const float4 x0 = *reinterpret_cast<const float4 *>(x + t * stride_x + c);
+            const float4 x1 = *reinterpret_cast<const float4 *>(x + t * stride_x + c + 4);
+            sum[t] += wf[0].x * x0.x + wf[0].y * x0.y + wf[1].x * x0.z + wf[1].y * x0.w +
+                      wf[2].x * x1.x + wf[2].y * x1.y + wf[3].x * x1.z + wf[3].y * x1.w;
+        }
+    }
+}
+
 // mm is a MUL_MAT whose f16 weights can be batched with others that read src1.
 bool ggml_cuda_mul_mat_vec_f16_multi_supported(const ggml_tensor * mm, const ggml_tensor * src1);
 

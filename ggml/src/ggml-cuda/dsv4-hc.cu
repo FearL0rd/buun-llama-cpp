@@ -296,15 +296,7 @@ static __global__ void dsv4_hc_pre_fused_f32(
         partials[blockIdx.x*nacc + a] = v;
     }
 
-    __shared__ unsigned int ticket;
-    __threadfence();
-    __syncthreads();
-    if (threadIdx.x == 0) {
-        // atomicInc wraps to 0 on the last block, leaving the counter ready for the next launch
-        ticket = atomicInc(&dsv4_hc_pre_fused_counter, gridDim.x - 1);
-    }
-    __syncthreads();
-
+    const unsigned int ticket = ggml_cuda_block_ticket(&dsv4_hc_pre_fused_counter);
     if (ticket != gridDim.x - 1) {
         if constexpr (apply) {
             // the host caps the grid at the resident block count, so the last ticket always gets scheduled

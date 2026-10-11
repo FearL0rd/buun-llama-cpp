@@ -9451,6 +9451,7 @@ struct test_topk_moe : public test_case {
     const bool bias_probs;
     const MoeGatingFunc gating_func;
     const float scale_w;
+    const int64_t router_k; // > 0: the logits come from an f16 router matmul of this width
     ggml_tensor * weights {};
     ggml_tensor * selected_experts {};
 
@@ -9459,17 +9460,34 @@ struct test_topk_moe : public test_case {
                   bool                   with_norm       = false,
                   bool                   bias_probs      = false,
                   MoeGatingFunc          gating_func     = GATING_FUNC_SOFTMAX,
-                  float                  scale_w         = 0.0f) :
+                  float                  scale_w         = 0.0f,
+                  int64_t                router_k        = 0) :
         ne(ne),
         n_expert_used(n_expert_used),
         with_norm(with_norm),
         bias_probs(bias_probs),
         gating_func(gating_func),
-        scale_w(scale_w) {
+        scale_w(scale_w),
+        router_k(router_k) {
         GGML_ASSERT(n_expert_used <= ne[0]);
     }
 
-    std::string vars() override { return VARS_TO_STR6(ne, n_expert_used, with_norm, bias_probs, gating_func, scale_w); }
+    std::string vars() override {
+        std::string s = VARS_TO_STR6(ne, n_expert_used, with_norm, bias_probs, gating_func, scale_w);
+        return router_k ? s + "," + VAR_TO_STR(router_k) : s;
+    }
+
+    // keep the router logits small enough that the gating does not saturate into ties
+    void initialize_tensors(ggml_context * ctx) override {
+        if (!router_k) {
+            test_case::initialize_tensors(ctx);
+            return;
+        }
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            const float r = strcmp(t->name, "router") == 0 ? 0.02f : 1.0f;
+            init_tensor_uniform(t, -r, r);
+        }
+    }
 
     std::string op_desc(ggml_tensor * t) override {
         GGML_UNUSED(t);
@@ -9482,7 +9500,16 @@ struct test_topk_moe : public test_case {
         const int n_expert = ne[0];
         const int n_tokens = ne[1];
 
-        ggml_tensor * logits = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne.data());
+        ggml_tensor * logits = nullptr;
+        if (router_k) {
+            ggml_tensor * router = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, router_k, n_expert);
+            ggml_set_name(router, "router");
+            // f16-exact activations: the CPU reference rounds them to f16, which would flip near-tied experts
+            ggml_tensor * cur = ggml_cast(ctx, ggml_new_tensor_2d(ctx, GGML_TYPE_F16, router_k, n_tokens), GGML_TYPE_F32);
+            logits = ggml_mul_mat(ctx, router, cur);
+        } else {
+            logits = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne.data());
+        }
         ggml_tensor * probs            =
             (gating_func == GATING_FUNC_SOFTMAX) ? ggml_soft_max(ctx, logits) :
             (gating_func == GATING_FUNC_SIGMOID) ? ggml_sigmoid(ctx, logits) :
@@ -14514,6 +14541,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                 }
             }
         }
+    }
+
+    // Router matmul fused into the gating at decode, and one token past its limit.
+    for (int64_t n_tokens : {1, 2, 3, 4, 5}) {
+        test_cases.emplace_back(new test_topk_moe({288, n_tokens, 1, 1}, 8, true, true, GATING_FUNC_SIGMOID, 2.5f, 4096));
+        test_cases.emplace_back(new test_topk_moe({256, n_tokens, 1, 1}, 8, false, false, GATING_FUNC_SOFTMAX, 0.0f, 2048));
     }
 
     // Large normalized softmax routing and both prefill-fusion boundaries.

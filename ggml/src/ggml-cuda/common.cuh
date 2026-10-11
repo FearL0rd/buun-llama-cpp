@@ -160,6 +160,21 @@ static __device__ __forceinline__ void ggml_cuda_pdl_lc() {
 #endif // defined(GGML_CUDA_USE_PDL) && __CUDA_ARCH__ >= GGML_CUDA_CC_HOPPER
 }
 
+// Completion order of this block within the grid, after its global writes are visible device-wide:
+// the block that gets gridDim.x - 1 is the last one and may read every other block's results with __ldcg.
+// Every thread of the block must call it. atomicInc wraps the counter to 0 on the last block,
+// leaving it ready for the next launch.
+static __device__ __forceinline__ unsigned int ggml_cuda_block_ticket(unsigned int * counter) {
+    __shared__ unsigned int ticket;
+    __threadfence();
+    __syncthreads();
+    if (threadIdx.x == 0 && threadIdx.y == 0 && threadIdx.z == 0) {
+        ticket = atomicInc(counter, gridDim.x - 1);
+    }
+    __syncthreads();
+    return ticket;
+}
+
 #ifdef __CUDA_ARCH_LIST__
 constexpr bool ggml_cuda_has_arch_impl(int) {
     return false;
@@ -1869,7 +1884,19 @@ struct ggml_backend_cuda_context {
 
     // EXL3 reductions can overlap across backend contexts and streams.
     int * exl3_int8_counter_storage[GGML_CUDA_MAX_STREAMS] = {};
+
+    // ggml_cuda_block_ticket counters, one per ggml_cuda_ticket_slot, so that launches on other
+    // contexts and streams of the same device cannot take each other's tickets.
+    unsigned int * ticket_counter_storage[GGML_CUDA_MAX_STREAMS] = {};
 };
+
+enum ggml_cuda_ticket_slot {
+    GGML_CUDA_TICKET_ROUTER_TOPK_MOE,
+    GGML_CUDA_TICKET_COUNT,
+};
+
+// Zero-at-rest counter for ggml_cuda_block_ticket on the current stream of ctx.
+unsigned int * ggml_cuda_ticket_counter(ggml_backend_cuda_context & ctx, ggml_cuda_ticket_slot slot);
 
 struct ggml_cuda_mm_fusion_args_host {
     const ggml_tensor * x_bias = nullptr;

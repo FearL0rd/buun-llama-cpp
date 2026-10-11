@@ -78,23 +78,7 @@ static __global__ void mul_mat_vec_f16_multi(
     const half * w = args.w[m] + local * args.stride_w[m];
 
     float sum[n_tokens] = { 0.0f };
-#pragma unroll 4
-    for (int c = lane * 8; c < ncols; c += WARP_SIZE * 8) {
-        const int4 raw = *reinterpret_cast<const int4 *>(w + c);
-        const half2 * h = reinterpret_cast<const half2 *>(&raw);
-        float2 wf[4];
-#pragma unroll
-        for (int k = 0; k < 4; ++k) {
-            wf[k] = __half22float2(h[k]);
-        }
-#pragma unroll
-        for (int t = 0; t < n_tokens; ++t) {
-            const float4 x0 = *reinterpret_cast<const float4 *>(x + t * stride_x + c);
-            const float4 x1 = *reinterpret_cast<const float4 *>(x + t * stride_x + c + 4);
-            sum[t] += wf[0].x * x0.x + wf[0].y * x0.y + wf[1].x * x0.z + wf[1].y * x0.w +
-                      wf[2].x * x1.x + wf[2].y * x1.y + wf[3].x * x1.z + wf[3].y * x1.w;
-        }
-    }
+    mmvf_f16_row_dot<n_tokens>(w, x, stride_x, ncols, lane, sum);
 #pragma unroll
     for (int t = 0; t < n_tokens; ++t) {
         const float s = warp_reduce_sum(sum[t]);
