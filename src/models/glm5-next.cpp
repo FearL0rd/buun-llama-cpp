@@ -196,9 +196,170 @@ void llama_model_glm5_next::load_arch_tensors(llama_model_loader & ml) {
 
 std::unique_ptr<llm_graph_context> llama_model_glm5_next::build_arch_graph(const llm_graph_params & params) const {
     if (params.gtype == LLM_GRAPH_TYPE_DECODER_MTP) {
-        throw std::runtime_error("GLM5-Next NextN graph not implemented yet");
+        return std::make_unique<graph_mtp>(*this, params);
     }
     return std::make_unique<graph>(*this, params);
+}
+
+// Nope MLA projections; wk_b is absorbed into q so the cache holds only the latent
+static void glm5_build_mla_qkv(const llm_graph_context & g, ggml_tensor * cur, const llama_layer & layer, int il,
+                               ggml_tensor ** qr_out, ggml_tensor ** q_absorbed_out, ggml_tensor ** kv_cmpr_out) {
+    GGML_ASSERT(g.hparams.n_rot() == 0 && "GLM5-Next MLA is nope-only");
+
+    ggml_tensor * qr = g.build_lora_mm(layer.wq_a, cur, layer.wq_a_s, layer.wq_a_in_s);
+    qr = g.build_norm(qr, layer.attn_q_a_norm, nullptr, LLM_NORM_RMS, il);
+    g.cb(qr, "q_resid", il);
+
+    ggml_tensor * q = g.build_lora_mm(layer.wq_b, qr, layer.wq_b_s, layer.wq_b_in_s);
+    q = ggml_reshape_3d(g.ctx0, q, g.hparams.n_embd_head_k_mla(), g.n_head, g.n_tokens);
+
+    ggml_tensor * kv_cmpr = g.build_lora_mm(layer.wkv_a_mqa, cur, layer.wkv_a_mqa_s, layer.wkv_a_mqa_in_s);
+    kv_cmpr = g.build_norm(kv_cmpr, layer.attn_kv_a_norm, nullptr, LLM_NORM_RMS, il);
+    kv_cmpr = ggml_reshape_3d(g.ctx0, kv_cmpr, g.hparams.n_lora_kv, 1, g.n_tokens);
+    g.cb(kv_cmpr, "kv_cmpr", il);
+
+    ggml_tensor * q_absorbed = ggml_permute(g.ctx0, q, 0, 2, 1, 3);
+    q_absorbed = ggml_mul_mat(g.ctx0, layer.wk_b, q_absorbed);
+    q_absorbed = ggml_permute(g.ctx0, q_absorbed, 0, 2, 1, 3);
+    g.cb(q_absorbed, "q_absorbed", il);
+
+    *qr_out         = qr;
+    *q_absorbed_out = q_absorbed;
+    *kv_cmpr_out    = kv_cmpr;
+}
+
+// Routed experts + shared expert
+static ggml_tensor * glm5_build_moe_shexp(const llm_graph_context & g, ggml_tensor * cur, const llama_layer & layer, int il) {
+    ggml_tensor * moe_out = g.build_moe_ffn(cur,
+            layer.ffn_gate_inp,
+            layer.ffn_up_exps,
+            layer.ffn_gate_exps,
+            layer.ffn_down_exps,
+            layer.ffn_exp_probs_b,
+            g.n_expert, g.n_expert_used,
+            LLM_FFN_SILU, g.hparams.expert_weights_norm,
+            g.hparams.expert_weights_scale,
+            (llama_expert_gating_func_type) g.hparams.expert_gating_func,
+            il,
+            nullptr, nullptr,                                   // probs_in, fused gate_up_exps
+            layer.ffn_up_exps_s, layer.ffn_gate_exps_s, layer.ffn_down_exps_s,
+            nullptr,                                            // selected_experts_in
+            layer.ffn_up_exps_in_s, layer.ffn_gate_exps_in_s, layer.ffn_down_exps_in_s);
+    g.cb(moe_out, "ffn_moe_out", il);
+
+    ggml_tensor * ffn_shexp = g.build_ffn(cur,
+            layer.ffn_up_shexp,   nullptr, layer.ffn_up_shexp_s,
+            layer.ffn_gate_shexp, nullptr, layer.ffn_gate_shexp_s,
+            layer.ffn_down_shexp, nullptr, layer.ffn_down_shexp_s,
+            nullptr, LLM_FFN_SILU, LLM_FFN_PAR, il,
+            layer.ffn_up_shexp_in_s, layer.ffn_gate_shexp_in_s, layer.ffn_down_shexp_in_s);
+    g.cb(ffn_shexp, "ffn_shexp", il);
+
+    ggml_tensor * out = ggml_add(g.ctx0, moe_out, ffn_shexp);
+    g.cb(out, "ffn_out", il);
+    return out;
+}
+
+// NextN draft head: enorm(embed) + hnorm(trunk post-norm state) -> eh_proj -> one plain-residual
+// decoder block (no mHC) -> shared_head_norm -> shared LM head.
+// The block attends densely: its indexer selects every cell below indexer_top_k context, and
+// only draft quality depends on it beyond that.
+llama_model_glm5_next::graph_mtp::graph_mtp(const llama_model & model, const llm_graph_params & params)
+    : llm_graph_context(params) {
+    GGML_ASSERT(hparams.n_layer_nextn == 1 && "GLM5-Next MTP supports a single NextN block");
+
+    const int il = hparams.n_layer() + cparams.nextn_layer_offset;
+    const auto & layer = model.layers[il];
+
+    GGML_ASSERT(layer.nextn.eh_proj && layer.nextn.enorm && layer.nextn.hnorm && layer.ffn_gate_inp);
+
+    const float kq_scale = 1.0f / sqrtf((float) hparams.n_embd_head_k_mla());
+
+    auto inp = std::make_unique<llm_graph_input_embd_h>(hparams.n_embd);
+
+    inp->tokens = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens);
+    ggml_set_input(inp->tokens);
+
+    inp->embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hparams.n_embd_inp(), n_tokens);
+    ggml_set_input(inp->embd);
+
+    ggml_tensor * tok_embd;
+    ASSERT_EMBD_OR_TOKEN(ubatch);
+    if (ubatch.token) {
+        tok_embd = ggml_get_rows(ctx0, layer.nextn.embed_tokens ? layer.nextn.embed_tokens : model.tok_embd, inp->tokens);
+    } else {
+        tok_embd = inp->embd;
+    }
+    cb(tok_embd, "mtp_tok_embd", il);
+
+    inp->h = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hparams.n_embd, n_tokens);
+    ggml_set_input(inp->h);
+    ggml_set_name(inp->h, "mtp_h_input");
+
+    ggml_tensor * h_embd = inp->h;
+
+    res->add_input(std::move(inp));
+
+    ggml_tensor * inp_out_ids = build_inp_out_ids();
+
+    // K-only cache: V is the latent view of K
+    auto * inp_attn = build_attn_inp_k();
+
+    ggml_tensor * h_norm = build_norm(h_embd,   layer.nextn.hnorm, nullptr, LLM_NORM_RMS, il);
+    ggml_tensor * e_norm = build_norm(tok_embd, layer.nextn.enorm, nullptr, LLM_NORM_RMS, il);
+
+    ggml_tensor * cur = build_lora_mm(layer.nextn.eh_proj, ggml_concat(ctx0, e_norm, h_norm, 0), layer.nextn.eh_proj_s);
+    cb(cur, "mtp_eh_proj", il);
+
+    ggml_tensor * inpSA = cur;
+
+    cur = build_norm(cur, layer.attn_norm, nullptr, LLM_NORM_RMS, il);
+    cb(cur, "mtp_attn_norm", il);
+
+    {
+        ggml_tensor * qr, * q_absorbed, * kv_cmpr;
+        glm5_build_mla_qkv(*this, cur, layer, il, &qr, &q_absorbed, &kv_cmpr);
+
+        cur = build_attn(inp_attn, nullptr, nullptr, nullptr,
+                q_absorbed, kv_cmpr, kv_cmpr, nullptr, nullptr, layer.wv_b, kq_scale, il);
+        cur = build_lora_mm(layer.wo, cur, layer.wo_s, layer.wo_in_s);
+        cb(cur, "mtp_attn_out", il);
+    }
+
+    // catch-up rows only write the cache; skip the FFN for rows nobody reads
+    if (crop_before_nextn(inp_out_ids)) {
+        cur   = ggml_get_rows(ctx0, cur,   inp_out_ids);
+        inpSA = ggml_get_rows(ctx0, inpSA, inp_out_ids);
+    }
+
+    ggml_tensor * ffn_inp = ggml_add(ctx0, cur, inpSA);
+    cb(ffn_inp, "mtp_ffn_inp", il);
+
+    cur = build_norm(ffn_inp, layer.ffn_norm, nullptr, LLM_NORM_RMS, il);
+    cb(cur, "mtp_ffn_norm", il);
+
+    cur = ggml_add(ctx0, glm5_build_moe_shexp(*this, cur, layer, il), ffn_inp);
+    cb(cur, "mtp_post_ffn", il);
+
+    // the post-norm state seeds the next draft step
+    cur = build_norm(cur, layer.nextn.shared_head_norm ? layer.nextn.shared_head_norm : model.output_norm,
+            nullptr, LLM_NORM_RMS, -1);
+    cb(cur, "h_nextn", -1);
+    res->t_h_nextn = cur;
+
+    if (crop_after_nextn(inp_out_ids)) {
+        cur = ggml_get_rows(ctx0, cur, inp_out_ids);
+    }
+
+    if (layer.nextn.shared_head_head) {
+        cur = build_lora_mm(layer.nextn.shared_head_head, cur, layer.nextn.shared_head_head_s);
+    } else {
+        cur = build_lora_mm(model.output, cur, model.output_s, model.output_in_s);
+    }
+    cb(cur, "result_output", -1);
+    res->t_logits = cur;
+
+    ggml_build_forward_expand(gf, cur);
 }
 
 // Causal conv1d over one of Q/K/V
@@ -636,33 +797,7 @@ llama_model_glm5_next::graph::graph(const llama_model & model, const llm_graph_p
                     layer.ffn_up_in_s, layer.ffn_gate_in_s, layer.ffn_down_in_s);
             cb(cur, "ffn_out", il);
         } else {
-            ggml_tensor * moe_out = build_moe_ffn(cur,
-                    layer.ffn_gate_inp,
-                    layer.ffn_up_exps,
-                    layer.ffn_gate_exps,
-                    layer.ffn_down_exps,
-                    layer.ffn_exp_probs_b,
-                    n_expert, n_expert_used,
-                    LLM_FFN_SILU, hparams.expert_weights_norm,
-                    hparams.expert_weights_scale,
-                    (llama_expert_gating_func_type) hparams.expert_gating_func,
-                    il,
-                    nullptr, nullptr,                                   // probs_in, fused gate_up_exps
-                    layer.ffn_up_exps_s, layer.ffn_gate_exps_s, layer.ffn_down_exps_s,
-                    nullptr,                                            // selected_experts_in
-                    layer.ffn_up_exps_in_s, layer.ffn_gate_exps_in_s, layer.ffn_down_exps_in_s);
-            cb(moe_out, "ffn_moe_out", il);
-
-            ggml_tensor * ffn_shexp = build_ffn(cur,
-                    layer.ffn_up_shexp,   nullptr, layer.ffn_up_shexp_s,
-                    layer.ffn_gate_shexp, nullptr, layer.ffn_gate_shexp_s,
-                    layer.ffn_down_shexp, nullptr, layer.ffn_down_shexp_s,
-                    nullptr, LLM_FFN_SILU, LLM_FFN_PAR, il,
-                    layer.ffn_up_shexp_in_s, layer.ffn_gate_shexp_in_s, layer.ffn_down_shexp_in_s);
-            cb(ffn_shexp, "ffn_shexp", il);
-
-            cur = ggml_add(ctx0, moe_out, ffn_shexp);
-            cb(cur, "ffn_out", il);
+            cur = glm5_build_moe_shexp(*this, cur, layer, il);
         }
 
         inpL = build_hc_post(cur, residual, post, comb, il);
@@ -951,28 +1086,10 @@ ggml_tensor * llama_model_glm5_next::graph::build_dsa_layer(
 
     const int64_t n_embd_head_k_mla = hparams.n_embd_head_k_mla();
     const int64_t kv_lora_rank      = hparams.n_lora_kv;
-    const int64_t n_embd_head_qk_nope = n_embd_head_k_mla - hparams.n_rot();
     const float   kq_scale = 1.0f / sqrtf((float) n_embd_head_k_mla);
 
-    GGML_ASSERT(hparams.n_rot() == 0 && "GLM5-Next MLA is nope-only");
-
-    ggml_tensor * qr = build_lora_mm(layer.wq_a, cur, layer.wq_a_s, layer.wq_a_in_s);
-    qr = build_norm(qr, layer.attn_q_a_norm, nullptr, LLM_NORM_RMS, il);
-    cb(qr, "q_resid", il);
-
-    ggml_tensor * q = build_lora_mm(layer.wq_b, qr, layer.wq_b_s, layer.wq_b_in_s);
-    q = ggml_reshape_3d(ctx0, q, n_embd_head_qk_nope, n_head, n_tokens);
-
-    ggml_tensor * kv_cmpr = build_lora_mm(layer.wkv_a_mqa, cur, layer.wkv_a_mqa_s, layer.wkv_a_mqa_in_s);
-    kv_cmpr = build_norm(kv_cmpr, layer.attn_kv_a_norm, nullptr, LLM_NORM_RMS, il);
-    kv_cmpr = ggml_reshape_3d(ctx0, kv_cmpr, kv_lora_rank, 1, n_tokens);
-    cb(kv_cmpr, "kv_cmpr", il);
-
-    // absorb wk_b so the cache holds only the latent
-    ggml_tensor * q_absorbed = ggml_permute(ctx0, q, 0, 2, 1, 3);
-    q_absorbed = ggml_mul_mat(ctx0, layer.wk_b, q_absorbed);
-    q_absorbed = ggml_permute(ctx0, q_absorbed, 0, 2, 1, 3);
-    cb(q_absorbed, "q_absorbed", il);
+    ggml_tensor * qr, * q_absorbed, * kv_cmpr;
+    glm5_build_mla_qkv(*this, cur, layer, il, &qr, &q_absorbed, &kv_cmpr);
 
     ggml_tensor * kq_mask = inp_attn->get_kq_mask();
 

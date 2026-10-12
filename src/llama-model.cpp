@@ -3353,6 +3353,27 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
         /*.compute_backend_for_buft =*/ params.compute_backend_for_buft,
     };
 
+    // MTP draft context whose NextN block attends densely: plain attention cache over the nextn layer(s) only
+    auto create_nextn_kv_cache = [&]() {
+        return new llama_kv_cache(
+                *this,
+                hparams,
+                params.type_k,
+                params.type_v,
+                !cparams.flash_attn,
+                cparams.offload_kqv,
+                cparams.kv_unified,
+                cparams.n_ctx_seq,
+                cparams.n_seq_max,
+                attn_n_pad,
+                hparams.n_swa,
+                hparams.swa_type,
+                nullptr,
+                [&](uint32_t il) { return il >= hparams.n_layer(); },
+                nullptr,
+                nullptr);
+    };
+
     switch (arch) {
         // Models that need specific instantiation should be handled in the
         // switch statement
@@ -3423,29 +3444,8 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
         case LLM_ARCH_DEEPSEEK32:
             {
                 if (params.ctx_type == LLAMA_CONTEXT_TYPE_MTP && hparams.n_layer_nextn > 0) {
-                    // The NextN/MTP draft head runs dense MLA (no DSA indexer), so the
-                    // MTP context uses a plain attention KV cache holding only the
-                    // nextn layer(s) - same pattern as the hybrid Qwen3.5 MTP context.
-                    llama_kv_cache::layer_filter_cb filter =
-                        [&](uint32_t il) { return il >= hparams.n_layer(); };
-
-                    res = new llama_kv_cache(
-                            *this,
-                            hparams,
-                            params.type_k,
-                            params.type_v,
-                            !cparams.flash_attn,
-                            cparams.offload_kqv,
-                            cparams.kv_unified,
-                            cparams.n_ctx_seq,
-                            cparams.n_seq_max,
-                            attn_n_pad,
-                            hparams.n_swa,
-                            hparams.swa_type,
-                            nullptr,
-                            filter,
-                            nullptr,
-                            nullptr);
+                    // The NextN/MTP draft head runs dense MLA (no DSA indexer)
+                    res = create_nextn_kv_cache();
                 } else {
                     // Main context: DSA cache for the trunk layers only - the nextn
                     // layer(s) are never attended by the trunk graph.
@@ -3474,6 +3474,12 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
             } break;
         case LLM_ARCH_GLM5_NEXT:
             {
+                // The NextN draft block attends densely, so the MTP context holds only its MLA cache.
+                if (params.ctx_type == LLAMA_CONTEXT_TYPE_MTP && hparams.n_layer_nextn > 0) {
+                    res = create_nextn_kv_cache();
+                    break;
+                }
+
                 // KDA layers are recurrent, the DSA layers use a K-only MLA cache plus an indexer cache.
                 // tThe Nextn block is never attended by the trunk graph
                 llama_memory_hybrid_idx::layer_filter_cb filter_attn = [&](uint32_t il) {
@@ -3485,11 +3491,6 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                 llama_memory_hybrid_idx::layer_filter_cb filter_recr = [&](uint32_t il) {
                     return il < hparams.n_layer() && hparams.is_recr(il);
                 };
-
-                // Tensor export alone is not an implemented draft graph.
-                if (params.ctx_type == LLAMA_CONTEXT_TYPE_MTP) {
-                    throw std::runtime_error("GLM5-Next NextN graph is not implemented");
-                }
 
                 res = new llama_memory_hybrid_idx(
                     /* model             */ *this,
@@ -3559,27 +3560,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                 GGML_ASSERT(hparams.swa_type != LLAMA_SWA_TYPE_NONE);
 
                 if (params.ctx_type == LLAMA_CONTEXT_TYPE_MTP && hparams.n_layer_nextn > 0) {
-                    // MTP draft context: plain attention KV cache holding only the nextn layer
-                    llama_kv_cache::layer_filter_cb filter =
-                        [&](uint32_t il) { return il >= hparams.n_layer(); };
-
-                    res = new llama_kv_cache(
-                            *this,
-                            hparams,
-                            params.type_k,
-                            params.type_v,
-                            !cparams.flash_attn,
-                            cparams.offload_kqv,
-                            cparams.kv_unified,
-                            cparams.n_ctx_seq,
-                            cparams.n_seq_max,
-                            attn_n_pad,
-                            hparams.n_swa,
-                            hparams.swa_type,
-                            nullptr,
-                            filter,
-                            nullptr,
-                            nullptr);
+                    res = create_nextn_kv_cache();
                 } else {
                     // main context: DSA cache for the trunk full-attention layers plus a window-sized SWA cache
                     llama_kv_cache::layer_filter_cb filter_mla = nullptr;
