@@ -3283,6 +3283,11 @@ bool llama_model::supports_classic_vbr() const {
     return arch == LLM_ARCH_BAILINGMOE3;
 }
 
+bool llama_model::supports_mtp_draft_chain() const {
+    return (arch == LLM_ARCH_QWEN4EXP || arch == LLM_ARCH_GLM5_NEXT) &&
+            split_mode() != LLAMA_SPLIT_MODE_TENSOR && hparams.n_layer_nextn == 1;
+}
+
 bool llama_model::supports_turbo_vbr() const {
     // DSV4 owns a specialized, safe Q8-capped interpretation of Turbo VBR.
     if (arch == LLM_ARCH_DEEPSEEK4) {

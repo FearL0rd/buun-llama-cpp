@@ -871,6 +871,9 @@ struct llama_model {
     bool supports_classic_vbr() const;
     bool supports_turbo_vbr() const;
 
+    // the MTP graph reads and writes the greedy draft chain stages
+    bool supports_mtp_draft_chain() const;
+
     llama_memory_i * create_memory(const llama_memory_params & params, const llama_cparams & cparams) const;
 
     ggml_cgraph * build_graph(const llm_graph_params & params) const;

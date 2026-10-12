@@ -4169,9 +4169,7 @@ bool llama_context::set_mtp_draft_chain(bool enable) {
     }
     if (enable && !mtp_chain_tok) {
         const auto & hparams = model.hparams;
-        // only the qwen4exp MTP graph reads and writes the chain stages
-        if (model.arch != LLM_ARCH_QWEN4EXP || model.split_mode() == LLAMA_SPLIT_MODE_TENSOR ||
-                hparams.n_layer_nextn != 1) {
+        if (!model.supports_mtp_draft_chain()) {
             return false;
         }
         // the stages live with the MTP block so its graph reads and writes them in place

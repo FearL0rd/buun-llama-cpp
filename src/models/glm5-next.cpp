@@ -275,32 +275,44 @@ llama_model_glm5_next::graph_mtp::graph_mtp(const llama_model & model, const llm
 
     const float kq_scale = 1.0f / sqrtf((float) hparams.n_embd_head_k_mla());
 
-    auto inp = std::make_unique<llm_graph_input_embd_h>(hparams.n_embd);
+    // Greedy draft chain: a 1-token draft step reads its token and hidden row from
+    // the device stages and writes its argmax token and next hidden row back.
+    const bool chain = cparams.mtp_chain_tok && n_tokens == 1 && n_outputs == 1;
 
-    inp->tokens = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens);
-    ggml_set_input(inp->tokens);
-
-    inp->embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hparams.n_embd_inp(), n_tokens);
-    ggml_set_input(inp->embd);
-
+    ggml_tensor * tok_embd_w = layer.nextn.embed_tokens ? layer.nextn.embed_tokens : model.tok_embd;
     ggml_tensor * tok_embd;
-    ASSERT_EMBD_OR_TOKEN(ubatch);
-    if (ubatch.token) {
-        tok_embd = ggml_get_rows(ctx0, layer.nextn.embed_tokens ? layer.nextn.embed_tokens : model.tok_embd, inp->tokens);
+    ggml_tensor * h_embd;
+    if (chain) {
+        tok_embd = ggml_get_rows(ctx0, tok_embd_w, cparams.mtp_chain_tok);
+        h_embd   = ggml_reshape_2d(ctx0, cparams.mtp_chain_h, hparams.n_embd, 1);
     } else {
-        tok_embd = inp->embd;
+        auto inp = std::make_unique<llm_graph_input_embd_h>(hparams.n_embd);
+
+        inp->tokens = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens);
+        ggml_set_input(inp->tokens);
+
+        inp->embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hparams.n_embd_inp(), n_tokens);
+        ggml_set_input(inp->embd);
+
+        ASSERT_EMBD_OR_TOKEN(ubatch);
+        if (ubatch.token) {
+            tok_embd = ggml_get_rows(ctx0, tok_embd_w, inp->tokens);
+        } else {
+            tok_embd = inp->embd;
+        }
+
+        inp->h = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hparams.n_embd, n_tokens);
+        ggml_set_input(inp->h);
+        ggml_set_name(inp->h, "mtp_h_input");
+
+        h_embd = inp->h;
+
+        res->add_input(std::move(inp));
     }
     cb(tok_embd, "mtp_tok_embd", il);
 
-    inp->h = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hparams.n_embd, n_tokens);
-    ggml_set_input(inp->h);
-    ggml_set_name(inp->h, "mtp_h_input");
-
-    ggml_tensor * h_embd = inp->h;
-
-    res->add_input(std::move(inp));
-
-    ggml_tensor * inp_out_ids = build_inp_out_ids();
+    // a chain step's single row is its output, so there is nothing to crop
+    ggml_tensor * inp_out_ids = chain ? nullptr : build_inp_out_ids();
 
     // K-only cache: V is the latent view of K
     auto * inp_attn = build_attn_inp_k();
@@ -345,11 +357,14 @@ llama_model_glm5_next::graph_mtp::graph_mtp(const llama_model & model, const llm
     cur = build_norm(cur, layer.nextn.shared_head_norm ? layer.nextn.shared_head_norm : model.output_norm,
             nullptr, LLM_NORM_RMS, -1);
     cb(cur, "h_nextn", -1);
-    res->t_h_nextn = cur;
+    if (!chain) {
+        res->t_h_nextn = cur;
+    }
 
     if (crop_after_nextn(inp_out_ids)) {
         cur = ggml_get_rows(ctx0, cur, inp_out_ids);
     }
+    ggml_tensor * h_next = cur;
 
     if (layer.nextn.shared_head_head) {
         cur = build_lora_mm(layer.nextn.shared_head_head, cur, layer.nextn.shared_head_head_s);
@@ -357,6 +372,10 @@ llama_model_glm5_next::graph_mtp::graph_mtp(const llama_model & model, const llm
         cur = build_lora_mm(model.output, cur, model.output_s, model.output_in_s);
     }
     cb(cur, "result_output", -1);
+    if (chain) {
+        build_mtp_chain_out(gf, cur, ggml_argmax(ctx0, cur), h_next);
+        return;
+    }
     res->t_logits = cur;
 
     ggml_build_forward_expand(gf, cur);

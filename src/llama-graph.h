@@ -1253,6 +1253,14 @@ struct llm_graph_context {
               ggml_tensor * d2t,
                   int64_t   n_vocab) const;
 
+    // MTP greedy draft chain tail: write the drafted token, its top-10 confidence and the next
+    // hidden row back to the device stages (tok is the argmax, remapped by the caller if needed)
+    void build_mtp_chain_out(
+              ggml_cgraph * gf,
+              ggml_tensor * logits,
+              ggml_tensor * tok,
+              ggml_tensor * h_next) const;
+
     // do mat_mul_id, while optionally apply lora and per-expert scale
     ggml_tensor * build_lora_mm_id(
               ggml_tensor * w,   // ggml_tensor * as

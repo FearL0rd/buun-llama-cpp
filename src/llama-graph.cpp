@@ -2071,6 +2071,24 @@ ggml_tensor * llm_graph_context::build_lora_mm(
     return res;
 }
 
+void llm_graph_context::build_mtp_chain_out(
+          ggml_cgraph * gf,
+          ggml_tensor * logits,
+          ggml_tensor * tok,
+          ggml_tensor * h_next) const {
+    // the draft's own inputs are ancestors of every copy, so overwriting the stages is safe
+    ggml_build_forward_expand(gf, ggml_cpy(ctx0, tok, cparams.mtp_chain_tok));
+
+    // confidence as the step-by-step drafter's top-10 sampler reports it
+    const int64_t n_vocab_head = logits->ne[0];
+    const int64_t n_cand       = std::min<int64_t>(10, n_vocab_head);
+    ggml_tensor * cand = ggml_get_rows(ctx0, ggml_reshape_2d(ctx0, logits, 1, n_vocab_head), ggml_top_k(ctx0, logits, n_cand));
+    cand = ggml_soft_max(ctx0, ggml_reshape_2d(ctx0, cand, n_cand, 1));
+    ggml_tensor * p = ggml_get_rows(ctx0, ggml_reshape_2d(ctx0, cand, 1, n_cand), ggml_argmax(ctx0, cand));
+    ggml_build_forward_expand(gf, ggml_cpy(ctx0, p, cparams.mtp_chain_p));
+    ggml_build_forward_expand(gf, ggml_cpy(ctx0, h_next, cparams.mtp_chain_h));
+}
+
 ggml_tensor * llm_graph_context::build_d2t_logits(
           ggml_tensor * cur,
           ggml_tensor * d2t,
