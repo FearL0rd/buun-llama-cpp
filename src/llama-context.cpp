@@ -267,6 +267,33 @@ llama_context::llama_context(
     embd_layer_inp.resize(hparams.n_layer() + 1);
 
     cparams.ctx_type          = params.ctx_type;
+    // An MTP context only routes the NextN layers' experts. Capping its expert cache at their
+    // size, plus scratch, leaves the rest of each device to the target context's cache instead
+    // of an even split between the two. A provider budget (environment) still wins, and the cap
+    // never drops below the automatic slab floor, which would leave the cache dormant.
+    ggml_moe_cache_config moe_cache_provider = {};
+    if (cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP && cparams.moe_cache_budget_mib == 0 &&
+        cparams.moe_cache_mode != LLAMA_MOE_CACHE_MODE_OFF && ggml_moe_cache.query_config &&
+        ggml_moe_cache.query_config(cparams.moe_cache_mode == LLAMA_MOE_CACHE_MODE_UNSPECIFIED
+                ? -1 : cparams.moe_cache_mode == LLAMA_MOE_CACHE_MODE_AUTO,
+            0, &moe_cache_provider) &&
+        moe_cache_provider.budget_bytes == 0) {
+        std::vector<llama_moe_tensor_info> moe_info(llama_model_get_moe_tensor_info(&model, nullptr, 0));
+        llama_model_get_moe_tensor_info(&model, moe_info.data(), moe_info.size());
+
+        size_t nextn_expert_bytes = 0;
+        for (const auto & t : moe_info) {
+            if (t.layer >= (int64_t) hparams.n_layer()) {
+                nextn_expert_bytes += t.expert_size * (size_t) t.n_expert;
+            }
+        }
+        if (nextn_expert_bytes > 0) {
+            // headroom for the cache's own per-device scratch
+            constexpr size_t mtp_moe_cache_scratch_mib = 256;
+            cparams.moe_cache_budget_mib = (std::max(nextn_expert_bytes, moe_cache_provider.minimum_slab_bytes) >> 20) +
+                mtp_moe_cache_scratch_mib;
+        }
+    }
     cparams.rope_scaling_type = params.rope_scaling_type;
     cparams.pooling_type      = params.pooling_type;
 
@@ -412,6 +439,12 @@ llama_context::llama_context(
     if ((llama_model_has_encoder(&model) && model.arch != LLM_ARCH_DFLASH) ||
         model.arch == LLM_ARCH_DFLASH_DRAFT || model.arch == LLM_ARCH_GEMMA4_DFLASH_DRAFT) {
         cparams.n_ubatch = cparams.n_batch;
+    }
+
+    // An MTP context runs one block over the target's hidden rows: a target-sized ubatch only grows
+    // its compute buffer, crowding out the target's expert cache. n_batch stays, decode micro-batches.
+    if (cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP) {
+        cparams.n_ubatch = std::min(cparams.n_ubatch, 256u);
     }
 
     cparams.n_outputs_max = params.n_outputs_max == 0 || llama_model_has_encoder(&model) ? cparams.n_batch : params.n_outputs_max;

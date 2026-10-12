@@ -34,7 +34,8 @@ static void test(void) {
         for (int32_t physical : { 0, 64, 256, 512, 2048 }) {
             base.n_ubatch = physical;
             const auto draft = common_base_params_to_speculative(base);
-            assert(draft.n_ubatch == std::min(physical, 256));
+            // the MTP context clamps its own ubatch (llama_context), the common params pass through
+            assert(draft.n_ubatch == physical);
             assert(draft.n_batch == base.n_batch);
             assert(base.n_ubatch == physical);
         }

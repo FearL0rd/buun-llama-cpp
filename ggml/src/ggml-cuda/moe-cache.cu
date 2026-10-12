@@ -329,6 +329,7 @@ struct moe_cache_device {
     bool budget_claimed = false;
     size_t automatic_reserve_bytes = 0;
     size_t budget_reserve_bytes = 0;
+    size_t budget_cap_bytes = 0;
     size_t budget_limit = 0;
     size_t coordinator_allocated_bytes = 0;
     size_t allocated_bytes = 0;
@@ -517,6 +518,9 @@ struct moe_cache_physical_budget {
     int prepared = 0;
     std::multiset<size_t> reserves;
     size_t outstanding_bytes = 0;
+    // budget caps of the participants that have not claimed yet
+    int pending_capped = 0;
+    size_t pending_caps = 0;
 };
 static std::mutex g_budget_mu;
 static std::unordered_map<int, moe_cache_physical_budget> g_physical_budgets;
@@ -541,11 +545,28 @@ static void moe_cache_retire_pending();
 static size_t moe_cache_trim_session(
         moe_cache_session & session, int physical_device);
 
+static void moe_cache_budget_pending_cap(
+        moe_cache_physical_budget & state, size_t cap_bytes, bool add) {
+    if (cap_bytes == 0) {
+        return;
+    }
+    if (add) {
+        state.pending_capped++;
+        state.pending_caps += cap_bytes;
+    } else {
+        state.pending_capped = std::max(state.pending_capped - 1, 0);
+        state.pending_caps = cap_bytes <= state.pending_caps ? state.pending_caps - cap_bytes : 0;
+    }
+}
+
 static void moe_cache_budget_remove_participant(
-        moe_cache_physical_budget & state, size_t reserve_bytes) {
-    auto reserve = state.reserves.find(reserve_bytes);
+        moe_cache_physical_budget & state, const moe_cache_device & device) {
+    auto reserve = state.reserves.find(device.budget_reserve_bytes);
     if (reserve != state.reserves.end()) {
         state.reserves.erase(reserve);
+    }
+    if (!device.budget_claimed) {
+        moe_cache_budget_pending_cap(state, device.budget_cap_bytes, false);
     }
     state.participants = std::max(state.participants - 1, 0);
 }
@@ -566,6 +587,8 @@ static bool moe_cache_budget_register(moe_cache_session & session) {
             state.participants++;
             device.budget_registered = true;
             device.budget_reserve_bytes = reserve_bytes;
+            device.budget_cap_bytes = session.config.budget_mb << 20;
+            moe_cache_budget_pending_cap(state, device.budget_cap_bytes, true);
             registered.push_back(&device);
         }
         return true;
@@ -573,14 +596,14 @@ static bool moe_cache_budget_register(moe_cache_session & session) {
         for (moe_cache_device * device : registered) {
             auto found = g_physical_budgets.find(device->physical);
             if (found != g_physical_budgets.end()) {
-                moe_cache_budget_remove_participant(
-                        found->second, device->budget_reserve_bytes);
+                moe_cache_budget_remove_participant(found->second, *device);
                 if (found->second.participants == 0) {
                     g_physical_budgets.erase(found);
                 }
             }
             device->budget_registered = false;
             device->budget_reserve_bytes = 0;
+            device->budget_cap_bytes = 0;
         }
         for (auto found = g_physical_budgets.begin();
              found != g_physical_budgets.end();) {
@@ -668,8 +691,7 @@ static void moe_cache_budget_unregister(moe_cache_device & device) {
                 ? state.outstanding_bytes - unallocated : 0;
             state.prepared = std::max(state.prepared - 1, 0);
         }
-        moe_cache_budget_remove_participant(
-                state, device.budget_reserve_bytes);
+        moe_cache_budget_remove_participant(state, device);
         if (state.participants == 0) {
             g_physical_budgets.erase(found);
         }
@@ -678,13 +700,13 @@ static void moe_cache_budget_unregister(moe_cache_device & device) {
     device.budget_claimed = false;
     device.budget_ready = false;
     device.budget_reserve_bytes = 0;
+    device.budget_cap_bytes = 0;
     device.budget_limit = 0;
     device.coordinator_allocated_bytes = 0;
 }
 
 static size_t moe_cache_budget_claim(
-        moe_cache_session & session, moe_cache_device & device,
-        size_t free_memory, size_t min_reserve, size_t & reserve_bytes) {
+        moe_cache_device & device, size_t free_memory, size_t min_reserve, size_t & reserve_bytes) {
     std::lock_guard<std::mutex> lock(g_budget_mu);
     reserve_bytes = 0;
     auto found = g_physical_budgets.find(device.physical);
@@ -708,9 +730,15 @@ static size_t moe_cache_budget_claim(
         ? available_after_reserve - state.outstanding_bytes : 0;
     const int remaining_participants = std::max(
             state.participants - state.prepared, 1);
+    moe_cache_budget_pending_cap(state, device.budget_cap_bytes, false);
     size_t claim = unclaimed / (size_t)remaining_participants;
-    if (session.config.budget_mb > 0) {
-        claim = std::min(claim, session.config.budget_mb << 20);
+    if (device.budget_cap_bytes > 0) {
+        claim = std::min(claim, device.budget_cap_bytes);
+    } else if (state.pending_capped > 0) {
+        // capped peers that have yet to claim keep at most their fair share; the rest is split
+        // among the uncapped ones, so a small capped session does not halve a large one
+        const size_t held = std::min(state.pending_caps, claim * (size_t)state.pending_capped);
+        claim = (unclaimed - held) / (size_t)std::max(remaining_participants - state.pending_capped, 1);
     }
     state.prepared++;
     state.outstanding_bytes += claim;
@@ -2119,12 +2147,12 @@ static bool moe_cache_prepare_budget(
 #endif
     size_t reserve_bytes = 0;
     const size_t available = moe_cache_budget_claim(
-            session, device, free_memory, min_reserve, reserve_bytes);
+            device, free_memory, min_reserve, reserve_bytes);
     device.budget_limit = available;
 
-    if (session.config.budget_mb > 0) {
+    if (device.budget_cap_bytes > 0) {
         MOE_CACHE_LOG("[moe-cache] CUDA%d capacity: cap=%zu MiB granted=%zu MiB free=%zu MiB reserve=%zu MiB\n",
-                device.physical, session.config.budget_mb, available >> 20,
+                device.physical, device.budget_cap_bytes >> 20, available >> 20,
                 free_memory >> 20, reserve_bytes >> 20);
     } else {
         MOE_CACHE_LOG("[moe-cache] CUDA%d capacity: policy=free-minus-reserve granted=%zu MiB free=%zu MiB reserve=%zu MiB\n",
