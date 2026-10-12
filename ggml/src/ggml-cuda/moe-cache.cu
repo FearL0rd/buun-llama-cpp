@@ -2116,6 +2116,15 @@ static int moe_cache_find_pool(
 static size_t moe_cache_lend_size(const moe_cache_device & device);
 #endif
 
+static bool moe_cache_free_memory(moe_cache_device & device, size_t * free_memory) {
+    size_t total_memory = 0;
+    // Use the same physical VRAM accounting as model fitting on HIP, where
+    // hipMemGetInfo can overcharge small VMM mappings.
+    return moe_cache_cuda_ok(device,
+            ggml_cuda_device_memory_info(device.logical, free_memory, &total_memory),
+            "memory query", false);
+}
+
 static bool moe_cache_prepare_budget(
         moe_cache_session & session, moe_cache_device & device) {
     if (device.budget_ready) {
@@ -2123,13 +2132,8 @@ static bool moe_cache_prepare_budget(
     }
     device.budget_ready = true;
 
-    ggml_cuda_set_device(device.logical);
     size_t free_memory = 0;
-    size_t total_memory = 0;
-    // Use the same physical VRAM accounting as model fitting on HIP, where
-    // hipMemGetInfo can overcharge small VMM mappings.
-    cudaError_t error = ggml_cuda_device_memory_info(device.logical, &free_memory, &total_memory);
-    if (!moe_cache_cuda_ok(device, error, "memory query", false)) {
+    if (!moe_cache_free_memory(device, &free_memory)) {
         device.dead.store(true);
         return false;
     }
@@ -2626,7 +2630,8 @@ static void * moe_cache_session_create(
                 supplied_config->overlap_cpu_rows < -1 ||
                 supplied_config->overlap_cpu_rows > 8 ||
                 supplied_config->expert_parallel < -1 ||
-                supplied_config->expert_parallel > moe_cache_expert_parallel_max) {
+                supplied_config->expert_parallel > moe_cache_expert_parallel_max ||
+                supplied_config->max_devices < 0) {
                 return nullptr;
             }
             config.enabled = true;
@@ -2642,6 +2647,9 @@ static void * moe_cache_session_create(
             config.min_compute_capability = supplied_config->min_compute_capability;
             config.overlap_cpu_rows = supplied_config->overlap_cpu_rows;
             config.expert_parallel = supplied_config->expert_parallel;
+            if (supplied_config->max_devices > 0) {
+                config.max_devices = std::min(config.max_devices, supplied_config->max_devices);
+            }
             config.profile_path = supplied_config->profile_path
                 ? supplied_config->profile_path : "";
         }
@@ -2656,17 +2664,14 @@ static void * moe_cache_session_create(
         session->config = std::move(config);
 
         std::unordered_set<int> seen_devices;
-        size_t default_min_expert_bytes = 0;
-        int minimum_capability = INT_MAX;
+        const ggml_cuda_device_info & info = ggml_cuda_info();
         const auto add_backend = [&](ggml_backend_t backend) {
-            if (!backend || !ggml_backend_is_cuda(backend) ||
-                (int)session->devices.size() >= session->config.max_devices) {
+            if (!backend || !ggml_backend_is_cuda(backend)) {
                 return;
             }
             ggml_backend_cuda_context * context =
                 (ggml_backend_cuda_context *)backend->context;
             const int logical = context->device;
-            const ggml_cuda_device_info & info = ggml_cuda_info();
             if (logical < 0 || logical >= info.device_count) {
                 return;
             }
@@ -2684,16 +2689,11 @@ static void * moe_cache_session_create(
                 return;
             }
 
-            default_min_expert_bytes = std::max(
-                    default_min_expert_bytes,
-                    moe_cache_default_min_expert_bytes(capability));
-            minimum_capability = std::min(minimum_capability, capability);
             session->devices.emplace_back(new moe_cache_device(logical, physical));
             session->devices.back()->automatic_reserve_bytes =
                 moe_cache_recommended_reserve_bytes(info.devices[logical].total_vram);
         };
-        for (int index = 0; index < n_backends &&
-                            (int)session->devices.size() < session->config.max_devices; index++) {
+        for (int index = 0; index < n_backends; index++) {
             ggml_backend_t backend = (ggml_backend_t)backends[index];
             if (ggml_backend_is_meta(backend)) {
                 const size_t n_simple = ggml_backend_meta_n_backends(backend);
@@ -2703,6 +2703,43 @@ static void * moe_cache_session_create(
             } else {
                 add_backend(backend);
             }
+        }
+        if ((int) session->devices.size() > session->config.max_devices) {
+            // Keep the devices with the most free memory beyond their reserve, in
+            // scheduler order; one that cannot report its free memory sorts last.
+            std::vector<size_t> free_memory(session->devices.size(), 0);
+            std::vector<int> order(session->devices.size());
+            for (size_t index = 0; index < order.size(); ++index) {
+                moe_cache_device & device = *session->devices[index];
+                const size_t reserve_bytes = ggml_moe_cache_effective_reserve_bytes(
+                        session->config.reserve_explicit,
+                        session->config.reserve_mb << 20,
+                        device.automatic_reserve_bytes);
+                size_t free_bytes = 0;
+                if (moe_cache_free_memory(device, &free_bytes) &&
+                    free_bytes > reserve_bytes) {
+                    free_memory[index] = free_bytes - reserve_bytes;
+                }
+                order[index] = (int) index;
+            }
+            std::stable_sort(order.begin(), order.end(),
+                    [&](int a, int b) { return free_memory[a] > free_memory[b]; });
+            order.resize(session->config.max_devices);
+            std::sort(order.begin(), order.end());
+            std::vector<std::unique_ptr<moe_cache_device>> kept;
+            for (int index : order) {
+                kept.push_back(std::move(session->devices[index]));
+            }
+            session->devices = std::move(kept);
+        }
+        size_t default_min_expert_bytes = 0;
+        int minimum_capability = INT_MAX;
+        for (const auto & device_ptr : session->devices) {
+            const int capability = info.devices[device_ptr->logical].cc;
+            default_min_expert_bytes = std::max(
+                    default_min_expert_bytes,
+                    moe_cache_default_min_expert_bytes(capability));
+            minimum_capability = std::min(minimum_capability, capability);
         }
 
         if ((int) session->devices.size() < session->config.min_devices) {

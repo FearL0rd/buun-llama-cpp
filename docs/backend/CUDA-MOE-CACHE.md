@@ -249,7 +249,7 @@ The following environment variables are implementation controls, not a stable co
 | `GGML_CUDA_MOE_CACHE_QUEUE` | `128` | Maximum queued jobs per device |
 | `GGML_CUDA_MOE_CACHE_QUEUE_MB` | `512` | Maximum queued source bytes per device |
 | `GGML_CUDA_MOE_CACHE_STATS` | `0` | Collection-call interval for periodic statistics, or `0` for teardown only |
-| `GGML_CUDA_MOE_CACHE_NDEV` | all | Maximum selected CUDA devices used by a session |
+| `GGML_CUDA_MOE_CACHE_NDEV` | all | Maximum CUDA devices used by a session; beyond it, those with the most free memory are kept |
 | `GGML_CUDA_MOE_CACHE_SERIAL_FILL` | hardware dependent | Serialize fills across devices; defaults to `0` with at least two compute capability 8.0 or newer devices and `1` otherwise |
 | `GGML_CUDA_MOE_CACHE_DEDICATED_MMV` | `0` | Force the cache-specific activation-map matvec; compatible routing uses the existing modulo-index MMV path by default |
 | `GGML_CUDA_MOE_CACHE_DOWN_DEDICATED_MMV` | `0` | Use the cache-specific MMV for a full-fusion down projection; the generic modulo-index MMV remains the default |

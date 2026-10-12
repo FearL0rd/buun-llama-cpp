@@ -56,6 +56,9 @@ struct ggml_moe_cache_config {
     int32_t overlap_cpu_rows;
     // -1 selects the provider policy; 0 disables expert-parallel dispatch.
     int32_t expert_parallel;
+    // 0 selects the provider policy; otherwise the session keeps at most this many
+    // devices, preferring those with the most free memory.
+    int32_t max_devices;
     const char * profile_path;
 };
 
@@ -208,7 +211,8 @@ GGML_API void (*ggml_moe_cache_cpu_rows)(enum ggml_type type, int n, float * con
 GGML_API void ggml_moe_cache_unregister(const void * owner);
 GGML_API void ggml_backend_sched_set_moe_cache(
         ggml_backend_sched_t sched, enum ggml_moe_cache_mode mode,
-        size_t budget_mib, int expert_parallel, int cpu_overlap, const char * profile_path);
+        size_t budget_mib, int max_devices, int expert_parallel, int cpu_overlap,
+        const char * profile_path);
 GGML_API void ggml_backend_sched_set_moe_cache_warmup(ggml_backend_sched_t sched, bool warmup);
 // Resolved provider admission, including no_alloc graph reservation. A session
 // does not imply that any particular expert is currently resident.

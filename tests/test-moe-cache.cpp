@@ -4153,7 +4153,7 @@ static bool run_scheduler_overlap_config(ggml_backend_t cuda, ggml_backend_t cpu
     for (auto mode : {GGML_MOE_CACHE_MODE_UNSPECIFIED, GGML_MOE_CACHE_MODE_AUTO}) {
         for (int overlap : {-2, -1, 0, 2}) {
             supplied = false;
-            ggml_backend_sched_set_moe_cache(scheduler, mode, 4, 0, overlap, nullptr);
+            ggml_backend_sched_set_moe_cache(scheduler, mode, 4, 0, 0, overlap, nullptr);
             const bool expected_call = mode != GGML_MOE_CACHE_MODE_UNSPECIFIED || overlap != -2;
             const bool matches = supplied == expected_call &&
                 (!supplied || captured.overlap_cpu_rows == (overlap == -2 ? 3 : overlap));
@@ -4162,8 +4162,12 @@ static bool run_scheduler_overlap_config(ggml_backend_t cuda, ggml_backend_t cpu
             ok &= matches;
         }
     }
+    // A device limit is an override even under the provider policy.
     supplied = false;
-    ggml_backend_sched_set_moe_cache(scheduler, GGML_MOE_CACHE_MODE_OFF, 4, 0, 2, nullptr);
+    ggml_backend_sched_set_moe_cache(scheduler, GGML_MOE_CACHE_MODE_UNSPECIFIED, 4, 1, 0, -2, nullptr);
+    ok &= supplied && captured.max_devices == 1;
+    supplied = false;
+    ggml_backend_sched_set_moe_cache(scheduler, GGML_MOE_CACHE_MODE_OFF, 4, 0, 0, 2, nullptr);
     ok &= !supplied;
     ggml_backend_sched_free(scheduler);
     ggml_moe_cache.session_create = saved_create;

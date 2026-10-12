@@ -247,6 +247,7 @@ llama_context::llama_context(
     cparams.n_threads_batch         = params.n_threads_batch;
     cparams.moe_cache_mode          = params.moe_cache_mode;
     cparams.moe_cache_budget_mib    = params.moe_cache_budget_mib;
+    cparams.moe_cache_max_devices   = 0;
     cparams.moe_cache_expert_parallel = params.moe_cache_expert_parallel;
     cparams.moe_cache_cpu_overlap = params.moe_cache_cpu_overlap;
     cparams.moe_cache_profile_path = params.moe_cache_profile_path
@@ -268,9 +269,10 @@ llama_context::llama_context(
 
     cparams.ctx_type          = params.ctx_type;
     // An MTP context only routes the NextN layers' experts. Capping its expert cache at their
-    // size, plus scratch, leaves the rest of each device to the target context's cache instead
-    // of an even split between the two. A provider budget (environment) still wins, and the cap
-    // never drops below the automatic slab floor, which would leave the cache dormant.
+    // size, plus scratch, on one device leaves the rest of the memory to the target context's
+    // cache instead of an even split between the two. A provider budget (environment) still
+    // wins, and the cap never drops below the automatic slab floor, which would leave the
+    // cache dormant.
     ggml_moe_cache_config moe_cache_provider = {};
     if (cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP && cparams.moe_cache_budget_mib == 0 &&
         cparams.moe_cache_mode != LLAMA_MOE_CACHE_MODE_OFF && ggml_moe_cache.query_config &&
@@ -292,6 +294,7 @@ llama_context::llama_context(
             constexpr size_t mtp_moe_cache_scratch_mib = 256;
             cparams.moe_cache_budget_mib = (std::max(nextn_expert_bytes, moe_cache_provider.minimum_slab_bytes) >> 20) +
                 mtp_moe_cache_scratch_mib;
+            cparams.moe_cache_max_devices = 1;
         }
     }
     cparams.rope_scaling_type = params.rope_scaling_type;
@@ -1205,6 +1208,7 @@ void llama_context::sched_reserve() {
     ggml_backend_sched_set_moe_cache(
             sched.get(), moe_cache_mode,
             cparams.moe_cache_budget_mib,
+            cparams.moe_cache_max_devices,
             moe_cache_expert_parallel,
             cparams.moe_cache_cpu_overlap,
             cparams.moe_cache_profile_path.empty() ? nullptr :
@@ -1277,6 +1281,7 @@ void llama_context::sched_reserve() {
                 ggml_backend_sched_set_moe_cache(
                         sched.get(), moe_cache_mode,
                         cparams.moe_cache_budget_mib,
+                        cparams.moe_cache_max_devices,
                         moe_cache_expert_parallel,
                         cparams.moe_cache_cpu_overlap,
                         cparams.moe_cache_profile_path.empty() ? nullptr :
