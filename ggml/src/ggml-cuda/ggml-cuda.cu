@@ -540,13 +540,10 @@ struct ggml_cuda_pool_leg : public ggml_cuda_pool {
             CUDA_CHECK(cudaDeviceSynchronize());
             clear_pool();
             err = ggml_cuda_device_malloc(&ptr, look_ahead_size, device);
-            if (err == cudaErrorMemoryAllocation) {
-                // Last resort: surrender cache storage before aborting on allocation failure.
-
+            // Last resort: surrender cache storage before aborting on allocation failure.
+            while (err == cudaErrorMemoryAllocation && ggml_moe_cache_trim(device, look_ahead_size) > 0) {
                 (void)cudaGetLastError();
-                if (ggml_moe_cache_trim(device) > 0) {
-                    err = ggml_cuda_device_malloc(&ptr, look_ahead_size, device);
-                }
+                err = ggml_cuda_device_malloc(&ptr, look_ahead_size, device);
             }
             if (err == cudaSuccess) {
                 GGML_LOG_DEBUG(GGML_CUDA_NAME " pool[%d]: retry succeeded\n", device);
@@ -585,6 +582,49 @@ struct ggml_cuda_pool_leg : public ggml_cuda_pool {
 
 // pool with virtual memory
 #if defined(GGML_USE_VMM)
+// Devices granted access to a VMM mapping on physical_device. NCCL implicitly enables peer
+// access (cudaDeviceEnablePeerAccess), and GGML_CUDA_P2P enables it explicitly. Unlike
+// cudaMalloc buffers, VMM allocations do not become peer-accessible from that alone, so
+// peers must be granted explicitly. With virtual devices, grant access on the backing
+// *physical* devices (deduplicated, since several virtual devices can map to the same GPU).
+static std::vector<CUmemAccessDesc> ggml_cuda_vmm_access_descs(int physical_device) {
+    bool use_peer_access = getenv("GGML_CUDA_P2P") != nullptr;
+#if defined(GGML_USE_NCCL)
+    use_peer_access = true;
+#endif // defined(GGML_USE_NCCL)
+
+    std::vector<CUmemAccessDesc> access_descs;
+    bool physical_seen[GGML_CUDA_MAX_DEVICES] = {};
+    const int device_count = use_peer_access ? ggml_cuda_info().device_count : 0;
+    for (int id = 0; id < device_count; ++id) {
+        const int id_physical = ggml_cuda_get_physical_device(id);
+        if (id_physical != physical_device) {
+            int can_access_peer = 0;
+            CUDA_CHECK(cudaDeviceCanAccessPeer(&can_access_peer, id_physical, physical_device));
+            if (!can_access_peer) {
+                continue;
+            }
+        }
+        if (physical_seen[id_physical]) {
+            continue;
+        }
+        physical_seen[id_physical] = true;
+        CUmemAccessDesc access = {};
+        access.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+        access.location.id = id_physical;
+        access.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
+        access_descs.push_back(access);
+    }
+    if (access_descs.empty()) {
+        CUmemAccessDesc access = {};
+        access.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+        access.location.id = physical_device;
+        access.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
+        access_descs.push_back(access);
+    }
+    return access_descs;
+}
+
 struct ggml_cuda_pool_vmm : public ggml_cuda_pool {
     static const size_t CUDA_POOL_VMM_MAX_SIZE = 1ull << 35; // 32 GB
 
@@ -648,20 +688,20 @@ struct ggml_cuda_pool_vmm : public ggml_cuda_pool {
             prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
             prop.location.id = physical_device;
             CUmemGenericAllocationHandle handle;
-            // On OOM, surrender MoE cache storage and retry once. Each vendor
+            // On OOM, surrender MoE cache storage while that frees any. Each vendor
             // returns its own error enum from cuMemCreate (CUresult on CUDA,
             // hipError_t on HIP, MUresult on MUSA).
-            auto create_result = cuMemCreate(&handle, reserve_size, &prop, 0);
-            const bool out_of_memory =
+            const auto out_of_memory =
 #if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
-                create_result == cudaErrorMemoryAllocation;
+                cudaErrorMemoryAllocation;
 #else
-                create_result == CUDA_ERROR_OUT_OF_MEMORY;
+                CUDA_ERROR_OUT_OF_MEMORY;
 #endif
-            if (out_of_memory) {
+            auto create_result = cuMemCreate(&handle, reserve_size, &prop, 0);
+            if (create_result == out_of_memory) {
                 GGML_LOG_WARN(GGML_CUDA_NAME " pool[%d]: growing %.2f MiB to %.2f MiB failed\n",
                               device, reserve_size/1024.0/1024.0, (pool_size + reserve_size)/1024.0/1024.0);
-                if (ggml_moe_cache_trim(device) > 0) {
+                while (create_result == out_of_memory && ggml_moe_cache_trim(device, reserve_size) > 0) {
                     create_result = cuMemCreate(&handle, reserve_size, &prop, 0);
                 }
             }
@@ -692,50 +732,8 @@ struct ggml_cuda_pool_vmm : public ggml_cuda_pool {
             // has been observed on both gfx1100 and gfx1201.
             // NOTE for VBR-on-ROCm: vbr-vmm.cu grants per-chunk AND unmaps (holes) — this
             // whole-range trick cannot transfer there; needs its own design.
-            // VMM Bug fix for P2P access if GGML_CUDA_P2P is set, or if NCCL build
-            bool use_peer_access = getenv("GGML_CUDA_P2P") != nullptr;
-#if defined(GGML_USE_NCCL)
-            use_peer_access = true;
-#endif // defined(GGML_USE_NCCL)
-
-            if (use_peer_access) {
-                // NCCL implicitly enables peer access (cudaDeviceEnablePeerAccess), and
-                // GGML_CUDA_P2P enables it explicitly. Unlike cudaMalloc buffers, VMM
-                // allocations do not become peer-accessible from that alone, so access
-                // must be granted explicitly here. With virtual devices, grant access
-                // on the backing *physical* devices (deduplicated, since several
-                // virtual devices can map to the same physical GPU).
-                std::vector<CUmemAccessDesc> access_descs;
-                bool physical_seen[GGML_CUDA_MAX_DEVICES] = {};
-                const int device_count = ggml_cuda_info().device_count;
-                for (int id = 0; id < device_count; ++id) {
-                    const int id_physical = ggml_cuda_get_physical_device(id);
-                    if (id_physical != physical_device) {
-                        int can_access_peer = 0;
-                        CUDA_CHECK(cudaDeviceCanAccessPeer(&can_access_peer, id_physical, physical_device));
-                        if (!can_access_peer) {
-                            continue;
-                        }
-                    }
-                    if (physical_seen[id_physical]) {
-                        continue;
-                    }
-                    physical_seen[id_physical] = true;
-                    CUmemAccessDesc access = {};
-                    access.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
-                    access.location.id = id_physical;
-                    access.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
-                    access_descs.push_back(access);
-                }
-                CU_CHECK(cuMemSetAccess(pool_addr, pool_size + reserve_size, access_descs.data(), access_descs.size()));
-            } else {
-                // set access for non P2P
-                CUmemAccessDesc access = {};
-                access.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
-                access.location.id = physical_device;
-                access.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
-                CU_CHECK(cuMemSetAccess(pool_addr, pool_size + reserve_size, &access, 1));
-            }
+            const std::vector<CUmemAccessDesc> access_descs = ggml_cuda_vmm_access_descs(physical_device);
+            CU_CHECK(cuMemSetAccess(pool_addr, pool_size + reserve_size, access_descs.data(), access_descs.size()));
 
             // add to the pool
             pool_size += reserve_size;
@@ -1464,11 +1462,6 @@ static bool ggml_backend_buft_is_cuda(ggml_backend_buffer_type_t buft) {
 static thread_local int g_compute_vmm_depth = 0;
 
 void ggml_cuda_compute_vmm_scope(bool enter) {
-    const ggml_cuda_device_info & info = ggml_cuda_info();
-    // Peer copies into a VMM mapping need explicit access grants; keep it single-GPU.
-    if (info.device_count != 1 || !info.devices[0].vmm) {
-        return;
-    }
     g_compute_vmm_depth += enter ? 1 : -1;
 }
 
@@ -1481,28 +1474,36 @@ static void * ggml_cuda_vmm_malloc(int device, size_t * size) {
     prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
     prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
     prop.location.id = physical;
-    CUmemGenericAllocationHandle handle;
-    if (cuMemCreate(&handle, mapped, &prop, 0) != CUDA_SUCCESS) {
+    CUdeviceptr addr = 0;
+    if (cuMemAddressReserve(&addr, mapped, 0, 0, 0) != CUDA_SUCCESS) {
         return nullptr;
     }
-    CUdeviceptr addr = 0;
-    bool ok = cuMemAddressReserve(&addr, mapped, 0, 0, 0) == CUDA_SUCCESS;
-    bool mapped_ok = ok && cuMemMap(addr, mapped, 0, handle, 0) == CUDA_SUCCESS;
-    cuMemRelease(handle);
-    if (mapped_ok) {
-        CUmemAccessDesc access = {};
-        access.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
-        access.location.id = physical;
-        access.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
-        if (cuMemSetAccess(addr, mapped, &access, 1) == CUDA_SUCCESS) {
+    size_t done = 0;
+    while (done < mapped) {
+        const size_t chunk = std::min(ggml_cuda_compute_vmm_chunk, mapped - done);
+        CUmemGenericAllocationHandle handle;
+        if (cuMemCreate(&handle, chunk, &prop, 0) != CUDA_SUCCESS) {
+            break;
+        }
+        const bool chunk_ok = cuMemMap(addr + done, chunk, 0, handle, 0) == CUDA_SUCCESS;
+        cuMemRelease(handle);
+        if (!chunk_ok) {
+            break;
+        }
+        done += chunk;
+    }
+    if (done == mapped) {
+        // peers copy graph inputs and outputs across split boundaries
+        const std::vector<CUmemAccessDesc> access_descs = ggml_cuda_vmm_access_descs(physical);
+        if (cuMemSetAccess(addr, mapped, access_descs.data(), access_descs.size()) == CUDA_SUCCESS) {
             *size = mapped;
             return (void *)addr;
         }
-        cuMemUnmap(addr, mapped);
     }
-    if (ok) {
-        cuMemAddressFree(addr, mapped);
+    if (done) {
+        cuMemUnmap(addr, done);
     }
+    cuMemAddressFree(addr, mapped);
     return nullptr;
 }
 #else
@@ -1511,13 +1512,20 @@ void ggml_cuda_compute_vmm_scope(bool enter) {
 }
 #endif
 
+size_t ggml_cuda_compute_vmm_size(ggml_backend_buffer_t buffer) {
+    if (!ggml_backend_buft_is_cuda(buffer->buft)) {
+        return 0;
+    }
+    return ((ggml_backend_cuda_buffer_context *)buffer->context)->vmm_size;
+}
+
 static ggml_backend_buffer_t ggml_backend_cuda_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
     ggml_backend_cuda_buffer_type_context * buft_ctx = (ggml_backend_cuda_buffer_type_context *)buft->context;
 
     ggml_cuda_set_device(buft_ctx->device);
 
 #if defined(GGML_USE_VMM) && !defined(GGML_USE_HIP)
-    if (g_compute_vmm_depth > 0) {
+    if (g_compute_vmm_depth > 0 && ggml_cuda_info().devices[buft_ctx->device].vmm) {
         size_t mapped = size;
         if (void * vmm_ptr = ggml_cuda_vmm_malloc(buft_ctx->device, &mapped)) {
             ggml_backend_cuda_buffer_context * ctx = new ggml_backend_cuda_buffer_context(buft_ctx->device, vmm_ptr);

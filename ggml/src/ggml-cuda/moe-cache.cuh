@@ -11,8 +11,9 @@ extern "C" {
 
 void ggml_moe_cache_register(const void * owner);
 
-// Surrender the device's cache VRAM under allocator pressure; returns bytes freed.
-size_t ggml_moe_cache_trim(int device);
+// Surrender the device's cache VRAM under allocator pressure, at least needed bytes when
+// whole cache chunks can cover them, else all of it; returns bytes freed.
+size_t ggml_moe_cache_trim(int device, size_t needed);
 
 #ifdef __cplusplus
 }
@@ -42,6 +43,13 @@ struct ggml_moe_cache_route_table {
 bool ggml_moe_cache_route_find(const void * host_base, ggml_moe_cache_route_table & route);
 
 // CUDA buffers this thread allocates inside the scope are VMM mappings that the
-// cache can alias (cuMemRetainAllocationHandle). No-op without single-GPU VMM.
+// cache can alias (cuMemRetainAllocationHandle). No-op without VMM.
 void ggml_cuda_compute_vmm_scope(bool enter);
+
+// Mapped size of such a buffer, 0 for any other buffer.
+size_t ggml_cuda_compute_vmm_size(struct ggml_backend_buffer * buffer);
+
+// Those buffers are built from allocations of this size (the last may be shorter), since
+// cuMemMap maps only whole allocations and each cache pool aliases its own range of chunks.
+static constexpr size_t ggml_cuda_compute_vmm_chunk = 64ull << 20;
 #endif
