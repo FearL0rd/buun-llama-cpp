@@ -480,11 +480,11 @@ static bool run_capability_queries(
     const int automatic_device_ok = ggml_moe_cache.query_device(
             cuda_device, &automatic_reserve, &automatic_caps);
     ok &= automatic_device_ok == 1;
-    ok &= automatic_caps.recommended_reserve_bytes >= 1024 * MiB;
+    ok &= automatic_caps.recommended_reserve_bytes >= 512 * MiB;
     ok &= automatic_caps.recommended_reserve_bytes <= 3072 * MiB;
     ok &= automatic_caps.recommended_reserve_bytes % reserve_step == 0;
     if (std::strstr(ggml_backend_dev_name(cuda_device), "RTX 3090")) {
-        ok &= automatic_caps.recommended_reserve_bytes == 1408 * MiB;
+        ok &= automatic_caps.recommended_reserve_bytes == 640 * MiB;
     }
     set_env("GGML_CUDA_MOE_CACHE_RESERVE_MB", "2048");
     ggml_moe_cache_config explicit_reserve = {};

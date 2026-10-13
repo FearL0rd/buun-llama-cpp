@@ -61,9 +61,11 @@ With default settings, a node must satisfy all of these conditions:
 
 Each physical device budget is coordinated across every target, draft, MTP, and server scheduler in the process. It is claimed once, at first eligible use. Shape inventory counts the exact number of experts in every observed tensor; mixed expert counts do not reserve nonexistent slots. Device reservations are tracked per participating session, so releasing a high-reserve target immediately restores the correct capacity for the remaining sessions.
 
-The automatic reserve is hardware-derived. By default it is 6% of physical
-VRAM rounded down to 128 MiB, clamped to 1024--3072 MiB and at most one quarter
-of the device. This resolves to 1408 MiB on a 24 GiB RTX 3090. An explicit
+The automatic reserve is hardware-derived. By default it is 3% of physical
+VRAM rounded down to 128 MiB, clamped to 512--3072 MiB and at most one quarter
+of the device. This resolves to 640 MiB on a 24 GiB RTX 3090. When an
+allocation still fails, the cache gives up idle 64 MiB chunks before the
+allocator retries. An explicit
 `GGML_CUDA_MOE_CACHE_RESERVE_MB` remains authoritative. The automatic budget is:
 
 ```

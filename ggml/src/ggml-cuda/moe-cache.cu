@@ -926,9 +926,9 @@ static moe_cache_config moe_cache_read_config() {
 static size_t moe_cache_recommended_reserve_bytes(size_t total_vram) {
     constexpr size_t MiB = 1024 * 1024;
     constexpr size_t step = 128 * MiB;
-    size_t reserve = total_vram / 100 * 6;
+    size_t reserve = total_vram / 100 * 3;
     reserve = reserve / step * step;
-    reserve = std::max<size_t>(1024 * MiB, reserve);
+    reserve = std::max<size_t>(512 * MiB, reserve);
     reserve = std::min<size_t>(3072 * MiB, reserve);
     return std::min(reserve, total_vram / 4);
 }
