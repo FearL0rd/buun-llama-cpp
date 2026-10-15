@@ -455,6 +455,7 @@ public:
         // The scatter mask shape follows n_kv.
         res &= n_kv              == idx->get_n_kv();
         res &= n_new             == std::max(mctx->get_n_kpool_new(), 1u);
+        res &= route_dead        == mctx->get_kpool_partial_share();
 
         return res;
     }
@@ -465,6 +466,9 @@ public:
     ggml_tensor * pool_mask     = nullptr; // F32/F16 [n_pool, n_tokens]
     ggml_tensor * tail_idxs     = nullptr; // I32     [kpool - 1, n_tokens]
     ggml_tensor * sel_mask      = nullptr; // F32     [n_sel, 1, 1, n_tokens] 0 for live selection slots, -inf for dead ones
+    // only with route_dead
+    ggml_tensor * sel_live      = nullptr; // F32     [n_pool_sel, n_tokens]  1 for live pool slots, 0 for dead ones
+    ggml_tensor * sel_dump      = nullptr; // F32     [n_pool_sel, n_tokens]  0 for live pool slots, n_kv for dead ones
     // n_new is never below 1, see build_inp_kpool
     ggml_tensor * new_pool_idxs = nullptr; // I32     [kpool, n_new]   members of the pools completed this ubatch
     ggml_tensor * new_pool_rep  = nullptr; // I64     [n_new]          cell to write each new pooled key into
@@ -474,6 +478,8 @@ public:
     uint32_t n_new = 0;
     uint32_t n_sel = 0;
     uint32_t n_kv  = 0;
+    // dead pool slots can share cells with live ones, so the scatter routes them to the dump
+    bool route_dead = false;
 };
 
 llama_model_glm5_next::llm_graph_input_kpool * llama_model_glm5_next::graph::build_inp_kpool(const llama_memory_hybrid_idx_context * mctx_hyb) {
@@ -520,6 +526,15 @@ llama_model_glm5_next::llm_graph_input_kpool * llama_model_glm5_next::graph::bui
         ggml_set_input(inp->sel_mask);
         // set_input_kpool always fills the mask, so it stays allocated in every graph
         ggml_build_forward_expand(gf, inp->sel_mask);
+
+        // per pool slot, live = exp(mask) and the dump offset n_kv*(1 - live), shared by every indexer layer
+        inp->route_dead = mctx_hyb->get_kpool_partial_share();
+        if (inp->route_dead) {
+            ggml_tensor * live = ggml_exp(ctx0, ggml_reshape_2d(ctx0, inp->sel_mask, n_sel, n_tokens));
+            ggml_tensor * dump = ggml_scale_bias(ctx0, live, -(float) n_kv, (float) n_kv);
+            inp->sel_live = ggml_view_2d(ctx0, live, kpool*n_top_pool, n_tokens, live->nb[1], 0);
+            inp->sel_dump = ggml_view_2d(ctx0, dump, kpool*n_top_pool, n_tokens, dump->nb[1], 0);
+        }
     }
 
     inp->n_new = n_new;
@@ -1070,10 +1085,18 @@ ggml_tensor * llama_model_glm5_next::graph::build_kpool_select(
     sel = ggml_fill(ctx0, sel, -INFINITY);
 
     // Scatter each slot's own mask value: 0 for live slots (visible pools, real tail cells), -inf for dead ones.
-    // Live pools are disjoint, and a dead pool is invisible to the token, so it holds no live pool cell. It can
-    // hold the token's tail cells though (a pool completed later in the ubatch): the tail scatter goes last.
+    // A dead pool, one top_k padded a short selection with, can share cells with a live pool when two sequences
+    // branched mid-pool, so its slots go to the dump column: idx = live*idx + n_kv*(1 - live).
+    // Without such sharing a dead pool's cells are all masked anyway, so the routing is skipped.
+    // It can hold the token's tail cells too (a pool completed later in the ubatch): the tail scatter goes last.
     GGML_ASSERT(inp_kpool->sel_mask->ne[3] == n_tokens);
     GGML_ASSERT(n_sel == n_pool_sel + (hparams.indexer_kpool_select_tail ? inp_kpool->tail_idxs->ne[0] : 0));
+    if (inp_kpool->route_dead) {
+        GGML_ASSERT(inp_kpool->sel_live->ne[0] == n_pool_sel);
+        ggml_tensor * idx_f = ggml_cast(ctx0, sel_idx, GGML_TYPE_F32);
+        idx_f = ggml_add(ctx0, ggml_mul(ctx0, idx_f, inp_kpool->sel_live), inp_kpool->sel_dump);
+        sel_idx = ggml_cast(ctx0, idx_f, GGML_TYPE_I32);
+    }
     const auto sel_val = [&](int64_t n, int64_t i0) {
         const ggml_tensor * m = inp_kpool->sel_mask;
         return ggml_view_3d(ctx0, inp_kpool->sel_mask, 1, n, n_tokens, m->nb[0], m->nb[3], ggml_row_size(m->type, i0));

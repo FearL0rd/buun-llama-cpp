@@ -192,6 +192,7 @@ public:
 
     uint32_t get_n_kpool() const;
     uint32_t get_n_kpool_new() const;
+    bool get_kpool_partial_share() const; // whether pools of different sequences overlap, see kpool_state
     kpool_access get_kpool_access(ggml_context * ctx, int32_t il, int64_t n_embd) const;
     void set_input_kpool(ggml_tensor * pool_cells, ggml_tensor * pool_idxs, ggml_tensor * pool_mask, ggml_tensor * tail_idxs,
                         ggml_tensor * sel_mask, ggml_tensor * new_pool_idxs, ggml_tensor * new_pool_rep,
