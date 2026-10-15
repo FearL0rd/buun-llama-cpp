@@ -1050,6 +1050,8 @@ struct ggml_backend_sched {
     int n_copies;
     int cur_copy;
     int next_copy;
+    bool fresh_alloc;      // the graph about to be computed was allocated, not reused
+    int last_graph_slot;   // slot of the last computed graph, -1 before the first
     ggml_backend_event_t events[GGML_SCHED_MAX_BACKENDS][GGML_SCHED_MAX_COPIES];
     struct ggml_tensor ** graph_inputs;
     int n_graph_inputs;
@@ -2513,6 +2515,7 @@ ggml_backend_sched_t ggml_backend_sched_new(
 
     sched->n_backends = n_backends;
     sched->n_copies = parallel ? GGML_SCHED_MAX_COPIES : 1;
+    sched->last_graph_slot = -1;
     sched->graph_size = graph_size;
 
     sched->debug_graph_size = 0;
@@ -2711,9 +2714,40 @@ bool ggml_backend_sched_alloc_graph(ggml_backend_sched_t sched, struct ggml_cgra
     }
 
     sched->is_alloc = true;
+    sched->fresh_alloc = true;
     sched->alloc_src_graph = graph;
 
     return true;
+}
+
+// point a reused graph's split inputs at another set of input copies, so it can be queued again
+// while earlier runs of it are still in flight
+static void ggml_backend_sched_rebind_copy(ggml_backend_sched_t sched, int copy) {
+    // a copy is listed only by the first split of its backend that needs it, later splits there use it too
+    std::unordered_map<ggml_tensor *, ggml_tensor *> remap;
+    for (int s = 0; s < sched->n_splits; s++) {
+        const struct ggml_backend_sched_split * split = &sched->splits[s];
+        for (int k = 0; k < split->n_inputs; k++) {
+            const size_t id = hash_id(split->inputs[k]);
+            remap[tensor_id_copy(id, split->backend_id, sched->cur_copy)] = tensor_id_copy(id, split->backend_id, copy);
+        }
+    }
+    for (int s = 0; s < sched->n_splits; s++) {
+        const struct ggml_backend_sched_split * split = &sched->splits[s];
+        for (int i = 0; i < split->graph.n_nodes; i++) {
+            struct ggml_tensor * node = split->graph.nodes[i];
+            for (int j = 0; j < GGML_MAX_SRC; j++) {
+                if (node->src[j] == NULL || !(node->src[j]->flags & GGML_TENSOR_FLAG_INPUT)) {
+                    continue;
+                }
+                auto it = remap.find(node->src[j]);
+                if (it != remap.end()) {
+                    node->src[j] = it->second;
+                }
+            }
+        }
+    }
+    sched->cur_copy = copy;
 }
 
 enum ggml_status ggml_backend_sched_graph_compute(ggml_backend_sched_t sched, struct ggml_cgraph * graph) {
@@ -2732,6 +2766,20 @@ enum ggml_status ggml_backend_sched_graph_compute_async(ggml_backend_sched_t sch
         if (!ggml_backend_sched_alloc_graph(sched, graph)) {
             return GGML_STATUS_ALLOC_FAILED;
         }
+    }
+
+    if (sched->n_copies > 1) {
+        if (sched->fresh_alloc || sched->cur_graph_slot != sched->last_graph_slot) {
+            // another allocation can overlap buffers that graphs still in flight use
+            for (int b = 0; b < sched->n_backends; b++) {
+                ggml_backend_synchronize(sched->backends[b]);
+            }
+        } else {
+            ggml_backend_sched_rebind_copy(sched, sched->next_copy);
+            sched->next_copy = (sched->next_copy + 1) % sched->n_copies;
+        }
+        sched->fresh_alloc = false;
+        sched->last_graph_slot = sched->cur_graph_slot;
     }
 
     ggml_backend_sched_scratch_prepare(sched);
