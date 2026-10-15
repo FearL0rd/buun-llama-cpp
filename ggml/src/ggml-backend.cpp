@@ -2176,7 +2176,11 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         // ensure the previous split's async work has completed before we start
         // this split, the allocator may have reused buffer regions across splits
         if (split->n_inputs == 0 && prev_backend_id >= 0 && prev_backend_id != split_backend_id) {
-            if (sched->events[prev_backend_id][sched->cur_copy] != NULL) {
+            // a device-side wait orders the GPU work without blocking the host, so later splits and
+            // ubatches can still be queued ahead (pipeline parallelism)
+            if (sched->events[prev_backend_id][sched->cur_copy] != NULL && split_backend->iface.event_wait != NULL) {
+                ggml_backend_event_wait(split_backend, sched->events[prev_backend_id][sched->cur_copy]);
+            } else if (sched->events[prev_backend_id][sched->cur_copy] != NULL) {
                 ggml_backend_event_synchronize(sched->events[prev_backend_id][sched->cur_copy]);
             } else {
                 ggml_backend_synchronize(sched->backends[prev_backend_id]);
