@@ -230,6 +230,11 @@ private:
     // The ubatch kpool_st was built for, guards against reads before apply.
     size_t i_kpool = SIZE_MAX;
 
+    // tokens of the ubatches after the first, 0 unless the attention cache keeps the batch's shapes stable
+    uint32_t n_tokens_rest = 0;
+    // pool count the first ubatch bounds the whole batch to
+    uint32_t n_pool_batch  = 0;
+
     // Whether this context tracks k-pool states.
     bool kpool_track() const;
 

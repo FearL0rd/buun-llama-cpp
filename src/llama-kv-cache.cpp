@@ -3391,6 +3391,8 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare_with_slots(
                 used_max_p1[s] = v_cells[s].used_max_p1();
             }
             scratch_cells = 0;
+            uint32_t n_kv_max        = 0;
+            size_t   stream_span_max = 0;
             const uint32_t n_pad_cur = std::max(n_pad, get_pad_floor());
             for (const auto & sinfo : sinfos) {
                 uint32_t n_kv = 0;
@@ -3404,6 +3406,12 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare_with_slots(
                 }
                 const size_t stream_span = (size_t) sinfo.s1 - sinfo.s0 + 1;
                 scratch_cells = std::max(scratch_cells, (size_t) n_kv * stream_span);
+                n_kv_max        = std::max(n_kv_max, n_kv);
+                stream_span_max = std::max(stream_span_max, stream_span);
+            }
+            if (spans_devices()) {
+                // batch-stable ubatches all read up to the batch's last cell (see llama_kv_cache_context)
+                scratch_cells = std::max(scratch_cells, (size_t) n_kv_max * stream_span_max);
             }
         }
         if (!vbr_scratch_reserve(scratch_cells)) {
@@ -12084,7 +12092,7 @@ uint32_t llama_kv_cache::get_stream(llama_seq_id seq_id) const {
     return seq_to_stream[seq_id];
 }
 
-uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo) const {
+uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo, uint32_t n_used_min) const {
     uint32_t result = 0;
 
     // pad the n_kv value so that the graph remains constant across batches and can be reused
@@ -12093,8 +12101,9 @@ uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo) const {
 
     for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
         const auto & cells = v_cells[sinfo.strm[s]];
+        const uint32_t n_used = std::max(cells.used_max_p1(), n_used_min);
 
-        result = std::max(std::min(cells.size(), std::max(n_pad_cur, GGML_PAD(cells.used_max_p1(), n_pad_cur))), result);
+        result = std::max(std::min(cells.size(), std::max(n_pad_cur, GGML_PAD(n_used, n_pad_cur))), result);
     }
 
     return result;
@@ -13810,7 +13819,31 @@ llama_kv_cache_context::llama_kv_cache_context(
 llama_kv_cache_context::llama_kv_cache_context(
         llama_kv_cache * kv,
         llama_kv_cache::slot_info_vec_t sinfos,
-        std::vector<llama_ubatch> ubatches) : status(LLAMA_MEMORY_STATUS_SUCCESS), kv(kv), sinfos(std::move(sinfos)), ubatches(std::move(ubatches)) {
+        std::vector<llama_ubatch> ubatches,
+        bool batch_stable) : status(LLAMA_MEMORY_STATUS_SUCCESS), kv(kv), sinfos(std::move(sinfos)), ubatches(std::move(ubatches)) {
+    // every ubatch of a multi-ubatch batch reads up to the batch's last cell, so their graphs keep one shape
+    // and are reused, which pipeline parallelism needs to overlap them
+    if (batch_stable && kv->spans_devices() && this->sinfos.size() > 1) {
+        for (const auto & sinfo : this->sinfos) {
+            for (const auto & idxs : sinfo.idxs) {
+                for (const uint32_t idx : idxs) {
+                    n_used_batch = std::max(n_used_batch, idx + 1);
+                }
+            }
+        }
+        uint32_t n_kv_batch = 0;
+        for (const auto & sinfo : this->sinfos) {
+            n_kv_batch = std::max(n_kv_batch, kv->get_n_kv(sinfo, n_used_batch));
+        }
+        // out of VBR memory: the ubatches grow their reads as they go, at the cost of a graph per ubatch
+        if (!kv->vbr_map_reads(n_kv_batch)) {
+            n_used_batch = 0;
+        }
+    }
+}
+
+bool llama_kv_cache::vbr_map_reads(uint32_t n_kv) {
+    return !vbr_vmm_active() || vbr_vmm_try_map(n_kv);
 }
 
 llama_kv_cache_context::~llama_kv_cache_context() = default;
@@ -13836,7 +13869,7 @@ bool llama_kv_cache_context::apply() {
     }
 
     kv->apply_ubatch(sinfos[i_cur], ubatches[i_cur]);
-    n_kv = kv->get_n_kv(sinfos[i_cur]);
+    n_kv = kv->get_n_kv(sinfos[i_cur], n_used_batch);
 
     return true;
 }
