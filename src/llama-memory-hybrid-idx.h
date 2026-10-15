@@ -130,6 +130,7 @@ private:
     std::unique_ptr<kpool_layout> kpool_lay;
     void mem_idx_stale_set(llama_seq_id seq_id, llama_pos p0);
     llama_pos mem_idx_stale_pos(llama_seq_id seq_id, llama_pos p0) const;
+    void mem_idx_stale_copy(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, bool dst_empty);
     bool kpool_can_remove(llama_seq_id seq_id, llama_pos p0, llama_pos p1) const;
     stale_pos_t mem_idx_stale = stale_pos_clean();
 };
