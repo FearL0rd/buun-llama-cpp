@@ -2164,6 +2164,16 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         prev_window_size = n_local;
     };
 
+    // user inputs are copied synchronously into this copy's buffers, which are free once the graph that last
+    // used this copy finished on every backend. waiting for that once, up front, keeps a later split's input
+    // copy from waiting on an earlier split of this graph (the events are re-recorded per split), which would
+    // block the host and serialize pipeline parallelism
+    for (int b = 0; b < sched->n_backends; b++) {
+        if (sched->events[b][sched->cur_copy] != NULL) {
+            ggml_backend_event_synchronize(sched->events[b][sched->cur_copy]);
+        }
+    }
+
     int prev_backend_id = -1;
 
     for (int split_id = 0; split_id < sched->n_splits; split_id++) {
@@ -2211,9 +2221,8 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
             if (input->flags & GGML_TENSOR_FLAG_INPUT) {
                 // inputs from the user must be copied immediately to prevent the user overwriting the data before the copy is done
-                if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
-                    ggml_backend_event_synchronize(sched->events[split_backend_id][sched->cur_copy]);
-                } else {
+                // (with events, the destination was already waited for before the first split)
+                if (sched->events[split_backend_id][sched->cur_copy] == NULL) {
                     sync_split_backend();
                 }
                 ggml_backend_tensor_copy(input, input_cpy);
