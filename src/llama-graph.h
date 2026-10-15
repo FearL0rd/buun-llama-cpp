@@ -1005,6 +1005,8 @@ struct llm_graph_params {
         }
 
         return
+            // a warmup graph routes every expert
+            cparams.warmup                  == other.cparams.warmup                  &&
             cparams.embeddings              == other.cparams.embeddings              &&
             cparams.embeddings_nextn        == other.cparams.embeddings_nextn        &&
             cparams.embeddings_nextn_masked == other.cparams.embeddings_nextn_masked &&
