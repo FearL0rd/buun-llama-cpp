@@ -1952,7 +1952,11 @@ struct ggml_cuda_step_graph {
     cudaGraphExec_t instance = nullptr;
 };
 
-static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph);
+static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph, int64_t * n_tokens);
+
+// Prefill-width splits are compute bound, so replay saves little, while each executable pins VRAM
+// per split. Graphs are kept for decode, verify and draft widths, and for pipelined prefill.
+static constexpr int64_t ggml_cuda_graph_max_tokens = 128;
 
 static bool ggml_backend_cuda_step_capturable(ggml_backend_t backend, ggml_cgraph * cgraph) {
 #ifdef USE_CUDA_GRAPH
@@ -1964,7 +1968,8 @@ static bool ggml_backend_cuda_step_capturable(ggml_backend_t backend, ggml_cgrap
     if (ggml_cuda_info().devices[cuda_ctx->device].cc < GGML_CUDA_CC_AMPERE) {
         return false;
     }
-    return ggml_cuda_graph_check_compability(cgraph);
+    int64_t n_tokens = 0;
+    return ggml_cuda_graph_check_compability(cgraph, &n_tokens) && n_tokens <= ggml_cuda_graph_max_tokens;
 #else
     GGML_UNUSED(backend); GGML_UNUSED(cgraph);
     return false;
@@ -4390,12 +4395,11 @@ static bool ggml_cuda_single_use(const ggml_cgraph * cgraph, const ggml_tensor *
 }
 
 #ifdef USE_CUDA_GRAPH
-static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
+// n_tokens: set to the widest matmul batch in the graph
+static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph, int64_t * n_tokens) {
 
     bool use_cuda_graph = true;
-    // Prefill-width splits are compute bound, so replay saves little, while each executable pins
-    // ~100 MiB of VRAM per distinct shape. Keep graphs for decode, verify and draft widths.
-    constexpr int64_t max_graph_tokens = 128;
+    *n_tokens = 0;
     // Loop over nodes in GGML graph to obtain info needed for CUDA graph
 
     for (int i = 0; i < cgraph->n_nodes; i++) {
@@ -4405,9 +4409,8 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
             continue;
         }
 
-        if (node->op == GGML_OP_MUL_MAT && node->ne[1] > max_graph_tokens) {
-            use_cuda_graph = false;
-            break;
+        if (node->op == GGML_OP_MUL_MAT) {
+            *n_tokens = std::max(*n_tokens, node->ne[1]);
         }
 
         if (node->op == GGML_OP_MUL_MAT_ID) {
@@ -4439,8 +4442,15 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
 // with an entry per split and shape that pushes the decode graphs out before they warm up.
 static constexpr uint64_t ggml_cuda_graph_uncapturable_key = 0;
 
-static uint64_t ggml_cuda_graph_get_key(ggml_cgraph * cgraph) {
-    return ggml_cuda_graph_check_compability(cgraph) ? ggml_cuda_graph_shape_key(cgraph) : ggml_cuda_graph_uncapturable_key;
+// prefill (optional): set when the graph is wider than ggml_cuda_graph_max_tokens
+static uint64_t ggml_cuda_graph_get_key(ggml_cgraph * cgraph, bool * prefill = nullptr) {
+    int64_t n_tokens = 0;
+    const bool compatible = ggml_cuda_graph_check_compability(cgraph, &n_tokens);
+    const bool wide = n_tokens > ggml_cuda_graph_max_tokens;
+    if (prefill) {
+        *prefill = wide;
+    }
+    return compatible && (!wide || cgraph->pipelined) ? ggml_cuda_graph_shape_key(cgraph) : ggml_cuda_graph_uncapturable_key;
 }
 
 static bool ggml_cuda_graph_update_required(
@@ -9565,16 +9575,28 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     }
 
 #ifdef USE_CUDA_GRAPH
-    graph_key = ggml_cuda_graph_get_key(cgraph);
+    bool prefill = false;
+    graph_key = ggml_cuda_graph_get_key(cgraph, &prefill);
 
     ggml_cuda_graph_set_enabled(cuda_ctx, graph_key);
 
     ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
     if (graph->is_enabled()) {
         if (graph_key != ggml_cuda_graph_uncapturable_key) {
+            if (prefill) {
+                // no warmup runs ahead of a prefill capture: grow its lazy scratch now, so no node
+                // frees an address an earlier node of the same capture recorded
+                ggml_cuda_fattn_scratch_reserve(*cuda_ctx, cgraph);
+            }
             const bool properties_changed = ggml_cuda_graph_update_required(cuda_ctx, cgraph, graph_key);
 
-            if (!graph->warmup_complete) {
+            if (prefill) {
+                // A pipelined prefill split keeps its shape for the rest of the batch and changes with the next
+                // one, so a warmup would run exactly the calls a capture serves eagerly. One launch per split keeps
+                // the host ahead of every device in the pipeline instead of stalling on one device's queue.
+                use_cuda_graph = true;
+                cuda_graph_update_required = properties_changed || graph->instance == nullptr;
+            } else if (!graph->warmup_complete) {
                 // Warmup: need at least 2 calls with no property change on the 2nd call
                 if (!properties_changed) {
                     graph->warmup_complete = true;
