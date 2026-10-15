@@ -4534,6 +4534,10 @@ static void ggml_cuda_graph_instantiate(ggml_backend_cuda_context * cuda_ctx, gg
         CUDA_CHECK(cudaStreamSynchronize(cuda_ctx->stream()));
         synced = true;
     }
+    if (err == cudaErrorMemoryAllocation) {
+        GGML_LOG_ERROR("%s: no device %d memory left for a CUDA graph executable: free some VRAM (lower -ngl/-ts on "
+                       "this device, smaller -ub) or set GGML_CUDA_DISABLE_GRAPHS=1\n", __func__, cuda_ctx->device);
+    }
     CUDA_CHECK(err);
 }
 
