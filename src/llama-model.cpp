@@ -1568,7 +1568,14 @@ llama_model::llama_model(const llama_model_params & params) : params(params), pi
         pimpl->tensor_split_owned.assign(params.tensor_split, params.tensor_split + llama_max_devices());
         this->params.tensor_split = pimpl->tensor_split_owned.data();
     }
-    pimpl->has_tensor_overrides = params.tensor_buft_overrides && params.tensor_buft_overrides[0].pattern;
+    // overrides that only move tensors between devices keep every layer on a device
+    pimpl->has_tensor_overrides = false;
+    for (const auto * o = params.tensor_buft_overrides; o && o->pattern; ++o) {
+        if (ggml_backend_buft_is_host(o->buft)) {
+            pimpl->has_tensor_overrides = true;
+            break;
+        }
+    }
 }
 
 llama_model::~llama_model() {
