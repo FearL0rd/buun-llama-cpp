@@ -450,6 +450,35 @@ llama_context::llama_context(
         cparams.n_ubatch = std::min(cparams.n_ubatch, 256u);
     }
 
+    cparams.layer_begin = params.layer_begin;
+    cparams.layer_end   = params.layer_end == 0 ? (int32_t) hparams.n_layer() : params.layer_end;
+    if (cparams.layer_begin != 0 || cparams.layer_end != (int32_t) hparams.n_layer()) {
+        if (model.arch != LLM_ARCH_GLM5_NEXT || cparams.ctx_type != LLAMA_CONTEXT_TYPE_DEFAULT) {
+            throw std::runtime_error("layer-split contexts are only supported for the GLM5-Next trunk");
+        }
+        if (cparams.layer_end < (int32_t) hparams.n_layer() && params.embeddings) {
+            throw std::runtime_error("a layer-split head has no outputs, embeddings are not supported");
+        }
+        // one hop per context: a head [0, s) or a tail [s, n_layer)
+        if (cparams.layer_begin < 0 || cparams.layer_begin >= cparams.layer_end || cparams.layer_end > (int32_t) hparams.n_layer() ||
+                (cparams.layer_begin > 0 && cparams.layer_end < (int32_t) hparams.n_layer())) {
+            throw std::runtime_error("invalid layer range");
+        }
+        // shared-indexer layers reuse the selection of the previous full one, which must be ours
+        for (int il = cparams.layer_begin; il < cparams.layer_end; ++il) {
+            if (!hparams.is_recr(il)) {
+                if (!hparams.is_indexer_full(il)) {
+                    throw std::runtime_error(format("layer split at %d: first attention layer %d has a shared indexer", cparams.layer_begin, il));
+                }
+                break;
+            }
+        }
+        // the hop is indexed by position modulo its rows: the head may run a whole batch plus one
+        // ubatch ahead of the tail
+        const int il_hop = cparams.layer_begin > 0 ? cparams.layer_begin : cparams.layer_end;
+        cparams.layer_hop = model.get_layer_hop(il_hop, (int64_t) cparams.n_batch + cparams.n_ubatch);
+    }
+
     cparams.n_outputs_max = params.n_outputs_max == 0 || llama_model_has_encoder(&model) ? cparams.n_batch : params.n_outputs_max;
     cparams.n_outputs_max_per_seq = params.n_outputs_max_per_seq == 0 ?
             cparams.n_outputs_max : std::min(params.n_outputs_max_per_seq, cparams.n_outputs_max);
@@ -7706,6 +7735,8 @@ llama_context_params llama_context_default_params() {
         /*.n_ubatch                    =*/ 512,
         /*.n_seq_max                   =*/ 1,
         /*.n_rs_seq                    =*/ 0,
+        /*.layer_begin                 =*/ 0,
+        /*.layer_end                   =*/ 0,
         /*.n_outputs_max               =*/ 0,
         /*.n_outputs_max_per_seq       =*/ 1,
         /*.n_threads                   =*/ GGML_DEFAULT_N_THREADS, // TODO: better default

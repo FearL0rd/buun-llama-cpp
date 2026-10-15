@@ -39,6 +39,7 @@
 #include <cmath>
 #include <functional>
 #include <map>
+#include <mutex>
 #include <numeric>
 #include <regex>
 #include <sstream>
@@ -1509,6 +1510,10 @@ struct llama_model::impl {
     // Effective, non-cumulative split weights in the physical device order.
     // Unlike params.tensor_split, this is populated for automatic placement too.
     std::vector<float> tensor_split_resolved;
+
+    // residual stream rows handed between layer-split contexts, keyed by the boundary layer
+    std::mutex hop_mutex;
+    std::map<int, std::pair<ggml_context_ptr, ggml_backend_buffer_ptr>> hops;
 };
 
 bool llama_prec_policy::apply(ggml_tensor * res) const {
@@ -3193,6 +3198,37 @@ ggml_backend_dev_t llama_model::dev_layer(int il) const {
     return pimpl->dev_layer.at(il).dev;
 }
 
+ggml_tensor * llama_model::get_layer_hop(int il, int64_t n_rows) const {
+    std::lock_guard<std::mutex> lock(pimpl->hop_mutex);
+
+    auto it = pimpl->hops.find(il);
+    if (it != pimpl->hops.end()) {
+        ggml_tensor * hop = ggml_get_first_tensor(it->second.first.get());
+        if (hop->ne[1] < n_rows) {
+            throw std::runtime_error(format("layer %d hop holds %" PRId64 " rows, %" PRId64 " needed", il, hop->ne[1], n_rows));
+        }
+        return hop;
+    }
+
+    // the receiving half reads it, so it lives with the boundary layer
+    ggml_backend_dev_t dev = dev_layer(il);
+    ggml_backend_buffer_type_t buft = dev ? ggml_backend_dev_buffer_type(dev) : ggml_backend_cpu_buffer_type();
+
+    ggml_init_params ip = { ggml_tensor_overhead(), nullptr, true };
+    ggml_context_ptr ctx(ggml_init(ip));
+    ggml_tensor * hop = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, (int64_t) hparams.n_embd * std::max(1u, hparams.dsv4_hc_mult), n_rows);
+    ggml_format_name(hop, "layer_hop_%d", il);
+
+    ggml_backend_buffer_ptr buf(ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), buft));
+    if (!buf) {
+        throw std::runtime_error(format("failed to allocate the layer %d hop", il));
+    }
+    ggml_backend_buffer_clear(buf.get(), 0);
+
+    pimpl->hops.emplace(il, std::make_pair(std::move(ctx), std::move(buf)));
+    return hop;
+}
+
 ggml_backend_dev_t llama_model::dev_output() const {
     return pimpl->dev_output.dev;
 }
@@ -3493,15 +3529,18 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                 }
 
                 // KDA layers are recurrent, the DSA layers use a K-only MLA cache plus an indexer cache.
-                // tThe Nextn block is never attended by the trunk graph
+                // The Nextn block is never attended by the trunk graph, a layer-split context keeps its range only
+                const auto in_range = [&](uint32_t il) {
+                    return (int32_t) il >= cparams.layer_begin && (int32_t) il < cparams.layer_end;
+                };
                 llama_memory_hybrid_idx::layer_filter_cb filter_attn = [&](uint32_t il) {
-                    return il < hparams.n_layer() && !hparams.is_recr(il);
+                    return in_range(il) && !hparams.is_recr(il);
                 };
                 llama_memory_hybrid_idx::layer_filter_cb filter_idx = [&](uint32_t il) {
-                    return il < hparams.n_layer() && !hparams.is_recr(il) && hparams.is_indexer_full(il);
+                    return in_range(il) && !hparams.is_recr(il) && hparams.is_indexer_full(il);
                 };
                 llama_memory_hybrid_idx::layer_filter_cb filter_recr = [&](uint32_t il) {
-                    return il < hparams.n_layer() && hparams.is_recr(il);
+                    return in_range(il) && hparams.is_recr(il);
                 };
 
                 res = new llama_memory_hybrid_idx(

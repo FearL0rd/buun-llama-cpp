@@ -857,6 +857,9 @@ struct llama_model {
     ggml_backend_dev_t dev_layer(int il) const;
     ggml_backend_dev_t dev_output() const;
 
+    // shared buffer that layer-split contexts exchange the residual stream through at layer il
+    ggml_tensor * get_layer_hop(int il, int64_t n_rows) const;
+
     ggml_backend_buffer_type_t select_buft(int il) const;
 
     bool has_tensor_overrides() const;

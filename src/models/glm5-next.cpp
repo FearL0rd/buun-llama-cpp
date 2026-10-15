@@ -753,6 +753,29 @@ ggml_tensor * llama_model_glm5_next::graph::build_hc_post(
     return out;
 }
 
+// rows of the layer hop a split context exchanges its residual stream through, by position
+class llm_graph_input_hop_rows : public llm_graph_input_i {
+public:
+    explicit llm_graph_input_hop_rows(int64_t n_rows) : n_rows(n_rows) {}
+
+    void set_input(const llama_ubatch * ubatch) override {
+        GGML_ASSERT(ggml_backend_buffer_is_host(rows->buffer));
+        // rows are keyed by position alone
+        GGML_ASSERT(ubatch->n_seqs_unq == 1 && "a layer-split context decodes one sequence at a time");
+        int32_t * data = (int32_t *) rows->data;
+        for (uint32_t i = 0; i < ubatch->n_tokens; ++i) {
+            data[i] = (int32_t) (ubatch->pos[i] % n_rows);
+        }
+    }
+
+    bool can_reuse(const llm_graph_params & params) override {
+        return rows->ne[0] == params.ubatch.n_tokens;
+    }
+
+    ggml_tensor * rows = nullptr; // I32 [n_tokens]
+    const int64_t n_rows;
+};
+
 llama_model_glm5_next::graph::graph(const llama_model & model, const llm_graph_params & params) :
     llm_build_delta_net_base(params), model(model) {
 
@@ -760,8 +783,18 @@ llama_model_glm5_next::graph::graph(const llama_model & model, const llm_graph_p
 
     ggml_tensor * cur;
 
-    ggml_tensor * inp = build_inp_embd(model.tok_embd);
-    cb(inp, "inp_embd", -1);
+    const int il_begin = cparams.layer_begin;
+    const int il_end   = cparams.layer_end;
+
+    ggml_tensor * hop      = cparams.layer_hop;
+    ggml_tensor * hop_rows = nullptr;
+    if (hop) {
+        auto inp = std::make_unique<llm_graph_input_hop_rows>(hop->ne[1]);
+        inp->rows = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens);
+        ggml_set_input(inp->rows);
+        hop_rows = inp->rows;
+        res->add_input(std::move(inp));
+    }
 
     // recurrent state + K-only MLA cache through the generic hybrid input, plus the indexer cache
     const auto * mctx_hyb = static_cast<const llama_memory_hybrid_idx_context *>(mctx);
@@ -771,7 +804,7 @@ llama_model_glm5_next::graph::graph(const llama_model & model, const llm_graph_p
     auto * inp_attn  = inp_hyb->get_attn();
     auto * inp_kpool = build_inp_kpool(mctx_hyb);
 
-    ggml_tensor * inp_out_ids = build_inp_out_ids();
+    ggml_tensor * inp_out_ids = il_end == n_layer ? build_inp_out_ids() : nullptr;
 
     const int64_t n_head_kda   = hparams.n_head();
     const int64_t head_dim     = hparams.n_embd_head_kda;
@@ -785,13 +818,25 @@ llama_model_glm5_next::graph::graph(const llama_model & model, const llm_graph_p
     GGML_ASSERT(ubatch.n_tokens == n_seq_tokens * n_seqs);
 
     const int64_t hc = hparams.dsv4_hc_mult;
-    ggml_tensor * inpL = ggml_reshape_3d(ctx0, inp, n_embd, 1, n_tokens);
-    inpL = ggml_repeat_4d(ctx0, inpL, n_embd, hc, n_tokens, 1);
-    cb(inpL, "hc_init", -1);
+    ggml_tensor * inpL;
+    if (il_begin == 0) {
+        ggml_tensor * inp = build_inp_embd(model.tok_embd);
+        cb(inp, "inp_embd", -1);
+
+        inpL = ggml_reshape_3d(ctx0, inp, n_embd, 1, n_tokens);
+        inpL = ggml_repeat_4d(ctx0, inpL, n_embd, hc, n_tokens, 1);
+        cb(inpL, "hc_init", -1);
+    } else {
+        // the tail picks up the streams the head left at layer il_begin; the context checks that its
+        // first DSA layer runs a full indexer, so no selection crosses the split
+        inpL = ggml_get_rows(ctx0, hop, hop_rows);
+        inpL = ggml_reshape_3d(ctx0, inpL, n_embd, hc, n_tokens);
+        cb(inpL, "hop_in", -1);
+    }
 
     ggml_tensor * prev_sel = nullptr;
 
-    for (int il = 0; il < n_layer; ++il) {
+    for (int il = il_begin; il < il_end; ++il) {
         const auto & layer = model.layers[il];
 
         ggml_tensor * residual = inpL;
@@ -837,6 +882,13 @@ llama_model_glm5_next::graph::graph(const llama_model & model, const llm_graph_p
         inpL = build_hc_post(cur, residual, post, comb, il);
         inpL = build_cvec(inpL, il);
         cb(inpL, "l_out", il);
+    }
+
+    if (il_end < n_layer) {
+        // the head hands its streams to the tail and has no outputs
+        ggml_tensor * flat = ggml_reshape_2d(ctx0, inpL, n_embd*hc, n_tokens);
+        ggml_build_forward_expand(gf, ggml_set_rows(ctx0, hop, flat, hop_rows));
+        return;
     }
 
     // narrow to the output tokens, then collapse the streams
