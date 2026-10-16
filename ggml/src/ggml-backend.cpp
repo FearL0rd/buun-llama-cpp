@@ -2071,15 +2071,17 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
             }
         }
 
-        // the re-allocation may cause the split inputs to be moved to a different address
-        // synchronize without ggml_backend_sched_synchronize to avoid changing cur_copy
-        for (int i = 0; i < sched->n_backends; i++) {
-            ggml_backend_synchronize(sched->backends[i]);
-        }
-
-        if (!ggml_gallocr_reserve_n(sched->galloc, &sched->graph, sched->node_backend_ids, sched->leaf_backend_ids)) {
-            GGML_LOG_ERROR("%s: failed to reserve graph buffers\n", __func__);
-            return false;
+        // a new layout in the same buffers is ordered like any freshly allocated graph, but a buffer
+        // re-allocation moves memory that graphs in flight still use, so wait for them first (without
+        // ggml_backend_sched_synchronize to avoid changing cur_copy)
+        if (!ggml_gallocr_reserve_n_in_place(sched->galloc, &sched->graph, sched->node_backend_ids, sched->leaf_backend_ids)) {
+            for (int i = 0; i < sched->n_backends; i++) {
+                ggml_backend_synchronize(sched->backends[i]);
+            }
+            if (!ggml_gallocr_reserve_n(sched->galloc, &sched->graph, sched->node_backend_ids, sched->leaf_backend_ids)) {
+                GGML_LOG_ERROR("%s: failed to reserve graph buffers\n", __func__);
+                return false;
+            }
         }
         if (!ggml_gallocr_alloc_graph(sched->galloc, &sched->graph)) {
             GGML_LOG_ERROR("%s: failed to allocate graph\n", __func__);
