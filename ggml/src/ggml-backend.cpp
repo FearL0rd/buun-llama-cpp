@@ -1373,24 +1373,23 @@ static void ggml_backend_sched_print_assignments(ggml_backend_sched_t sched, str
     }
 }
 
-static bool ggml_backend_sched_buffer_supported(ggml_backend_sched_t sched, struct ggml_tensor * t, int backend_id) {
+// the buffer type the tensor is or will be allocated in, NULL if not known yet
+static ggml_backend_buffer_type_t ggml_backend_sched_tensor_buft(ggml_backend_sched_t sched, struct ggml_tensor * t) {
     ggml_backend_buffer_t buf = t->view_src ? t->view_src->buffer : t->buffer;
-    ggml_backend_buffer_type_t buft = NULL;
-
     if (buf) {
         // the tensor is already allocated
-        buft = buf->buft;
-    } else {
-        // see if the tensor already has a backend assigned, and use the buffer type of that backend
-        int tensor_backend_id = tensor_backend_id(t);
-        if (tensor_backend_id == -1 && t->view_src) {
-            tensor_backend_id = tensor_backend_id(t->view_src);
-        }
-        if (tensor_backend_id != -1) {
-            buft = sched->bufts[tensor_backend_id];
-        }
+        return buf->buft;
     }
+    // see if the tensor already has a backend assigned, and use the buffer type of that backend
+    int tensor_backend_id = tensor_backend_id(t);
+    if (tensor_backend_id == -1 && t->view_src) {
+        tensor_backend_id = tensor_backend_id(t->view_src);
+    }
+    return tensor_backend_id != -1 ? sched->bufts[tensor_backend_id] : NULL;
+}
 
+static bool ggml_backend_sched_buffer_supported(ggml_backend_sched_t sched, struct ggml_tensor * t, int backend_id) {
+    ggml_backend_buffer_type_t buft = ggml_backend_sched_tensor_buft(sched, t);
     return buft != NULL && ggml_backend_supports_buft(sched->backends[backend_id], buft);
 }
 
@@ -2105,12 +2104,10 @@ struct ggml_backend_sched_staged_input {
     size_t              offset; // in the copy's input_stage buffer
 };
 
-// copy the host user inputs of the splits whose backends can upload asynchronously into this copy's
-// staging buffer, which stays untouched until this copy's events are waited for again; empty: copy
-// the inputs synchronously
-static std::vector<ggml_backend_sched_staged_input> ggml_backend_sched_stage_inputs(ggml_backend_sched_t sched) {
-    std::vector<ggml_backend_sched_staged_input> staged;
-    ggml_backend_buffer_type_t host_buft = NULL;
+// lay out the host user inputs of the splits whose backends can upload asynchronously in one staging
+// buffer and return its size; the graph does not have to be allocated yet
+static size_t ggml_backend_sched_stage_layout(ggml_backend_sched_t sched,
+        std::vector<ggml_backend_sched_staged_input> & staged, ggml_backend_buffer_type_t & host_buft) {
     size_t size = 0;
     for (int s = 0; s < sched->n_splits; s++) {
         const struct ggml_backend_sched_split * split = &sched->splits[s];
@@ -2128,7 +2125,8 @@ static std::vector<ggml_backend_sched_staged_input> ggml_backend_sched_stage_inp
             const ggml_tensor * input = split->inputs[i];
             // views of user inputs (e.g. a reshaped mask) hold user data too, but lack the flag
             const ggml_tensor * owner = input->view_src ? input->view_src : input;
-            if (!(owner->flags & GGML_TENSOR_FLAG_INPUT) || !ggml_backend_buffer_is_host(input->buffer) ||
+            ggml_backend_buffer_type_t input_buft = ggml_backend_sched_tensor_buft(sched, split->inputs[i]);
+            if (!(owner->flags & GGML_TENSOR_FLAG_INPUT) || input_buft == NULL || !ggml_backend_buft_is_host(input_buft) ||
                 std::any_of(staged.begin(), staged.end(), [&](const auto & e) { return e.tensor == input; })) {
                 continue;
             }
@@ -2136,21 +2134,36 @@ static std::vector<ggml_backend_sched_staged_input> ggml_backend_sched_stage_inp
             size += GGML_PAD(ggml_nbytes(input), align);
         }
     }
+    return size;
+}
+
+// a staging buffer only grows, NULL if that failed. Freeing or allocating pinned host memory waits for
+// every device, which drains the pipeline, so reserve grows the buffers of all copies to the worst case
+// up front; a failure there is retried when a graph is computed
+static ggml_backend_buffer_t ggml_backend_sched_stage_grow(ggml_backend_sched_t sched, int copy,
+        ggml_backend_buffer_type_t host_buft, size_t size) {
+    ggml_backend_buffer_t & buf = sched->input_stage[copy];
+    if (buf == NULL || ggml_backend_buffer_get_size(buf) < size) {
+        ggml_backend_buffer_free(buf);
+        buf = ggml_backend_buft_alloc_buffer(host_buft, size);
+    }
+    return buf;
+}
+
+// copy the host user inputs of the splits whose backends can upload asynchronously into this copy's
+// staging buffer, which stays untouched until this copy's events are waited for again; empty: copy
+// the inputs synchronously
+static std::vector<ggml_backend_sched_staged_input> ggml_backend_sched_stage_inputs(ggml_backend_sched_t sched) {
+    std::vector<ggml_backend_sched_staged_input> staged;
+    ggml_backend_buffer_type_t host_buft = NULL;
+    const size_t size = ggml_backend_sched_stage_layout(sched, staged, host_buft);
     if (staged.empty()) {
         return staged;
     }
-
-    ggml_backend_buffer_t & buf = sched->input_stage[sched->cur_copy];
-    if (buf != NULL && ggml_backend_buffer_get_size(buf) < size) {
-        ggml_backend_buffer_free(buf);
-        buf = NULL;
-    }
+    ggml_backend_buffer_t buf = ggml_backend_sched_stage_grow(sched, sched->cur_copy, host_buft, size);
     if (buf == NULL) {
-        buf = ggml_backend_buft_alloc_buffer(host_buft, size);
-        if (buf == NULL) {
-            staged.clear();
-            return staged;
-        }
+        staged.clear();
+        return staged;
     }
     char * base = (char *) ggml_backend_buffer_get_base(buf);
     for (const auto & e : staged) {
@@ -2785,6 +2798,15 @@ bool ggml_backend_sched_reserve(ggml_backend_sched_t sched, struct ggml_cgraph *
     sched->galloc_graph_slot = sched->cur_graph_slot;
     if (!ggml_gallocr_reserve_n(sched->galloc, &sched->graph, sched->node_backend_ids, sched->leaf_backend_ids)) {
         return false;
+    }
+
+    std::vector<ggml_backend_sched_staged_input> staged;
+    ggml_backend_buffer_type_t host_buft = NULL;
+    const size_t stage_size = ggml_backend_sched_stage_layout(sched, staged, host_buft);
+    if (!staged.empty()) {
+        for (int c = 0; c < sched->n_copies; c++) {
+            ggml_backend_sched_stage_grow(sched, c, host_buft, stage_size);
+        }
     }
 
     ggml_backend_sched_reset(sched);
