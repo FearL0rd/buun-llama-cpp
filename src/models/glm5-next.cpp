@@ -466,6 +466,9 @@ public:
     ggml_tensor * pool_mask     = nullptr; // F32/F16 [n_pool, n_tokens]
     ggml_tensor * tail_idxs     = nullptr; // I32     [kpool - 1, n_tokens]
     ggml_tensor * sel_mask      = nullptr; // F32     [n_sel, 1, 1, n_tokens] 0 for live selection slots, -inf for dead ones
+    // shared by every indexer layer, so a device split copies each once per device instead of once per layer
+    ggml_tensor * sel_pool_val  = nullptr; // F32     [1, n_pool_sel, n_tokens] view of sel_mask
+    ggml_tensor * kq_mask_2d    = nullptr; // F32/F16 [n_kv, n_tokens]          reshape of the attention mask
     // only with route_dead
     ggml_tensor * sel_live      = nullptr; // F32     [n_pool_sel, n_tokens]  1 for live pool slots, 0 for dead ones
     ggml_tensor * sel_dump      = nullptr; // F32     [n_pool_sel, n_tokens]  0 for live pool slots, n_kv for dead ones
@@ -502,7 +505,7 @@ llama_model_glm5_next::llm_graph_input_kpool * llama_model_glm5_next::graph::bui
     inp->pool_cells = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_pool);
     inp->pool_idxs  = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, kpool, n_pool);
     inp->pool_mask  = ggml_new_tensor_2d(ctx0, type_mask, n_pool, n_tokens);
-    inp->tail_idxs  = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, kpool - 1, n_tokens);
+    inp->tail_idxs  = ggml_new_tensor_3d(ctx0, GGML_TYPE_I32, kpool - 1, n_tokens, 1);
     ggml_set_input(inp->pool_cells);
     ggml_set_input(inp->pool_idxs);
     ggml_set_input(inp->pool_mask);
@@ -526,6 +529,9 @@ llama_model_glm5_next::llm_graph_input_kpool * llama_model_glm5_next::graph::bui
         ggml_set_input(inp->sel_mask);
         // set_input_kpool always fills the mask, so it stays allocated in every graph
         ggml_build_forward_expand(gf, inp->sel_mask);
+
+        const ggml_tensor * m = inp->sel_mask;
+        inp->sel_pool_val = ggml_view_3d(ctx0, inp->sel_mask, 1, kpool*n_top_pool, n_tokens, m->nb[0], m->nb[3], 0);
 
         // per pool slot, live = exp(mask) and the dump offset n_kv*(1 - live), shared by every indexer layer
         inp->route_dead = mctx_hyb->get_kpool_partial_share();
@@ -803,6 +809,10 @@ llama_model_glm5_next::graph::graph(const llama_model & model, const llm_graph_p
     auto * inp_rs    = inp_hyb->get_recr();
     auto * inp_attn  = inp_hyb->get_attn();
     auto * inp_kpool = build_inp_kpool(mctx_hyb);
+    {
+        ggml_tensor * kq_mask = inp_attn->get_kq_mask();
+        inp_kpool->kq_mask_2d = ggml_reshape_2d(ctx0, kq_mask, kq_mask->ne[0], ubatch.n_tokens);
+    }
 
     ggml_tensor * inp_out_ids = il_end == n_layer ? build_inp_out_ids() : nullptr;
 
@@ -1128,7 +1138,6 @@ ggml_tensor * llama_model_glm5_next::graph::build_kpool_select(
         sel_idx = ggml_reshape_3d(ctx0, sel_idx, kpool*n_top_pool, n_tokens, 1);
     }
     const int64_t n_pool_sel = sel_idx->ne[0];
-    const int64_t n_sel      = inp_kpool->sel_mask->ne[0];
 
     ggml_build_forward_expand(gf, sel_idx);
 
@@ -1141,29 +1150,26 @@ ggml_tensor * llama_model_glm5_next::graph::build_kpool_select(
     // branched mid-pool, so its slots go to the dump column: idx = live*idx + n_kv*(1 - live).
     // Without such sharing a dead pool's cells are all masked anyway, so the routing is skipped.
     // It can hold the token's tail cells too (a pool completed later in the ubatch): the tail scatter goes last.
+    // Absent tail cells point at the dump column, so the tail scatters plain zeros.
     GGML_ASSERT(inp_kpool->sel_mask->ne[3] == n_tokens);
-    GGML_ASSERT(n_sel == n_pool_sel + (hparams.indexer_kpool_select_tail ? inp_kpool->tail_idxs->ne[0] : 0));
     if (inp_kpool->route_dead) {
         GGML_ASSERT(inp_kpool->sel_live->ne[0] == n_pool_sel);
         ggml_tensor * idx_f = ggml_cast(ctx0, sel_idx, GGML_TYPE_F32);
         idx_f = ggml_add(ctx0, ggml_mul(ctx0, idx_f, inp_kpool->sel_live), inp_kpool->sel_dump);
         sel_idx = ggml_cast(ctx0, idx_f, GGML_TYPE_I32);
     }
-    const auto sel_val = [&](int64_t n, int64_t i0) {
-        const ggml_tensor * m = inp_kpool->sel_mask;
-        return ggml_view_3d(ctx0, inp_kpool->sel_mask, 1, n, n_tokens, m->nb[0], m->nb[3], ggml_row_size(m->type, i0));
-    };
-    sel = ggml_set_rows(ctx0, sel, sel_val(n_pool_sel, 0), sel_idx);
+    GGML_ASSERT(inp_kpool->sel_pool_val->ne[1] == n_pool_sel);
+    sel = ggml_set_rows(ctx0, sel, inp_kpool->sel_pool_val, sel_idx);
     if (hparams.indexer_kpool_select_tail) {
         ggml_tensor * tail_idxs = inp_kpool->tail_idxs;
-        sel = ggml_set_rows(ctx0, sel, sel_val(tail_idxs->ne[0], n_pool_sel),
-            ggml_reshape_3d(ctx0, tail_idxs, tail_idxs->ne[0], n_tokens, 1));
+        ggml_tensor * zeros = ggml_fill(ctx0, ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, 1, tail_idxs->ne[0], n_tokens), 0.0f);
+        sel = ggml_set_rows(ctx0, sel, zeros, tail_idxs);
     }
     sel = ggml_view_2d(ctx0, sel, n_kv, n_tokens, sel->nb[2], 0);
 
     // Fold causal visibility before shared-indexer reuse.
-    GGML_ASSERT(kq_mask->ne[0] == n_kv && kq_mask->ne[1]*kq_mask->ne[2]*kq_mask->ne[3] == n_tokens);
-    sel = ggml_add(ctx0, sel, ggml_reshape_2d(ctx0, kq_mask, n_kv, n_tokens));
+    GGML_ASSERT(kq_mask->ne[0] == n_kv && kq_mask->ne[1] == n_tokens);
+    sel = ggml_add(ctx0, sel, kq_mask);
     cb(sel, "indexer_sel", il);
 
     return sel;
@@ -1189,7 +1195,7 @@ ggml_tensor * llama_model_glm5_next::graph::build_dsa_layer(
 
     ggml_tensor * sel = nullptr;
     if (il >= (int) hparams.n_layer() || hparams.is_indexer_full(il)) { // the NextN block always has a full indexer
-        sel = build_kpool_select(cur, qr, kq_mask, layer, mctx_hyb, inp_kpool, il);
+        sel = build_kpool_select(cur, qr, inp_kpool->kq_mask_2d, layer, mctx_hyb, inp_kpool, il);
         *prev_sel = sel;
     } else {
         GGML_ASSERT(*prev_sel != nullptr && "shared indexer layer must follow a full indexer layer");

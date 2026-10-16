@@ -1678,6 +1678,8 @@ struct cmd_params_instance {
         cparams.embeddings      = embeddings;
         cparams.op_offload      = !no_op_offload;
         cparams.swa_full        = false;
+        // batches only request the last token's logits, logits_all would size the reserve for n_ubatch*n_vocab
+        cparams.logits_all      = false;
 
         llama_bench_vbr_row row;
         row.active = vbr;
