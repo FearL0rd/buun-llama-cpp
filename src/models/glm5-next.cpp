@@ -1142,8 +1142,10 @@ ggml_tensor * llama_model_glm5_next::graph::build_kpool_select(
     ggml_build_forward_expand(gf, sel_idx);
 
     // Column n_kv is the dump for the n_kv sentinel of padded pools and absent tail cells.
-    ggml_tensor * sel = ggml_new_tensor_3d(ctx0, kq_mask->type, 1, n_kv + 1, n_tokens);
-    sel = ggml_fill(ctx0, sel, -INFINITY);
+    // A node rather than a new leaf: the allocator holds every leaf for the whole graph, which would keep
+    // each indexer layer's selection alive at once (FILL overwrites whatever REPEAT wrote).
+    ggml_tensor * sel = ggml_repeat_4d(ctx0, ggml_view_1d(ctx0, kq_mask, 1, 0), 1, n_kv + 1, n_tokens, 1);
+    sel = ggml_fill_inplace(ctx0, sel, -INFINITY);
 
     // Scatter each slot's own mask value: 0 for live slots (visible pools, real tail cells), -inf for dead ones.
     // A dead pool, one top_k padded a short selection with, can share cells with a live pool when two sequences
