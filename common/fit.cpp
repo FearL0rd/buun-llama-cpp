@@ -2108,9 +2108,11 @@ static void common_params_fit_impl(
             __func__, dev_names[id].c_str(), ngl_per_device[id].n_layer, ngl_per_device[id].n_part, mem[id]/MiB, projected_margin/MiB);
     }
 
+    // a device's first partial layer may overflow to the next GPU, which keeps its experts in VRAM
     bool stock_spills_experts = false;
-    for (const ngl_t & layers : ngl_per_device) {
-        if (layers.n_part > 0) {
+    for (size_t id = 0; id < nd; id++) {
+        const uint32_t n_part = ngl_per_device[id].n_part;
+        if (n_part > 1 || (n_part == 1 && overflow_bufts[id] == ggml_backend_cpu_buffer_type())) {
             stock_spills_experts = true;
             break;
         }
