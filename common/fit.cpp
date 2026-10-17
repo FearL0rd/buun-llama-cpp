@@ -15,6 +15,7 @@
 #include <cassert>
 #include <cstdlib>
 #include <cinttypes>
+#include <filesystem>
 #include <limits>
 #include <set>
 #include <stdexcept>
@@ -1818,7 +1819,7 @@ static void common_params_fit_impl(
     std::vector<uint32_t> cache_layers;
     dmds_t cache_memory;
     bool cache_candidate_valid = false;
-    bool cache_candidate_main = false;
+    const char * cache_candidate_label = "packed";
 
     int64_t global_surplus_cpu_moe = 0;
     if (hp_nex > 0) {
@@ -1943,16 +1944,53 @@ static void common_params_fit_impl(
             assigned_layers += dense_layers[id];
         }
 
+        // Pinned experts (no mmap: GGUF banks, EXL3 banks) take the MoE cache route, which serves a
+        // layer's misses from the cache of the device that owns the layer only. Stacking every layer
+        // on the main device would strand the other devices' caches, so spread the layers instead.
+        // Expert-parallel sessions, --no-host and GGML_CUDA_MOE_ROUTE=0 keep the CPU-side path.
+        const bool use_mmap = mparams->load_mode == LLAMA_LOAD_MODE_AUTO ||
+            mparams->load_mode == LLAMA_LOAD_MODE_MMAP || mparams->load_mode == LLAMA_LOAD_MODE_MMAP_MLOCK;
+        const char * route_env = getenv("GGML_CUDA_MOE_ROUTE");
+        const bool route_enabled = (!route_env || atoi(route_env) != 0) && !mparams->no_host &&
+            cparams->moe_cache_expert_parallel == 0;
+        const bool routed_experts = route_enabled && !use_mmap && (!std::filesystem::is_directory(path_model) ||
+            std::any_of(moe_tensors.begin(), moe_tensors.end(),
+                [](const llama_moe_tensor_info & t) { return ggml_type_is_exl3(t.type); }));
+
         const uint64_t required_layers = (uint64_t)hp_ngl + 1;
-        if (assigned_layers == required_layers) {
+        if (assigned_layers == required_layers && required_layers <= UINT32_MAX) {
+            std::vector<int64_t> free_targets(nd);
+            int64_t total = 0;
+            for (size_t id = 0; id < nd; id++) {
+                free_targets[id] = std::max<int64_t>(targets[id], 0);
+                total += free_targets[id];
+            }
             const int main_gpu = mparams->main_gpu;
-            if (main_gpu >= 0 && main_gpu < (int)nd && required_layers <= UINT32_MAX) {
+            if (routed_experts && nd > 1) {
+                if (total > 0) {
+                    // layers in proportion to each device's free memory, the default -sm layer split
+                    std::vector<uint32_t> spread_layers(nd, 0);
+                    int64_t acc = 0;
+                    uint32_t prev = 0;
+                    for (size_t id = 0; id < nd; id++) {
+                        acc += free_targets[id];
+                        const uint32_t end = (uint32_t)((double)required_layers * acc / total + 0.5);
+                        spread_layers[id] = end - prev;
+                        prev = end;
+                    }
+                    if (get_cache_candidate_memory(spread_layers, cache_memory)) {
+                        cache_layers = std::move(spread_layers);
+                        cache_candidate_valid = true;
+                        cache_candidate_label = "spread";
+                    }
+                }
+            } else if (main_gpu >= 0 && main_gpu < (int)nd) {
                 std::vector<uint32_t> main_layers(nd, 0);
                 main_layers[main_gpu] = (uint32_t)required_layers;
                 if (get_cache_candidate_memory(main_layers, cache_memory)) {
                     cache_layers = std::move(main_layers);
                     cache_candidate_valid = true;
-                    cache_candidate_main = true;
+                    cache_candidate_label = "main-device";
                 }
             }
             if (!cache_candidate_valid && get_cache_candidate_memory(dense_layers, cache_memory)) {
@@ -2310,7 +2348,7 @@ static void common_params_fit_impl(
                         (double)cache_fit.expert_bytes
                     : 0.0;
                 LOG_INF("%s: MoE cache fit selected %s dense placement with %zu MiB projected cache capacity for %zu MiB of routed expert weights (up to %.1f%% coverage)\n",
-                        __func__, cache_candidate_main ? "main-device" : "packed",
+                        __func__, cache_candidate_label,
                         cache_fit.cache_bytes / MiB, cache_fit.expert_bytes / MiB, coverage);
                 for (const common_moe_cache_fit_device & device : cache_fit.devices) {
                     LOG_INF("%s: MoE cache fit CUDA%d leaves %zu MiB after reserve; minimum complete pool set is %zu MiB\n",
