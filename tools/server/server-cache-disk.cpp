@@ -531,6 +531,7 @@ bool server_cache_disk_tier::read_index(std::string & error) {
         if (producer != producer_identity) {
             continue; // another model's conversation: dropped below
         }
+        entry.producer_identity = std::move(producer);
         if (entry.file.empty() || entry.file.find('/') != std::string::npos ||
             entry.file.rfind("pc-", 0) != 0 ||
             entry.file.size() < 5 || entry.file.compare(entry.file.size() - 4, 4, ".bin") != 0) {
@@ -634,6 +635,24 @@ bool server_cache_disk_tier::build_index_from_files(std::string & error) {
         if (!in) {
             continue;
         }
+        // the identities follow the tokens: an unindexed object must still be keyed by them
+        auto read_string = [&](std::string & s) {
+            uint8_t len_bytes[4];
+            uint32_t len = 0;
+            if (!in.read(reinterpret_cast<char *>(len_bytes), 4)) {
+                return false;
+            }
+            le_reader lr { len_bytes, 4 };
+            if (!lr.get(len) || len > kIndexBodyLimit) {
+                return false;
+            }
+            s.resize(len);
+            return len == 0 || bool(in.read(s.data(), len));
+        };
+        std::string producer, adapter;
+        if (!read_string(producer) || producer != producer_identity || !read_string(adapter)) {
+            continue;
+        }
 
         // whole-file checksum for the index row
         std::ifstream fin(path, std::ios::binary);
@@ -663,6 +682,8 @@ bool server_cache_disk_tier::build_index_from_files(std::string & error) {
         if (n_tokens > 0) {
             std::memcpy(entry.tokens.data(), token_bytes.data(), token_bytes.size());
         }
+        entry.producer_identity = std::move(producer);
+        entry.adapter_config_key = std::move(adapter);
         entry.saved_unix_ms = 0;
         entry.sha256 = hash.finish();
         entries_.push_back(std::move(entry));

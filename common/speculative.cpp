@@ -292,6 +292,36 @@ void common_speculative_proposal::clear() {
     exact_q = false;
 }
 
+// pad the q row starting at row0 (n real entries) to width with zero-mass ids absent from the row
+static void pq_pad_row(llama_tokens & ids, std::vector<float> & q, size_t row0, size_t n, int32_t width) {
+    llama_token next = 0;
+    for (size_t k = n; k < (size_t) width; ++k) {
+        while (std::find(ids.begin() + row0, ids.end(), next) != ids.end()) {
+            ++next;
+        }
+        ids.push_back(next++);
+        q.push_back(0.0f);
+    }
+}
+
+// widen every recorded q row of p to width
+static void pq_repad(common_speculative_proposal & p, int32_t width) {
+    const size_t old_w = (size_t) p.top_k;
+    const size_t rows  = p.candidate_ids.size() / old_w;
+    llama_tokens       ids;
+    std::vector<float> q;
+    ids.reserve(rows * width);
+    q.reserve(rows * width);
+    for (size_t r = 0; r < rows; ++r) {
+        const size_t row0 = ids.size();
+        ids.insert(ids.end(), p.candidate_ids.begin() + r * old_w, p.candidate_ids.begin() + (r + 1) * old_w);
+        q.insert(q.end(), p.q_rows.begin() + r * old_w, p.q_rows.begin() + (r + 1) * old_w);
+        pq_pad_row(ids, q, row0, old_w, width);
+    }
+    p.candidate_ids = std::move(ids);
+    p.q_rows        = std::move(q);
+}
+
 size_t common_speculative_proposal::matching_prefix_size(
         llama_seq_id seq, const llama_tokens & draft) const {
     const size_t count = std::min(q_covered_tokens, draft.size());
@@ -2627,11 +2657,19 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         }
         auto & proposal = proposals[seq_id];
         proposal.seq_id = seq_id;
-        proposal.top_k = (int32_t) q->size;
+        // top-p/min-p keep a different count per position, but the verifier needs one row
+        // width: rows are padded with zero-mass ids to the widest row so far
+        const int32_t width = std::max(proposal.top_k, (int32_t) q->size);
+        if (proposal.top_k > 0 && width > proposal.top_k) {
+            pq_repad(proposal, width);
+        }
+        proposal.top_k = width;
+        const size_t row0 = proposal.candidate_ids.size();
         for (size_t r = 0; r < q->size; ++r) {
             proposal.candidate_ids.push_back(q->data[r].id);
             proposal.q_rows.push_back(q->data[r].p);
         }
+        pq_pad_row(proposal.candidate_ids, proposal.q_rows, row0, q->size, width);
         proposal.selected.push_back(token);
         proposal.q_covered_tokens = proposal.selected.size();
         proposal.exact_q = true;
@@ -3125,11 +3163,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             n_drafting++;
             drafting[seq_id] = true;
             common_sampler_reset(smpls[seq_id].get());
-            // a fresh draft starts a fresh q draw stream (the q sampler has no
-            // token-history state to preserve, only its RNG)
-            if (q_smpls[seq_id]) {
-                common_sampler_reset(q_smpls[seq_id].get());
-            }
+            // the q sampler is NOT reset per round: reset reseeds its RNG, which would replay
+            // the same uniform draws every draft block (it is rebuilt per request in pq_sampler)
 
             common_batch_add(batch, dp.id_last, dp.pos0, { seq_id }, true);
             std::memcpy(batch.embd + (size_t) (batch.n_tokens - 1) * n_embd, carry, row_bytes);
@@ -5931,7 +5966,8 @@ common_speculative_output_limits common_speculative_get_output_limits(
 static bool common_speculative_copyspec_is_shared(const common_params_speculative & params) {
     return params.has_type(COMMON_SPECULATIVE_TYPE_COPYSPEC) &&
         (params.has_type(COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH) ||
-         params.has_type(COMMON_SPECULATIVE_TYPE_DRAFT_MTP));
+         params.has_type(COMMON_SPECULATIVE_TYPE_DRAFT_MTP) ||
+         params.has_type(COMMON_SPECULATIVE_TYPE_DRAFT_MTP_ADAPTIVE));
 }
 
 // initialization of the speculative decoding system

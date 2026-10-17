@@ -9208,13 +9208,14 @@ bool server_prompt_cache::load_impl(
     restore_shape = server_prompt_cache_restore_shape::none;
     const auto selected = select_impl<Observed>(prompt, tokens_new, adapter_config_key, rec, reuse);
     if (selected.source == states.end()) {
-        // The RAM cache has nothing better. The disk tier may hold a parked conversation that
-        // matches the incoming tokens: restore its state verbatim into the (empty) slot so the
-        // prefill below skips the restored prefix. A disk miss leaves the slot untouched.
+        // The RAM cache has nothing better than the live slot. The disk tier may hold a parked
+        // conversation that matches the incoming tokens further than the live prefix does:
+        // restore its state verbatim so the prefill below skips the restored prefix. A disk
+        // miss leaves the slot untouched.
         if (disk_tier && !tokens_new.has_mtmd) {
             const llama_tokens incoming = tokens_new.get_text_tokens();
             auto best = disk_tier->entries().end();
-            int best_lcp = 0;
+            int best_lcp = (int) prompt.tokens.get_common_prefix(tokens_new);
             for (auto it = disk_tier->entries().begin(); it != disk_tier->entries().end(); ++it) {
                 if (it->adapter_config_key != adapter_config_key) {
                     continue;

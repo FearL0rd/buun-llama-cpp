@@ -5015,6 +5015,17 @@ static void ggml_cuda_gdn_state_read_plan(ggml_backend_cuda_context * cuda_ctx, 
         if (G == nullptr) {
             continue;
         }
+        // input_rows disables the FLA PTX prefill, whose shape also lets the cache fusion fold
+        // the RMS/MUL epilogue into it: leave those GDNs (prefill, the read is negligible) alone
+        {
+            const ggml_tensor * v = gdn->src[2];
+            const int64_t S_v = v->ne[0];
+            if (ggml_cuda_gdn_fla_ptx_supported(ggml_cuda_info().devices[cuda_ctx->device].cc,
+                    gdn->src[3]->ne[0] == S_v, ggml_get_op_params_i32(gdn, 0) > 1,
+                    S_v, v->ne[1], gdn->src[0]->ne[1], v->ne[2], v->ne[3])) {
+                continue;
+            }
+        }
         int ri = -1;
         for (int j = gi - 1; j >= 0; --j) {
             if (cgraph->nodes[j] == G) {

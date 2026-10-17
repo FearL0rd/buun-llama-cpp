@@ -3062,11 +3062,16 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
     // is unrotated, so Q must NOT be WHT-rotated) and V from the turbo3 or q8_0 cache, both
     // dequanted into the shmem tile inside the kernel. D=256 decode/verify widths only (see
     // the knobs above); everything else falls through to the dequant routes below.
+#if defined(GGML_CUDA_TURBO_FA)
+    // widths 5..8 take the (8,8) tile directly, so they need the grouped-head eligibility
+    // (mask, no ALiBi, aligned strides) the ncols2 switch would otherwise check
+    const bool wide_ok = Q->ne[1] <= 4 || ggml_cuda_fattn_turbo_ncols2(dst) == 8;
     {
         const bool q8_k_fused = K->type == GGML_TYPE_Q8_0 && (V->type == GGML_TYPE_TURBO3_0 || V->type == GGML_TYPE_Q8_0);
+        // cp.async: these pairs stage KV tiles (ggml_cuda_fattn_turbo_stage), Ampere+ only
         if (ggml_cuda_q8_turbo3_mma_fused() && q8_k_fused && Q->ne[0] == 256 && V->ne[0] == 256 &&
-            Q->ne[1] >= ggml_cuda_q8_turbo3_mma_min_q() && Q->ne[1] <= ggml_cuda_q8_turbo3_mma_max_q() &&
-            turing_mma_available(ggml_cuda_info().devices[ggml_cuda_get_device()].cc)) {
+            Q->ne[1] >= ggml_cuda_q8_turbo3_mma_min_q() && Q->ne[1] <= ggml_cuda_q8_turbo3_mma_max_q() && wide_ok &&
+            cp_async_available(ggml_cuda_info().devices[ggml_cuda_get_device()].cc)) {
             if (V->type == GGML_TYPE_TURBO3_0) {
                 if (Q->ne[1] >= 5) {
                     // widths 5..8 (MTP depth-4 verify pad, DFlash2 block 8): the (8,8)
@@ -3101,9 +3106,8 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
         return (v >= 4 && v <= 8) ? v : 8;
     }();
     const bool turbo4_matched_wide = K->type == GGML_TYPE_TURBO4_0 && V->type == GGML_TYPE_TURBO4_0 &&
-        Q->ne[0] == 256 && V->ne[0] == 256 && Q->ne[1] >= 5 && Q->ne[1] <= t4_mma_fused_max_q;
+        Q->ne[0] == 256 && V->ne[0] == 256 && Q->ne[1] >= 5 && Q->ne[1] <= t4_mma_fused_max_q && wide_ok;
 
-#if defined(GGML_CUDA_TURBO_FA)
     if (turbo_mma_fused && (turbo_matched || turbo_fused_asym || turbo1_tcq_matched) &&
         (Q->ne[1] <= 4 || turbo4_matched_wide) &&
         (Q->ne[0] == 128 || Q->ne[0] == 256) &&
