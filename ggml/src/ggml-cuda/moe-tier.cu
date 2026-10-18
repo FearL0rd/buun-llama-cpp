@@ -43,6 +43,11 @@ void ggml_moe_tier_unpin(ggml_moe_tier_route *, int32_t) {
 void ggml_moe_tier_set_vram(ggml_moe_tier_route *, int32_t, bool) {
 }
 
+void ggml_moe_tier_arena(const ggml_moe_tier_route *, const char ** lo, const char ** hi) {
+    *lo = nullptr;
+    *hi = nullptr;
+}
+
 void ggml_moe_tier_prefill(ggml_moe_tier_route *, uint32_t *, bool, char *, cudaStream_t) {
 }
 
@@ -1265,6 +1270,11 @@ void ggml_moe_tier_unpin(ggml_moe_tier_route * route, int32_t expert) {
 
 void ggml_moe_tier_set_vram(ggml_moe_tier_route * route, int32_t expert, bool vram) {
     route->vram[expert].store(vram, std::memory_order_relaxed);
+}
+
+void ggml_moe_tier_arena(const ggml_moe_tier_route * route, const char ** lo, const char ** hi) {
+    *lo = route->tier->arena;
+    *hi = route->tier->arena + route->tier->reserved;
 }
 
 static void moe_tier_staged_done(void * user, bool ok) {
