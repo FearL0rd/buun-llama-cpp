@@ -1608,6 +1608,7 @@ static int moe_cache_query_config(
     result->min_devices = config.min_devices;
     result->overlap_cpu_rows = config.overlap_cpu_rows;
     result->expert_parallel = config.expert_parallel;
+    result->route_mapped = ggml_moe_tier_enabled();
     result->profile_path = nullptr;
     return 1;
 }
@@ -4289,7 +4290,7 @@ static bool moe_cache_route_register(
         return false;
     }
     if (tiered && !device.tier && !device.tier_failed) {
-        device.tier = ggml_moe_tier_create(device.logical, stream);
+        device.tier = ggml_moe_tier_create(device.logical, (int) session.devices.size(), stream);
         device.tier_failed = !device.tier;
     }
     if (tiered && !device.tier) {

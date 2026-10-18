@@ -24,8 +24,10 @@ void ggml_moe_tier_forget(const void * base, size_t size);
 // GGML_CUDA_MOE_TIER (off | auto | MiB) enables the tier.
 bool ggml_moe_tier_enabled();
 // Null when disabled. Routed kernels must run on stream. The arena is sized at the
-// first resolve for the largest expert added by then.
-ggml_moe_tier * ggml_moe_tier_create(int device, cudaStream_t stream);
+// first resolve for the largest expert added by then, and pins at most one slot per expert
+// of the routes. An auto budget is a 1/n_share part of the host headroom, n_share the devices
+// that may route.
+ggml_moe_tier * ggml_moe_tier_create(int device, int n_share, cudaStream_t stream);
 // The caller has synchronized every stream that read the arena.
 void ggml_moe_tier_free(ggml_moe_tier * tier);
 void ggml_moe_tier_log_stats(const ggml_moe_tier * tier, int device);

@@ -1947,13 +1947,17 @@ static void common_params_fit_impl(
         // Pinned experts (no mmap: GGUF banks, EXL3 banks) take the MoE cache route, which serves a
         // layer's misses from the cache of the device that owns the layer only. Stacking every layer
         // on the main device would strand the other devices' caches, so spread the layers instead.
+        // Mapped experts take the route too when the provider's RAM tier serves them.
         // Expert-parallel sessions, --no-host and GGML_CUDA_MOE_ROUTE=0 keep the CPU-side path.
         const bool use_mmap = mparams->load_mode == LLAMA_LOAD_MODE_AUTO ||
             mparams->load_mode == LLAMA_LOAD_MODE_MMAP || mparams->load_mode == LLAMA_LOAD_MODE_MMAP_MLOCK;
+        ggml_moe_cache_config cache_config = {};
+        const bool route_mapped = ggml_moe_cache.query_config &&
+            ggml_moe_cache.query_config(1, 0, &cache_config) && cache_config.route_mapped;
         const char * route_env = getenv("GGML_CUDA_MOE_ROUTE");
         const bool route_enabled = (!route_env || atoi(route_env) != 0) && !mparams->no_host &&
             cparams->moe_cache_expert_parallel == 0;
-        const bool routed_experts = route_enabled && !use_mmap && (!std::filesystem::is_directory(path_model) ||
+        const bool routed_experts = route_enabled && (!use_mmap || route_mapped) && (!std::filesystem::is_directory(path_model) ||
             std::any_of(moe_tensors.begin(), moe_tensors.end(),
                 [](const llama_moe_tensor_info & t) { return ggml_type_is_exl3(t.type); }));
 
