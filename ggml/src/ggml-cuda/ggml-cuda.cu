@@ -11282,8 +11282,44 @@ const ggml_vbr_cross_domain_iface_v1 * ggml_backend_cuda_vbr_cross_domain_iface_
     return &iface;
 }
 
+// Pool bytes the sorted MUL_MAT_ID fallback takes on dev for n_tokens tokens, n_used experts each, through
+// an expert matrix of type [n_in, n_out, n_expert]; 0 when a kernel handles the shape without sorting.
+static size_t ggml_backend_cuda_mul_mat_id_sorted_bytes(ggml_backend_dev_t dev, ggml_type type,
+        int64_t n_in, int64_t n_out, int64_t n_expert, int64_t n_used, int64_t n_tokens) {
+    const int cc = ggml_cuda_info().devices[((ggml_backend_cuda_device_context *) dev->context)->device].cc;
+    auto shape = [](ggml_tensor & t, ggml_type type, int64_t ne0, int64_t ne1, int64_t ne2) {
+        t.type  = type;
+        t.ne[0] = ne0; t.ne[1] = ne1; t.ne[2] = ne2; t.ne[3] = 1;
+        t.nb[0] = ggml_type_size(type);
+        t.nb[1] = ggml_row_size(type, ne0);
+        t.nb[2] = t.nb[1]*ne1;
+        t.nb[3] = t.nb[2]*ne2;
+    };
+    ggml_tensor w = {}, x = {}, ids = {}, dst = {};
+    shape(w,   type,           n_in,   n_out,    n_expert);
+    shape(x,   GGML_TYPE_F32,  n_in,   1,        n_tokens);
+    shape(ids, GGML_TYPE_I32,  n_used, n_tokens, 1);
+    shape(dst, GGML_TYPE_F32,  n_out,  n_used,   n_tokens);
+    dst.op     = GGML_OP_MUL_MAT_ID;
+    dst.src[0] = &w;
+    dst.src[1] = &x;
+    dst.src[2] = &ids;
+    // EXL3 expert banks carry their trellis tables as extra sources
+    dst.src[3] = &w;
+    dst.src[4] = &w;
+    if (!ggml_cuda_mul_mat_id_needs_sync(&dst, cc)) {
+        return 0;
+    }
+    const size_t ts_x = (type == GGML_TYPE_F16 && !fast_fp16_hardware_available(cc)) || ggml_is_quantized(type)
+        ? sizeof(float) : ggml_type_size(type);
+    return (size_t) (n_tokens*n_used) * (n_in*ts_x + n_out*sizeof(float));
+}
+
 static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     GGML_UNUSED(reg);
+    if (strcmp(name, "ggml_backend_cuda_mul_mat_id_sorted_bytes") == 0) {
+        return (void *) ggml_backend_cuda_mul_mat_id_sorted_bytes;
+    }
     if (strcmp(name, GGML_VBR_BACKEND_IFACE_PROC) == 0) {
         return (void *)ggml_backend_cuda_vbr_iface;
     }

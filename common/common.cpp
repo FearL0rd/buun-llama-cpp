@@ -1476,6 +1476,7 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
             /*.borrows_target_tensors =*/ has_draft && extra_is_mtp,
         };
 
+        // LoRA adapters load after the fit and have no tensor split rules, so they keep the split mode
         const common_params_fit_status fit_status = common_fit_params(
             params.model.path.c_str(), &mparams, &cparams,
             params.tensor_split,
@@ -1486,7 +1487,7 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
             has_draft || spec_mtp ? &extra_dft : nullptr,
             params.verbosity >= LOG_LEVEL_DEBUG ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR,
             !params.n_ubatch_auto ? 0 : params.n_batch_explicit ? params.n_batch : UINT32_MAX,
-            !params.split_mode_explicit);
+            !params.split_mode_explicit && params.lora_adapters.empty());
         if (fit_status != COMMON_PARAMS_FIT_STATUS_SUCCESS) {
             COM_ERR("%s", "fit could not prove a viable placement; restoring the pre-fit parameters\n");
             mparams = mparams_before;

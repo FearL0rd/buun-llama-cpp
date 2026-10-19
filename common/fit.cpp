@@ -2699,36 +2699,59 @@ static bool common_fit_resident_multi_gpu(
     return common_fit_n_gpus(devs) > 1 && stats.split_tensor && stats.host_offload == 0.0;
 }
 
-// Run-time scratch on every device that the no_alloc measurement does not see, per ubatch token:
-// a sorted MUL_MAT_ID (expert types without a quantized ids kernel: float, and the types from
-// F8_E4M3 on) takes f32 copies of its input and output rows per (token, expert) pair from the
-// backend pool, and tensor split keeps one all-reduce buffer per reduce step sized to its largest
-// partial sum, the f32 expert outputs of a ubatch (ggml-backend-meta.cpp n_reduce_steps, allocated
-// in graph_compute, so no reserve sees them).
+typedef size_t (*common_fit_mmid_sorted_bytes_t)(ggml_backend_dev_t dev, ggml_type type,
+        int64_t n_in, int64_t n_out, int64_t n_expert, int64_t n_used, int64_t n_tokens);
+
+// Run-time scratch on every device that the no_alloc measurement does not see: a MUL_MAT_ID without
+// a kernel for its expert type and batch sorts copies of its input and output rows per (token,
+// expert) pair in the backend pool (the backend reports the bytes), and tensor split keeps one
+// all-reduce buffer per reduce step sized to its largest partial sum, the f32 expert outputs of a
+// ubatch (ggml-backend-meta.cpp n_reduce_steps, allocated in graph_compute, so no reserve sees them).
 struct common_fit_scratch {
-    uint64_t sort   = 0;
-    uint64_t reduce = 0; // tensor split only
+    struct gpu {
+        ggml_backend_dev_t             dev;
+        common_fit_mmid_sorted_bytes_t sorted_bytes;
+    };
+    std::vector<gpu>                   gpus;
+    std::vector<llama_moe_tensor_info> experts;
+    int64_t  n_used = 1;
+    uint64_t reduce = 0; // per ubatch token, tensor split only
+
+    uint64_t sort(uint32_t n_ubatch) const {
+        size_t bytes = 0;
+        for (const gpu & g : gpus) {
+            for (const llama_moe_tensor_info & e : experts) {
+                bytes = std::max(bytes, g.sorted_bytes(g.dev, e.type, e.n_input, e.n_output, e.n_expert, n_used, n_ubatch));
+            }
+        }
+        return bytes;
+    }
 };
 
 static common_fit_scratch common_fit_measure_scratch(
         const char * path_model, const llama_model_params * mparams, const llama_context_params * cparams,
         ggml_log_level log_level) {
     std::vector<ggml_backend_dev_t> devs;
-    std::vector<llama_moe_tensor_info> experts;
+    common_fit_scratch scratch;
     const common_fit_ubatch_stats stats =
-            common_fit_measure_placement(path_model, mparams, cparams, log_level, devs, &experts);
-    int64_t sort_row = 0;
-    for (const llama_moe_tensor_info & info : experts) {
-        if (!ggml_is_quantized(info.type) || info.type >= GGML_TYPE_F8_E4M3) {
-            sort_row = std::max(sort_row, info.n_input + info.n_output);
+            common_fit_measure_placement(path_model, mparams, cparams, log_level, devs, &scratch.experts);
+    if (devs.size() == 1 && ggml_backend_dev_is_meta(devs[0])) {
+        const ggml_backend_dev_t meta = devs[0];
+        devs.clear();
+        for (size_t i = 0; i < ggml_backend_meta_dev_n_devs(meta); i++) {
+            devs.push_back(ggml_backend_meta_dev_simple_dev(meta, i));
         }
     }
-    const double n_used = std::max(1.0, stats.n_expert_used);
-    const size_t n_gpus = common_fit_n_gpus(devs);
-    common_fit_scratch scratch;
-    scratch.sort = (uint64_t) (n_used * sort_row * sizeof(float));
-    if (n_gpus > 1) {
-        scratch.reduce = (uint64_t) (std::ceil(std::log2((double) n_gpus)) * n_used * stats.n_embd * sizeof(float));
+    for (ggml_backend_dev_t dev : devs) {
+        auto fn = (common_fit_mmid_sorted_bytes_t) ggml_backend_reg_get_proc_address(
+                ggml_backend_dev_backend_reg(dev), "ggml_backend_cuda_mul_mat_id_sorted_bytes");
+        if (fn) {
+            scratch.gpus.push_back({dev, fn});
+        }
+    }
+    scratch.n_used = std::max<int64_t>(1, std::llround(stats.n_expert_used));
+    if (devs.size() > 1) {
+        scratch.reduce = (uint64_t) (std::ceil(std::log2((double) devs.size())) * scratch.n_used * stats.n_embd * sizeof(float));
     }
     return scratch;
 }
@@ -2837,8 +2860,12 @@ enum common_params_fit_status common_fit_params(
                 LOG_WRN("%s: scratch measurement failed, fitting without it: %s\n", __func__, e.what());
             }
         }
-        const uint64_t per_token = scratch.sort + (mparams->split_mode == LLAMA_SPLIT_MODE_TENSOR ? scratch.reduce : 0);
-        const uint64_t charge = (uint64_t) (std::max(cparams->n_ubatch, ubatch_default) - ubatch_default) * per_token;
+        uint64_t charge = 0;
+        if (cparams->n_ubatch > ubatch_default) {
+            const uint64_t reduce = mparams->split_mode == LLAMA_SPLIT_MODE_TENSOR ? scratch.reduce : 0;
+            charge = std::max(scratch.sort(cparams->n_ubatch), scratch.sort(ubatch_default)) - scratch.sort(ubatch_default) +
+                (uint64_t) (cparams->n_ubatch - ubatch_default) * reduce;
+        }
         for (size_t i = 0; i < margins_ub.size(); i++) {
             margins_ub[i] = margins[i] + charge;
         }
