@@ -1020,6 +1020,8 @@ static void common_params_fit_impl(
     const dmds_t dmds_extra_full = dmds_extra;
 
     const size_t nd = devs.size(); // number of devices
+    const bool exl3_experts = std::any_of(moe_tensors.begin(), moe_tensors.end(),
+        [](const llama_moe_tensor_info & t) { return ggml_type_is_exl3(t.type); });
 
     // dynamic VBR: measured dry-load KV bytes are PRICE-tier-priced (largest tier <= the floor)
     // but the runtime clamp holds the aggregate at a discrete tier MIX >= the literal floor —
@@ -1613,6 +1615,10 @@ static void common_params_fit_impl(
                     LOG_WRN("%s: tensor-sharded dense weights fit with CPU experts, but a complete MoE cache layout is unavailable (%s); uncached experts stay on CPU\n",
                             __func__, cache_fit.reason.c_str());
                 }
+                // The MoE cache route needs a CUDA backend, not the meta device, so cache misses run on
+                // the CPU here; EXL3 has no fast CPU path, which makes this several times slower.
+                LOG_WRN("%s: -sm tensor with offloaded experts serves cache misses on the CPU%s; omit -sm (or use -sm layer) for the MoE cache route\n",
+                        __func__, exl3_experts ? ", which is very slow for EXL3" : "");
                 return;
             }
         }
@@ -1962,8 +1968,6 @@ static void common_params_fit_impl(
         const char * route_env = getenv("GGML_CUDA_MOE_ROUTE");
         const bool route_enabled = (!route_env || atoi(route_env) != 0) && !mparams->no_host &&
             cparams->moe_cache_expert_parallel == 0;
-        const bool exl3_experts = std::any_of(moe_tensors.begin(), moe_tensors.end(),
-            [](const llama_moe_tensor_info & t) { return ggml_type_is_exl3(t.type); });
         // The default load mode maps EXL3 experts only when the route cannot serve them unmapped:
         // the CPU-side path decodes mapped EXL3 banks several times slower than the route.
         // GGUF banks keep mmap, which their CPU-side path decodes well.
@@ -2047,6 +2051,17 @@ static void common_params_fit_impl(
     }
     assert(id_dense_start < nd);
 
+    // filling a later device can grow the compute buffers of earlier, already filled ones
+    // (fewer graph splits to host experts), so a candidate must fit on every device up to `last`
+    auto fits_through = [&](const std::vector<int64_t> & m, size_t last) {
+        for (size_t jd = 0; jd <= last && jd < nd; jd++) {
+            if (m[jd] > targets[jd]) {
+                return false;
+            }
+        }
+        return true;
+    };
+
     LOG_TRC("%s: converting dense-only layers to full layers and filling them front-to-back with overflow to next device/system memory:\n", __func__);
     for (size_t id = 0; id <= id_dense_start && id_dense_start < nd; id++) {
         std::vector<ngl_t> ngl_per_device_high = ngl_per_device;
@@ -2059,11 +2074,13 @@ static void common_params_fit_impl(
         size_t id_dense_start_high = nd - 1;
         std::vector<int64_t> mem_high = get_memory_for_layers(__func__, ngl_per_device_high, overflow_bufts);
 
-        if (mem_high[id] > targets[id]) {
+        if (!fits_through(mem_high, id)) {
             assert(ngl_per_device_high[id].n_full() >= ngl_per_device[id].n_full());
             uint32_t delta = ngl_per_device_high[id].n_full() - ngl_per_device[id].n_full();
             while (delta > 1) {
-                uint32_t step_size = int64_t(delta) * (targets[id] - mem[id]) / (mem_high[id] - mem[id]);
+                // interpolate on this device's memory; bisect when an earlier device is the one over target
+                uint32_t step_size = mem_high[id] > targets[id] ?
+                    int64_t(delta) * (targets[id] - mem[id]) / (mem_high[id] - mem[id]) : delta / 2;
                 step_size = std::max(step_size, uint32_t(1));
                 step_size = std::min(step_size, delta - 1);
 
@@ -2083,7 +2100,7 @@ static void common_params_fit_impl(
                 }
                 const std::vector<int64_t> mem_test = get_memory_for_layers(__func__, ngl_per_device_test, overflow_bufts);
 
-                if (mem_test[id] <= targets[id]) {
+                if (fits_through(mem_test, id)) {
                     ngl_per_device = ngl_per_device_test;
                     mem            = mem_test;
                     id_dense_start = id_dense_start_test;
@@ -2125,7 +2142,7 @@ static void common_params_fit_impl(
             }
             LOG_TRC("%s: trying to fit one extra layer with overflow_type=LAYER_FRACTION_UP\n", __func__);
             std::vector<int64_t> mem_test = get_memory_for_layers(__func__, ngl_per_device_test, overflow_bufts_test);
-            if (mem_test[id] < targets[id] && (id + 1 == nd || mem_test[id + 1] < targets[id + 1])) {
+            if (fits_through(mem_test, id + 1)) {
                 ngl_per_device = ngl_per_device_test;
                 overflow_bufts = overflow_bufts_test;
                 mem            = mem_test;
@@ -2136,7 +2153,7 @@ static void common_params_fit_impl(
                 ngl_per_device_test[id].overflow_type = LAYER_FRACTION_GATE;
                 LOG_TRC("%s: trying to fit one extra layer with overflow_type=LAYER_FRACTION_GATE\n", __func__);
                 mem_test = get_memory_for_layers(__func__, ngl_per_device_test, overflow_bufts_test);
-                if (mem_test[id] < targets[id] && (id + 1 == nd || mem_test[id + 1] < targets[id + 1])) {
+                if (fits_through(mem_test, id + 1)) {
                     ngl_per_device = ngl_per_device_test;
                     overflow_bufts = overflow_bufts_test;
                     mem            = mem_test;
@@ -2148,7 +2165,7 @@ static void common_params_fit_impl(
                 ngl_per_device_test[id].overflow_type = LAYER_FRACTION_ATTN;
                 LOG_TRC("%s: trying to fit one extra layer with overflow_type=LAYER_FRACTION_ATTN\n", __func__);
                 mem_test = get_memory_for_layers(__func__, ngl_per_device_test, overflow_bufts_test);
-                if (mem_test[id] < targets[id] && (id + 1 == nd || mem_test[id + 1] < targets[id + 1])) {
+                if (fits_through(mem_test, id + 1)) {
                     ngl_per_device = ngl_per_device_test;
                     overflow_bufts = overflow_bufts_test;
                     mem            = mem_test;
