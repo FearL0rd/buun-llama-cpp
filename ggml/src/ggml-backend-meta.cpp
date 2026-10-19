@@ -357,6 +357,53 @@ static size_t ggml_backend_meta_buffer_type_get_alloc_size(ggml_backend_buffer_t
     return max_alloc_size;
 }
 
+// Shape of simple buffer j's shard of a tensor split along ss.axis (0 <= axis < GGML_MAX_DIMS).
+static void ggml_backend_meta_shard_shape(const ggml_tensor * tensor, const ggml_backend_meta_split_state & ss,
+        size_t n_bufs, size_t j, int64_t ne[GGML_MAX_DIMS], size_t nb[GGML_MAX_DIMS]) {
+    ne[ss.axis] = 0;
+    for (size_t s = 0; s < ss.n_segments; s++) {
+        ne[ss.axis] += ss.ne[s*n_bufs + j] * ss.nr[s];
+    }
+    for (int i = 0; i < GGML_MAX_DIMS; i++) {
+        if (tensor->nb[i] > tensor->nb[ss.axis]) {
+            nb[i] = tensor->nb[i] * ne[ss.axis]/tensor->ne[ss.axis];
+        }
+    }
+}
+
+// Total bytes across all simple buffers, as ggml_backend_meta_alloc_tensors_ext would place them:
+// a mirrored tensor costs a full copy per device, a split tensor one shard per device.
+// Sized from the registered split rules (statically allocated tensors are leaves); a tensor without
+// a rule keeps the max-over-devices size.
+static size_t ggml_backend_meta_buffer_type_get_alloc_size_n(ggml_backend_buffer_type_t buft, ggml_tensor ** tensors, int n_tensors) {
+    const size_t n_simple_bufts = ggml_backend_meta_buft_n_bufts(buft);
+    const ggml_backend_meta_device_context * dev_ctx = (const ggml_backend_meta_device_context *) ggml_backend_buft_get_device(buft)->context;
+
+    size_t total = 0;
+    for (int i = 0; i < n_tensors; i++) {
+        const ggml_tensor * t = tensors[i];
+        if (t->data != nullptr || t->view_src != nullptr || ggml_nelements(t) == 0) {
+            continue;
+        }
+        const ggml_backend_meta_split_state ss = dev_ctx->get_split_state(t, dev_ctx->get_split_state_ud);
+        for (size_t j = 0; j < n_simple_bufts; j++) {
+            ggml_backend_buffer_type_t simple_buft = ggml_backend_meta_buft_simple_buft(buft, j);
+            size_t size;
+            if (ss.axis >= 0 && ss.axis < GGML_MAX_DIMS) {
+                ggml_tensor shard = *t;
+                ggml_backend_meta_shard_shape(t, ss, n_simple_bufts, j, shard.ne, shard.nb);
+                size = ggml_nelements(&shard) == 0 ? 0 : ggml_backend_buft_get_alloc_size(simple_buft, &shard);
+            } else if (ss.axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED || ss.axis == GGML_BACKEND_SPLIT_AXIS_PARTIAL) {
+                size = ggml_backend_buft_get_alloc_size(simple_buft, t);
+            } else {
+                size = j == 0 ? ggml_backend_meta_buffer_type_get_alloc_size(buft, t) : 0;
+            }
+            total += GGML_PAD(size, ggml_backend_buft_get_alignment(simple_buft));
+        }
+    }
+    return total;
+}
+
 static bool ggml_backend_meta_buffer_type_is_host(ggml_backend_buffer_type_t buft) {
     const size_t n_simple_bufts = ggml_backend_meta_buft_n_bufts(buft);
     for (size_t i = 0; i < n_simple_bufts; i++) {
@@ -374,7 +421,7 @@ static const struct ggml_backend_buffer_type_i ggml_backend_meta_buffer_type_ifa
     /* .get_alignment       = */ ggml_backend_meta_buffer_type_get_alignment,
     /* .get_max_size        = */ ggml_backend_meta_buffer_type_get_max_size,
     /* .get_alloc_size      = */ ggml_backend_meta_buffer_type_get_alloc_size,
-    /* .get_alloc_size_n    = */ NULL,
+    /* .get_alloc_size_n    = */ ggml_backend_meta_buffer_type_get_alloc_size_n,
     /* .is_host             = */ ggml_backend_meta_buffer_type_is_host,
 };
 
@@ -1407,15 +1454,7 @@ static enum ggml_status ggml_backend_meta_buffer_init_tensor_impl(ggml_backend_m
         if (split_dim >= 0 && split_dim < GGML_MAX_DIMS) {
             // TODO: the following assert fails for llama-parallel even though the results are correct:
             // GGML_ASSERT(ggml_is_contiguously_allocated(tensor));
-            ne[split_dim] = 0;
-            for (size_t s = 0; s < split_state.n_segments; s++) {
-                ne[split_dim] += split_state.ne[s*n_simple_bufs + j] * split_state.nr[s];
-            }
-            for (int i = 0; i < GGML_MAX_DIMS; i++) {
-                if (tensor->nb[i] > tensor->nb[split_dim]) {
-                    nb[i] = tensor->nb[i] * ne[split_dim]/tensor->ne[split_dim];
-                }
-            }
+            ggml_backend_meta_shard_shape(tensor, split_state, n_simple_bufs, j, ne, nb);
         }
 
         ggml_tensor * t_ij = ggml_new_tensor(simple_ctx, tensor->type, GGML_MAX_DIMS, ne);
