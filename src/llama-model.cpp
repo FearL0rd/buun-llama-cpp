@@ -495,9 +495,10 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
     // Expert parallelism needs every routed row to stay on one device between the up/gate projection and
     // the down projection; per-expert biases (added on all devices as partial sums) would break that, so
     // models with expert biases keep the sliced layout until the bias add learns the expert window.
+    // Slicing decodes faster on the models measured, so expert parallelism is opt-in (LLAMA_SPLIT_EXPERTS=parallel).
     static const bool expert_parallel_env = [] {
         const char * env = std::getenv("LLAMA_SPLIT_EXPERTS");
-        return env == nullptr || std::string(env) != "slice";
+        return env != nullptr && std::string(env) == "parallel";
     }();
     const bool expert_parallel = expert_parallel_env &&
         ud->model->get_tensor("blk.0.ffn_down_exps.bias") == nullptr &&
@@ -733,10 +734,9 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
         }
 
         // FFN
-        // Stacked expert tensors: expert parallelism keeps whole experts per device (split on the expert
-        // axis) instead of slicing every expert across all devices; the MUL_MAT_ID nodes get a per-device
-        // expert window and the expert outputs are reduced once per layer. LLAMA_SPLIT_EXPERTS=slice restores
-        // the sliced layout.
+        // Stacked expert tensors: expert parallelism (LLAMA_SPLIT_EXPERTS=parallel) keeps whole experts per
+        // device (split on the expert axis) instead of slicing every expert across all devices; the MUL_MAT_ID
+        // nodes get a per-device expert window and the expert outputs are reduced once per layer.
         if (expert_parallel && tensor->ne[2] > 1 &&
                 (std::regex_match(tensor_name, pattern_ffn_up_exps_any) || std::regex_match(tensor_name, pattern_ffn_gate_exps_any) ||
                  std::regex_match(tensor_name, pattern_ffn_gate_up_exps_any) || std::regex_match(tensor_name, pattern_ffn_down_exps_any))) {
