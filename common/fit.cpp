@@ -1956,17 +1956,33 @@ static void common_params_fit_impl(
         // on the main device would strand the other devices' caches, so spread the layers instead.
         // Mapped experts take the route too when the provider's RAM tier serves them.
         // Expert-parallel sessions, --no-host and GGML_CUDA_MOE_ROUTE=0 keep the CPU-side path.
-        const bool use_mmap = mparams->load_mode == LLAMA_LOAD_MODE_AUTO ||
-            mparams->load_mode == LLAMA_LOAD_MODE_MMAP || mparams->load_mode == LLAMA_LOAD_MODE_MMAP_MLOCK;
         ggml_moe_cache_config cache_config = {};
         const bool route_mapped = ggml_moe_cache.query_config &&
             ggml_moe_cache.query_config(1, 0, &cache_config) && cache_config.route_mapped;
         const char * route_env = getenv("GGML_CUDA_MOE_ROUTE");
         const bool route_enabled = (!route_env || atoi(route_env) != 0) && !mparams->no_host &&
             cparams->moe_cache_expert_parallel == 0;
-        const bool routed_experts = route_enabled && (!use_mmap || route_mapped) && (!std::filesystem::is_directory(path_model) ||
-            std::any_of(moe_tensors.begin(), moe_tensors.end(),
-                [](const llama_moe_tensor_info & t) { return ggml_type_is_exl3(t.type); }));
+        const bool exl3_experts = std::any_of(moe_tensors.begin(), moe_tensors.end(),
+            [](const llama_moe_tensor_info & t) { return ggml_type_is_exl3(t.type); });
+        // The default load mode maps EXL3 experts only when the route cannot serve them unmapped:
+        // the CPU-side path decodes mapped EXL3 banks several times slower than the route.
+        // GGUF banks keep mmap, which their CPU-side path decodes well.
+        if (mparams->load_mode == LLAMA_LOAD_MODE_AUTO && exl3_experts && route_enabled && !route_mapped) {
+            uint64_t expert_bytes = 0;
+            for (const llama_moe_tensor_info & t : moe_tensors) {
+                expert_bytes += (uint64_t) t.expert_size * t.n_expert;
+            }
+            const int64_t host_free = dmds_full.back().free;
+            if (host_free > 0 && expert_bytes + expert_bytes/16 <= (uint64_t) host_free) {
+                LOG_INF("%s: loading the EXL3 experts (%" PRIu64 " MiB) without mmap so the MoE cache route serves them\n",
+                    __func__, expert_bytes/MiB);
+                mparams->load_mode = LLAMA_LOAD_MODE_NONE;
+            }
+        }
+        const bool use_mmap = mparams->load_mode == LLAMA_LOAD_MODE_AUTO ||
+            mparams->load_mode == LLAMA_LOAD_MODE_MMAP || mparams->load_mode == LLAMA_LOAD_MODE_MMAP_MLOCK;
+        const bool routed_experts = route_enabled && (!use_mmap || route_mapped) &&
+            (!std::filesystem::is_directory(path_model) || exl3_experts);
 
         const uint64_t required_layers = (uint64_t)hp_ngl + 1;
         if (assigned_layers == required_layers && required_layers <= UINT32_MAX) {
