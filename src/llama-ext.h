@@ -170,6 +170,9 @@ LLAMA_API size_t llama_model_host_offload_weight_bytes(const struct llama_model 
 LLAMA_API bool llama_model_largest_block_weight(
         const struct llama_model * model, enum ggml_type * type, int64_t * ne0, int64_t * ne1);
 
+// Whether the architecture has split rules for LLAMA_SPLIT_MODE_TENSOR.
+LLAMA_API bool llama_model_supports_split_tensor(const struct llama_model * model);
+
 LLAMA_API ggml_backend_dev_t llama_model_get_device(const struct llama_model * model, int i);
 
 LLAMA_API llama_memory_breakdown llama_get_memory_breakdown(const struct llama_context * ctx);

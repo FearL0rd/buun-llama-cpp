@@ -1485,7 +1485,8 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
             params.fit_params_min_ctx,
             has_draft || spec_mtp ? &extra_dft : nullptr,
             params.verbosity >= LOG_LEVEL_DEBUG ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR,
-            !params.n_ubatch_auto ? 0 : params.n_batch_explicit ? params.n_batch : UINT32_MAX);
+            !params.n_ubatch_auto ? 0 : params.n_batch_explicit ? params.n_batch : UINT32_MAX,
+            !params.split_mode_explicit);
         if (fit_status != COMMON_PARAMS_FIT_STATUS_SUCCESS) {
             COM_ERR("%s", "fit could not prove a viable placement; restoring the pre-fit parameters\n");
             mparams = mparams_before;
@@ -1507,6 +1508,7 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
             // mparams, and callers (e.g. the cache-plan calibration profile) must key on the
             // effective value, never the unresolved -1 sentinel
             params.n_gpu_layers = mparams.n_gpu_layers;
+            params.split_mode   = mparams.split_mode;
             params.n_ubatch     = cparams.n_ubatch;
             params.n_batch      = cparams.n_batch;
             if (common_params_apply_vbr_cpu_fallback(params, true) ==

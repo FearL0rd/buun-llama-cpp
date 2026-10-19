@@ -3937,9 +3937,10 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         {"-sm", "--split-mode"}, "{none,layer,row,tensor}",
         "how to split the model across multiple GPUs, one of:\n"
         "- none: use one GPU only\n"
-        "- layer (default): split layers and KV across GPUs (pipelined)\n"
+        "- layer: split layers and KV across GPUs (pipelined)\n"
         "- row: split weight across GPUs by rows (parallelized)\n"
-        "- tensor: split weights and KV across GPUs (parallelized, EXPERIMENTAL)",
+        "- tensor: split weights and KV across GPUs (parallelized, EXPERIMENTAL)\n"
+        "(default: tensor when -fit places the whole model on several GPUs, else layer)",
         [](common_params & params, const std::string & value) {
             if (value == "none") {
                 params.split_mode = LLAMA_SPLIT_MODE_NONE;
@@ -3952,6 +3953,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             } else {
                 throw std::invalid_argument("invalid value");
             }
+            params.split_mode_explicit = true;
             if (!llama_supports_gpu_offload()) {
                 fprintf(stderr, "warning: llama.cpp was compiled without support for GPU offload. Setting the split mode has no effect.\n");
             }

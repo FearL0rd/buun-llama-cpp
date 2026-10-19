@@ -5186,6 +5186,10 @@ bool llama_model_largest_block_weight(
     return true;
 }
 
+bool llama_model_supports_split_tensor(const llama_model * model) {
+    return llm_arch_supports_sm_tensor(model->arch);
+}
+
 int32_t llama_model_n_devices(const struct llama_model * model) {
     return (int32_t)model->devices.size();
 }
