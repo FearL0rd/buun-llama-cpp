@@ -18,6 +18,7 @@
 #include <cinttypes>
 #include <filesystem>
 #include <limits>
+#include <map>
 #include <set>
 #include <stdexcept>
 #include <string>
@@ -45,6 +46,9 @@ struct common_fit_ubatch_stats {
     double host_offload    = 0.0;
     bool   host_moe        = false;
     bool   split_tensor    = false; // the architecture supports LLAMA_SPLIT_MODE_TENSOR
+    // MTP blocks [draft_layer0, draft_layer0 + n_draft_layers), which only a draft context runs
+    int32_t draft_layer0   = 0;
+    int32_t n_draft_layers = 0;
     // largest block weight, the matmul the dense ubatch probe times
     bool      has_block    = false;
     ggml_type block_type   = GGML_TYPE_F32;
@@ -712,8 +716,13 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
         ub_stats->n_expert_used = llama_model_n_expert_used(model.get());
         ub_stats->n_embd        = llama_model_n_embd(model.get());
         ub_stats->host_offload  = llama_model_host_offload_weight_bytes(model.get());
-        ub_stats->host_moe     = llama_model_has_host_moe_weights(model.get());
+        // MTP experts on the host serve only the draft, so a target batch streams experts only with host_offload
+        ub_stats->host_moe     = llama_model_has_host_moe_weights(model.get()) && ub_stats->host_offload > 0.0;
         ub_stats->split_tensor = llama_model_supports_split_tensor(model.get());
+        if (llama_model_has_mtp(model.get())) {
+            ub_stats->draft_layer0   = llama_model_n_layer(model.get());
+            ub_stats->n_draft_layers = llama_model_n_layer_nextn(model.get());
+        }
         ub_stats->has_block    = llama_model_largest_block_weight(model.get(), &ub_stats->block_type,
                 &ub_stats->block_ne0, &ub_stats->block_ne1);
     }
@@ -846,7 +855,8 @@ static void common_params_fit_impl(
 
     if (moe_cache) {
         moe_cache->fit_selected = false;
-        moe_cache->fit_covers_experts = false;
+        moe_cache->fit_cache_bytes = 0;
+        moe_cache->fit_expert_bytes = 0;
     }
 
     // with non-unified kv, we need to take into account n_streams
@@ -1607,6 +1617,8 @@ static void common_params_fit_impl(
                 mparams->use_extra_bufts = false;
                 moe_cache->fit_selected = cache_fit.feasible;
                 if (cache_fit.feasible) {
+                    moe_cache->fit_cache_bytes = cache_fit.cache_bytes;
+                    moe_cache->fit_expert_bytes = cache_fit.expert_bytes;
                     LOG_INF("%s: MoE cache fit selected tensor-sharded dense weights with CPU experts; %zu MiB projected cache capacity\n",
                             __func__, cache_fit.cache_bytes / MiB);
                 } else {
@@ -2386,7 +2398,8 @@ static void common_params_fit_impl(
             if (cache_fit.feasible) {
                 set_cache_layer_split(cache_layers, *mparams, tensor_split, tensor_buft_overrides);
                 moe_cache->fit_selected = true;
-                moe_cache->fit_covers_experts = cache_fit.cache_bytes >= cache_fit.expert_bytes;
+                moe_cache->fit_cache_bytes = cache_fit.cache_bytes;
+                moe_cache->fit_expert_bytes = cache_fit.expert_bytes;
 
                 const double coverage = cache_fit.expert_bytes > 0
                     ? 100.0 * (double)std::min(cache_fit.cache_bytes, cache_fit.expert_bytes) /
@@ -2543,7 +2556,8 @@ static common_fit_ubatch_stats common_fit_measure_placement(
 }
 
 // Picks the ubatch for the fitted placement. A ubatch pays a fixed cost F for the weights that
-// stream to the GPU (op offload of host weights, MoE cache misses), so t(ub) ~ F + ub / C with
+// stream to the GPU (op offload of host weights, MoE cache misses: the host experts beyond the
+// cache capacity `cached` of the first fit), so t(ub) ~ F + ub / C with
 // F = streamed bytes / H2D rate and C = tokens/s of compute. The ubatch doubles until F stays
 // under 10% of the compute time, then halves until the compute buffer, which grows with it,
 // fits under a share of each device: 60% of VRAM when the MoE cache lends its slab to the
@@ -2552,7 +2566,7 @@ static common_fit_ubatch_stats common_fit_measure_placement(
 // is set when one of those picked it.
 static uint32_t common_fit_auto_ubatch(
         const char * path_model, const llama_model_params * mparams, const llama_context_params * cparams,
-        bool moe_cache_active, uint32_t n_ubatch_max, ggml_log_level log_level, bool & resident) {
+        bool moe_cache_active, double cached, uint32_t n_ubatch_max, ggml_log_level log_level, bool & resident) {
     // measured prefill on quantized weights reaches about this share of the dense f16 rate
     constexpr double compute_efficiency = 0.3;
     constexpr uint32_t ubatch_limit = 16384;
@@ -2572,7 +2586,8 @@ static uint32_t common_fit_auto_ubatch(
     const common_fit_ubatch_stats stats =
             common_fit_measure_placement(path_model, mparams, cparams, log_level, devs, &experts);
 
-    const double streamed = stats.host_offload;
+    // host experts the MoE cache holds do not stream again
+    const double streamed = std::max(0.0, stats.host_offload - cached);
     if (devs.empty()) {
         return ub0;
     }
@@ -2713,23 +2728,39 @@ static size_t common_fit_n_gpu_devices(const llama_model_params * mparams) {
     return n;
 }
 
-// The fitted placement, under either split mode, keeps every weight on two or more GPUs, and the
-// architecture has tensor split rules.
+// The fitted placement, under either split mode, keeps every weight a target batch runs on two or
+// more GPUs, and the architecture has tensor split rules. `stats` receives the measurement.
 static bool common_fit_resident_multi_gpu(
         const char * path_model, const llama_model_params * mparams, const llama_context_params * cparams,
-        ggml_log_level log_level) {
+        ggml_log_level log_level, common_fit_ubatch_stats * stats = nullptr) {
     if (common_fit_n_gpu_devices(mparams) < 2) {
         return false;
     }
     std::vector<ggml_backend_dev_t> devs;
-    common_fit_ubatch_stats stats;
+    common_fit_ubatch_stats s;
     try {
-        stats = common_fit_measure_placement(path_model, mparams, cparams, log_level, devs, nullptr);
+        s = common_fit_measure_placement(path_model, mparams, cparams, log_level, devs, nullptr);
     } catch (const std::runtime_error & e) {
         LOG_WRN("%s: split mode auto: measurement failed, keeping layer split: %s\n", __func__, e.what());
         return false;
     }
-    return common_fit_n_gpus(devs) > 1 && stats.split_tensor && stats.host_offload == 0.0;
+    if (stats) {
+        *stats = s;
+    }
+    return common_fit_n_gpus(devs) > 1 && s.split_tensor && s.host_offload == 0.0;
+}
+
+// Puts the routed experts of the MTP blocks, which only the draft runs, one token at a time, on the host.
+static void common_fit_draft_experts_to_host(
+        const common_fit_ubatch_stats & stats, std::vector<llama_model_tensor_buft_override> & tbo) {
+    // interned per layer and never freed: the overrides of an earlier fit may still point at them
+    static std::map<int32_t, std::string> patterns;
+    size_t n = 0;
+    for (int32_t il = stats.draft_layer0; il < stats.draft_layer0 + stats.n_draft_layers && n + 1 < tbo.size(); il++) {
+        auto it = patterns.emplace(il, llm_ffn_block_regex(il, LLM_FFN_EXPS_REGEX)).first;
+        tbo[n++] = {it->second.c_str(), ggml_backend_cpu_buffer_type()};
+    }
+    tbo[n] = {nullptr, nullptr};
 }
 
 typedef size_t (*common_fit_mmid_sorted_bytes_t)(ggml_backend_dev_t dev, ggml_type type,
@@ -2849,7 +2880,7 @@ enum common_params_fit_status common_fit_params(
     llama_model_params         mparams_in = *mparams; // the auto split mode lands here
     const llama_context_params cparams_in = *cparams;
     const std::vector<float> tensor_split_in(tensor_split, tensor_split + llama_max_devices());
-    const std::vector<llama_model_tensor_buft_override> tbo_in(
+    std::vector<llama_model_tensor_buft_override> tbo_in(
             tensor_buft_overrides, tensor_buft_overrides + llama_max_tensor_buft_overrides());
     const common_moe_cache_params moe_cache_in = moe_cache ? *moe_cache : common_moe_cache_params();
     const auto extra_models = common_fit_extra_model_chain(extra);
@@ -2883,6 +2914,7 @@ enum common_params_fit_status common_fit_params(
     const uint32_t ubatch_default = llama_context_default_params().n_ubatch;
     common_fit_scratch scratch;
     bool scratch_measured = false;
+    std::vector<size_t> margins_fit(margins, margins + llama_max_devices());
     std::vector<size_t> margins_ub(llama_max_devices());
     auto fit_once = [&] {
         if (!scratch_measured && cparams->n_ubatch > ubatch_default) {
@@ -2900,7 +2932,7 @@ enum common_params_fit_status common_fit_params(
                 (uint64_t) (cparams->n_ubatch - ubatch_default) * reduce;
         }
         for (size_t i = 0; i < margins_ub.size(); i++) {
-            margins_ub[i] = margins[i] + charge;
+            margins_ub[i] = margins_fit[i] + charge;
         }
         try {
             common_params_fit_impl(path_model, mparams, cparams, tensor_split, tensor_buft_overrides,
@@ -2929,6 +2961,7 @@ enum common_params_fit_status common_fit_params(
     struct fit_outcome {
         uint32_t n_ctx;
         bool     cache_fit;
+        bool     cache_whole;
         int32_t  ngl;
         size_t   tbo;
     };
@@ -2936,29 +2969,90 @@ enum common_params_fit_status common_fit_params(
     auto ngl = [&] {
         return mparams->n_gpu_layers < 0 ? INT32_MAX : mparams->n_gpu_layers;
     };
+    // share of the routed experts the projected cache holds
+    auto coverage = [&] {
+        return moe_cache && moe_cache->fit_expert_bytes > 0 ?
+            (double) moe_cache->fit_cache_bytes / moe_cache->fit_expert_bytes : 0.0;
+    };
+    // a cache holding every routed expert streams nothing, which the ubatch choice relies on
+    auto cache_whole = [&] {
+        return moe_cache && moe_cache->fit_selected && coverage() >= 1.0;
+    };
     auto outcome = [&] {
-        return fit_outcome{cparams->n_ctx, moe_cache && moe_cache->fit_selected, ngl(), n_overrides()};
+        return fit_outcome{cparams->n_ctx, moe_cache && moe_cache->fit_selected, cache_whole(), ngl(), n_overrides()};
     };
     auto loses_to = [&](const fit_outcome & o) {
         return status != COMMON_PARAMS_FIT_STATUS_SUCCESS || cparams->n_ctx < o.n_ctx ||
-            (moe_cache && moe_cache->fit_selected) != o.cache_fit || ngl() < o.ngl || n_overrides() > o.tbo;
+            (moe_cache && moe_cache->fit_selected) != o.cache_fit || (o.cache_whole && !cache_whole()) ||
+            ngl() < o.ngl || n_overrides() > o.tbo;
     };
 
     status = fit_once();
     // tensor split decodes a model resident on several GPUs much faster than layer split, while
-    // with host weights it loses; drafters have no tensor split rules, and it needs flash attention.
-    // A layer fit that moved the experts to the host for a cache with room for all of them may only
-    // have missed residency on the layer split's compute buffers, so tensor split gets a try too.
-    const bool cache_covers = moe_cache && moe_cache->fit_covers_experts;
-    if (split_mode_auto && status == COMMON_PARAMS_FIT_STATUS_SUCCESS && extra == nullptr &&
+    // with host weights it loses; separate drafters have no tensor split rules, and it needs flash attention.
+    // A layer fit that moved the experts to the host for a cache with room for (nearly) all of them
+    // may only have missed residency on the layer split's compute buffers and its uneven packing,
+    // so tensor split gets a try too.
+    const bool cache_covers = coverage() >= 0.95;
+    // an MTP context on the target model follows its placement, split mode included
+    bool extras_share_model = true;
+    for (const common_fit_extra_model * current : extra_models) {
+        extras_share_model = extras_share_model && current->shares_model && !current->borrows_target_tensors;
+    }
+    if (split_mode_auto && status == COMMON_PARAMS_FIT_STATUS_SUCCESS && extras_share_model &&
             mparams->split_mode == LLAMA_SPLIT_MODE_LAYER && cparams->flash_attn_type != LLAMA_FLASH_ATTN_TYPE_DISABLED &&
             (cache_covers || common_fit_resident_multi_gpu(path_model, mparams, cparams, log_level))) {
         const uint32_t layer_n_ctx = cparams->n_ctx;
         mparams_in.split_mode = LLAMA_SPLIT_MODE_TENSOR;
-        restore_inputs(cparams_in.n_ubatch);
-        status = fit_once();
-        if (status != COMMON_PARAMS_FIT_STATUS_SUCCESS || cparams->n_ctx < layer_n_ctx ||
-                !common_fit_resident_multi_gpu(path_model, mparams, cparams, log_level)) {
+        common_fit_ubatch_stats stats;
+        // measure even a failed fit, whose stats still show the MTP blocks
+        auto tensor_holds = [&] {
+            const bool resident = common_fit_resident_multi_gpu(path_model, mparams, cparams, log_level, &stats);
+            return status == COMMON_PARAMS_FIT_STATUS_SUCCESS && cparams->n_ctx >= layer_n_ctx && resident;
+        };
+        bool mtp_costs = false;
+        auto try_tensor = [&] {
+            restore_inputs(cparams_in.n_ubatch);
+            status = fit_once();
+            bool holds = tensor_holds();
+            // the MTP experts alone may cost residency; the draft runs them a token at a time, which the
+            // host serves for a small share of the step, while the target stays tensor-sharded
+            if (!holds && stats.n_draft_layers > 0 && !extra_models.empty() && !tbo_in[0].pattern) {
+                const llama_model_tensor_buft_override * user_tbo = mparams_in.tensor_buft_overrides;
+                common_fit_draft_experts_to_host(stats, tbo_in);
+                mparams_in.tensor_buft_overrides = tensor_buft_overrides;
+                restore_inputs(cparams_in.n_ubatch);
+                status = fit_once();
+                holds = tensor_holds();
+                mtp_costs = !holds;
+                if (holds) {
+                    LOG_INF("%s: split mode auto: tensor split holds with the MTP experts on the host\n", __func__);
+                } else {
+                    tbo_in[0] = {nullptr, nullptr};
+                    mparams_in.tensor_buft_overrides = user_tbo;
+                }
+            }
+            return holds;
+        };
+        bool holds = try_tensor();
+        // a model that only just fits may miss tensor split on the stock margin alone, and then decodes
+        // at about half the speed on a layer split that streams experts, so tensor split may use a smaller one
+        const size_t margin_stock = 1024u*1024*1024;
+        const size_t margin_tensor = 512u*1024*1024;
+        if (!holds && std::all_of(margins_fit.begin(), margins_fit.end(), [&](size_t m) { return m == margin_stock; })) {
+            std::fill(margins_fit.begin(), margins_fit.end(), margin_tensor);
+            holds = try_tensor();
+            if (holds) {
+                LOG_INF("%s: split mode auto: tensor split holds with a %zu MiB fit target\n", __func__, margin_tensor/(1024*1024));
+            } else {
+                std::fill(margins_fit.begin(), margins_fit.end(), margin_stock);
+            }
+        }
+        if (!holds && mtp_costs) {
+            LOG_WRN("%s: split mode auto: the MTP draft costs tensor split; layer split with MTP usually "
+                    "decodes slower than tensor split without it, a smaller --fit-target may keep both\n", __func__);
+        }
+        if (!holds) {
             LOG_INF("%s: split mode auto: tensor split loses context or residency, keeping layer split\n", __func__);
             mparams_in.split_mode = LLAMA_SPLIT_MODE_LAYER;
             restore_inputs(cparams_in.n_ubatch);
@@ -2971,8 +3065,10 @@ enum common_params_fit_status common_fit_params(
     if (status == COMMON_PARAMS_FIT_STATUS_SUCCESS && n_ubatch_max > ub0 && !cparams->embeddings) {
         uint32_t ub = ub0;
         bool resident = false;
+        const double cached = moe_cache && moe_cache->fit_selected ?
+            (double) std::min(moe_cache->fit_cache_bytes, moe_cache->fit_expert_bytes) : 0.0;
         try {
-            ub = common_fit_auto_ubatch(path_model, mparams, cparams, moe_fit_active, n_ubatch_max, log_level, resident);
+            ub = common_fit_auto_ubatch(path_model, mparams, cparams, moe_fit_active, cached, n_ubatch_max, log_level, resident);
         } catch (const std::runtime_error & e) {
             LOG_WRN("%s: ubatch auto: measurement failed, keeping %u: %s\n", __func__, ub0, e.what());
         }
@@ -2992,7 +3088,7 @@ enum common_params_fit_status common_fit_params(
             if (!loses) {
                 break;
             }
-            LOG_INF("%s: ubatch auto: the fit at %u loses context, placement, GPU layers or KV budget\n", __func__, ub);
+            LOG_INF("%s: ubatch auto: the fit at %u loses context, placement, cache coverage, GPU layers or KV budget\n", __func__, ub);
         }
         if (ub <= ub0 && cparams->n_ubatch != ub0) {
             // refit rather than restore the first fit: its override patterns live in buffers the refit reused

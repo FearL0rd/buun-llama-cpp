@@ -5082,6 +5082,16 @@ int32_t llama_model_n_expert_used(const struct llama_model * model) {
     return model->hparams.n_expert_used_max();
 }
 
+// block index of a "blk.<il>." tensor, -1 for other tensors
+static int64_t llama_model_tensor_layer(const std::string & name) {
+    if (name.compare(0, 4, "blk.") != 0) {
+        return -1;
+    }
+    char * end = nullptr;
+    const long parsed = strtol(name.c_str() + 4, &end, 10);
+    return end != name.c_str() + 4 ? parsed : -1;
+}
+
 static bool llama_model_is_routed_expert_weight(
         const std::string & name, const ggml_tensor * tensor) {
     if (!tensor) {
@@ -5114,15 +5124,7 @@ size_t llama_model_get_moe_tensor_info(
             continue;
         }
 
-        int64_t layer = -1;
-        if (name.compare(0, 4, "blk.") == 0) {
-            char * end = nullptr;
-            const long parsed = strtol(name.c_str() + 4, &end, 10);
-            if (end != name.c_str() + 4) {
-                layer = parsed;
-            }
-        }
-
+        const int64_t layer = llama_model_tensor_layer(name);
         if (info && count < capacity) {
             info[count] = {
                 tensor->type,
@@ -5157,8 +5159,13 @@ bool llama_model_has_host_moe_weights(const llama_model * model) {
 }
 
 size_t llama_model_host_offload_weight_bytes(const llama_model * model) {
+    // MTP blocks run only in the draft context, never in a target batch
+    const int64_t il_draft = model->hparams.has_mtp() ? (int64_t) model->hparams.n_layer() : INT64_MAX;
     size_t bytes = 0;
     for (const auto & [name, tensor] : model->tensors_by_name) {
+        if (llama_model_tensor_layer(name) >= il_draft) {
+            continue;
+        }
         // token embeddings are row lookups, which stay on the host
         if (tensor->view_src == nullptr && tensor->buffer && ggml_backend_buffer_is_host(tensor->buffer) &&
                 name.find("token_embd") == std::string::npos) {

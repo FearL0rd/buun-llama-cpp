@@ -163,6 +163,7 @@ LLAMA_API bool llama_model_has_host_moe_weights(const struct llama_model * model
 
 // Bytes of host-resident weights a GPU copies in to run a large batch (op offload, MoE cache
 // misses), with the resolved placement. Token embeddings are excluded: their row lookups stay on the host.
+// So are MTP blocks, which only the draft context runs.
 LLAMA_API size_t llama_model_host_offload_weight_bytes(const struct llama_model * model);
 
 // The largest 2D block weight (routed experts and the embedding/output matrices aside), the

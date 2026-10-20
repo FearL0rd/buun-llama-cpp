@@ -583,7 +583,8 @@ struct common_moe_cache_params {
     int cpu_overlap            = -2; // -2 = inherit provider, -1 = auto, 0..8 = CPU rows
     bool mode_explicit         = false;
     bool fit_selected          = false;
-    bool fit_covers_experts    = false; // the cache-aware placement projects room for every routed expert
+    size_t fit_cache_bytes     = 0;     // projected cache capacity of the selected placement
+    size_t fit_expert_bytes    = 0;     // routed expert bytes that placement caches from the host
     bool no_repack             = false; // deprecated "on": auto with canonical expert weights
     bool profile               = true;
     std::string profile_path;
