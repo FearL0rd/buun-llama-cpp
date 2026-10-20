@@ -17,7 +17,7 @@ static const struct {
     const char * drafter; // name used in the log line
 } spec_family_defaults[] = {
     // Qwen3.8 (qwen35) ships a trained single MTP head: the production settings are the
-    // current flag defaults (fixed draft depth 4, p-min 0), so the default only needs to
+    // current flag defaults (fixed draft depth 3, p-min 0), so the default only needs to
     // select the drafter
     { "qwen35", "MTP drafter" },
 };
