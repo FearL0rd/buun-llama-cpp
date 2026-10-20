@@ -655,7 +655,9 @@ static bool share_init(share_host & h, int n_embd) {
 #endif
 
     const char * threads = getenv("GGML_CUDA_MOE_CPU_SHARE_THREADS");
-    h.n_threads = threads ? std::max(1, atoi(threads)) : (int) std::clamp(std::thread::hardware_concurrency()/2, 1u, 6u);
+    // a sixth of the cores (6..32), never more than half: 6 starves the share on large hosts
+    const unsigned hw = std::max(std::thread::hardware_concurrency(), 2u);
+    h.n_threads = threads ? std::max(1, atoi(threads)) : (int) std::min(hw/2, std::clamp(hw/6, 6u, 32u));
     std::thread(share_leader, std::ref(h)).detach();
     for (int tid = 1; tid < h.n_threads; ++tid) {
         std::thread(share_worker, std::ref(h)).detach();
