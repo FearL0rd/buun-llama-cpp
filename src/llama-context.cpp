@@ -5861,11 +5861,6 @@ llm_graph_result * llama_context::get_gf_res_reserve() const {
 // Small batches (decode, speculative verify, draft catch-up) get a slot per token count and larger
 // ones share one, separately for batches with and without outputs.
 int llama_context::graph_slot(const llama_ubatch & ubatch) const {
-    // the meta backend keeps the external-view mappings of only its last two graphs, so a graph
-    // parked in another slot would come back with unmapped views; one slot stays within that window
-    if (model.split_mode() == LLAMA_SPLIT_MODE_TENSOR) {
-        return 0;
-    }
     const int half = GGML_SCHED_MAX_GRAPH_SLOTS / 2;
     return (n_outputs > 0 ? half : 0) + (int) std::min<uint32_t>(ubatch.n_tokens - 1, half - 1);
 }
