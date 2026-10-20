@@ -3064,7 +3064,7 @@ static int moe_cache_prefetch_supported(void * backend_opaque, const ggml_tensor
             source->ne[2] < 1 || source->ne[2] > 512 || source->ne[3] != 1 ||
             source->nb[2] % sizeof(uint4) || ggml_nbytes(source) > (1ull << 30)) return 0;
     auto * ctx = (ggml_backend_cuda_context *) backend->context;
-    return !ctx->external_capture && ggml_cuda_info().device_count == 1;
+    return !ctx->external_capture;
 }
 
 struct moe_cache_prefetch_job {
@@ -3143,14 +3143,15 @@ static void * moe_cache_prefetch_begin(void * opaque, void * backend_opaque,
     bool ready = false;
     {
         std::lock_guard<std::mutex> lock(session.mu);
-        if (!session.stopping && !session.dormant && session.active_scopes > 0 && session.devices.size() == 1) {
+        moe_cache_device * local = moe_cache_device_for(session, ctx->device);
+        if (!session.stopping && !session.dormant && session.active_scopes > 0 && local) {
             try {
                 auto & lease = session.active_sources[source->data];
                 lease.bytes = std::max(lease.bytes, ggml_nbytes(source));
                 lease.references++;
                 session.active_nodes++;
                 job->leased = true;
-                auto & device = *session.devices[0];
+                auto & device = *local;
                 const int pool_id = moe_cache_find_pool(device, source->nb[2], source->type);
                 if (!device.dead && pool_id >= 0 && device.pools[pool_id]->slab) {
                     const auto & pool = *device.pools[pool_id];
