@@ -2684,6 +2684,15 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         is_mem_shared = llama_memory_has_shared_cells(llama_get_memory(ctx_dft));
         chain_heads   = n_mtp_layers > 1 && !is_mem_shared;
 
+        // Tensor split drafts step by step (no draft chain), and each extra step costs
+        // more than its acceptance returns, so a default depth drafts one token.
+        if (!params.draft.n_max_set && this->params.n_max > 1 &&
+            llama_model_split_mode(llama_get_model(ctx_tgt)) == LLAMA_SPLIT_MODE_TENSOR) {
+            LOG_INF("%s: tensor split: MTP draft depth %d -> 1 (set --draft-max to override)\n",
+                    __func__, this->params.n_max);
+            this->params.n_max = 1;
+        }
+
         const char * adaptive_env = getenv("GGML_MTP_DRAFT_ADAPTIVE");
         // Qualified recursive caps retain backoff/recovery; a larger configured
         // cap must not silently turn low-match prose into fixed-depth drafting.

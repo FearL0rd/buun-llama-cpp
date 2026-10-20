@@ -161,6 +161,9 @@ LLAMA_API size_t llama_model_get_moe_tensor_info(
 // This is intentionally about resolved placement, not architecture metadata.
 LLAMA_API bool llama_model_has_host_moe_weights(const struct llama_model * model);
 
+// Split mode the model was loaded with (after split mode auto resolved it).
+LLAMA_API enum llama_split_mode llama_model_split_mode(const struct llama_model * model);
+
 // Bytes of host-resident weights a GPU copies in to run a large batch (op offload, MoE cache
 // misses), with the resolved placement. Token embeddings are excluded: their row lookups stay on the host.
 // So are MTP blocks, which only the draft context runs.

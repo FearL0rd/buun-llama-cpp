@@ -5140,6 +5140,10 @@ size_t llama_model_get_moe_tensor_info(
     return count;
 }
 
+llama_split_mode llama_model_split_mode(const llama_model * model) {
+    return model->split_mode();
+}
+
 bool llama_model_has_host_moe_weights(const llama_model * model) {
     if (!model) {
         return false;
