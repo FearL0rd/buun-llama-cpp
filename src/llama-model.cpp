@@ -524,20 +524,20 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
         size_t   rotation; // when assigning tensor slices, rotate how the rounding is done for more even allocation
     };
 
+    // the layers in a tensor can be inhomogeneous, if the pattern is cleanly divided by the number of GPUs there can be aliasing effects,
+    //     count only the same type of previous layers to avoid this
+    auto get_il_eff = [&](const size_t il){
+        size_t ret = 0;
+        const bool il_is_recr = hparams.is_recr(il);
+        const bool il_is_swa  = hparams.is_swa(il);
+        for (size_t il_prev = 0; il_prev < il; il_prev++) {
+            ret += hparams.is_recr(il_prev) == il_is_recr && hparams.is_swa(il_prev) == il_is_swa;
+        }
+        return ret;
+    };
+
     auto get_tensor_config_impl = [&](
                 const ggml_backend_meta_split_axis axis, const std::string & suffix = "", const std::string & suffix_fallback = "") -> tensor_config {
-        // the layers in a tensor can be inhomogeneous, if the pattern is cleanly divided by the number of GPUs there can be aliasing effects,
-        //     count only the same type of previous layers to avoid this
-        auto get_il_eff = [&](const size_t il){
-            size_t ret = 0;
-            const bool il_is_recr = hparams.is_recr(il);
-            const bool il_is_swa  = hparams.is_swa(il);
-            for (size_t il_prev = 0; il_prev < il; il_prev++) {
-                ret += hparams.is_recr(il_prev) == il_is_recr && hparams.is_swa(il_prev) == il_is_swa;
-            }
-            return ret;
-        };
-
         uint32_t il;
         std::string prefix;
         // NOTE: the per-layer rotation spreads shard bytes evenly across devices regardless of
@@ -1110,6 +1110,33 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
 
     ggml_backend_meta_split_state split_state;
     memset(&split_state, 0, sizeof(split_state));
+
+    // GLM DSA owner placement: an owned DSA layer (MLA + its own indexer and both caches) lives whole on one
+    // device, round-robin over the DSA layers, instead of mirroring its latent caches on every device.
+    // Its output projection splits on axis 0, so the layer ends in the usual partial-sum all-reduce.
+    static const std::regex pattern_glm_dsa_attn(
+        "blk\\.\\d+\\.(attn_(q_a_norm|kv_a_norm|q_a|q_b|kv_a_mqa|k_b|v_b)\\.(weight|scale|input_scale)|indexer[._].*)");
+    const int32_t n_attn_owned = ud->n_attn_owned;
+    if (n_attn_owned > 0 && ud->n_devices > 1 && llama_model_n_attn_ownable(ud->model) > 0) {
+        // pattern_kv_cache also matches the indexer caches
+        const bool cache = std::regex_match(tensor_name, pattern_kv_cache);
+        const bool out = !cache && std::regex_match(tensor_name, pattern_attn_out_weight);
+        if (cache || out || std::regex_match(tensor_name, pattern_glm_dsa_attn)) {
+            const tensor_config tc = get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+            if (!hparams.is_recr(tc.il) && get_il_eff(tc.il) < size_t(n_attn_owned)) {
+                // rotation counts the DSA layers before this one, so it is the owner
+                // (the axis only matters for the output projection and for the EXL3 vectors that follow it)
+                const bool axis_0 = cache || out || tensor->ne[1] == 1;
+                split_state.axis = axis_0 ? GGML_BACKEND_SPLIT_AXIS_0 :
+                    tensor->ne[2] > 1 ? GGML_BACKEND_SPLIT_AXIS_2 : GGML_BACKEND_SPLIT_AXIS_1;
+                split_state.ne[tc.rotation] = tensor->ne[split_state.axis];
+                split_state.nr[0] = 1;
+                split_state.n_segments = 1;
+                return split_state;
+            }
+        }
+    }
+
     tensor_config tc = get_tensor_config();
     split_state.axis = tc.axis;
     if (split_state.axis >= 0 && split_state.axis < GGML_MAX_DIMS) {
@@ -4020,6 +4047,7 @@ llama_model_params llama_model_default_params() {
         /*.mmap_prefetch               =*/ LLAMA_MMAP_PREFETCH_MODE_AUTO,
         /*.repack_cache                =*/ nullptr,
         /*.main_gpu                    =*/ 0,
+        /*.n_attn_owned                =*/ -1,
         /*.tensor_split                =*/ nullptr,
         /*.progress_callback           =*/ nullptr,
         /*.progress_callback_user_data =*/ nullptr,
@@ -5199,6 +5227,25 @@ bool llama_model_largest_block_weight(
 
 bool llama_model_supports_split_tensor(const llama_model * model) {
     return llm_arch_supports_sm_tensor(model->arch);
+}
+
+int32_t llama_model_n_attn_ownable(const struct llama_model * model) {
+    if (model->arch != LLM_ARCH_GLM5_NEXT) {
+        return 0;
+    }
+    // a layer that reuses the previous layer's top-k selection would have to share its device, so require full indexers
+    const llama_hparams & hparams = model->hparams;
+    int32_t n = 0;
+    for (uint32_t il = 0; il < hparams.n_layer_all; il++) {
+        if (hparams.is_recr(il)) {
+            continue;
+        }
+        if (il < hparams.n_layer() && !hparams.is_indexer_full(il)) {
+            return 0;
+        }
+        n++;
+    }
+    return n;
 }
 
 int32_t llama_model_n_devices(const struct llama_model * model) {

@@ -3997,6 +3997,15 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_MAIN_GPU"));
     add_opt(common_arg(
+        {"--split-attn-owned"}, "N",
+        "with split-mode = tensor, hold N attention layers and their KV caches whole on one GPU each (round robin) "
+        "instead of mirroring the latent caches on every GPU; trades decode/prefill speed for context (GLM DSA only, "
+        "-1 = chosen by --fit, default: -1)",
+        [](common_params & params, int value) {
+            params.n_attn_owned = value;
+        }
+    ).set_env("LLAMA_ARG_SPLIT_ATTN_OWNED"));
+    add_opt(common_arg(
         { "-fit", "--fit" }, "[on|off]",
         string_format("whether to adjust unset arguments to fit in device memory ('on' or 'off', default: '%s')", params.fit_params ? "on" : "off"),
         [](common_params & params, const std::string & value) {

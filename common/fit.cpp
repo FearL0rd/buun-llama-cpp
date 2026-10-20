@@ -46,6 +46,7 @@ struct common_fit_ubatch_stats {
     double host_offload    = 0.0;
     bool   host_moe        = false;
     bool   split_tensor    = false; // the architecture supports LLAMA_SPLIT_MODE_TENSOR
+    int32_t n_attn_ownable = 0;     // llama_model_n_attn_ownable
     // MTP blocks [draft_layer0, draft_layer0 + n_draft_layers), which only a draft context runs
     int32_t draft_layer0   = 0;
     int32_t n_draft_layers = 0;
@@ -719,6 +720,7 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
         // MTP experts on the host serve only the draft, so a target batch streams experts only with host_offload
         ub_stats->host_moe     = llama_model_has_host_moe_weights(model.get()) && ub_stats->host_offload > 0.0;
         ub_stats->split_tensor = llama_model_supports_split_tensor(model.get());
+        ub_stats->n_attn_ownable = llama_model_n_attn_ownable(model.get());
         if (llama_model_has_mtp(model.get())) {
             ub_stats->draft_layer0   = llama_model_n_layer(model.get());
             ub_stats->n_draft_layers = llama_model_n_layer_nextn(model.get());
@@ -3046,14 +3048,46 @@ enum common_params_fit_status common_fit_params(
         // at about half the speed on a layer split that streams experts, so tensor split may use a smaller one
         const size_t margin_stock = 1024u*1024*1024;
         const size_t margin_tensor = 512u*1024*1024;
-        if (!holds && std::all_of(margins_fit.begin(), margins_fit.end(), [&](size_t m) { return m == margin_stock; })) {
+        const bool margins_stock = std::all_of(margins_fit.begin(), margins_fit.end(), [&](size_t m) { return m == margin_stock; });
+        if (!holds && margins_stock) {
             std::fill(margins_fit.begin(), margins_fit.end(), margin_tensor);
             holds = try_tensor();
             if (holds) {
                 LOG_INF("%s: split mode auto: tensor split holds with a %zu MiB fit target\n", __func__, margin_tensor/(1024*1024));
-            } else {
-                std::fill(margins_fit.begin(), margins_fit.end(), margin_stock);
             }
+        }
+        // attention layers held whole on one GPU each free the other GPUs' copies of their latent caches,
+        // at a cost in decode and prefill speed, so own the fewest that hold (more owned never costs a device memory).
+        // The fit checks the GPUs' total, so own them in whole rounds over the GPUs to keep every GPU's share equal.
+        const int32_t n_ownable = stats.n_attn_ownable;
+        if (!holds && mparams_in.n_attn_owned < 0 && n_ownable > 0) {
+            const int32_t n_gpus = std::max<int32_t>(1, int32_t(common_fit_n_gpu_devices(mparams)));
+            auto try_rounds = [&](int32_t k) {
+                mparams_in.n_attn_owned = std::min(k*n_gpus, n_ownable);
+                return try_tensor();
+            };
+            const int32_t n_rounds = (n_ownable + n_gpus - 1) / n_gpus;
+            if (try_rounds(n_rounds)) {
+                int32_t lo = 0;
+                int32_t hi = n_rounds;
+                bool hi_last = true;
+                while (hi - lo > 1) {
+                    const int32_t mid = (lo + hi) / 2;
+                    hi_last = try_rounds(mid);
+                    (hi_last ? hi : lo) = mid;
+                }
+                // the fit state is the last probe's, so re-probe hi only when the last one failed
+                holds = hi_last || try_rounds(hi);
+            }
+            if (holds) {
+                LOG_INF("%s: split mode auto: tensor split holds with %d of %d attention layers owned by one GPU each\n",
+                        __func__, mparams_in.n_attn_owned, n_ownable);
+            } else {
+                mparams_in.n_attn_owned = -1;
+            }
+        }
+        if (!holds && margins_stock) {
+            std::fill(margins_fit.begin(), margins_fit.end(), margin_stock);
         }
         if (!holds && mtp_costs) {
             LOG_WRN("%s: split mode auto: the MTP draft costs tensor split; layer split with MTP usually "

@@ -177,6 +177,10 @@ LLAMA_API bool llama_model_largest_block_weight(
 // Whether the architecture has split rules for LLAMA_SPLIT_MODE_TENSOR.
 LLAMA_API bool llama_model_supports_split_tensor(const struct llama_model * model);
 
+// The number of attention layers that llama_model_params::n_attn_owned can hold whole on one device each,
+// 0 when the architecture mirrors its latent KV caches under LLAMA_SPLIT_MODE_TENSOR.
+LLAMA_API int32_t llama_model_n_attn_ownable(const struct llama_model * model);
+
 LLAMA_API ggml_backend_dev_t llama_model_get_device(const struct llama_model * model, int i);
 
 LLAMA_API llama_memory_breakdown llama_get_memory_breakdown(const struct llama_context * ctx);

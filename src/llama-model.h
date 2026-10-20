@@ -659,6 +659,7 @@ struct llama_device {
 struct llama_meta_device_get_split_state_userdata {
     size_t                     n_devices;
     const struct llama_model * model;
+    int32_t                    n_attn_owned; // llama_model_params::n_attn_owned
 };
 
 struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const struct ggml_tensor * tensor, void * userdata);
