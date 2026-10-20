@@ -2916,7 +2916,14 @@ enum common_params_fit_status common_fit_params(
     bool scratch_measured = false;
     std::vector<size_t> margins_fit(margins, margins + llama_max_devices());
     std::vector<size_t> margins_ub(llama_max_devices());
+    uint32_t n_rs_seq_tensor = UINT32_MAX;
+    for (const common_fit_extra_model * e : extra_models) {
+        n_rs_seq_tensor = std::min(n_rs_seq_tensor, e->target_n_rs_seq_tensor);
+    }
     auto fit_once = [&] {
+        if (mparams->split_mode == LLAMA_SPLIT_MODE_TENSOR) {
+            cparams->n_rs_seq = std::min(cparams->n_rs_seq, n_rs_seq_tensor);
+        }
         if (!scratch_measured && cparams->n_ubatch > ubatch_default) {
             scratch_measured = true;
             try {

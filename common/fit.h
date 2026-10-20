@@ -76,6 +76,8 @@ struct common_fit_extra_model {
     const common_fit_extra_model * next = nullptr;
     bool optional_if_no_mtp = false;
     bool borrows_target_tensors = false;
+    // the target's rollback planes when it lands on tensor split, where the drafter may draft fewer tokens
+    uint32_t target_n_rs_seq_tensor = UINT32_MAX;
 };
 
 uint32_t common_fit_extra_context_size(

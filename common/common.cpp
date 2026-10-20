@@ -1474,6 +1474,7 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
             /*.next         =*/ spec_mtp && !extra_is_mtp ? &extra_mtp : nullptr,
             /*.optional_if_no_mtp =*/ false,
             /*.borrows_target_tensors =*/ has_draft && extra_is_mtp,
+            /*.target_n_rs_seq_tensor =*/ params.speculative.need_n_rs_seq_tensor(),
         };
 
         // LoRA adapters load after the fit and have no tensor split rules, so they keep the split mode
@@ -1557,6 +1558,9 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
     if (!params.fit_params) {
         common_params_resolve_vbr_codec_auto_from_model(params, model);
         cparams = common_context_params_to_llama(params);
+    }
+    if (llama_model_split_mode(model) == LLAMA_SPLIT_MODE_TENSOR) {
+        cparams.n_rs_seq = std::min(cparams.n_rs_seq, params.speculative.need_n_rs_seq_tensor());
     }
 
     if (params.moe_cache.profile && params.moe_cache.profile_path.empty() &&

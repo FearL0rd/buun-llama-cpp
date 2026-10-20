@@ -485,6 +485,16 @@ struct common_params_speculative {
         return needs_rs_seq ? draft.n_max : 0u;
     }
 
+    // a default-depth MTP drafter drafts one token on a tensor split target (see the MTP drafter),
+    // so the target needs one rollback plane there unless --draft-max or another drafter asks for more
+    uint32_t need_n_rs_seq_tensor() const {
+        const bool mtp_only = std::none_of(types.begin(), types.end(), [&](auto t) {
+            return t == COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3 || t == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH || t == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK;
+        });
+        const uint32_t n = need_n_rs_seq();
+        return mtp_only && !draft.n_max_set ? std::min(n, 1u) : n;
+    }
+
     // model-free self-speculation (no -md): drafts come from the target context alone but are
     // still VERIFIED through the target, so hybrid/recurrent targets need the same rollback
     // backup sequence as draft-model speculation (see server load_model n_parallel doubling)
