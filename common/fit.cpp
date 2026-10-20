@@ -3050,7 +3050,7 @@ enum common_params_fit_status common_fit_params(
         }
         if (!holds && mtp_costs) {
             LOG_WRN("%s: split mode auto: the MTP draft costs tensor split; layer split with MTP usually "
-                    "decodes slower than tensor split without it, a smaller --fit-target may keep both\n", __func__);
+                    "decodes slower than tensor split without it, a smaller context (-c) may keep both\n", __func__);
         }
         if (!holds) {
             LOG_INF("%s: split mode auto: tensor split loses context or residency, keeping layer split\n", __func__);
