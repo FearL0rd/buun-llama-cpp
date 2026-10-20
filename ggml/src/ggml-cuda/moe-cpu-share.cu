@@ -92,6 +92,7 @@ struct share_state {
     share_copy copy[3*share_max_staged];
     uint64_t t_ring;            // timer when the copies were set up
     unsigned int n_copy_blocks; // stage copy blocks finished
+    uint32_t n_rings;           // layers with misses
 };
 
 static __device__ __forceinline__ uint64_t share_ticks() {
@@ -140,6 +141,7 @@ struct share_doorbell_args {
     size_t stage_stride;
     int layer;
     int up_type;
+    bool probe;            // the share is balanced, not pinned
     float glu_limit;
     share_mailbox * mb;
     float * mb_x;
@@ -211,7 +213,15 @@ static __global__ void share_doorbell(const share_doorbell_args a) {
             }
         }
         // The host takes the experts with the most bytes on the bus first.
-        const int n_host = min((n_miss*host_num + 128) >> 8, share_max_experts);
+        int n_host = min((n_miss*host_num + 128) >> 8, share_max_experts);
+        // A side that gets no misses is never measured again, so now and then it gets one.
+        if (a.probe && (++st->n_rings & 63) == 0) {
+            if (n_host == 0) {
+                n_host = 1;
+            } else if (n_host == n_miss) {
+                n_host--;
+            }
+        }
         int picked[share_max_experts];
         int n_pick = 0;
         for (int score = 3; score > 0 && n_pick < n_host; --score) {
@@ -819,6 +829,7 @@ ggml_moe_cpu_share_args ggml_moe_cpu_share_begin(
     a.stage_stride = d.stage_stride;
     a.layer = layer;
     a.up_type = l.up.type;
+    a.probe = !share_pinned();
     // Pass the activation with the GPU job, so captured graphs replay their own
     // limit rather than observing mutable launch-time state from another layer.
     a.glu_limit = fusion->glu_limit;
