@@ -1141,6 +1141,38 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_calculate_split_st
             return ret;
         }
 
+        // Owner placement: a tensor held whole by one device (empty on the others) combined only with
+        // mirrored tensors is computed on that device alone, and its result is held whole there too.
+        // A projection back to the residual stream (an axis 0 weight) ends the owner chain as a partial
+        // sum that the non-owners contribute zeros to.
+        int owner = -1;
+        bool owner_chain = n_bufs > 1;
+        for (size_t i = 0; owner_chain && i < GGML_MAX_SRC; i++) {
+            const ggml_tensor * src = ggml_backend_meta_split_state_source(tensor, i);
+            if (src == nullptr || src == tensor || src_ss[i].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
+                continue;
+            }
+            const ggml_backend_meta_split_state & ss = src_ss[i];
+            owner_chain = ss.axis >= 0 && ss.axis < GGML_MAX_DIMS && ss.n_segments == 1 && ss.nr[0] == 1;
+            for (size_t j = 0; owner_chain && j < n_bufs; j++) {
+                if (ss.ne[j] == 0) {
+                    continue;
+                }
+                owner_chain = ss.ne[j] == src->ne[ss.axis] && (owner < 0 || owner == int(j));
+                owner = j;
+            }
+        }
+        if (owner_chain && owner >= 0) {
+            // (handle_mul_mat would reject an axis 0 weight against a mirrored input, which is valid here)
+            if (tensor->op == GGML_OP_MUL_MAT && src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_0 && tensor->src[0]->ne[1] > 1 &&
+                    ggml_backend_buffer_get_usage(tensor->src[0]->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
+                return {assume_sync ? GGML_BACKEND_SPLIT_AXIS_MIRRORED : GGML_BACKEND_SPLIT_AXIS_PARTIAL, {0}, {1}, 1};
+            }
+            ggml_backend_meta_split_state ret = {GGML_BACKEND_SPLIT_AXIS_0, {0}, {1}, 1};
+            ret.ne[owner] = tensor->ne[0];
+            return ret;
+        }
+
         ggml_backend_meta_split_state split_state;
         switch (tensor->op) {
             case GGML_OP_NONE: {
