@@ -1422,7 +1422,8 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
 
         // the draft context is created from the same base params and follows the main context, fit both together
         const bool has_draft = params.speculative.has_dft();
-        const bool spec_mtp = params.speculative.has_type(COMMON_SPECULATIVE_TYPE_DRAFT_MTP);
+        const bool spec_mtp = params.speculative.has_type(COMMON_SPECULATIVE_TYPE_DRAFT_MTP)
+                            || params.speculative.has_type(COMMON_SPECULATIVE_TYPE_DRAFT_MTP_ADAPTIVE);
 
         common_params params_dft = common_base_params_to_speculative(params);
 
@@ -2039,7 +2040,9 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     mparams.progress_callback           = params.load_progress_callback;
     mparams.progress_callback_user_data = params.load_progress_callback_user_data;
     mparams.no_alloc                    = params.no_alloc;
-    mparams.load_mtp                    = params.load_mtp || std::find(params.speculative.types.begin(), params.speculative.types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params.speculative.types.end();
+    mparams.load_mtp                    = params.load_mtp
+                                        || params.speculative.has_type(COMMON_SPECULATIVE_TYPE_DRAFT_MTP)
+                                        || params.speculative.has_type(COMMON_SPECULATIVE_TYPE_DRAFT_MTP_ADAPTIVE);
 
     return mparams;
 }
