@@ -3020,9 +3020,15 @@ enum common_params_fit_status common_fit_params(
             return status == COMMON_PARAMS_FIT_STATUS_SUCCESS && cparams->n_ctx >= layer_n_ctx && resident;
         };
         bool mtp_costs = false;
+        // a model that cannot load under tensor split (e.g. mixed-precision expert banks) is not retried
+        bool tensor_refused = false;
         auto try_tensor = [&] {
             restore_inputs(cparams_in.n_ubatch);
             status = fit_once();
+            tensor_refused = status == COMMON_PARAMS_FIT_STATUS_ERROR;
+            if (tensor_refused) {
+                return false;
+            }
             bool holds = tensor_holds();
             // the MTP experts alone may cost residency; the draft runs them a token at a time, which the
             // host serves for a small share of the step, while the target stays tensor-sharded
@@ -3049,7 +3055,7 @@ enum common_params_fit_status common_fit_params(
         const size_t margin_stock = 1024u*1024*1024;
         const size_t margin_tensor = 512u*1024*1024;
         const bool margins_stock = std::all_of(margins_fit.begin(), margins_fit.end(), [&](size_t m) { return m == margin_stock; });
-        if (!holds && margins_stock) {
+        if (!holds && !tensor_refused && margins_stock) {
             std::fill(margins_fit.begin(), margins_fit.end(), margin_tensor);
             holds = try_tensor();
             if (holds) {
@@ -3060,7 +3066,7 @@ enum common_params_fit_status common_fit_params(
         // at a cost in decode and prefill speed, so own the fewest that hold (more owned never costs a device memory).
         // The fit checks the GPUs' total, so own them in whole rounds over the GPUs to keep every GPU's share equal.
         const int32_t n_ownable = stats.n_attn_ownable;
-        if (!holds && mparams_in.n_attn_owned < 0 && n_ownable > 0) {
+        if (!holds && !tensor_refused && mparams_in.n_attn_owned < 0 && n_ownable > 0) {
             const int32_t n_gpus = std::max<int32_t>(1, int32_t(common_fit_n_gpu_devices(mparams)));
             auto try_rounds = [&](int32_t k) {
                 mparams_in.n_attn_owned = std::min(k*n_gpus, n_ownable);

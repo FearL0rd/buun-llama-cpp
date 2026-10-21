@@ -4421,12 +4421,15 @@ static int moe_cache_route_supported(void * opaque, void * backend_opaque, const
     // Mirror ggml_cuda_mul_mat_id's selection: only MMVQ and the grouped EXL3 kernel read the
     // table. Host weights take MMVQ up to the mmid cap, past the dense MMVQ/MMQ crossover; the
     // grouped EXL3 kernel reads an expert per (token, expert) pair, so short prompts route while
-    // that reads no more than offloading the whole tensor would copy.
+    // that reads no more than offloading the whole tensor would copy. A windowed op (mixed-precision
+    // group) only stages its in-window experts, so small batches route even when pairs > ne[2].
     const int cc = ggml_cuda_info().devices[ctx->device].cc;
     const int64_t n_tokens = op->ne[2];
     const int64_t pairs = ids->ne[0] * ids->ne[1];
+    const bool exl3_bounded = pairs <= weights->ne[2] ||
+        (ggml_mmid_window_n_local(op) != 0 && n_tokens <= MMVQ_MAX_BATCH_SIZE);
     const bool routable = pairs <= moe_cache_route_log_max &&
-        (ggml_type_is_exl3(weights->type) ? pairs <= weights->ne[2] && ggml_cuda_exl3_mul_mat_id_fast(op) :
+        (ggml_type_is_exl3(weights->type) ? exl3_bounded && ggml_cuda_exl3_mul_mat_id_fast(op) :
             n_tokens <= MMVQ_MAX_BATCH_SIZE && n_tokens <= get_mmvq_mmid_max_batch(weights->type, cc)) &&
         ggml_backend_supports_op(backend, op);
     std::lock_guard<std::mutex> lock(session->mu);

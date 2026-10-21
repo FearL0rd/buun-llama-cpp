@@ -5125,18 +5125,10 @@ static bool llama_model_is_routed_expert_weight(
     if (!tensor) {
         return false;
     }
-    bool has_suffix = false;
-    {
-        if (name.size() >= strlen("_exps.weight") &&
-            name.compare(name.size() - strlen("_exps.weight"), strlen("_exps.weight"), "_exps.weight") == 0) {
-            has_suffix = true;
-        } else if (name.size() >= strlen("_chexps.weight") &&
-                   name.compare(name.size() - strlen("_chexps.weight"), strlen("_chexps.weight"), "_chexps.weight") == 0) {
-            has_suffix = true;
-        }
-    }
-    return has_suffix && name.find(".ffn_") != std::string::npos &&
-        ggml_n_dims(tensor) == 3 && tensor->ne[0] > 0 &&
+    // mixed-precision expert banks store each precision group as <base>.g<i>.weight
+    static const std::regex routed(R"(_(ch)?exps(\.g[0-9]+)?\.weight$)");
+    return std::regex_search(name, routed) && name.find(".ffn_") != std::string::npos &&
+        tensor->ne[3] == 1 && tensor->ne[0] > 0 && // single-expert groups are [K,N,1]
         tensor->ne[1] > 0 && tensor->ne[2] > 0 && tensor->nb[2] != 0;
 }
 
