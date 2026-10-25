@@ -211,6 +211,8 @@ static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params
             return new llama_model_dots3note(params);
         case LLM_ARCH_DEEPSEEK4:
             return new llama_model_deepseek4(params);
+        case LLM_ARCH_DEEPSEEK41:
+            return new llama_model_deepseek41(params);
         case LLM_ARCH_GLM_DSA:
             return new llama_model_glm_dsa(params);
         case LLM_ARCH_MISTRAL4:
@@ -417,7 +419,7 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             return {GGML_BACKEND_SPLIT_AXIS_MIRRORED, {0}, {1}, 1};
         }
     }
-    const bool is_dsv4 = ud->model->arch == LLM_ARCH_DEEPSEEK4 ||
+    const bool is_dsv4 = ud->model->arch == LLM_ARCH_DEEPSEEK4 || ud->model->arch == LLM_ARCH_DEEPSEEK41 ||
         (ud->model->arch == LLM_ARCH_DFLASH && hparams.dsv4_hc_mult > 0);
     const bool is_glm5_next = ud->model->arch == LLM_ARCH_GLM5_NEXT;
     const bool is_qwen_hybrid = ud->model->arch == LLM_ARCH_QWEN3NEXT ||
@@ -3664,6 +3666,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             nullptr);
                 }
             } break;
+        case LLM_ARCH_DEEPSEEK41:
         case LLM_ARCH_DEEPSEEK4:
             {
                 GGML_ASSERT(hparams.swa_type != LLAMA_SWA_TYPE_NONE);
@@ -4179,7 +4182,7 @@ int32_t llama_model_n_head_kv(const llama_model * model) {
 }
 
 bool llama_model_kv_cache_types_coupled(const llama_model * model) {
-    return model->hparams.is_mla() || model->arch == LLM_ARCH_DEEPSEEK4;
+    return model->hparams.is_mla() || model->arch == LLM_ARCH_DEEPSEEK4 || model->arch == LLM_ARCH_DEEPSEEK41;
 }
 
 bool llama_model_supports_vbr_codec(const llama_model * model, llama_vbr_codec codec) {
@@ -4193,7 +4196,7 @@ bool llama_model_supports_vbr_codec(const llama_model * model, llama_vbr_codec c
 int32_t llama_model_n_swa(const llama_model * model) {
     // dsv4 kv-cache has SWA but it cannot be used as a rollback because of
     // other compression ratios, so we return 0 here
-    if (model->arch == LLM_ARCH_DEEPSEEK4) {
+    if (model->arch == LLM_ARCH_DEEPSEEK4 || model->arch == LLM_ARCH_DEEPSEEK41) {
         return 0;
     }
     return model->hparams.n_swa;
@@ -4280,6 +4283,7 @@ llama_rope_type llama_model_rope_type(const llama_model * model) {
         case LLM_ARCH_DEEPSEEK2OCR:
         case LLM_ARCH_DEEPSEEK32:
         case LLM_ARCH_DEEPSEEK4:
+        case LLM_ARCH_DEEPSEEK41:
         case LLM_ARCH_MUSE_GLIMMER:
         case LLM_ARCH_PLM:
         case LLM_ARCH_CHATGLM:
