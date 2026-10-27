@@ -252,6 +252,36 @@ int32_t common_cpu_get_num_moe_threads() {
     return common_cpu_resolve_moe_threads(common_cpu_get_num_physical_cores());
 }
 
+int32_t common_cpu_get_num_numa_nodes() {
+#if defined(__linux__)
+    // count the nodes holding a CPU this process may run on, so numactl/cpuset binds count as one node
+    cpu_set_t affinity;
+    if (sched_getaffinity(0, sizeof(affinity), &affinity) != 0) {
+        return 1;
+    }
+    int32_t n_nodes = 0;
+    for (int node = 0; ; ++node) {
+        const std::string dir = "/sys/devices/system/node/node" + std::to_string(node);
+        if (!std::filesystem::is_directory(dir)) {
+            break;
+        }
+        for (int cpu = 0; cpu < CPU_SETSIZE; ++cpu) {
+            if (CPU_ISSET(cpu, &affinity) && std::filesystem::exists(dir + "/cpu" + std::to_string(cpu))) {
+                ++n_nodes;
+                break;
+            }
+        }
+    }
+    return std::max<int32_t>(n_nodes, 1);
+#else
+    return 1;
+#endif
+}
+
+ggml_numa_strategy common_numa_auto_strategy() {
+    return common_cpu_get_num_numa_nodes() > 1 ? GGML_NUMA_STRATEGY_EXPERTS : GGML_NUMA_STRATEGY_DISABLED;
+}
+
 // Helper for setting process priority
 
 #if defined(_WIN32)

@@ -562,7 +562,8 @@ static void print_usage(int /* argc */, char ** argv) {
     printf("options:\n");
     printf("  -h, --help\n");
     printf("  --version                                   show version and build info\n");
-    printf("  --numa <distribute|isolate|numactl>         numa mode (default: disabled)\n");
+    printf("  --numa <auto|disabled|experts|distribute|isolate|numactl>\n");
+    printf("                                              numa mode (default: auto = experts on a multi-node host)\n");
     printf("  -r, --repetitions <n>                       number of times to repeat each test (default: %d)\n", cmd_params_defaults.reps);
     printf("  --prio <-1|0|1|2|3>                         process/thread priority (default: %d)\n", cmd_params_defaults.prio);
     printf("  --delay <0...N> (seconds)                   delay between each test (default: %d)\n", cmd_params_defaults.delay);
@@ -699,8 +700,8 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
     params.output_format        = cmd_params_defaults.output_format;
     params.output_format_stderr = cmd_params_defaults.output_format_stderr;
     params.reps                 = cmd_params_defaults.reps;
-    params.numa                 = cmd_params_defaults.numa;
-    params.prio                 = cmd_params_defaults.prio;
+    params.numa                 = common_numa_auto_strategy();
+    params.prio                = cmd_params_defaults.prio;
     params.delay                = cmd_params_defaults.delay;
     params.progress             = cmd_params_defaults.progress;
     params.no_warmup            = cmd_params_defaults.no_warmup;
@@ -1147,7 +1148,13 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
                     break;
                 }
                 std::string value(argv[i]);
-                if (value == "distribute" || value == "") {
+                if (value == "auto") {
+                    params.numa = common_numa_auto_strategy();
+                } else if (value == "disabled") {
+                    params.numa = GGML_NUMA_STRATEGY_DISABLED;
+                } else if (value == "experts") {
+                    params.numa = GGML_NUMA_STRATEGY_EXPERTS;
+                } else if (value == "distribute" || value == "") {
                     params.numa = GGML_NUMA_STRATEGY_DISTRIBUTE;
                 } else if (value == "isolate") {
                     params.numa = GGML_NUMA_STRATEGY_ISOLATE;
