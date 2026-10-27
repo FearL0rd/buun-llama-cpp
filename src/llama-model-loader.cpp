@@ -2161,6 +2161,7 @@ void llama_model_loader::init_mappings(
             const auto & file = files[idx];
 
             bool is_numa = false;
+            bool numa_experts = false;
 
             auto * dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
             if (dev) {
@@ -2169,9 +2170,18 @@ void llama_model_loader::init_mappings(
                 if (is_numa_fn) {
                     is_numa = is_numa_fn();
                 }
+                auto * numa_experts_fn = (decltype(ggml_numa_experts) *) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cpu_numa_experts");
+                if (numa_experts_fn) {
+                    numa_experts = numa_experts_fn();
+                }
             }
 
-            const size_t prefetch_size = prefetch && use_mmap ? -1 : 0;
+            // --numa experts places the expert pages itself, so nothing may fault them in first, but
+            // it keeps readahead: refaulting an evicted expert one page at a time stalls decode
+            if (numa_experts) {
+                is_numa = false;
+            }
+            const size_t prefetch_size = prefetch && use_mmap && !numa_experts ? -1 : 0;
 
             std::unique_ptr<llama_mmap> mapping = std::make_unique<llama_mmap>(file.get(), prefetch_size, is_numa,
                     lazy.for_file(idx));

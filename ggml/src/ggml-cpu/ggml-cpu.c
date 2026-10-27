@@ -791,7 +791,7 @@ bool ggml_is_numa(void) {
     return g_state.numa.n_nodes > 1;
 }
 
-static bool ggml_numa_experts(void) {
+bool ggml_numa_experts(void) {
     return g_state.numa.numa_strategy == GGML_NUMA_STRATEGY_EXPERTS && ggml_is_numa();
 }
 
