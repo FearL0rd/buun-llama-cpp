@@ -2178,12 +2178,10 @@ void llama_model_loader::init_mappings(
 
             // --numa experts places the expert pages itself, so nothing may fault them in first, but
             // it keeps readahead: refaulting an evicted expert one page at a time stalls decode
-            if (numa_experts) {
-                is_numa = false;
-            }
+            const bool mmap_numa = is_numa && !numa_experts;
             const size_t prefetch_size = prefetch && use_mmap && !numa_experts ? -1 : 0;
 
-            std::unique_ptr<llama_mmap> mapping = std::make_unique<llama_mmap>(file.get(), prefetch_size, is_numa,
+            std::unique_ptr<llama_mmap> mapping = std::make_unique<llama_mmap>(file.get(), prefetch_size, mmap_numa,
                     lazy.for_file(idx));
             mmaps_used.emplace_back(mapping->size(), 0);
             if (mlock_mmaps) {

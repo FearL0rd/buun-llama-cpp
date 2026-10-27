@@ -916,6 +916,11 @@ bool ggml_numa_place_experts(int fd, size_t offset, size_t row_size, int64_t n_r
     // most often comes from an earlier placed load, and re-reading it from disk costs far more
     // load time than misplaced pages cost decode.
     if (ggml_numa_cached_fraction(fd, offset, expert_size * n_expert) >= 0.5) {
+        static bool logged = false;
+        if (!logged) {
+            logged = true;
+            GGML_LOG_INFO("%s: experts already page-cached, keeping their pages where they are (drop the page cache to re-place them)\n", __func__);
+        }
         return false;
     }
     // A private open file description, so its readahead state is ours: readahead past an

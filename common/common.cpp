@@ -282,6 +282,17 @@ ggml_numa_strategy common_numa_auto_strategy() {
     return common_cpu_get_num_numa_nodes() > 1 ? GGML_NUMA_STRATEGY_EXPERTS : GGML_NUMA_STRATEGY_DISABLED;
 }
 
+bool common_numa_strategy_from_str(const std::string & value, ggml_numa_strategy & numa) {
+    /**/ if (value == "auto") { numa = common_numa_auto_strategy(); }
+    else if (value == "disabled") { numa = GGML_NUMA_STRATEGY_DISABLED; }
+    else if (value == "distribute" || value == "") { numa = GGML_NUMA_STRATEGY_DISTRIBUTE; }
+    else if (value == "isolate") { numa = GGML_NUMA_STRATEGY_ISOLATE; }
+    else if (value == "numactl") { numa = GGML_NUMA_STRATEGY_NUMACTL; }
+    else if (value == "experts") { numa = GGML_NUMA_STRATEGY_EXPERTS; }
+    else { return false; }
+    return true;
+}
+
 // Helper for setting process priority
 
 #if defined(_WIN32)

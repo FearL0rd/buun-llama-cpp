@@ -90,6 +90,8 @@ int32_t common_cpu_get_num_moe_threads();
 int32_t common_cpu_get_num_numa_nodes();
 // --numa auto: experts on a host whose usable CPUs span more than one NUMA node, else disabled
 ggml_numa_strategy common_numa_auto_strategy();
+// parse a --numa value ("auto" resolves via common_numa_auto_strategy); false if unknown
+bool common_numa_strategy_from_str(const std::string & value, ggml_numa_strategy & numa);
 
 //
 // Common params

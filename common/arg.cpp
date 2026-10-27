@@ -3801,13 +3801,11 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         "if run without this previously, it is recommended to drop the system page cache before using this\n"
         "see https://github.com/ggml-org/llama.cpp/issues/1437",
         [](common_params & params, const std::string & value) {
+            // auto resolves after parsing, so the log line below names the choice
             params.numa_auto = value == "auto";
-            /**/ if (params.numa_auto || value == "disabled") { params.numa = GGML_NUMA_STRATEGY_DISABLED; }
-            else if (value == "distribute" || value == "") { params.numa = GGML_NUMA_STRATEGY_DISTRIBUTE; }
-            else if (value == "isolate") { params.numa = GGML_NUMA_STRATEGY_ISOLATE; }
-            else if (value == "numactl") { params.numa = GGML_NUMA_STRATEGY_NUMACTL; }
-            else if (value == "experts") { params.numa = GGML_NUMA_STRATEGY_EXPERTS; }
-            else { throw std::invalid_argument("invalid value"); }
+            if (!params.numa_auto && !common_numa_strategy_from_str(value, params.numa)) {
+                throw std::invalid_argument("invalid value");
+            }
         }
     ).set_env("LLAMA_ARG_NUMA"));
     add_opt(common_arg(

@@ -540,7 +540,7 @@ static const cmd_params cmd_params_defaults = {
     /* vbr_entry_explicit   */ false,
     /* vbr_floor_explicit   */ false,
     /* vbr_vram_explicit    */ false,
-    /* numa                 */ GGML_NUMA_STRATEGY_DISABLED,
+    /* numa                 */ common_numa_auto_strategy(),
     /* reps                 */ 5,
     /* prio                 */ GGML_SCHED_PRIO_NORMAL,
     /* delay                */ 0,
@@ -700,8 +700,8 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
     params.output_format        = cmd_params_defaults.output_format;
     params.output_format_stderr = cmd_params_defaults.output_format_stderr;
     params.reps                 = cmd_params_defaults.reps;
-    params.numa                 = common_numa_auto_strategy();
-    params.prio                = cmd_params_defaults.prio;
+    params.numa                 = cmd_params_defaults.numa;
+    params.prio                 = cmd_params_defaults.prio;
     params.delay                = cmd_params_defaults.delay;
     params.progress             = cmd_params_defaults.progress;
     params.no_warmup            = cmd_params_defaults.no_warmup;
@@ -1148,19 +1148,7 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
                     break;
                 }
                 std::string value(argv[i]);
-                if (value == "auto") {
-                    params.numa = common_numa_auto_strategy();
-                } else if (value == "disabled") {
-                    params.numa = GGML_NUMA_STRATEGY_DISABLED;
-                } else if (value == "experts") {
-                    params.numa = GGML_NUMA_STRATEGY_EXPERTS;
-                } else if (value == "distribute" || value == "") {
-                    params.numa = GGML_NUMA_STRATEGY_DISTRIBUTE;
-                } else if (value == "isolate") {
-                    params.numa = GGML_NUMA_STRATEGY_ISOLATE;
-                } else if (value == "numactl") {
-                    params.numa = GGML_NUMA_STRATEGY_NUMACTL;
-                } else {
+                if (!common_numa_strategy_from_str(value, params.numa)) {
                     invalid_param = true;
                     break;
                 }
