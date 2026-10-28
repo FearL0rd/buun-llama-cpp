@@ -460,8 +460,12 @@ struct common_params_speculative {
     }
 
     bool has_non_mtp_model_drafter() const {
-        return has_type(COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE) ||
-               has_type(COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3) ||
+        return has_type(COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE) || has_target_feature_drafter();
+    }
+
+    // EAGLE3/DFlash/DSpark sidecars read the target's hidden states and may borrow its embedding/output
+    bool has_target_feature_drafter() const {
+        return has_type(COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3) ||
                has_type(COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH) ||
                has_type(COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK) ||
                has_type(COMMON_SPECULATIVE_TYPE_DFLASH);

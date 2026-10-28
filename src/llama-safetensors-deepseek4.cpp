@@ -235,11 +235,15 @@ target_spec map_target(
         // EXL3 experts: per-expert svh / suh vectors stack to [n, n_expert] / [k, n_expert]
         const auto role = suffix == base + ".scale" ? llama_safetensors_quant_role::WEIGHT_SCALE :
             llama_safetensors_quant_role::INPUT_SCALE;
+        const auto module_of = [&](uint32_t expert) {
+            return prefix + "ffn.experts." + std::to_string(expert) + ".w" + expert_projection;
+        };
+        // expert 0 stands for the bank, as in describe()
+        const auto weight = bind_quant(quant, module_of(0), llama_safetensors_quant_role::WEIGHT);
+        if (!weight || !ggml_type_is_exl3(weight->target_type)) return {};
         target_spec result;
         for (uint32_t expert = 0; expert < n_expert; ++expert) {
-            const std::string module = prefix + "ffn.experts." + std::to_string(expert) + ".w" + expert_projection;
-            const auto weight = bind_quant(quant, module, llama_safetensors_quant_role::WEIGHT);
-            if (!weight || !ggml_type_is_exl3(weight->target_type)) return {};
+            const std::string module = module_of(expert);
             auto side = bind_quant(quant, module, role);
             if (!side) throw std::runtime_error("missing DeepSeek-V4 EXL3 expert side vector for '" + module + "'");
             result.stack.push_back(std::move(*side));

@@ -5186,6 +5186,11 @@ bool llama_model_has_host_moe_weights(const llama_model * model) {
     return false;
 }
 
+// token_embd, per_layer_token_embd (incl. Engram tables): read by row lookup, never multiplied
+static bool is_token_embd_table(const std::string & name) {
+    return name.find("token_embd") != std::string::npos;
+}
+
 size_t llama_model_host_offload_weight_bytes(const llama_model * model) {
     // MTP blocks run only in the draft context, never in a target batch
     const int64_t il_draft = model->hparams.has_mtp() ? (int64_t) model->hparams.n_layer() : INT64_MAX;
@@ -5196,7 +5201,7 @@ size_t llama_model_host_offload_weight_bytes(const llama_model * model) {
         }
         // token embeddings are row lookups, which stay on the host
         if (tensor->view_src == nullptr && tensor->buffer && ggml_backend_buffer_is_host(tensor->buffer) &&
-                name.find("token_embd") == std::string::npos) {
+                !is_token_embd_table(name)) {
             bytes += ggml_nbytes(tensor);
         }
     }
@@ -5206,7 +5211,7 @@ size_t llama_model_host_offload_weight_bytes(const llama_model * model) {
 uint64_t llama_model_n_lookup_params(const llama_model * model) {
     uint64_t n = 0;
     for (const auto & [name, tensor] : model->tensors_by_name) {
-        if (tensor->view_src == nullptr && name.find("token_embd") != std::string::npos) {
+        if (tensor->view_src == nullptr && is_token_embd_table(name)) {
             n += ggml_nelements(tensor);
         }
     }
