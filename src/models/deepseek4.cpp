@@ -426,7 +426,7 @@ ggml_tensor * llama_model_deepseek4::graph::build_hc_mixes(
         cb(pre, "hc_pre", il);
         cb(*post, "hc_post", il);
         cb(*comb, "hc_comb", il);
-        return build_hc_pre(x, pre, il);
+        return pre;
     }
 
     ggml_tensor * scale_pre  = dsv4_view_1d(ctx0, hc_scale, 1, 0);
