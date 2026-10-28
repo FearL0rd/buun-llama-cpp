@@ -5203,6 +5203,16 @@ size_t llama_model_host_offload_weight_bytes(const llama_model * model) {
     return bytes;
 }
 
+uint64_t llama_model_n_lookup_params(const llama_model * model) {
+    uint64_t n = 0;
+    for (const auto & [name, tensor] : model->tensors_by_name) {
+        if (tensor->view_src == nullptr && name.find("token_embd") != std::string::npos) {
+            n += ggml_nelements(tensor);
+        }
+    }
+    return n;
+}
+
 bool llama_model_largest_block_weight(
         const llama_model * model, ggml_type * type, int64_t * ne0, int64_t * ne1) {
     const ggml_tensor * best = nullptr;
