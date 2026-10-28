@@ -596,7 +596,6 @@ class MODEL_ARCH(IntEnum):
     DEEPSEEK2OCR     = auto()
     DEEPSEEK32       = auto()
     DEEPSEEK4        = auto()
-    DEEPSEEK41       = auto()
     CHATGLM          = auto()
     GLM4             = auto()
     GLM4_MOE         = auto()
@@ -676,6 +675,7 @@ class MODEL_ARCH(IntEnum):
     GLM5_NEXT = 249
     CLEF = 250
     K2HORIZON = 251
+    DEEPSEEK41 = 252
 
 
 class VISION_PROJECTOR_TYPE(IntEnum):
@@ -1255,8 +1255,6 @@ class MODEL_TENSOR(IntEnum):
     DFLASH2_ATTN_CONV_PROJ  = auto() # per-layer attention convolution coefficient projection
     DFLASH2_FFN_CONV_BASE   = auto() # per-layer MLP convolution base kernel
     DFLASH2_FFN_CONV_PROJ   = auto() # per-layer MLP convolution coefficient projection
-    ENGRAM_KV              = auto()
-    ENGRAM_GATE            = auto()
     DFLASH_ATTN_CONV_BASE  = auto()
     DFLASH_ATTN_CONV_PROJ  = auto()
     DFLASH_FFN_CONV_BASE   = auto()
@@ -1317,6 +1315,8 @@ class MODEL_TENSOR(IntEnum):
     INDEXER_KPOOL_APE = 602
     ATTN_V_GATE = 603
     ATTN_V_EXP = 604
+    ENGRAM_KV = 605
+    ENGRAM_GATE = 606
 
 
 MODEL_ARCH_NAMES: dict[MODEL_ARCH, str] = {
