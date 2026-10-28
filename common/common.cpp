@@ -1515,7 +1515,12 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
                 ? (uint32_t) params.speculative.draft.n_ctx : 0,
             /*.next         =*/ spec_mtp && !extra_is_mtp ? &extra_mtp : nullptr,
             /*.optional_if_no_mtp =*/ false,
-            /*.borrows_target_tensors =*/ has_draft && extra_is_mtp,
+            // EAGLE3/DFlash/DSpark sidecars may omit the embedding and output and need the target to build a context
+            /*.borrows_target_tensors =*/ has_draft && (extra_is_mtp ||
+                params.speculative.has_type(COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3) ||
+                params.speculative.has_type(COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH) ||
+                params.speculative.has_type(COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK) ||
+                params.speculative.has_type(COMMON_SPECULATIVE_TYPE_DFLASH)),
             /*.target_n_rs_seq_tensor =*/ params.speculative.need_n_rs_seq_tensor(),
         };
 
