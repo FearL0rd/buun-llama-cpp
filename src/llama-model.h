@@ -565,6 +565,15 @@ struct llama_layer {
     struct ggml_tensor * indexer_attn_q_b_in_s = nullptr;
     struct ggml_tensor * indexer_comp_wkv_s    = nullptr;
     struct ggml_tensor * indexer_comp_wgate_s  = nullptr;
+    // DeepSeek-V4 EXL3 input-sign (suh) vectors
+    struct ggml_tensor * wkv_in_s                = nullptr;
+    struct ggml_tensor * wo_a_in_s               = nullptr;
+    struct ggml_tensor * wo_b_in_s               = nullptr;
+    struct ggml_tensor * attn_comp_wkv_in_s      = nullptr;
+    struct ggml_tensor * attn_comp_wgate_in_s    = nullptr;
+    struct ggml_tensor * indexer_proj_in_s       = nullptr;
+    struct ggml_tensor * indexer_comp_wkv_in_s   = nullptr;
+    struct ggml_tensor * indexer_comp_wgate_in_s = nullptr;
 
     // cogvlm
     struct ggml_tensor * visexp_attn_wqkv = nullptr;

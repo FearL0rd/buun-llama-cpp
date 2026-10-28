@@ -2002,7 +2002,7 @@ ggml_tensor * llm_graph_context::build_lora_mm(
             (in_s->type == GGML_TYPE_F32 || in_s->type == GGML_TYPE_I32 || in_s->type == GGML_TYPE_I16);
         const bool mxfp4_scale = w->type == GGML_TYPE_MXFP4 && in_s->type == GGML_TYPE_I32;
         const bool exl3_signs = ggml_type_is_exl3(w->type) &&
-            in_s->type == GGML_TYPE_F16 && ggml_nelements(in_s) == w->ne[0];
+            in_s->type == GGML_TYPE_F16 && ggml_nelements(in_s) == w->ne[0]*w->ne[2];
         if (!exl3_signs && ((!fp8_scale && !i8_scale && !i4_scale && !mxfp4_scale) ||
             ggml_nelements(in_s) != 1)) {
             throw std::runtime_error(format(
@@ -2033,7 +2033,7 @@ ggml_tensor * llm_graph_context::build_lora_mm(
         const bool w8a16_scale = w->type == GGML_TYPE_I8 && w_s->type == GGML_TYPE_I8 &&
             w_s->ne[0] >= static_cast<int64_t>(sizeof(ggml_w8a16_scale_header));
         const bool exl3_scale = ggml_type_is_exl3(w->type) &&
-            w_s->type == GGML_TYPE_F16 && ggml_nelements(w_s) == w->ne[1];
+            w_s->type == GGML_TYPE_F16 && ggml_nelements(w_s) == w->ne[1]*w->ne[2];
         if ((w->type == GGML_TYPE_F8_E4M3 &&
              (w_s->type == GGML_TYPE_F32 || w_s->type == GGML_TYPE_I8 || fp8_group_scale ||
               is_dynamic_fp8_bf16_channel_scale(w, w_s, in_s))) ||

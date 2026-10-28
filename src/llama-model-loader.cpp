@@ -1438,8 +1438,11 @@ static bool weight_buft_supported(const llama_hparams & hparams, ggml_tensor * w
             } break;
         case GGML_OP_MUL_MAT:
             {
-                ggml_tensor * b = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, w->ne[0], 512, w->ne[2], w->ne[3]);
-                op_tensor = ggml_mul_mat(ctx, w, b);
+                // EXL3 executors are 2-D only; stacked EXL3 weights are multiplied plane by plane
+                ggml_tensor * a = ggml_type_is_exl3(w->type) && (w->ne[2] > 1 || w->ne[3] > 1) ?
+                    ggml_view_2d(ctx, w, w->ne[0], w->ne[1], w->nb[1], 0) : w;
+                ggml_tensor * b = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, w->ne[0], 512, a->ne[2], a->ne[3]);
+                op_tensor = ggml_mul_mat(ctx, a, b);
             } break;
         case GGML_OP_MUL_MAT_ID:
             {
@@ -1542,6 +1545,9 @@ static bool weight_buft_supported(const llama_hparams & hparams, ggml_tensor * w
     // create a temporary dummy buffer for the weight so that supports_op can check the buffer type
     GGML_ASSERT(w->buffer == nullptr);
     w->buffer = ggml_backend_buft_alloc_buffer(buft, 0);
+    if (op_tensor->src[0] != nullptr && op_tensor->src[0]->view_src == w) {
+        op_tensor->src[0]->buffer = w->buffer;
+    }
     bool op_supported = ggml_backend_dev_supports_op(dev, op_tensor);
     ggml_backend_buffer_free(w->buffer);
     w->buffer = nullptr;
