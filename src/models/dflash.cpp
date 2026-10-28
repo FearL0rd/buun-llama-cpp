@@ -1473,7 +1473,6 @@ llama_model_dflash::graph_dsv4::graph_dsv4(const llama_model & model, const llm_
 //   * token batch -> [anchor, noise...] block through the stages, single-pass mHC, no per-head q norm
 llama_model_dflash::graph_dsv41::graph_dsv41(const llama_model & model, const llm_graph_params & params) :
     llama_model_deepseek41::graph(params) {
-    const int64_t n_embd_inp       = hparams.n_embd_inp_enc();
     const int64_t n_embd_head      = hparams.n_embd_head_k();
     const int64_t n_embd_head_rope = hparams.n_rot();
     const int64_t n_embd_head_nope = n_embd_head - n_embd_head_rope;
@@ -1493,18 +1492,8 @@ llama_model_dflash::graph_dsv41::graph_dsv41(const llama_model & model, const ll
 
     ASSERT_EMBD_OR_TOKEN(ubatch);
     if (ubatch.embd) {
-        auto inp = std::make_unique<llm_graph_input_embd>(n_embd_inp);
-
-        inp->embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd_inp, n_tokens);
-        ggml_set_input(inp->embd);
-
-        ggml_tensor * inp_target = inp->embd;
-        cb(inp_target, "inp_target_features", -1);
-
-        res->add_input(std::move(inp));
-
-        ggml_tensor * inp_g = build_lora_mm(model.fc, inp_target, model.fc_s);
-        inp_g = build_norm(inp_g, model.output_norm_enc, nullptr, LLM_NORM_RMS, -1);
+        // staged / fused / pre-encoded target features, as in graph_dsv4
+        ggml_tensor * inp_g = build_dflash_inject_input(*this, model, n_embd);
         cb(inp_g, "main_x", -1);
 
         for (int il = 0; il < n_layer; ++il) {
@@ -1528,6 +1517,16 @@ llama_model_dflash::graph_dsv41::graph_dsv41(const llama_model & model, const ll
         return;
     }
 
+    // single-graph fused cycle: rows [0, n_inj) are staged injections from the carry tensor,
+    // spliced in after attn_norm so their KV takes the inject-graph math (see graph_dsv4)
+    const int64_t n_inj = cparams.dflash_oneg_stage ? cparams.dflash_oneg_n_inject : 0;
+    GGML_ASSERT(n_inj < n_tokens);
+
+    ggml_tensor * inp_g = nullptr;
+    if (n_inj > 0) {
+        inp_g = build_dflash_staged_enc(*this, model, cparams.dflash_oneg_stage, n_inj);
+    }
+
     auto * tok_embd = model.tok_embd;
     if (tok_embd == nullptr) {
         GGML_ASSERT(cparams.ctx_other != nullptr);
@@ -1543,7 +1542,7 @@ llama_model_dflash::graph_dsv41::graph_dsv41(const llama_model & model, const ll
 
     ggml_tensor * inp_tokens = inp->tokens;
 
-    ggml_tensor * inpL = ggml_get_rows(ctx0, tok_embd, inp->tokens);
+    ggml_tensor * inpL = build_get_rows_embd(tok_embd, inp->tokens);
     cb(inpL, "inp_noise_embd", -1);
 
     res->add_input(std::move(inp));
@@ -1563,7 +1562,7 @@ llama_model_dflash::graph_dsv41::graph_dsv41(const llama_model & model, const ll
     cb(inpL, "hc_init", -1);
 
     // window of a block = window of its first query, see n_swa
-    {
+    if (n_inj == 0) {
         ggml_tensor * m = inp_attn->self_kq_mask_swa_cnv;
         const int64_t n_blocks = ubatch.n_seqs_unq;
         const int64_t bd       = n_blocks > 0 ? n_tokens / n_blocks : 0;
@@ -1572,6 +1571,22 @@ llama_model_dflash::graph_dsv41::graph_dsv41(const llama_model & model, const ll
             ggml_tensor * r0 = ggml_view_4d(ctx0, m4, m4->ne[0], 1, m4->ne[2], m4->ne[3], m4->nb[1], m4->nb[2], m4->nb[3], 0);
             m4 = ggml_repeat(ctx0, r0, m4);
             inp_attn->self_kq_mask_swa_cnv = ggml_reshape_4d(ctx0, m4, m->ne[0], m->ne[1], 1, m->ne[3]);
+            cb(inp_attn->self_kq_mask_swa_cnv, "dspark_block_mask", -1);
+        }
+    } else {
+        // fused cycle: rewrite only the noise rows; the injection prefix (scratch seq) keeps its own rows
+        ggml_tensor * m = inp_attn->self_kq_mask_swa_cnv;
+        const int64_t n_blocks = (int64_t) ubatch.n_seqs_unq - 1;
+        const int64_t n_noise  = n_tokens - n_inj;
+        const int64_t bd       = n_blocks > 0 ? n_noise / n_blocks : 0;
+        if (m && bd > 1 && n_noise % n_blocks == 0 && m->ne[1] == n_tokens && m->ne[2] == 1 && m->ne[3] == 1 &&
+                ggml_is_contiguous(m)) {
+            ggml_tensor * head = ggml_view_2d(ctx0, m, m->ne[0], n_inj, m->nb[1], 0);
+            ggml_tensor * mn   = ggml_view_3d(ctx0, m, m->ne[0], bd, n_blocks, m->nb[1], bd*m->nb[1], n_inj*m->nb[1]);
+            ggml_tensor * r0   = ggml_view_3d(ctx0, m, m->ne[0], 1,  n_blocks, m->nb[1], bd*m->nb[1], n_inj*m->nb[1]);
+            mn = ggml_reshape_2d(ctx0, ggml_repeat(ctx0, r0, mn), m->ne[0], n_noise);
+            inp_attn->self_kq_mask_swa_cnv = ggml_reshape_4d(ctx0, ggml_concat(ctx0, ggml_cont(ctx0, head), mn, 1),
+                    m->ne[0], m->ne[1], 1, 1);
             cb(inp_attn->self_kq_mask_swa_cnv, "dspark_block_mask", -1);
         }
     }
@@ -1598,6 +1613,12 @@ llama_model_dflash::graph_dsv41::graph_dsv41(const llama_model & model, const ll
 
         cur = build_norm(cur, layer.attn_norm, nullptr, LLM_NORM_RMS, il);
         cb(cur, "attn_norm", il);
+
+        if (inp_g) {
+            ggml_tensor * tail = ggml_view_2d(ctx0, cur, n_embd, n_tokens - n_inj,
+                    cur->nb[1], (size_t) n_inj * cur->nb[1]);
+            cur = ggml_concat(ctx0, inp_g, tail, 1);
+        }
 
         // non-causal draft context: block queries see the main-KV ring plus every block key
         {
@@ -1688,6 +1709,11 @@ llama_model_dflash::graph_dsv41::graph_dsv41(const llama_model & model, const ll
     ggml_tensor * cur = build_hc_pre(inpL, pre_prev, -1);
     cb(cur, "hc_out", -1);
 
+    if (n_inj > 0) {
+        // only the noise rows produce outputs
+        cur = ggml_view_2d(ctx0, cur, n_embd, n_tokens - n_inj, cur->nb[1], (size_t) n_inj * cur->nb[1]);
+    }
+
     // confidence head takes the un-normed collapsed state
     res->t_embd = cur;
 
@@ -1711,8 +1737,14 @@ llama_model_dflash::graph_dsv41::graph_dsv41(const llama_model & model, const ll
     ggml_build_forward_expand(gf, cur);
 
     if (model.dspark_markov_w1) {
-        build_dspark_markov_head(*this, model, inp_tokens);
+        ggml_tensor * tok = inp_tokens;
+        if (n_inj > 0) {
+            tok = ggml_view_1d(ctx0, inp_tokens, n_tokens - n_inj, (size_t) n_inj * inp_tokens->nb[0]);
+        }
+        build_dspark_markov_head(*this, model, tok);
     }
+
+    build_dflash_draft_argmax(*this);
 }
 
 std::unique_ptr<llm_graph_context> llama_model_dflash::build_arch_graph(const llm_graph_params & params) const {
